@@ -403,6 +403,67 @@ Khi truy cập từ trình duyệt hoặc kiểm tra Health Check:
 
 ---
 
+## 👥 Danh Sách REST API Nhân Viên & Hệ Thống
+
+Hệ thống hỗ trợ đầy đủ các endpoint RESTful với cơ chế route aliases linh hoạt (chấp nhận cả có tiền tố `/api/` hoặc gọi trực tiếp):
+
+### 1. Lấy danh sách nhân viên (`GET /api/employees`)
+* **Endpoint:** `GET /api/employees` (Aliases: `/api/employees/`, `/employees`, `/employees/`, `/api/employee`)
+* **Mô tả:** Trả về danh sách tất cả nhân viên đã đăng ký khuôn mặt trong cơ sở dữ liệu SQLite.
+* **Curl kiểm tra:**
+  ```bash
+  curl -X GET http://localhost:3000/api/employees
+  ```
+* **Response mẫu:**
+  ```json
+  [
+    {
+      "id": "EMP-001",
+      "name": "Nguyễn Hoàng Minh",
+      "employeeCode": "NV-1082",
+      "department": "Phòng Kỹ Thuật AI",
+      "position": "Trưởng nhóm AI",
+      "photoUrl": "https://...",
+      "registeredAt": "2026-09-01T08:30:00.000Z",
+      "accessLevel": "ALL_ACCESS"
+    }
+  ]
+  ```
+
+### 2. Thêm nhân viên mới (`POST /api/employees`)
+* **Endpoint:** `POST /api/employees` (Aliases: `/employees`)
+* **Content-Type:** `application/json`
+* **Body:**
+  ```json
+  {
+    "name": "Trần Văn An",
+    "employeeCode": "NV-5501",
+    "department": "Phòng Công Nghệ Thông Tin",
+    "position": "Kỹ sư Phần mềm",
+    "photoUrl": "data:image/jpeg;base64,...",
+    "accessLevel": "ALL_ACCESS"
+  }
+  ```
+
+### 3. Xóa nhân viên (`DELETE /api/employees/:id`)
+* **Endpoint:** `DELETE /api/employees/:id` (Aliases: `/employees/:id`)
+
+### 4. Lấy lịch sử vào ra (`GET /api/logs`)
+* **Endpoint:** `GET /api/logs` (Aliases: `/logs`, `/api/access-logs`)
+
+### 5. Kiểm tra trạng thái khóa thông minh (`GET /api/lock/status`)
+* **Endpoint:** `GET /api/lock/status` (Aliases: `/lock/status`, `/api/status`, `/status`)
+
+### 6. Lấy thông báo di động (`GET /api/notifications`)
+* **Endpoint:** `GET /api/notifications` (Aliases: `/notifications`)
+
+### 7. Luồng sự kiện thời gian thực (`GET /api/events`)
+* **Endpoint:** `GET /api/events` (Aliases: `/events`, `/api/stream`, `/stream`)
+* **Giao thức:** Server-Sent Events (SSE) đẩy dữ liệu tự động khi có sự kiện mở cửa, chấm công, chuông báo.
+
+
+---
+
 ## 🔍 API Kiểm Tra Trạng Thái Database
 
 Bạn có thể kiểm tra loại database engine, kích thước file và số lượng bản ghi bất kỳ lúc nào qua endpoint:

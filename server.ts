@@ -28,6 +28,20 @@ app.use((req, res, next) => {
   next();
 });
 
+// Incoming request logger for transparency and debugging
+app.use((req, _res, next) => {
+  if (
+    !req.url.startsWith("/@") &&
+    !req.url.startsWith("/node_modules") &&
+    !req.url.startsWith("/src/") &&
+    !req.url.includes("vite") &&
+    !req.url.includes("hot-update")
+  ) {
+    console.log(`[HTTP ${req.method}] ${req.url}`);
+  }
+  next();
+});
+
 // Server-side Gemini client
 function getGeminiClient(): GoogleGenAI | null {
   const apiKey = process.env.GEMINI_API_KEY;
@@ -423,7 +437,7 @@ app.get("/api/health", (_req, res) => {
 });
 
 // SSE endpoint for real-time mobile notifications and lock status
-app.get("/api/events", (req, res) => {
+app.get(["/api/events", "/api/events/", "/events", "/events/"], (req, res) => {
   res.setHeader("Content-Type", "text/event-stream");
   res.setHeader("Cache-Control", "no-cache");
   res.setHeader("Connection", "keep-alive");
@@ -452,9 +466,19 @@ app.get("/api/events", (req, res) => {
 });
 
 // --- Smart Lock Endpoints ---
-app.get("/api/lock/status", (_req, res) => {
-  res.json(smartLockState);
-});
+app.get(
+  [
+    "/api/lock/status",
+    "/api/lock/status/",
+    "/lock/status",
+    "/lock/status/",
+    "/api/status",
+    "/status",
+  ],
+  (_req, res) => {
+    res.json(smartLockState);
+  }
+);
 
 app.post("/api/lock/unlock", (req, res) => {
   const { source = "API Remote", employeeName, employeeId } = req.body;
@@ -593,11 +617,20 @@ app.post("/api/webhook/client-log", (req, res) => {
 });
 
 // --- Employee Endpoints ---
-app.get(["/api/employees", "/api/employees/"], (_req, res) => {
+const EMPLOYEE_ROUTES = [
+  "/api/employees",
+  "/api/employees/",
+  "/employees",
+  "/employees/",
+  "/api/employee",
+  "/api/employee/",
+];
+
+app.get(EMPLOYEE_ROUTES, (_req, res) => {
   res.json(employees);
 });
 
-app.post(["/api/employees", "/api/employees/"], async (req, res) => {
+app.post(EMPLOYEE_ROUTES, async (req, res) => {
   console.log(`[API] Received POST /api/employees with body keys:`, Object.keys(req.body || {}));
   const { name, employeeCode, department, position, photoUrl, accessLevel } =
     req.body || {};
@@ -652,7 +685,7 @@ app.post(["/api/employees", "/api/employees/"], async (req, res) => {
   });
 });
 
-app.delete("/api/employees/:id", (req, res) => {
+app.delete(["/api/employees/:id", "/employees/:id"], (req, res) => {
   const { id } = req.params;
   const index = employees.findIndex((e) => e.id === id);
   if (index === -1) {
@@ -666,11 +699,20 @@ app.delete("/api/employees/:id", (req, res) => {
 });
 
 // --- Access Logs Endpoints ---
-app.get("/api/logs", (_req, res) => {
+const LOG_ROUTES = [
+  "/api/logs",
+  "/api/logs/",
+  "/logs",
+  "/logs/",
+  "/api/access-logs",
+  "/api/access-logs/",
+];
+
+app.get(LOG_ROUTES, (_req, res) => {
   res.json(accessLogs);
 });
 
-app.post("/api/logs/clear", (_req, res) => {
+app.post(["/api/logs/clear", "/logs/clear"], (_req, res) => {
   accessLogs = [];
   db.clearAccessLogs();
   broadcastSSE("logs_cleared", {});
@@ -678,18 +720,25 @@ app.post("/api/logs/clear", (_req, res) => {
 });
 
 // --- Mobile Notifications Endpoints ---
-app.get("/api/notifications", (_req, res) => {
+const NOTIFICATION_ROUTES = [
+  "/api/notifications",
+  "/api/notifications/",
+  "/notifications",
+  "/notifications/",
+];
+
+app.get(NOTIFICATION_ROUTES, (_req, res) => {
   res.json(mobileNotifications);
 });
 
-app.post("/api/notifications/clear", (_req, res) => {
+app.post(["/api/notifications/clear", "/notifications/clear"], (_req, res) => {
   mobileNotifications = [];
   db.clearNotifications();
   broadcastSSE("notifications_cleared", {});
   res.json({ success: true });
 });
 
-app.post("/api/notifications/mark-read", (_req, res) => {
+app.post(["/api/notifications/mark-read", "/notifications/mark-read"], (_req, res) => {
   mobileNotifications.forEach((n) => (n.read = true));
   db.markNotificationsRead();
   broadcastSSE("notifications_read", {});
@@ -1305,7 +1354,11 @@ app.use((err: any, _req: Request, res: Response, next: any) => {
 
 // --- Mount Vite in dev or static files in production ---
 async function startServer() {
-  if (process.env.NODE_ENV !== "production") {
+  const isProduction =
+    process.env.NODE_ENV === "production" ||
+    (typeof __filename !== "undefined" && __filename.endsWith("server.cjs"));
+
+  if (!isProduction) {
     const vite = await createViteServer({
       server: { middlewareMode: true },
       appType: "spa",
@@ -1320,7 +1373,7 @@ async function startServer() {
   }
 
   app.listen(PORT, "0.0.0.0", () => {
-    console.log(`Server running on http://0.0.0.0:${PORT}`);
+    console.log(`Server running on http://0.0.0.0:${PORT} (Mode: ${isProduction ? "production" : "development"})`);
   });
 }
 

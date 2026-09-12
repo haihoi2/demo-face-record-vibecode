@@ -57,23 +57,70 @@ export async function parseJsonResponse<T = any>(
   }
 }
 
+/**
+ * Normalizes API endpoint URLs ensuring correct leading slash and structure,
+ * preventing relative path 404s when navigating or querying.
+ */
+export function normalizeApiUrl(rawUrl: string): string {
+  if (!rawUrl) return "/api/health";
+  if (rawUrl.startsWith("http://") || rawUrl.startsWith("https://")) {
+    return rawUrl;
+  }
+  let path = rawUrl.trim();
+  if (path.startsWith("api/")) {
+    path = "/" + path;
+  } else if (!path.startsWith("/")) {
+    path = "/" + path;
+  }
+  return path;
+}
+
 export async function safeJsonFetch<T = any>(
   url: string,
   options?: RequestInit,
-  fallback?: T
+  fallback?: T,
+  retries = 2
 ): Promise<{ ok: boolean; status: number; data: T; error?: string }> {
-  try {
-    const res = await fetch(url, options);
-    return await parseJsonResponse<T>(res, fallback);
-  } catch (netErr: any) {
-    console.error(`[API Network Error] ${url}:`, netErr?.message);
-    return {
-      ok: false,
-      status: 0,
-      data: fallback as T,
-      error: netErr?.message || "Không thể kết nối đến máy chủ",
-    };
+  const normalizedUrl = normalizeApiUrl(url);
+
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    try {
+      const res = await fetch(normalizedUrl, options);
+      const parsed = await parseJsonResponse<T>(res, fallback);
+
+      // If successful, return immediately
+      if (parsed.ok) {
+        return parsed;
+      }
+
+      // If 404 or 5xx error and we still have retries (e.g. dev server rebooting or proxy connecting)
+      if (attempt < retries && (parsed.status === 404 || parsed.status >= 500)) {
+        await new Promise((resolve) => setTimeout(resolve, 600 * (attempt + 1)));
+        continue;
+      }
+
+      return parsed;
+    } catch (netErr: any) {
+      if (attempt < retries) {
+        await new Promise((resolve) => setTimeout(resolve, 600 * (attempt + 1)));
+        continue;
+      }
+      console.error(`[API Network Error] ${normalizedUrl}:`, netErr?.message);
+      return {
+        ok: false,
+        status: 0,
+        data: fallback as T,
+        error: netErr?.message || "Không thể kết nối đến máy chủ",
+      };
+    }
   }
+
+  return {
+    ok: false,
+    status: 0,
+    data: fallback as T,
+    error: "Yêu cầu thất bại sau nhiều lần thử",
+  };
 }
 
 /**
