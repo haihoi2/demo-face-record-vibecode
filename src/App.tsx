@@ -91,91 +91,124 @@ export default function App() {
     fetchData();
   }, [fetchData]);
 
-  // Connect to SSE event stream
+  // Connect to SSE event stream with controlled backoff
   useEffect(() => {
-    const eventSource = new EventSource("/api/events");
+    let eventSource: EventSource | null = null;
+    let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+    let isMounted = true;
+    let retryDelay = 8000;
 
-    eventSource.onopen = () => {
-      setSseConnected(true);
-    };
-
-    eventSource.onerror = () => {
-      setSseConnected(false);
-    };
-
-    // Lock State Updates
-    eventSource.addEventListener("lock_state", (e: MessageEvent) => {
+    function connect() {
+      if (!isMounted) return;
       try {
-        const data = JSON.parse(e.data);
-        setLockState(data);
-      } catch {}
-    });
+        eventSource = new EventSource("/api/events");
 
-    // Countdown updates
-    eventSource.addEventListener("lock_countdown", (e: MessageEvent) => {
-      try {
-        const { remainingSeconds } = JSON.parse(e.data);
-        setLockState((prev) => ({
-          ...prev,
-          remainingRelockSeconds: remainingSeconds,
-        }));
-      } catch {}
-    });
+        eventSource.onopen = () => {
+          if (isMounted) {
+            setSseConnected(true);
+            retryDelay = 8000;
+          }
+        };
 
-    // New Push Notifications
-    eventSource.addEventListener("notification", (e: MessageEvent) => {
-      try {
-        const notif: MobileNotification = JSON.parse(e.data);
-        setNotifications((prev) => [notif, ...prev.filter((n) => n.id !== notif.id)]);
-        // Show floating toast
-        setLatestToast(notif);
-        setTimeout(() => setLatestToast(null), 4500);
-      } catch {}
-    });
+        eventSource.onerror = () => {
+          if (isMounted) {
+            setSseConnected(false);
+            if (eventSource) {
+              eventSource.close();
+              eventSource = null;
+            }
+            if (reconnectTimer) clearTimeout(reconnectTimer);
+            reconnectTimer = setTimeout(() => {
+              if (isMounted) connect();
+            }, retryDelay);
+            retryDelay = Math.min(retryDelay * 1.5, 30000);
+          }
+        };
 
-    // Access Granted Event
-    eventSource.addEventListener("access_granted", (e: MessageEvent) => {
-      try {
-        const { log } = JSON.parse(e.data);
-        if (log) {
-          setAccessLogs((prev) => [log, ...prev.filter((l) => l.id !== log.id)]);
-        }
-      } catch {}
-    });
+        // Lock State Updates
+        eventSource.addEventListener("lock_state", (e: MessageEvent) => {
+          try {
+            const data = JSON.parse(e.data);
+            setLockState(data);
+          } catch {}
+        });
 
-    // Access Denied Event
-    eventSource.addEventListener("access_denied", (e: MessageEvent) => {
-      try {
-        const { log } = JSON.parse(e.data);
-        if (log) {
-          setAccessLogs((prev) => [log, ...prev.filter((l) => l.id !== log.id)]);
-        }
-      } catch {}
-    });
+        // Countdown updates
+        eventSource.addEventListener("lock_countdown", (e: MessageEvent) => {
+          try {
+            const { remainingSeconds } = JSON.parse(e.data);
+            setLockState((prev) => ({
+              ...prev,
+              remainingRelockSeconds: remainingSeconds,
+            }));
+          } catch {}
+        });
 
-    // Employee Registered
-    eventSource.addEventListener("employee_registered", (e: MessageEvent) => {
-      try {
-        const newEmp = JSON.parse(e.data);
-        setEmployees((prev) => [newEmp, ...prev.filter((item) => item.id !== newEmp.id)]);
-      } catch {}
-    });
+        // New Push Notifications
+        eventSource.addEventListener("notification", (e: MessageEvent) => {
+          try {
+            const notif: MobileNotification = JSON.parse(e.data);
+            setNotifications((prev) => [notif, ...prev.filter((n) => n.id !== notif.id)]);
+            // Show floating toast
+            setLatestToast(notif);
+            setTimeout(() => setLatestToast(null), 4500);
+          } catch {}
+        });
 
-    // Employee Deleted
-    eventSource.addEventListener("employee_deleted", (e: MessageEvent) => {
-      try {
-        const { id } = JSON.parse(e.data);
-        setEmployees((prev) => prev.filter((item) => item.id !== id));
-      } catch {}
-    });
+        // Access Granted Event
+        eventSource.addEventListener("access_granted", (e: MessageEvent) => {
+          try {
+            const { log } = JSON.parse(e.data);
+            if (log) {
+              setAccessLogs((prev) => [log, ...prev.filter((l) => l.id !== log.id)]);
+            }
+          } catch {}
+        });
 
-    // Logs Cleared
-    eventSource.addEventListener("logs_cleared", () => {
-      setAccessLogs([]);
-    });
+        // Access Denied Event
+        eventSource.addEventListener("access_denied", (e: MessageEvent) => {
+          try {
+            const { log } = JSON.parse(e.data);
+            if (log) {
+              setAccessLogs((prev) => [log, ...prev.filter((l) => l.id !== log.id)]);
+            }
+          } catch {}
+        });
+
+        // Employee Registered
+        eventSource.addEventListener("employee_registered", (e: MessageEvent) => {
+          try {
+            const newEmp = JSON.parse(e.data);
+            setEmployees((prev) => [newEmp, ...prev.filter((item) => item.id !== newEmp.id)]);
+          } catch {}
+        });
+
+        // Employee Deleted
+        eventSource.addEventListener("employee_deleted", (e: MessageEvent) => {
+          try {
+            const { id } = JSON.parse(e.data);
+            setEmployees((prev) => prev.filter((item) => item.id !== id));
+          } catch {}
+        });
+
+        // Logs Cleared
+        eventSource.addEventListener("logs_cleared", () => {
+          setAccessLogs([]);
+        });
+      } catch (err) {
+        console.warn("[SSE Warning] Could not establish EventSource:", err);
+      }
+    }
+
+    connect();
 
     return () => {
-      eventSource.close();
+      isMounted = false;
+      if (reconnectTimer) clearTimeout(reconnectTimer);
+      if (eventSource) {
+        eventSource.close();
+        eventSource = null;
+      }
     };
   }, []);
 
