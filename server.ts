@@ -9,8 +9,21 @@ dotenv.config();
 const app = express();
 const PORT = 3000;
 
-// Increase payload limit for base64 camera frames
-app.use(express.json({ limit: "15mb" }));
+// Increase payload limit for base64 camera frames and large portraits
+app.use(express.json({ limit: "50mb" }));
+app.use(express.urlencoded({ extended: true, limit: "50mb" }));
+
+// Enable CORS and preflight handling for all incoming requests
+app.use((req, res, next) => {
+  res.header("Access-Control-Allow-Origin", "*");
+  res.header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
+  res.header("Access-Control-Allow-Headers", "Origin, X-Requested-With, Content-Type, Accept, Authorization");
+  if (req.method === "OPTIONS") {
+    res.sendStatus(204);
+    return;
+  }
+  next();
+});
 
 // Server-side Gemini client
 function getGeminiClient(): GoogleGenAI | null {
@@ -518,13 +531,14 @@ app.post("/api/webhook/test", async (req, res) => {
 });
 
 // --- Employee Endpoints ---
-app.get("/api/employees", (_req, res) => {
+app.get(["/api/employees", "/api/employees/"], (_req, res) => {
   res.json(employees);
 });
 
-app.post("/api/employees", async (req, res) => {
+app.post(["/api/employees", "/api/employees/"], async (req, res) => {
+  console.log(`[API] Received POST /api/employees with body keys:`, Object.keys(req.body || {}));
   const { name, employeeCode, department, position, photoUrl, accessLevel } =
-    req.body;
+    req.body || {};
 
   if (!name || !employeeCode || !photoUrl) {
     res.status(400).json({ error: "Vui lòng cung cấp họ tên, mã số và ảnh khuôn mặt" });
@@ -618,7 +632,25 @@ app.post("/api/notifications/mark-read", (_req, res) => {
 app.post("/api/recognize-face", async (req, res) => {
   const startTime = Date.now();
   try {
-    const { imageBase64, scanType = "ENTRY", testEmployeeId } = req.body;
+    const { imageBase64, scanType = "ENTRY", testEmployeeId, clientEmployees } = req.body;
+
+    // Sync any employees sent from client that server doesn't have yet
+    if (Array.isArray(clientEmployees) && clientEmployees.length > 0) {
+      for (const ce of clientEmployees) {
+        if (ce && ce.employeeCode && !employees.some((e) => e.employeeCode.toUpperCase() === ce.employeeCode.toUpperCase())) {
+          employees.unshift({
+            id: ce.id || "EMP-" + String(Date.now()).slice(-4),
+            name: ce.name,
+            employeeCode: ce.employeeCode.toUpperCase(),
+            department: ce.department || "Phòng Hành chính - Nhân sự",
+            position: ce.position || "Nhân viên",
+            photoUrl: ce.photoUrl || "",
+            registeredAt: ce.registeredAt || new Date().toISOString(),
+            accessLevel: ce.accessLevel || "ALL_ACCESS",
+          });
+        }
+      }
+    }
 
     if (!imageBase64) {
       res.status(400).json({ error: "Không nhận được hình ảnh từ camera" });

@@ -153,6 +153,7 @@ export const FaceScanner: React.FC<FaceScannerProps> = ({
             imageBase64: imageToSend,
             scanType,
             testEmployeeId,
+            clientEmployees: employees,
           }),
         }
       );

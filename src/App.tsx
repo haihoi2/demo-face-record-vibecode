@@ -51,7 +51,34 @@ export default function App() {
         safeJsonFetch<MobileNotification[]>("/api/notifications", undefined, []),
       ]);
 
-      if (empRes.ok && Array.isArray(empRes.data)) setEmployees(empRes.data);
+      // Read local offline employees
+      let localEmps: Employee[] = [];
+      try {
+        const raw = localStorage.getItem("smartlock_offline_employees");
+        if (raw) localEmps = JSON.parse(raw);
+      } catch {}
+
+      if (empRes.ok && Array.isArray(empRes.data)) {
+        // Merge server and local employees
+        const merged = [...empRes.data];
+        for (const localEmp of localEmps) {
+          if (!merged.some((m) => m.id === localEmp.id || m.employeeCode === localEmp.employeeCode)) {
+            merged.unshift(localEmp);
+          }
+        }
+        setEmployees(merged);
+      } else if (localEmps.length > 0) {
+        setEmployees((prev) => {
+          const merged = [...prev];
+          for (const localEmp of localEmps) {
+            if (!merged.some((m) => m.id === localEmp.id || m.employeeCode === localEmp.employeeCode)) {
+              merged.unshift(localEmp);
+            }
+          }
+          return merged;
+        });
+      }
+
       if (logRes.ok && Array.isArray(logRes.data)) setAccessLogs(logRes.data);
       if (lockRes.ok && lockRes.data) setLockState(lockRes.data);
       if (notifRes.ok && Array.isArray(notifRes.data)) setNotifications(notifRes.data);
