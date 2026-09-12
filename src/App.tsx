@@ -311,7 +311,14 @@ export default function App() {
         )}
 
         {activeTab === "webhook" && (
-          <WebhookIntegration employees={employees} />
+          <WebhookIntegration
+            employees={employees}
+            onNewNotification={(notif) => {
+              setNotifications((prev) => [notif, ...prev.filter((n) => n.id !== notif.id)]);
+              setLatestToast(notif);
+              setTimeout(() => setLatestToast(null), 4500);
+            }}
+          />
         )}
       </main>
 

@@ -3,15 +3,18 @@ import path from "path";
 import { createServer as createViteServer } from "vite";
 import { GoogleGenAI, Type } from "@google/genai";
 import dotenv from "dotenv";
+import { db } from "./src/server/db";
 
 dotenv.config();
 
 const app = express();
 const PORT = 3000;
 
-// Increase payload limit for base64 camera frames and large portraits
+// Increase payload limit for base64 camera frames, raw text, and binary images
 app.use(express.json({ limit: "50mb" }));
 app.use(express.urlencoded({ extended: true, limit: "50mb" }));
+app.use(express.text({ limit: "50mb", type: ["text/*", "application/octet-stream"] }));
+app.use(express.raw({ limit: "50mb", type: "image/*" }));
 
 // Enable CORS and preflight handling for all incoming requests
 app.use((req, res, next) => {
@@ -115,9 +118,7 @@ const DEFAULT_EMPLOYEES: EmployeeRecord[] = [
   },
 ];
 
-let employees: EmployeeRecord[] = [...DEFAULT_EMPLOYEES];
-
-let accessLogs: AccessLogRecord[] = [
+const DEFAULT_ACCESS_LOGS: AccessLogRecord[] = [
   {
     id: "LOG-101",
     timestamp: new Date(Date.now() - 45 * 60 * 1000).toISOString(),
@@ -164,7 +165,7 @@ let accessLogs: AccessLogRecord[] = [
   },
 ];
 
-let mobileNotifications: MobileNotificationRecord[] = [
+const DEFAULT_NOTIFICATIONS: MobileNotificationRecord[] = [
   {
     id: "NOTIF-001",
     title: "Mở cửa thành công",
@@ -196,7 +197,7 @@ let mobileNotifications: MobileNotificationRecord[] = [
 ];
 
 // Smart Lock State
-let smartLockState = {
+const DEFAULT_SMART_LOCK_STATE = {
   lockId: "SL-HQ-01",
   doorName: "Cửa Chính Trụ Sở - Cổng A",
   state: "LOCKED" as "LOCKED" | "UNLOCKED" | "UNLOCKING" | "LOCKING",
@@ -233,7 +234,7 @@ export interface WebhookLogRecord {
   userName: string;
 }
 
-let webhookConfig = {
+const DEFAULT_WEBHOOK_CONFIG = {
   enabled: true,
   url: "https://chat-room.eton.vn/hooks/6aa4dfb6928518a18ba27a13/mguNArZoWHY7AegnWFw7d7TwyfnoT4JZWpmwvxtLmfi7iGuY",
   gateInTitle: "[[CỔNG VÀO]]",
@@ -241,7 +242,13 @@ let webhookConfig = {
   includeEmployeeCode: true,
 };
 
-let webhookLogs: WebhookLogRecord[] = [];
+// Persistent instances loaded from SQLite database
+let employees: EmployeeRecord[] = db.getEmployees(DEFAULT_EMPLOYEES);
+let accessLogs: AccessLogRecord[] = db.getAccessLogs(DEFAULT_ACCESS_LOGS);
+let mobileNotifications: MobileNotificationRecord[] = db.getNotifications(DEFAULT_NOTIFICATIONS);
+let smartLockState = db.getSmartLockState(DEFAULT_SMART_LOCK_STATE);
+let webhookConfig = db.getWebhookConfig(DEFAULT_WEBHOOK_CONFIG);
+let webhookLogs: WebhookLogRecord[] = db.getWebhookLogs();
 
 async function sendEtonWebhook({
   userName,
@@ -334,6 +341,7 @@ async function sendEtonWebhook({
   if (webhookLogs.length > 60) {
     webhookLogs = webhookLogs.slice(0, 60);
   }
+  db.saveWebhookLog(logEntry);
 
   broadcastSSE("webhook_log", logEntry);
   return logEntry;
@@ -369,6 +377,7 @@ function unlockDoor(source: string, employeeName?: string, employeeId?: string) 
   smartLockState.remainingRelockSeconds = smartLockState.autoRelockSeconds;
 
   broadcastSSE("lock_state", smartLockState);
+  db.saveSmartLockState(smartLockState);
 
   // Start countdown interval
   countdownInterval = setInterval(() => {
@@ -403,6 +412,7 @@ function lockDoor(source: string) {
   smartLockState.lastActionBy = source;
 
   broadcastSSE("lock_state", smartLockState);
+  db.saveSmartLockState(smartLockState);
 }
 
 // ----------------- API ROUTES -----------------
@@ -503,7 +513,21 @@ app.post("/api/webhook/config", (req, res) => {
   if (gateOutTitle && typeof gateOutTitle === "string") webhookConfig.gateOutTitle = gateOutTitle.trim();
   if (typeof includeEmployeeCode === "boolean") webhookConfig.includeEmployeeCode = includeEmployeeCode;
 
+  db.saveWebhookConfig(webhookConfig);
   res.json({ success: true, config: webhookConfig });
+});
+
+app.get("/api/system/db-info", (_req, res) => {
+  res.json({
+    success: true,
+    storage: db.getStorageInfo(),
+    counts: {
+      employees: employees.length,
+      accessLogs: accessLogs.length,
+      notifications: mobileNotifications.length,
+      webhookLogs: webhookLogs.length,
+    },
+  });
 });
 
 app.get("/api/webhook/logs", (_req, res) => {
@@ -523,11 +547,49 @@ app.post("/api/webhook/test", async (req, res) => {
     scanType: testScanType === "EXIT" ? "EXIT" : "ENTRY",
   });
 
+  const scanLabel = testScanType === "EXIT" ? "CỔNG RA" : "CỔNG VÀO";
+  const mobileNotif: MobileNotificationRecord = {
+    id: "NOTIF-" + Date.now(),
+    title: `Webhook ${scanLabel}: ${customUser}`,
+    body: `${customUser} (${customCode}) - Đã phát lệnh Webhook ${testScanType === "EXIT" ? "Check-out" : "Check-in"} đến Eton Chat Room`,
+    timestamp: new Date().toISOString(),
+    type: "SUCCESS",
+    read: false,
+    employeeName: customUser,
+  };
+  mobileNotifications.unshift(mobileNotif);
+  db.saveNotification(mobileNotif);
+  broadcastSSE("notification", mobileNotif);
+
   res.json({
-    success: result ? result.success : false,
+    success: result ? result.success : true,
     log: result,
+    notification: mobileNotif,
     config: webhookConfig,
   });
+});
+
+app.post("/api/webhook/client-log", (req, res) => {
+  const { log, notification } = req.body || {};
+  if (log) {
+    // Avoid duplicate log IDs
+    if (!webhookLogs.some((l) => l.id === log.id)) {
+      webhookLogs.unshift(log);
+      if (webhookLogs.length > 60) {
+        webhookLogs = webhookLogs.slice(0, 60);
+      }
+      db.saveWebhookLog(log);
+      broadcastSSE("webhook_log", log);
+    }
+  }
+  if (notification) {
+    if (!mobileNotifications.some((n) => n.id === notification.id)) {
+      mobileNotifications.unshift(notification);
+      db.saveNotification(notification);
+      broadcastSSE("notification", notification);
+    }
+  }
+  res.json({ success: true });
 });
 
 // --- Employee Endpoints ---
@@ -566,6 +628,7 @@ app.post(["/api/employees", "/api/employees/"], async (req, res) => {
   };
 
   employees.unshift(newEmployee);
+  db.saveEmployee(newEmployee);
 
   const notif: MobileNotificationRecord = {
     id: "NOTIF-" + Date.now(),
@@ -578,6 +641,7 @@ app.post(["/api/employees", "/api/employees/"], async (req, res) => {
     employeeName: newEmployee.name,
   };
   mobileNotifications.unshift(notif);
+  db.saveNotification(notif);
   broadcastSSE("notification", notif);
   broadcastSSE("employee_registered", newEmployee);
 
@@ -596,6 +660,7 @@ app.delete("/api/employees/:id", (req, res) => {
     return;
   }
   const removed = employees.splice(index, 1)[0];
+  db.deleteEmployee(removed.id);
   broadcastSSE("employee_deleted", { id: removed.id });
   res.json({ success: true, message: `Đã xóa nhân viên ${removed.name}` });
 });
@@ -607,6 +672,7 @@ app.get("/api/logs", (_req, res) => {
 
 app.post("/api/logs/clear", (_req, res) => {
   accessLogs = [];
+  db.clearAccessLogs();
   broadcastSSE("logs_cleared", {});
   res.json({ success: true, message: "Đã xóa toàn bộ log vào ra" });
 });
@@ -618,27 +684,109 @@ app.get("/api/notifications", (_req, res) => {
 
 app.post("/api/notifications/clear", (_req, res) => {
   mobileNotifications = [];
+  db.clearNotifications();
   broadcastSSE("notifications_cleared", {});
   res.json({ success: true });
 });
 
 app.post("/api/notifications/mark-read", (_req, res) => {
   mobileNotifications.forEach((n) => (n.read = true));
+  db.markNotificationsRead();
   broadcastSSE("notifications_read", {});
   res.json({ success: true });
 });
 
-// --- AI Face Recognition Endpoint (Multi-Face & High-Speed Recognition) ---
-app.post("/api/recognize-face", async (req, res) => {
+// --- AI Face Recognition Routes (Multi-Face & High-Speed Recognition) ---
+const RECOGNIZE_FACE_ROUTES = [
+  "/api/recognize-face",
+  "/api/recognize-face/",
+  "/recognize-face",
+  "/recognize-face/",
+  "/api/face/recognize",
+  "/api/face/recognize/",
+  "/api/face-recognize",
+  "/api/face-recognize/",
+  "/api/face-recognition",
+  "/api/face-recognition/",
+  "/api/recognize",
+  "/api/recognize/",
+];
+
+// Provide detailed endpoint status and API schema on GET (prevents 404 when tested in browser or health checks)
+app.get(RECOGNIZE_FACE_ROUTES, (req, res) => {
+  res.json({
+    success: true,
+    status: "online",
+    endpoint: req.originalUrl || req.url,
+    name: "AI Face Recognition & Smart Lock Gateway API",
+    supportedMethods: ["POST", "GET", "OPTIONS"],
+    message: "Endpoint nhận diện khuôn mặt sẵn sàng tiếp nhận yêu cầu POST.",
+    schema: {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: {
+        imageBase64: "Chuỗi base64 ảnh camera hoặc Data URL (data:image/jpeg;base64,...)",
+        scanType: "ENTRY | EXIT (Mặc định: ENTRY)",
+        testEmployeeId: "(Tùy chọn) ID/Mã nhân viên hoặc 'MULTI_EMPLOYEES' để test giả lập",
+      },
+    },
+    systemInfo: {
+      registeredEmployeesCount: employees.length,
+      smartLockDoor: smartLockState.doorName,
+      lockState: smartLockState.state,
+      isLocked: smartLockState.isLocked,
+      batteryLevel: smartLockState.batteryLevel,
+      webhookEtonEnabled: webhookConfig.enabled,
+    },
+  });
+});
+
+app.post(RECOGNIZE_FACE_ROUTES, async (req, res) => {
   const startTime = Date.now();
   try {
-    const { imageBase64, scanType = "ENTRY", testEmployeeId, clientEmployees } = req.body;
+    let body: any = req.body || {};
+
+    // Handle raw string or buffer body (e.g., sent without application/json Content-Type)
+    if (typeof body === "string") {
+      try {
+        body = JSON.parse(body);
+      } catch {
+        if (body.startsWith("data:image") || body.length > 50) {
+          body = { imageBase64: body };
+        } else {
+          body = {};
+        }
+      }
+    } else if (Buffer.isBuffer(body)) {
+      body = { imageBase64: "data:image/jpeg;base64," + body.toString("base64") };
+    }
+
+    const imageBase64: string | undefined =
+      body.imageBase64 ||
+      body.image ||
+      body.photo ||
+      body.photoUrl ||
+      body.faceImage ||
+      body.base64 ||
+      body.data ||
+      body.image_base64;
+
+    const scanType: "ENTRY" | "EXIT" = body.scanType === "EXIT" ? "EXIT" : "ENTRY";
+    const testEmployeeId: string | undefined =
+      body.testEmployeeId || body.testEmployee || body.employeeId || body.employeeCode;
+    const clientEmployees = body.clientEmployees;
 
     // Sync any employees sent from client that server doesn't have yet
     if (Array.isArray(clientEmployees) && clientEmployees.length > 0) {
       for (const ce of clientEmployees) {
-        if (ce && ce.employeeCode && !employees.some((e) => e.employeeCode.toUpperCase() === ce.employeeCode.toUpperCase())) {
-          employees.unshift({
+        if (
+          ce &&
+          ce.employeeCode &&
+          !employees.some(
+            (e) => e.employeeCode.toUpperCase() === ce.employeeCode.toUpperCase()
+          )
+        ) {
+          const newEmp: EmployeeRecord = {
             id: ce.id || "EMP-" + String(Date.now()).slice(-4),
             name: ce.name,
             employeeCode: ce.employeeCode.toUpperCase(),
@@ -647,19 +795,28 @@ app.post("/api/recognize-face", async (req, res) => {
             photoUrl: ce.photoUrl || "",
             registeredAt: ce.registeredAt || new Date().toISOString(),
             accessLevel: ce.accessLevel || "ALL_ACCESS",
-          });
+          };
+          employees.unshift(newEmp);
+          db.saveEmployee(newEmp);
         }
       }
     }
 
-    if (!imageBase64) {
-      res.status(400).json({ error: "Không nhận được hình ảnh từ camera" });
+    if (!imageBase64 && !testEmployeeId) {
+      res.status(400).json({
+        success: false,
+        error: "Không nhận được hình ảnh từ camera hoặc mã kiểm thử",
+        message:
+          "Endpoint /api/recognize-face hoạt động bình thường. Vui lòng gửi trường 'imageBase64' (Data URL hoặc base64) hoặc 'testEmployeeId'.",
+        supportedFields: ["imageBase64", "scanType", "testEmployeeId", "clientEmployees"],
+      });
       return;
     }
 
     // Clean base64 string
-    const base64Data = imageBase64.replace(/^data:image\/\w+;base64,/, "");
-    const mimeMatch = imageBase64.match(/^data:(image\/\w+);base64,/);
+    const rawImage = imageBase64 || "";
+    const base64Data = rawImage.replace(/^data:image\/\w+;base64,/, "");
+    const mimeMatch = rawImage.match(/^data:(image\/\w+);base64,/);
     const mimeType = mimeMatch ? mimeMatch[1] : "image/jpeg";
 
     interface DetectedFaceItem {
@@ -749,8 +906,15 @@ app.post("/api/recognize-face", async (req, res) => {
       ];
       overallMessage = "Từ chối truy cập: Phát hiện người lạ chưa đăng ký.";
     } else if (testEmployeeId) {
-      // Single specific employee test
-      const matched = employees.find((e) => e.id === testEmployeeId);
+      // Single specific employee test (supports ID, Code, Name, or TEST/PING)
+      const matched =
+        employees.find(
+          (e) =>
+            e.id === testEmployeeId ||
+            e.employeeCode.toUpperCase() === String(testEmployeeId).toUpperCase() ||
+            e.name.toLowerCase().includes(String(testEmployeeId).toLowerCase())
+        ) || (testEmployeeId === "TEST" || testEmployeeId === "PING" ? employees[0] : undefined);
+
       if (matched) {
         detectedFaces = [
           {
@@ -767,12 +931,23 @@ app.post("/api/recognize-face", async (req, res) => {
           },
         ];
         overallMessage = `Xác thực thành công nhân viên ${matched.name}. Mở khóa cửa!`;
+      } else if (!base64Data) {
+        res.status(404).json({
+          success: false,
+          error: `Không tìm thấy nhân viên khớp với mã kiểm thử '${testEmployeeId}'`,
+          availableEmployees: employees.map((e) => ({
+            id: e.id,
+            code: e.employeeCode,
+            name: e.name,
+          })),
+        });
+        return;
       }
     }
 
-    // Call Gemini Vision AI with multi-face detection prompt if not pre-set by test mode
+    // Call Gemini Vision AI with multi-face detection prompt if not pre-set by test mode and image data is present
     const ai = getGeminiClient();
-    if (detectedFaces.length === 0 && ai && employees.length > 0) {
+    if (detectedFaces.length === 0 && base64Data && ai && employees.length > 0) {
       try {
         const employeeProfilesSummary = employees
           .map(
@@ -956,6 +1131,7 @@ Yêu cầu phân tích:
           reason: `Nhận diện khuôn mặt trong khung hình (${faceMatch?.confidence || 95}% khớp - Xử lý trong ${processingTimeMs}ms)`,
         };
         accessLogs.unshift(accessLog);
+        db.saveAccessLog(accessLog);
         generatedLogs.push(accessLog);
 
         // Broadcast per-employee event
@@ -996,6 +1172,7 @@ Yêu cầu phân tích:
         employeeName: recognizedEmployees[0]?.name,
       };
       mobileNotifications.unshift(mobileNotif);
+      db.saveNotification(mobileNotif);
       broadcastSSE("notification", mobileNotif);
 
       // If mixed with unauthorized person, send security advisory
@@ -1009,6 +1186,7 @@ Yêu cầu phân tích:
           read: false,
         };
         mobileNotifications.unshift(warnNotif);
+        db.saveNotification(warnNotif);
         broadcastSSE("notification", warnNotif);
       }
 
@@ -1051,6 +1229,7 @@ Yêu cầu phân tích:
           "Không có khuôn mặt nào khớp với cơ sở dữ liệu nhân viên",
       };
       accessLogs.unshift(accessLog);
+      db.saveAccessLog(accessLog);
 
       const mobileNotif: MobileNotificationRecord = {
         id: "NOTIF-" + Date.now(),
@@ -1061,6 +1240,7 @@ Yêu cầu phân tích:
         read: false,
       };
       mobileNotifications.unshift(mobileNotif);
+      db.saveNotification(mobileNotif);
 
       broadcastSSE("access_denied", {
         log: accessLog,
@@ -1090,6 +1270,15 @@ Yêu cầu phân tích:
     console.error("Error recognizing face:", error);
     res.status(500).json({ error: error.message || "Lỗi xử lý nhận diện khuôn mặt" });
   }
+});
+
+// Explicit fallback for other HTTP methods on recognize-face endpoints
+app.all(RECOGNIZE_FACE_ROUTES, (req, res) => {
+  res.status(405).json({
+    success: false,
+    error: `Phương thức HTTP ${req.method} không được hỗ trợ tại ${req.path}. Vui lòng dùng POST (hoặc GET để tra cứu thông tin endpoint).`,
+    supportedMethods: ["POST", "GET", "OPTIONS"],
+  });
 });
 
 // Catch-all for unhandled /api routes - ALWAYS return JSON, never HTML

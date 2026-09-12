@@ -1,0 +1,438 @@
+# Hệ Thống Điểm Danh Khuôn Mặt AI & Điều Khiển Khóa Thông Minh (SmartLock Gateway)
+
+Hệ thống nhận diện khuôn mặt nhân viên đa đối tượng thời gian thực bằng mô hình **Gemini AI**, tự động điều khiển khóa cửa thông minh (Smart Lock API), ghi nhận lịch sử chấm công Vào/Ra, đồng bộ thông báo thời gian thực qua Server-Sent Events (SSE) và gửi Webhook tích hợp trực tiếp vào **Eton Chat Room**.
+
+Toàn bộ dữ liệu của phần Backend được lưu trữ bền vững vào cơ sở dữ liệu **SQLite 3 (`data/smartface.db`)**, không bị mất mát khi khởi động lại máy chủ hoặc nâng cấp hệ thống.
+
+---
+
+## 📑 Mục Lục
+1. [Kiến Trúc Lưu Trữ SQLite](#-kiến-trúc-lưu-trữ-sqlite)
+2. [Cấu Trúc Bảng Dữ Liệu SQLite](#-cấu-trúc-bảng-dữ-liệu-sqlite)
+3. [Yêu Cầu Hệ Thống (Prerequisites)](#-yêu-cầu-hệ-thống)
+4. [Hướng Dẫn Cài Đặt & Chạy Môi Trường Phát Triển (Dev)](#-hướng-dẫn-chạy-môi-trường-phát-triển)
+5. [Hướng Dẫn Biên Dịch (Build Production)](#-hướng-dẫn-biên-dịch-build-production)
+6. [Hướng Dẫn Deploy Production](#-hướng-dẫn-deploy-production)
+   - [Cách 1: Deploy trên Máy Chủ Linux/Ubuntu với PM2](#cách-1-deploy-trực-tiếp-bằng-pm2-khuyên-dùng-cho-vps)
+   - [Cách 2: Deploy bằng Docker & Docker Compose (Volume Persist)](#cách-2-deploy-bằng-docker--docker-compose)
+   - [Cách 3: Cấu hình Nginx Reverse Proxy & Chứng Chỉ SSL HTTPS](#cách-3-cấu-hình-nginx-reverse-proxy--ssl-https)
+7. [Sao Lưu (Backup) & Phục Hồi (Restore) SQLite](#-sao-lưu-và-phục-hồi-cơ-sở-dữ-liệu-sqlite)
+8. [Tích Hợp Webhook Eton Chat Room](#-tích-hợp-webhook-eton-chat-room)
+9. [API Kiểm Tra Trạng Thái Database](#-api-kiểm-tra-trạng-thái-database)
+
+---
+
+## 🗄️ Kiến Trúc Lưu Trữ SQLite
+
+Hệ thống sử dụng cơ chế lưu trữ SQLite 3 với các đặc điểm tối ưu:
+* **Engine Native Node.js 22+ (`node:sqlite`)**: Sử dụng trực tiếp engine SQLite tích hợp sẵn trong Node.js runtime, mang lại tốc độ truy vấn tức thì (in-process microsecond latency), không phụ thuộc vào `node-gyp` hay trình biên dịch C++ phức tạp của hệ điều hành.
+* **Vị trí file dữ liệu**: `./data/smartface.db` (tự động tạo thư mục `data/` và khởi tạo bảng khi khởi chạy lần đầu).
+* **Cơ chế Fallback an toàn**: Nếu chạy trên phiên bản Node cũ hơn chưa hỗ trợ `node:sqlite`, hệ thống tự động kích hoạt bộ lưu trữ tệp atomic JSON (`data/smartface_data.json`) để ứng dụng luôn hoạt động thông suốt.
+* **Toàn vẹn dữ liệu**: Toàn bộ dữ liệu nhân viên, ảnh đại diện, lịch sử chấm công, cấu hình webhook và thông báo được ghi đĩa ngay khi có thay đổi.
+
+---
+
+## 📊 Cấu Trúc Bảng Dữ Liệu SQLite
+
+File `data/smartface.db` quản lý 6 bảng cơ bản:
+
+| Tên Bảng | Mô Tả | Các Trường Chính |
+| :--- | :--- | :--- |
+| `employees` | Danh sách nhân viên & khuôn mặt | `id`, `name`, `employeeCode` (UNIQUE), `department`, `position`, `photoUrl`, `registeredAt`, `accessLevel` |
+| `access_logs` | Nhật ký chấm công & mở khóa Vào/Ra | `id`, `timestamp`, `type` (ENTRY/EXIT), `status` (GRANTED/DENIED), `employeeId`, `employeeName`, `employeeCode`, `department`, `confidence`, `livenessScore`, `lockAction`, `doorName`, `reason` |
+| `smart_lock_state` | Trạng thái chốt khóa thông minh | `lockId`, `doorName`, `state` (LOCKED/UNLOCKED), `isLocked`, `batteryLevel`, `signalDbm`, `firmwareVersion`, `lastActionAt`, `lastActionBy`, `autoRelockSeconds`, `status` |
+| `webhook_config` | Cấu hình Eton Chat Room Webhook | `id`, `enabled`, `url`, `gateInTitle`, `gateOutTitle`, `includeEmployeeCode` |
+| `webhook_logs` | Lịch sử bản tin Webhook đã phát | `id`, `timestamp`, `url`, `method`, `payload`, `statusCode`, `statusText`, `responseBody`, `success`, `error`, `scanType`, `userName` |
+| `mobile_notifications` | Thông báo đẩy cho ứng dụng di động | `id`, `title`, `body`, `timestamp`, `type`, `read`, `employeeId`, `employeeName` |
+
+---
+
+## 💻 Yêu Cầu Hệ Thống
+
+* **Hệ điều hành**: Linux (Ubuntu 20.04+, Debian 11+), macOS hoặc Windows 10/11.
+* **Node.js**: Phiên bản **Node.js >= 22.0.0 LTS** (khuyên dùng để sử dụng Native SQLite).
+* **Package Manager**: npm (đi kèm Node.js).
+* **Camera / Webcam**: Hỗ trợ độ phân giải tối thiểu 720p để nhận diện khuôn mặt qua trình duyệt.
+* **Khóa cửa**: Khóa cửa thông minh có kết nối mạng (Zigbee Gateway / Wi-Fi API) hoặc mô phỏng qua SmartLock Gateway tích hợp.
+
+---
+
+## 🚀 Hướng Dẫn Chạy Môi Trường Phát Triển
+
+### 1. Tải mã nguồn và cài đặt thư viện
+```bash
+git clone <URL_REPOSITORY>
+cd <THU_MUC_DU_AN>
+npm install
+```
+
+### 2. Cấu hình biến môi trường
+Tạo file `.env` từ mẫu `.env.example`:
+```bash
+cp .env.example .env
+```
+
+Chỉnh sửa nội dung file `.env`:
+```env
+# Port ứng dụng (mặc định 3000)
+PORT=3000
+
+# Khóa API Google Gemini (dùng cho nhận diện khuôn mặt AI & đánh giá độ sống thật)
+GEMINI_API_KEY="AIzaSy..."
+```
+
+### 3. Chạy ứng dụng ở chế độ Dev
+```bash
+npm run dev
+```
+Truy cập trình duyệt tại: **`http://localhost:3000`**
+
+Khi khởi động, server sẽ hiển thị log:
+```text
+[SQLite] Đã kết nối cơ sở dữ liệu SQLite thành công tại: /path/to/data/smartface.db
+Server running on http://localhost:3000
+```
+
+---
+
+## 📦 Hướng Dẫn Biên Dịch (Build Production)
+
+Lệnh build thực hiện 2 nhiệm vụ trong một bước duy nhất:
+1. Biên dịch giao diện React TypeScript bằng **Vite** vào thư mục `dist/`.
+2. Đóng gói toàn bộ mã nguồn máy chủ Express & Database SQLite bằng **esbuild** thành file duy nhất `dist/server.cjs`.
+
+Chạy lệnh build:
+```bash
+npm run build
+```
+
+Sau khi hoàn tất, cấu trúc thư mục phát hành sẽ bao gồm:
+```text
+dist/
+├── index.html       # Single Page Application
+├── assets/          # JS, CSS, Media đóng gói
+├── server.cjs       # Node.js bundled backend server
+└── server.cjs.map   # Sourcemap hỗ trợ debug
+data/
+└── smartface.db     # Cơ sở dữ liệu SQLite bền vững
+```
+
+Kiểm tra chạy thử file đã build:
+```bash
+npm start
+# Tương đương: node dist/server.cjs
+```
+
+---
+
+## 🌐 Hướng Dẫn Deploy Production
+
+### Cách 1: Deploy Trực Tiếp Bằng PM2 (Khuyên dùng cho VPS)
+
+**PM2** là trình quản lý tiến trình chuyên dụng cho Node.js, tự động khởi động lại ứng dụng nếu gặp sự cố và khởi động cùng hệ thống khi reboot máy chủ.
+
+#### Bước 1: Cài đặt PM2 toàn cục
+```bash
+sudo npm install -g pm2
+```
+
+#### Bước 2: Build dự án
+```bash
+npm run build
+```
+
+#### Bước 3: Tạo file cấu hình `ecosystem.config.cjs`
+Tạo file `ecosystem.config.cjs` tại thư mục gốc:
+```javascript
+module.exports = {
+  apps: [
+    {
+      name: "smartface-gateway",
+      script: "dist/server.cjs",
+      instances: 1, // Chạy 1 instance vì SQLite là file-based database
+      autorestart: true,
+      watch: false,
+      max_memory_restart: "800M",
+      env: {
+        NODE_ENV: "production",
+        PORT: 3000,
+        GEMINI_API_KEY: "AIzaSy..."
+      }
+    }
+  ]
+};
+```
+
+#### Bước 4: Khởi chạy và lưu cấu hình PM2
+```bash
+# Khởi chạy ứng dụng
+pm2 start ecosystem.config.cjs
+
+# Lưu danh sách tiến trình tự khởi động cùng OS
+pm2 save
+pm2 startup
+```
+
+Các lệnh quản trị tiện ích:
+```bash
+pm2 status              # Xem trạng thái
+pm2 logs smartface-gateway  # Xem log thời gian thực
+pm2 restart smartface-gateway # Khởi động lại
+```
+
+---
+
+### Cách 2: Deploy Bằng Docker & Docker Compose
+
+Deploy bằng Docker giúp đóng gói toàn bộ môi trường Node 22 đồng nhất và gắn thư mục `./data` ra ngoài máy chủ chủ để bảo đảm dữ liệu SQLite không bao giờ bị mất khi cập nhật container.
+
+#### Khởi chạy với Docker Compose (1 Lệnh duy nhất):
+```bash
+# Đặt biến môi trường nếu có
+export GEMINI_API_KEY="AIzaSy..."
+
+# Build image và chạy container ở chế độ nền (detached)
+docker compose up -d --build
+```
+
+#### Kiểm tra container:
+```bash
+# Xem danh sách container đang chạy
+docker compose ps
+
+# Xem log khởi động
+docker compose logs -f
+```
+
+File cơ sở dữ liệu SQLite nằm tại thư mục `./data/smartface.db` trên máy chủ host, được đồng bộ trực tiếp hai chiều với `/app/data/smartface.db` bên trong container.
+
+---
+
+### Cách 3: Cấu Hình Nginx Reverse Proxy & SSL (HTTPS)
+
+Trình duyệt yêu cầu kết nối an toàn **HTTPS** để cho phép người dùng cấp quyền truy cập Camera/Webcam (`navigator.mediaDevices.getUserMedia`). Dưới đây là cấu hình Nginx tiêu chuẩn:
+
+#### Bước 1: Cài đặt Nginx & Certbot
+```bash
+sudo apt update
+sudo apt install -y nginx certbot python3-certbot-nginx
+```
+
+#### Bước 2: Tạo cấu hình Virtual Host Nginx
+Tạo file cấu hình: `/etc/nginx/sites-available/smartface.conf`:
+```nginx
+server {
+    server_name smartface.yourcompany.com;
+
+    # Cho phép tải ảnh khuôn mặt base64 dung lượng lớn
+    client_max_body_size 50M;
+
+    location / {
+        proxy_pass http://127.0.0.1:3000;
+        proxy_http_version 1.1;
+
+        # Cấu hình WebSocket và Server-Sent Events (SSE)
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection 'upgrade';
+        proxy_set_header Host $host;
+        proxy_cache_bypass $http_upgrade;
+
+        # Tối ưu cho luồng SSE thông báo thời gian thực
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_buffering off;
+        proxy_read_timeout 86400s;
+    }
+}
+```
+
+Kích hoạt site và khởi động lại Nginx:
+```bash
+sudo ln -s /etc/nginx/sites-available/smartface.conf /etc/nginx/sites-enabled/
+sudo nginx -t
+sudo systemctl reload nginx
+```
+
+#### Bước 3: Cấp chứng chỉ SSL miễn phí qua Let's Encrypt
+```bash
+sudo certbot --nginx -d smartface.yourcompany.com
+```
+
+---
+
+## 💾 Sao Lưu và Phục Hồi Cơ Sở Dữ Liệu SQLite
+
+Vì toàn bộ backend lưu trong file duy nhất `data/smartface.db`, việc sao lưu và di chuyển hệ thống cực kỳ đơn giản:
+
+### 1. Sao lưu tự động định kỳ (Hot Backup không gián đoạn dịch vụ)
+Sử dụng công cụ `sqlite3` chính thống để tạo bản sao lưu an toàn ngay cả khi ứng dụng đang ghi log:
+```bash
+# Tạo bản sao lưu có gắn ngày giờ
+sqlite3 data/smartface.db ".backup 'data/smartface_backup_$(date +%Y%m%d_%H%M%S).db'"
+```
+
+### 2. Thiết lập Cronjob sao lưu mỗi đêm (00:00 hàng ngày)
+Mở crontab:
+```bash
+crontab -e
+```
+Thêm dòng sau:
+```cron
+0 0 * * * sqlite3 /duong-dan/data/smartface.db ".backup '/duong-dan/data/backup_$(date +\%Y\%m\%d).db'" && find /duong-dan/data/backup_*.db -mtime +30 -delete
+```
+*(Lệnh trên tự động giữ lại bản sao lưu trong vòng 30 ngày gần nhất).*
+
+### 3. Phục hồi dữ liệu (Restore)
+Khi cần phục hồi lại một bản sao lưu trước đó:
+```bash
+# 1. Dừng ứng dụng
+pm2 stop smartface-gateway
+# (hoặc: docker compose stop)
+
+# 2. Thay thế file cơ sở dữ liệu
+cp data/smartface_backup_YYYYMMDD.db data/smartface.db
+
+# 3. Khởi động lại ứng dụng
+pm2 start smartface-gateway
+# (hoặc: docker compose start)
+```
+
+---
+
+## 🔗 Tích Hợp Webhook Eton Chat Room
+
+Hệ thống hỗ trợ gửi thông báo điểm danh tự động vào kênh Chat Room của Eton:
+* **Địa chỉ mặc định**: `https://chat-room.eton.vn/hooks/...`
+* **Định dạng Payload chuẩn Eton**:
+```json
+{
+  "text": "Nguyễn Hoàng Minh (NV-1082) - 16:30:00 12/09/2026",
+  "attachments": [
+    {
+      "title": "[[CỔNG VÀO]]"
+    }
+  ]
+}
+```
+* **Chế độ phát trực tiếp từ trình duyệt (Direct Browser Delivery)**: Bỏ qua hạn chế CORS để các máy quét đặt trong mạng VPN/Intranet nội bộ của Eton có thể phát lệnh thông suốt.
+
+---
+
+## 📡 Danh Mục API Endpoints & Nhận Diện Khuôn Mặt
+
+Hệ thống cung cấp đầy đủ các cổng API RESTful để tích hợp cùng camera AI, đầu đọc khuôn mặt hoặc hệ thống kiểm soát cửa bên ngoài:
+
+### 1. Cổng Nhận Diện Khuôn Mặt & Điều Khiển Khóa (`/api/recognize-face`)
+
+Hỗ trợ các phương thức **POST**, **GET** và **OPTIONS** (bao gồm alias `/recognize-face`, `/api/face/recognize` và `/api/face-recognize`):
+
+#### A. Gửi ảnh nhận diện và tự động mở cửa (POST)
+
+**Endpoint:** `POST /api/recognize-face`  
+**Headers:** `Content-Type: application/json`
+
+**Body mẫu (Gửi ảnh camera thực tế):**
+```json
+{
+  "imageBase64": "data:image/jpeg;base64,/9j/4AAQSkZJRgABAQ...",
+  "scanType": "ENTRY"
+}
+```
+* `imageBase64`: Chuỗi ảnh Base64 (hỗ trợ cả Data URL hoặc chuỗi raw base64, tối đa 50MB).
+* `scanType`: `"ENTRY"` (Cổng Vào) hoặc `"EXIT"` (Cổng Ra).
+
+**Body mẫu (Kiểm thử nhanh không cần ảnh):**
+```json
+{
+  "testEmployeeId": "NV-1082",
+  "scanType": "ENTRY"
+}
+```
+*(Hỗ trợ `testEmployeeId`: Mã nhân viên `NV-1082`, ID, hoặc `"MULTI_EMPLOYEES"` để mô phỏng nhận diện đồng thời nhiều người).*
+
+**Response mẫu (Thành công - Mở khóa tự động):**
+```json
+{
+  "recognized": true,
+  "employee": {
+    "id": "EMP-001",
+    "name": "Nguyễn Hoàng Minh",
+    "employeeCode": "NV-1082",
+    "department": "Phòng Kỹ Thuật AI",
+    "position": "Trưởng nhóm AI"
+  },
+  "detectedFaces": [
+    {
+      "box2d": [170, 270, 730, 730],
+      "employeeName": "Nguyễn Hoàng Minh",
+      "confidence": 98,
+      "livenessScore": 99,
+      "recognized": true
+    }
+  ],
+  "totalFacesDetected": 1,
+  "lockUnlocked": true,
+  "message": "Xác thực thành công nhân viên Nguyễn Hoàng Minh. Mở khóa cửa!"
+}
+```
+
+#### B. Kiểm tra trạng thái cổng API & Cấu hình (GET)
+
+Khi truy cập từ trình duyệt hoặc kiểm tra Health Check:
+
+**Request:** `GET /api/recognize-face`
+
+**Response mẫu:**
+```json
+{
+  "success": true,
+  "status": "online",
+  "endpoint": "/api/recognize-face",
+  "supportedMethods": ["POST", "GET", "OPTIONS"],
+  "message": "Endpoint nhận diện khuôn mặt sẵn sàng tiếp nhận yêu cầu POST.",
+  "systemInfo": {
+    "registeredEmployeesCount": 4,
+    "smartLockDoor": "Cửa Chính Trụ Sở - Cổng A",
+    "lockState": "UNLOCKED",
+    "isLocked": false,
+    "batteryLevel": 96
+  }
+}
+```
+
+---
+
+## 🔍 API Kiểm Tra Trạng Thái Database
+
+Bạn có thể kiểm tra loại database engine, kích thước file và số lượng bản ghi bất kỳ lúc nào qua endpoint:
+
+**Request:**
+```http
+GET /api/system/db-info HTTP/1.1
+Host: localhost:3000
+```
+
+**Response mẫu:**
+```json
+{
+  "success": true,
+  "storage": {
+    "engine": "SQLite 3 (Node.js native DatabaseSync)",
+    "dbPath": "/app/data/smartface.db",
+    "sizeBytes": 57344,
+    "sizeFormatted": "56.00 KB"
+  },
+  "counts": {
+    "employees": 3,
+    "accessLogs": 24,
+    "notifications": 12,
+    "webhookLogs": 8
+  }
+}
+```
+
+---
+
+## 🛡️ Bản Quyền & Giấy Phép
+Dự án được xây dựng và tối ưu cho môi trường doanh nghiệp. Toàn bộ mã nguồn mở và dễ dàng mở rộng theo các chuẩn kết nối phần cứng khóa thông minh và camera IP RTSP.

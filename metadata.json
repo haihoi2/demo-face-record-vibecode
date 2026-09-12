@@ -1,6 +1,6 @@
 {
   "name": "Hệ Thống Mở Cửa Khuôn Mặt AI & Khóa Thông Minh",
-  "description": "Demo nhận diện khuôn mặt nhân viên bằng AI, tự động kích hoạt khóa cửa thông minh qua API, ghi log chấm công vào ra và thông báo di động thời gian thực.",
+  "description": "Demo nhận diện khuôn mặt nhân viên bằng AI, tự động kích hoạt khóa cửa thông minh qua API, ghi log chấm công vào ra, thông báo di động và lưu trữ dữ liệu bền vững bằng SQLite.",
   "requestFramePermissions": ["camera"],
   "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
 }
