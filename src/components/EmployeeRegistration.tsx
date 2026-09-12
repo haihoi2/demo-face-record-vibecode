@@ -238,7 +238,7 @@ export const EmployeeRegistration: React.FC<EmployeeRegistrationProps> = ({
             </label>
 
             {/* Photo Preview or Live Camera Capture */}
-            <div className="relative w-56 h-56 rounded-2xl bg-slate-100 border-2 border-dashed border-slate-300 overflow-hidden flex items-center justify-center group shadow-inner">
+            <div className="relative w-full max-w-sm aspect-4/3 rounded-2xl bg-slate-100 border-2 border-dashed border-slate-300 overflow-hidden flex items-center justify-center group shadow-inner">
               {isCapturingCamera ? (
                 <video
                   ref={regVideoRef}
@@ -254,21 +254,31 @@ export const EmployeeRegistration: React.FC<EmployeeRegistrationProps> = ({
                   className="w-full h-full object-cover"
                 />
               ) : (
-                <div className="text-center p-4 text-slate-400">
-                  <Camera className="w-10 h-10 mx-auto mb-2 opacity-50" />
-                  <p className="text-xs font-medium">Chưa có ảnh khuôn mặt</p>
-                  <p className="text-[11px] text-slate-400 mt-0.5">
-                    Chụp từ webcam hoặc tải tệp ảnh
+                <div className="text-center p-6 text-slate-400">
+                  <Camera className="w-12 h-12 mx-auto mb-2 opacity-50 text-indigo-500" />
+                  <p className="text-xs font-semibold text-slate-700">Chưa có ảnh khuôn mặt</p>
+                  <p className="text-[11px] text-slate-500 mt-1">
+                    Bật camera hoặc tải tệp ảnh từ máy tính
                   </p>
                 </div>
               )}
 
-              {/* Target guidelines when in camera mode */}
+              {/* Panoramic Face Frame Guide when in camera mode */}
               {isCapturingCamera && (
-                <div className="absolute inset-4 border border-indigo-400/80 rounded-2xl pointer-events-none flex items-center justify-center">
-                  <span className="text-[11px] font-mono text-indigo-300 bg-black/60 px-2 py-0.5 rounded">
-                    Căn giữa khuôn mặt
-                  </span>
+                <div className="absolute inset-0 pointer-events-none p-4 flex flex-col justify-between">
+                  <div className="flex justify-between">
+                    <div className="w-6 h-6 border-t-2 border-l-2 border-emerald-400" />
+                    <div className="w-6 h-6 border-t-2 border-r-2 border-emerald-400" />
+                  </div>
+                  <div className="flex items-center justify-center">
+                    <span className="text-[11px] font-mono text-emerald-300 bg-black/70 px-2.5 py-1 rounded-full border border-emerald-500/40">
+                      👁️ AI Đang Quét Toàn Khung Hình • Sẵn Sàng Chụp
+                    </span>
+                  </div>
+                  <div className="flex justify-between">
+                    <div className="w-6 h-6 border-b-2 border-l-2 border-emerald-400" />
+                    <div className="w-6 h-6 border-b-2 border-r-2 border-emerald-400" />
+                  </div>
                 </div>
               )}
             </div>

@@ -9,14 +9,22 @@ import {
   ShieldCheck,
   Zap,
   Upload,
-  UserCheck,
   UserX,
   Sparkles,
-  ArrowRightLeft,
   KeyRound,
   DoorOpen,
+  Users,
+  Timer,
+  Eye,
+  Send,
 } from "lucide-react";
-import { Employee, FaceRecognitionResult, ScanType, SmartLockState } from "../types";
+import {
+  Employee,
+  FaceRecognitionResult,
+  ScanType,
+  SmartLockState,
+  DetectedFace,
+} from "../types";
 import { soundEffects } from "../utils/audio";
 
 interface FaceScannerProps {
@@ -40,8 +48,10 @@ export const FaceScanner: React.FC<FaceScannerProps> = ({
   const [isScanning, setIsScanning] = useState<boolean>(false);
   const [scanType, setScanType] = useState<ScanType>("ENTRY");
   const [lastResult, setLastResult] = useState<FaceRecognitionResult | null>(null);
-  const [autoScan, setAutoScan] = useState<boolean>(false);
+  const [scanMode, setScanMode] = useState<"OFF" | "FAST" | "TURBO">("OFF");
   const [capturedSnapshot, setCapturedSnapshot] = useState<string | null>(null);
+  const [activeFaces, setActiveFaces] = useState<DetectedFace[]>([]);
+  const [lastLatencyMs, setLastLatencyMs] = useState<number>(140);
 
   // Initialize webcam
   const startCamera = async () => {
@@ -68,7 +78,7 @@ export const FaceScanner: React.FC<FaceScannerProps> = ({
     } catch (err: any) {
       console.warn("Camera access warning:", err);
       setCameraError(
-        "Không thể truy cập camera (Có thể chưa cấp quyền hoặc đang chạy trong sandbox). Bạn có thể tải ảnh lên hoặc dùng chức năng thử nghiệm 1 chạm bên dưới."
+        "Không thể truy cập camera trực tiếp. Bạn có thể sử dụng tính năng Tải Ảnh hoặc nhấn các nút Thử Nghiệm Nhanh Đa Nhân Viên bên dưới."
       );
       setStreamActive(false);
     }
@@ -90,26 +100,28 @@ export const FaceScanner: React.FC<FaceScannerProps> = ({
     };
   }, []);
 
-  // Capture frame as base64 string
+  // Capture frame as base64 string optimized for fast AI processing
   const captureFrame = (): string | null => {
     if (!videoRef.current) return null;
     const video = videoRef.current;
 
     const canvas = canvasRef.current || document.createElement("canvas");
-    canvas.width = video.videoWidth || 640;
-    canvas.height = video.videoHeight || 480;
+    // Optimize resolution for high-speed AI transmission
+    canvas.width = 640;
+    canvas.height = 480;
 
     const ctx = canvas.getContext("2d");
     if (!ctx) return null;
 
     ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-    return canvas.toDataURL("image/jpeg", 0.85);
+    return canvas.toDataURL("image/jpeg", 0.82);
   };
 
-  // Perform AI Face Recognition
+  // Perform AI Face Recognition (Full-frame multi-face & high-speed)
   const handleScan = async (overrideBase64?: string, testEmployeeId?: string) => {
     if (isScanning) return;
     setIsScanning(true);
+    const clientStartTime = Date.now();
 
     let imageToSend = overrideBase64;
     if (!imageToSend) {
@@ -118,7 +130,7 @@ export const FaceScanner: React.FC<FaceScannerProps> = ({
       }
     }
 
-    // Fallback if no camera image and no override
+    // Fallback image if camera inactive and no override
     if (!imageToSend && employees.length > 0) {
       imageToSend = employees[0].photoUrl;
     }
@@ -142,7 +154,16 @@ export const FaceScanner: React.FC<FaceScannerProps> = ({
       });
 
       const data: FaceRecognitionResult = await res.json();
+      const latency = Date.now() - clientStartTime;
+      setLastLatencyMs(data.processingTimeMs || latency);
+
       setLastResult(data);
+      if (data.detectedFaces && data.detectedFaces.length > 0) {
+        setActiveFaces(data.detectedFaces);
+      } else {
+        setActiveFaces([]);
+      }
+
       onRecognitionComplete(data);
 
       if (data.recognized) {
@@ -151,24 +172,25 @@ export const FaceScanner: React.FC<FaceScannerProps> = ({
         soundEffects.playDenied();
       }
     } catch (err) {
-      console.error("Lỗi gửi dữ liệu nhận diện:", err);
+      console.error("Lỗi gửi dữ liệu nhận diện khuôn mặt:", err);
     } finally {
       setIsScanning(false);
     }
   };
 
-  // Auto-scan loop if enabled
+  // High-speed auto-scan loop
   useEffect(() => {
     let timer: NodeJS.Timeout | null = null;
-    if (autoScan && streamActive && !isScanning) {
+    if (scanMode !== "OFF" && streamActive && !isScanning) {
+      const intervalMs = scanMode === "TURBO" ? 1600 : 3000;
       timer = setInterval(() => {
         handleScan();
-      }, 5000);
+      }, intervalMs);
     }
     return () => {
       if (timer) clearInterval(timer);
     };
-  }, [autoScan, streamActive, isScanning]);
+  }, [scanMode, streamActive, isScanning]);
 
   // Handle local file upload for testing
   const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -185,51 +207,76 @@ export const FaceScanner: React.FC<FaceScannerProps> = ({
 
   return (
     <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
-      {/* Hidden canvas for capturing frames */}
-      <canvas ref={canvasRef} className="hidden" />
-
-      {/* Main Scanner Viewport */}
+      {/* Left Column: Full-Frame Biometric Viewport & Live Scanner */}
       <div className="lg:col-span-8 space-y-4">
-        <div className="bg-slate-900 rounded-2xl overflow-hidden shadow-xl border border-slate-800 relative">
-          {/* Top Bar on Video */}
-          <div className="absolute top-0 left-0 right-0 p-4 z-20 flex items-center justify-between bg-gradient-to-b from-black/80 via-black/40 to-transparent">
+        {/* Main Camera Viewport Card */}
+        <div className="bg-slate-900 rounded-2xl overflow-hidden border border-slate-800 shadow-xl relative">
+          {/* Top Camera Header Bar */}
+          <div className="p-3 bg-slate-950/90 border-b border-slate-800/80 flex flex-wrap items-center justify-between gap-3 text-xs">
             <div className="flex items-center gap-2">
-              <div className="w-3 h-3 rounded-full bg-rose-500 animate-ping" />
-              <span className="text-white text-xs font-mono uppercase tracking-wider font-semibold">
-                AI Face Sensor 01 • {scanType === "ENTRY" ? "CỔNG VÀO" : "CỔNG RA"}
+              <span
+                className={`w-2.5 h-2.5 rounded-full ${
+                  streamActive ? "bg-emerald-500 animate-pulse" : "bg-rose-500"
+                }`}
+              />
+              <span className="font-mono font-bold text-slate-200">
+                CAMERA TOÀN CẢNH ĐA MỤC TIÊU
+              </span>
+              <span className="px-2 py-0.5 rounded-md bg-indigo-950/80 text-indigo-300 border border-indigo-500/30 text-[11px] font-semibold flex items-center gap-1">
+                <Eye className="w-3 h-3 text-indigo-400" />
+                Không giới hạn ô quét
               </span>
             </div>
 
-            {/* Entry / Exit Mode Toggle */}
-            <div className="flex items-center bg-black/50 backdrop-blur-md rounded-lg p-1 border border-white/10">
-              <button
-                id="btn-mode-entry"
-                onClick={() => setScanType("ENTRY")}
-                className={`px-3 py-1 rounded text-xs font-medium transition-all ${
-                  scanType === "ENTRY"
-                    ? "bg-emerald-500 text-white shadow-xs"
-                    : "text-slate-300 hover:text-white"
-                }`}
+            {/* Entry / Exit Mode Toggle & Speed Badge */}
+            <div className="flex items-center gap-2">
+              {/* Speed latency pill */}
+              <div className="hidden sm:flex items-center gap-1 px-2.5 py-1 rounded-lg bg-slate-800/80 border border-slate-700 text-slate-300 font-mono text-[11px]">
+                <Timer className="w-3 h-3 text-amber-400" />
+                <span>Tốc độ:</span>
+                <span className="text-emerald-400 font-bold">{lastLatencyMs}ms</span>
+              </div>
+
+              {/* Webhook Status pill */}
+              <div
+                className="hidden md:flex items-center gap-1 px-2 py-1 rounded-lg bg-indigo-950/70 border border-indigo-500/30 text-indigo-300 text-[11px] font-medium"
+                title="Tự động POST webhook vào https://chat-room.eton.vn khi mở cửa"
               >
-                Vào (Check-in)
-              </button>
-              <button
-                id="btn-mode-exit"
-                onClick={() => setScanType("EXIT")}
-                className={`px-3 py-1 rounded text-xs font-medium transition-all ${
-                  scanType === "EXIT"
-                    ? "bg-blue-500 text-white shadow-xs"
-                    : "text-slate-300 hover:text-white"
-                }`}
-              >
-                Ra (Check-out)
-              </button>
+                <Send className="w-3 h-3 text-indigo-400 animate-pulse" />
+                <span>Webhook Eton: Bật</span>
+              </div>
+
+              {/* Mode Toggle */}
+              <div className="flex items-center bg-black/50 backdrop-blur-md rounded-lg p-0.5 border border-white/10">
+                <button
+                  id="btn-mode-entry"
+                  onClick={() => setScanType("ENTRY")}
+                  className={`px-3 py-1 rounded text-xs font-semibold transition-all cursor-pointer ${
+                    scanType === "ENTRY"
+                      ? "bg-emerald-500 text-white shadow-xs"
+                      : "text-slate-300 hover:text-white"
+                  }`}
+                >
+                  Vào (Check-in)
+                </button>
+                <button
+                  id="btn-mode-exit"
+                  onClick={() => setScanType("EXIT")}
+                  className={`px-3 py-1 rounded text-xs font-semibold transition-all cursor-pointer ${
+                    scanType === "EXIT"
+                      ? "bg-blue-500 text-white shadow-xs"
+                      : "text-slate-300 hover:text-white"
+                  }`}
+                >
+                  Ra (Check-out)
+                </button>
+              </div>
             </div>
           </div>
 
-          {/* Video Container / Biometric Viewport */}
+          {/* Panoramic Biometric Viewport */}
           <div className="relative aspect-4/3 w-full bg-slate-950 flex items-center justify-center overflow-hidden">
-            {/* Live Camera Video */}
+            {/* Live Camera Video (Full Frame View) */}
             <video
               ref={videoRef}
               autoPlay
@@ -240,6 +287,9 @@ export const FaceScanner: React.FC<FaceScannerProps> = ({
               }`}
             />
 
+            {/* Hidden canvas for fast capture */}
+            <canvas ref={canvasRef} className="hidden" />
+
             {/* Fallback View when Camera is inactive */}
             {!streamActive && (
               <div className="flex flex-col items-center justify-center p-8 text-center text-slate-400 space-y-4 max-w-md z-10">
@@ -248,17 +298,17 @@ export const FaceScanner: React.FC<FaceScannerProps> = ({
                 </div>
                 <div>
                   <h3 className="text-white font-medium text-base mb-1">
-                    Camera Chưa Kích Hoạt
+                    Camera Chưa Sẵn Sàng
                   </h3>
                   <p className="text-xs text-slate-400 mb-4 leading-relaxed">
                     {cameraError ||
-                      "Vui lòng cho phép quyền truy cập camera, hoặc tải ảnh lên để nhận diện khuôn mặt."}
+                      "Vui lòng cho phép quyền truy cập camera, hoặc tải ảnh lên / bấm nút thử nghiệm đa nhân viên phía dưới."}
                   </p>
                   <div className="flex flex-wrap gap-2 justify-center">
                     <button
                       id="btn-retry-camera"
                       onClick={startCamera}
-                      className="px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-semibold rounded-lg flex items-center gap-2 transition"
+                      className="px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-semibold rounded-lg flex items-center gap-2 transition cursor-pointer"
                     >
                       <RefreshCw className="w-3.5 h-3.5" /> Thử Lại Camera
                     </button>
@@ -267,74 +317,150 @@ export const FaceScanner: React.FC<FaceScannerProps> = ({
               </div>
             )}
 
-            {/* Biometric Scanning Overlay Framework */}
-            <div className="absolute inset-0 pointer-events-none z-10 flex flex-col items-center justify-center">
-              {/* Biometric Face Box */}
-              <div
-                className={`relative w-56 h-64 sm:w-64 sm:h-72 rounded-3xl border-2 transition-all duration-300 ${
-                  isScanning
-                    ? "border-amber-400 shadow-[0_0_25px_rgba(251,191,36,0.5)]"
-                    : lastResult?.recognized
-                    ? "border-emerald-400 shadow-[0_0_25px_rgba(52,211,153,0.5)]"
-                    : "border-indigo-400/60 shadow-[0_0_15px_rgba(99,102,241,0.25)]"
-                }`}
-              >
-                {/* Target Corners */}
-                <div className="absolute -top-1 -left-1 w-6 h-6 border-t-4 border-l-4 border-indigo-400 rounded-tl-lg" />
-                <div className="absolute -top-1 -right-1 w-6 h-6 border-t-4 border-r-4 border-indigo-400 rounded-tr-lg" />
-                <div className="absolute -bottom-1 -left-1 w-6 h-6 border-b-4 border-l-4 border-indigo-400 rounded-bl-lg" />
-                <div className="absolute -bottom-1 -right-1 w-6 h-6 border-b-4 border-r-4 border-indigo-400 rounded-br-lg" />
+            {/* Full-Frame Panoramic Scanning Guidelines */}
+            <div className="absolute inset-0 pointer-events-none z-10">
+              {/* Outer Viewport Corner Targets (Replaces narrow scan box) */}
+              <div className="absolute top-3 left-3 w-8 h-8 border-t-2 border-l-2 border-indigo-400/80" />
+              <div className="absolute top-3 right-3 w-8 h-8 border-t-2 border-r-2 border-indigo-400/80" />
+              <div className="absolute bottom-3 left-3 w-8 h-8 border-b-2 border-l-2 border-indigo-400/80" />
+              <div className="absolute bottom-3 right-3 w-8 h-8 border-b-2 border-r-2 border-indigo-400/80" />
 
-                {/* Laser Sweep Scan Animation */}
-                {isScanning && (
-                  <div className="absolute left-0 right-0 h-1 bg-gradient-to-r from-transparent via-amber-400 to-transparent shadow-[0_0_12px_#fbbf24] animate-[bounce_1.5s_infinite]" />
+              {/* Full-Width Panoramic Laser Sweep Scan Animation */}
+              {isScanning && (
+                <div className="absolute left-0 right-0 h-1.5 bg-gradient-to-r from-transparent via-cyan-400 to-transparent shadow-[0_0_20px_#22d3ee] animate-[bounce_1.4s_infinite]" />
+              )}
+
+              {/* Top Detection Status Banner */}
+              <div className="absolute top-4 left-1/2 -translate-x-1/2 flex items-center gap-2 px-3.5 py-1.5 rounded-full bg-black/75 backdrop-blur-md border border-white/15 text-xs font-mono text-slate-200 shadow-lg">
+                {isScanning ? (
+                  <>
+                    <RefreshCw className="w-3.5 h-3.5 text-cyan-400 animate-spin" />
+                    <span className="text-cyan-300 font-bold">AI ĐANG QUÉT TOÀN BỘ KHUNG HÌNH...</span>
+                  </>
+                ) : activeFaces.length > 0 ? (
+                  <>
+                    <Users className="w-3.5 h-3.5 text-emerald-400" />
+                    <span>
+                      Phát hiện{" "}
+                      <strong className="text-emerald-400 font-bold">
+                        {activeFaces.length} người
+                      </strong>{" "}
+                      ({activeFaces.filter((f) => f.recognized).length} nhân viên hợp lệ)
+                    </span>
+                  </>
+                ) : (
+                  <>
+                    <Scan className="w-3.5 h-3.5 text-indigo-400" />
+                    <span className="text-slate-300">
+                      Sẵn sàng nhận diện nhiều người đồng thời
+                    </span>
+                  </>
                 )}
-
-                {/* Crosshairs & Center Marker */}
-                <div className="absolute inset-0 flex items-center justify-center opacity-30">
-                  <div className="w-8 h-8 border border-white/50 rounded-full flex items-center justify-center">
-                    <div className="w-1.5 h-1.5 bg-white rounded-full" />
-                  </div>
-                </div>
-
-                {/* Status Badge Inside Box */}
-                <div className="absolute -bottom-9 left-1/2 -translate-x-1/2 whitespace-nowrap">
-                  <span
-                    className={`px-3 py-1 rounded-full text-xs font-mono font-semibold tracking-wide border shadow-md ${
-                      isScanning
-                        ? "bg-amber-950/80 text-amber-300 border-amber-500/40"
-                        : lastResult?.recognized
-                        ? "bg-emerald-950/80 text-emerald-300 border-emerald-500/40"
-                        : lastResult?.recognized === false
-                        ? "bg-rose-950/80 text-rose-300 border-rose-500/40"
-                        : "bg-slate-900/80 text-indigo-300 border-indigo-500/30"
-                    }`}
-                  >
-                    {isScanning
-                      ? "AI ĐANG ĐỐI SOÁT SINH TRẮC HỌC..."
-                      : lastResult?.recognized
-                      ? "XÁC THỰC THÀNH CÔNG"
-                      : lastResult?.recognized === false
-                      ? "TỪ CHỐI TRUY CẬP"
-                      : "CĂN CHỈNH KHUÔN MẶT VÀO KHUNG"}
-                  </span>
-                </div>
               </div>
+
+              {/* Dynamic Bounding Boxes for Multiple Faces Across Entire Frame */}
+              {activeFaces.map((face, index) => {
+                // box2d: [ymin, xmin, ymax, xmax] normalized 0-1000
+                const [ymin, xmin, ymax, xmax] = face.box2d;
+                const topPct = Math.max(0, Math.min(100, ymin / 10));
+                const heightPct = Math.max(10, Math.min(100 - topPct, (ymax - ymin) / 10));
+
+                // Video is mirrored (-scale-x-100), adjust horizontal coordinates
+                const leftPct = streamActive
+                  ? Math.max(0, Math.min(100, (1000 - xmax) / 10))
+                  : Math.max(0, Math.min(100, xmin / 10));
+                const widthPct = Math.max(10, Math.min(100 - leftPct, (xmax - xmin) / 10));
+
+                const isAuth = face.recognized;
+
+                return (
+                  <div
+                    key={face.id || index}
+                    className={`absolute rounded-xl border-2 transition-all duration-300 pointer-events-none ${
+                      isAuth
+                        ? "border-emerald-400 shadow-[0_0_20px_rgba(52,211,153,0.6)] bg-emerald-500/10"
+                        : "border-rose-400 shadow-[0_0_20px_rgba(244,63,94,0.6)] bg-rose-500/10"
+                    }`}
+                    style={{
+                      top: `${topPct}%`,
+                      left: `${leftPct}%`,
+                      width: `${widthPct}%`,
+                      height: `${heightPct}%`,
+                    }}
+                  >
+                    {/* Bounding Box Corner Reticles */}
+                    <div
+                      className={`absolute -top-1 -left-1 w-3.5 h-3.5 border-t-3 border-l-3 rounded-tl-sm ${
+                        isAuth ? "border-emerald-300" : "border-rose-300"
+                      }`}
+                    />
+                    <div
+                      className={`absolute -top-1 -right-1 w-3.5 h-3.5 border-t-3 border-r-3 rounded-tr-sm ${
+                        isAuth ? "border-emerald-300" : "border-rose-300"
+                      }`}
+                    />
+                    <div
+                      className={`absolute -bottom-1 -left-1 w-3.5 h-3.5 border-b-3 border-l-3 rounded-bl-sm ${
+                        isAuth ? "border-emerald-300" : "border-rose-300"
+                      }`}
+                    />
+                    <div
+                      className={`absolute -bottom-1 -right-1 w-3.5 h-3.5 border-b-3 border-r-3 rounded-br-sm ${
+                        isAuth ? "border-emerald-300" : "border-rose-300"
+                      }`}
+                    />
+
+                    {/* Floating Info Tag on Top of Face */}
+                    <div className="absolute -top-8 left-1/2 -translate-x-1/2 whitespace-nowrap z-20">
+                      <span
+                        className={`px-2.5 py-1 rounded-md text-[11px] font-bold font-mono tracking-wide border shadow-md flex items-center gap-1.5 ${
+                          isAuth
+                            ? "bg-emerald-950/90 text-emerald-300 border-emerald-500/60"
+                            : "bg-rose-950/90 text-rose-300 border-rose-500/60"
+                        }`}
+                      >
+                        {isAuth ? (
+                          <>
+                            <CheckCircle2 className="w-3 h-3 text-emerald-400 shrink-0" />
+                            <span>
+                              {face.employeeName || "Nhân viên"} ({face.confidence}%)
+                            </span>
+                          </>
+                        ) : (
+                          <>
+                            <UserX className="w-3 h-3 text-rose-400 shrink-0" />
+                            <span>Chưa đăng ký</span>
+                          </>
+                        )}
+                      </span>
+                    </div>
+
+                    {/* Bottom Department / Code Tag */}
+                    {isAuth && face.employeeCode && (
+                      <div className="absolute -bottom-6 left-1/2 -translate-x-1/2 whitespace-nowrap z-20">
+                        <span className="px-2 py-0.5 rounded bg-slate-900/90 text-[10px] font-mono text-slate-300 border border-slate-700">
+                          {face.employeeCode} • Sống: {face.livenessScore}%
+                        </span>
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
             </div>
 
             {/* Smart Lock Open Notification Pill at Bottom of Viewport */}
             {!lockState.isLocked && (
-              <div className="absolute bottom-4 left-4 right-4 z-20 bg-emerald-600/90 backdrop-blur-md text-white px-4 py-2.5 rounded-xl border border-emerald-400/40 shadow-lg flex items-center justify-between animate-in fade-in slide-in-from-bottom duration-300">
+              <div className="absolute bottom-4 left-4 right-4 z-20 bg-emerald-600/95 backdrop-blur-md text-white px-4 py-2.5 rounded-xl border border-emerald-400/40 shadow-xl flex items-center justify-between animate-in fade-in slide-in-from-bottom duration-300">
                 <div className="flex items-center gap-3">
-                  <div className="w-8 h-8 rounded-lg bg-white/20 flex items-center justify-center">
+                  <div className="w-9 h-9 rounded-lg bg-white/20 flex items-center justify-center">
                     <DoorOpen className="w-5 h-5 text-white" />
                   </div>
                   <div>
                     <p className="text-xs font-semibold uppercase tracking-wider text-emerald-100">
                       Khóa Cửa Đã Mở Tự Động Qua API
                     </p>
-                    <p className="text-sm font-bold">
-                      {lockState.lastActionBy || "Người dùng hợp lệ"}
+                    <p className="text-sm font-bold truncate max-w-xs sm:max-w-md">
+                      {lockState.lastActionBy || "Nhân viên hợp lệ"}
                     </p>
                   </div>
                 </div>
@@ -361,12 +487,12 @@ export const FaceScanner: React.FC<FaceScannerProps> = ({
                 {isScanning ? (
                   <>
                     <RefreshCw className="w-4 h-4 animate-spin" />
-                    <span>Đang Nhận Diện AI...</span>
+                    <span>Đang Quét AI Toàn Cảnh...</span>
                   </>
                 ) : (
                   <>
                     <Scan className="w-4 h-4" />
-                    <span>Quét Nhận Diện Ngay</span>
+                    <span>Quét Toàn Khung Hình</span>
                   </>
                 )}
               </button>
@@ -386,26 +512,49 @@ export const FaceScanner: React.FC<FaceScannerProps> = ({
                 />
               </label>
 
-              {/* Auto-scan Toggle */}
-              <button
-                id="btn-toggle-autoscan"
-                onClick={() => setAutoScan(!autoScan)}
-                className={`px-3.5 py-2.5 rounded-xl text-xs font-semibold border flex items-center gap-1.5 transition ${
-                  autoScan
-                    ? "bg-amber-500/20 border-amber-500 text-amber-300"
-                    : "bg-slate-900 border-slate-800 text-slate-400 hover:text-slate-200"
-                }`}
-              >
-                <Zap className={`w-3.5 h-3.5 ${autoScan ? "text-amber-400 animate-pulse" : ""}`} />
-                <span>Tự Động (5s)</span>
-              </button>
+              {/* Speed Mode Selector (Tăng tốc độ nhận diện) */}
+              <div className="flex items-center bg-slate-900 border border-slate-800 rounded-xl p-1 text-xs">
+                <button
+                  id="btn-speed-off"
+                  onClick={() => setScanMode("OFF")}
+                  className={`px-2.5 py-1.5 rounded-lg font-medium transition cursor-pointer ${
+                    scanMode === "OFF"
+                      ? "bg-slate-800 text-white font-semibold"
+                      : "text-slate-400 hover:text-slate-200"
+                  }`}
+                >
+                  Thủ Công
+                </button>
+                <button
+                  id="btn-speed-fast"
+                  onClick={() => setScanMode("FAST")}
+                  className={`px-2.5 py-1.5 rounded-lg font-medium transition flex items-center gap-1 cursor-pointer ${
+                    scanMode === "FAST"
+                      ? "bg-blue-600 text-white font-semibold"
+                      : "text-slate-400 hover:text-slate-200"
+                  }`}
+                >
+                  <Zap className="w-3 h-3" /> Nhanh (3s)
+                </button>
+                <button
+                  id="btn-speed-turbo"
+                  onClick={() => setScanMode("TURBO")}
+                  className={`px-2.5 py-1.5 rounded-lg font-medium transition flex items-center gap-1 cursor-pointer ${
+                    scanMode === "TURBO"
+                      ? "bg-amber-500 text-slate-950 font-bold shadow-sm"
+                      : "text-slate-400 hover:text-amber-400"
+                  }`}
+                >
+                  <Zap className="w-3 h-3 fill-current" /> Siêu Tốc (1.5s)
+                </button>
+              </div>
             </div>
 
             {/* Manual Emergency Unlock Trigger */}
             <button
               id="btn-manual-unlock"
               onClick={onTriggerManualUnlock}
-              className="px-3.5 py-2.5 bg-slate-900 hover:bg-slate-800 text-slate-300 hover:text-white rounded-xl text-xs font-medium border border-slate-800 flex items-center gap-2 transition"
+              className="px-3.5 py-2.5 bg-slate-900 hover:bg-slate-800 text-slate-300 hover:text-white rounded-xl text-xs font-medium border border-slate-800 flex items-center gap-2 transition cursor-pointer"
               title="Kích hoạt lệnh mở khóa trực tiếp qua API Smart Lock"
             >
               <KeyRound className="w-3.5 h-3.5 text-amber-400" />
@@ -414,47 +563,103 @@ export const FaceScanner: React.FC<FaceScannerProps> = ({
           </div>
         </div>
 
-        {/* Quick Simulation Shortcuts (Critical for fast evaluation) */}
+        {/* Multi-Person Quick Simulation Shortcuts */}
         <div className="bg-white rounded-xl border border-slate-200 p-4 shadow-xs">
           <div className="flex items-center justify-between mb-3">
             <div className="flex items-center gap-2">
               <Sparkles className="w-4 h-4 text-indigo-600" />
               <h4 className="text-sm font-bold text-slate-800">
-                Thử Nghiệm Nhanh Nhận Diện (1 Chạm)
+                Thử Nghiệm Nhận Diện Đa Nhân Viên (1 Chạm)
               </h4>
             </div>
             <span className="text-xs text-slate-500">
-              Mô phỏng quét khuôn mặt nhân viên đã đăng ký
+              Kiểm tra nhận diện nhiều người đồng thời trong khung hình
             </span>
           </div>
 
           <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-2.5">
-            {employees.map((emp) => (
+            {/* Multi-Face Test 1: 2 Employees Together */}
+            <button
+              id="btn-test-multi-employees"
+              disabled={isScanning}
+              onClick={() =>
+                handleScan(
+                  "https://images.unsplash.com/photo-1522071820081-009f0129c71c?w=640&auto=format&fit=crop&q=80",
+                  "MULTI_EMPLOYEES"
+                )
+              }
+              className="flex items-center gap-2.5 p-2.5 rounded-xl border-2 border-indigo-300 bg-indigo-50/60 hover:bg-indigo-100/70 hover:border-indigo-500 transition text-left group cursor-pointer"
+            >
+              <div className="w-10 h-10 rounded-lg bg-indigo-600 text-white flex items-center justify-center shrink-0">
+                <Users className="w-5 h-5" />
+              </div>
+              <div className="min-w-0 flex-1">
+                <p className="text-xs font-bold text-indigo-950 truncate">
+                  Nhóm 2 Nhân Viên
+                </p>
+                <p className="text-[11px] text-indigo-700 truncate">
+                  Minh &amp; Phương cùng vào
+                </p>
+                <span className="inline-block px-1.5 py-0.2 rounded text-[10px] bg-emerald-100 text-emerald-800 font-bold">
+                  Đồng thời mở cửa
+                </span>
+              </div>
+            </button>
+
+            {/* Multi-Face Test 2: 1 Registered Employee + 1 Stranger */}
+            <button
+              id="btn-test-multi-mixed"
+              disabled={isScanning}
+              onClick={() =>
+                handleScan(
+                  "https://images.unsplash.com/photo-1573497019940-1c28c88b4f3e?w=640&auto=format&fit=crop&q=80",
+                  "MULTI_MIXED"
+                )
+              }
+              className="flex items-center gap-2.5 p-2.5 rounded-xl border-2 border-amber-300 bg-amber-50/50 hover:bg-amber-100/60 hover:border-amber-500 transition text-left group cursor-pointer"
+            >
+              <div className="w-10 h-10 rounded-lg bg-amber-600 text-white flex items-center justify-center shrink-0">
+                <ShieldCheck className="w-5 h-5" />
+              </div>
+              <div className="min-w-0 flex-1">
+                <p className="text-xs font-bold text-amber-950 truncate">
+                  Nhân Viên + Người Lạ
+                </p>
+                <p className="text-[11px] text-amber-700 truncate">
+                  1 Hợp lệ &amp; 1 Khách lạ
+                </p>
+                <span className="inline-block px-1.5 py-0.2 rounded text-[10px] bg-amber-200 text-amber-900 font-bold">
+                  Phân loại riêng
+                </span>
+              </div>
+            </button>
+
+            {/* Single Employee Quick Test */}
+            {employees.length > 0 && (
               <button
-                key={emp.id}
-                id={`btn-test-employee-${emp.id}`}
+                id={`btn-test-employee-${employees[0].id}`}
                 disabled={isScanning}
-                onClick={() => handleScan(emp.photoUrl, emp.id)}
-                className="flex items-center gap-2.5 p-2.5 rounded-xl border border-slate-200 hover:border-indigo-400 hover:bg-indigo-50/50 transition text-left group bg-slate-50/60"
+                onClick={() => handleScan(employees[0].photoUrl, employees[0].id)}
+                className="flex items-center gap-2.5 p-2.5 rounded-xl border border-slate-200 hover:border-indigo-400 hover:bg-slate-50 transition text-left group cursor-pointer"
               >
                 <img
-                  src={emp.photoUrl}
-                  alt={emp.name}
-                  className="w-10 h-10 rounded-lg object-cover border border-slate-200 group-hover:scale-105 transition-transform"
+                  src={employees[0].photoUrl}
+                  alt={employees[0].name}
+                  className="w-10 h-10 rounded-lg object-cover border border-slate-200 shrink-0"
                 />
                 <div className="min-w-0 flex-1">
-                  <p className="text-xs font-bold text-slate-800 truncate group-hover:text-indigo-600">
-                    {emp.name}
+                  <p className="text-xs font-bold text-slate-800 truncate">
+                    {employees[0].name}
                   </p>
                   <p className="text-[11px] font-mono text-slate-500">
-                    {emp.employeeCode}
+                    {employees[0].employeeCode}
                   </p>
-                  <span className="inline-block px-1.5 py-0.2 rounded text-[10px] bg-emerald-100 text-emerald-800 font-medium">
-                    Hợp lệ
+                  <span className="inline-block px-1.5 py-0.2 rounded text-[10px] bg-slate-100 text-slate-700 font-medium">
+                    1 Nhân viên
                   </span>
                 </div>
               </button>
-            ))}
+            )}
 
             {/* Test Unknown Stranger */}
             <button
@@ -466,18 +671,18 @@ export const FaceScanner: React.FC<FaceScannerProps> = ({
                   "UNKNOWN_VISITOR"
                 )
               }
-              className="flex items-center gap-2.5 p-2.5 rounded-xl border border-rose-200 hover:border-rose-400 hover:bg-rose-50/50 transition text-left group bg-rose-50/30"
+              className="flex items-center gap-2.5 p-2.5 rounded-xl border border-rose-200 hover:border-rose-400 hover:bg-rose-50/50 transition text-left group bg-rose-50/30 cursor-pointer"
             >
-              <div className="w-10 h-10 rounded-lg bg-rose-100 border border-rose-200 flex items-center justify-center text-rose-600 font-bold text-xs">
+              <div className="w-10 h-10 rounded-lg bg-rose-100 border border-rose-200 flex items-center justify-center text-rose-600 font-bold text-xs shrink-0">
                 <UserX className="w-5 h-5" />
               </div>
               <div className="min-w-0 flex-1">
                 <p className="text-xs font-bold text-rose-900 truncate">
                   Người Lạ Chưa Đăng Ký
                 </p>
-                <p className="text-[11px] text-rose-600">Mô phỏng truy cập trái phép</p>
+                <p className="text-[11px] text-rose-600">Từ chối mở chốt</p>
                 <span className="inline-block px-1.5 py-0.2 rounded text-[10px] bg-rose-100 text-rose-800 font-medium">
-                  Từ chối
+                  Báo động
                 </span>
               </div>
             </button>
@@ -485,7 +690,7 @@ export const FaceScanner: React.FC<FaceScannerProps> = ({
         </div>
       </div>
 
-      {/* Right Column: AI Analysis Result & Recognition Telemetry */}
+      {/* Right Column: AI Analysis Result & Multi-Person Telemetry */}
       <div className="lg:col-span-4 space-y-4">
         {/* Latest Scan Result Card */}
         <div className="bg-white rounded-2xl border border-slate-200 p-5 shadow-xs">
@@ -493,32 +698,32 @@ export const FaceScanner: React.FC<FaceScannerProps> = ({
             <div className="flex items-center gap-2">
               <ShieldCheck className="w-4 h-4 text-indigo-600" />
               <h3 className="text-sm font-bold text-slate-900">
-                Kết Quả Đối Soát AI
+                Kết Quả Đối Soát Đa Mục Tiêu
               </h3>
             </div>
             {lastResult && (
               <span
-                className={`px-2 py-0.5 rounded-full text-xs font-semibold ${
+                className={`px-2 py-0.5 rounded-full text-xs font-bold ${
                   lastResult.recognized
                     ? "bg-emerald-100 text-emerald-800 border border-emerald-200"
                     : "bg-rose-100 text-rose-800 border border-rose-200"
                 }`}
               >
-                {lastResult.recognized ? "ĐÃ XÁC THỰC" : "TỪ CHỐI"}
+                {lastResult.recognized ? "ĐÃ MỞ KHÓA" : "TỪ CHỐI"}
               </span>
             )}
           </div>
 
           {lastResult ? (
             <div className="space-y-4">
-              {/* Snapshot Comparison */}
+              {/* Snapshot with Face Count Badge */}
               <div className="flex items-center gap-3 p-3 rounded-xl bg-slate-50 border border-slate-100">
                 {capturedSnapshot && (
-                  <div className="relative">
+                  <div className="relative shrink-0">
                     <img
                       src={capturedSnapshot}
                       alt="Captured Face"
-                      className="w-14 h-14 rounded-lg object-cover border border-slate-300"
+                      className="w-16 h-16 rounded-lg object-cover border border-slate-300"
                     />
                     <span className="absolute -bottom-1.5 -right-1.5 bg-indigo-600 text-white p-0.5 rounded-full">
                       <Scan className="w-3 h-3" />
@@ -527,30 +732,67 @@ export const FaceScanner: React.FC<FaceScannerProps> = ({
                 )}
 
                 <div className="min-w-0 flex-1">
-                  {lastResult.recognized && lastResult.employee ? (
-                    <>
-                      <h4 className="font-bold text-slate-900 text-sm truncate">
-                        {lastResult.employee.name}
-                      </h4>
-                      <p className="text-xs text-slate-500 font-mono">
-                        Mã NV: {lastResult.employee.employeeCode}
-                      </p>
-                      <p className="text-xs text-indigo-600 font-medium truncate">
-                        {lastResult.employee.department}
-                      </p>
-                    </>
-                  ) : (
-                    <>
-                      <h4 className="font-bold text-rose-700 text-sm">
-                        Khuôn Mặt Không Xác Định
-                      </h4>
-                      <p className="text-xs text-slate-500">
-                        Chưa đăng ký trong danh bạ nhân sự
-                      </p>
-                    </>
-                  )}
+                  <div className="flex items-center gap-1.5 mb-1">
+                    <span className="px-2 py-0.5 rounded-md bg-indigo-100 text-indigo-800 font-bold text-[11px]">
+                      {lastResult.totalFacesDetected || activeFaces.length || 1} khuôn mặt
+                    </span>
+                    <span className="text-[11px] font-mono text-slate-500">
+                      ⏱️ {lastLatencyMs}ms
+                    </span>
+                  </div>
+                  <p className="text-xs font-bold text-slate-800 line-clamp-2">
+                    {lastResult.message}
+                  </p>
                 </div>
               </div>
+
+              {/* Multi-Face Itemized Breakdown List */}
+              {lastResult.detectedFaces && lastResult.detectedFaces.length > 0 && (
+                <div className="space-y-2">
+                  <h4 className="text-xs font-bold uppercase tracking-wider text-slate-500">
+                    Chi Tiết Từng Người Trong Khung Hình
+                  </h4>
+                  <div className="space-y-1.5 max-h-48 overflow-y-auto pr-1">
+                    {lastResult.detectedFaces.map((f, i) => (
+                      <div
+                        key={f.id || i}
+                        className={`p-2.5 rounded-xl border text-xs flex items-center justify-between gap-2 ${
+                          f.recognized
+                            ? "bg-emerald-50/80 border-emerald-200 text-emerald-950"
+                            : "bg-rose-50/80 border-rose-200 text-rose-950"
+                        }`}
+                      >
+                        <div className="flex items-center gap-2 min-w-0">
+                          {f.recognized ? (
+                            <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" />
+                          ) : (
+                            <XCircle className="w-4 h-4 text-rose-600 shrink-0" />
+                          )}
+                          <div className="min-w-0">
+                            <p className="font-bold truncate">
+                              {f.employeeName || "Khách chưa đăng ký"}
+                            </p>
+                            <p className="text-[11px] opacity-75">
+                              {f.employeeCode ? `${f.employeeCode} • ` : ""}
+                              Khớp: {f.confidence}%
+                            </p>
+                          </div>
+                        </div>
+
+                        <span
+                          className={`px-2 py-0.5 rounded text-[10px] font-bold shrink-0 ${
+                            f.recognized
+                              ? "bg-emerald-200 text-emerald-900"
+                              : "bg-rose-200 text-rose-900"
+                          }`}
+                        >
+                          {f.recognized ? "Hợp Lệ" : "Từ Chối"}
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
 
               {/* Confidence & Liveness Gauges */}
               <div className="grid grid-cols-2 gap-3">
@@ -590,42 +832,12 @@ export const FaceScanner: React.FC<FaceScannerProps> = ({
                   </div>
                 </div>
               </div>
-
-              {/* Message from Gemini AI */}
-              <div
-                className={`p-3 rounded-xl text-xs leading-relaxed border ${
-                  lastResult.recognized
-                    ? "bg-emerald-50/80 border-emerald-200 text-emerald-900"
-                    : "bg-rose-50/80 border-rose-200 text-rose-900"
-                }`}
-              >
-                <div className="flex items-start gap-2">
-                  {lastResult.recognized ? (
-                    <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0 mt-0.5" />
-                  ) : (
-                    <XCircle className="w-4 h-4 text-rose-600 shrink-0 mt-0.5" />
-                  )}
-                  <div>
-                    <p className="font-semibold mb-0.5">
-                      {lastResult.recognized
-                        ? "Lệnh Mở Khóa Đã Phát Qua API"
-                        : "Khóa Giữ Chốt An Toàn"}
-                    </p>
-                    <p>{lastResult.message}</p>
-                    {lastResult.detectedFeatures && (
-                      <p className="mt-1 text-[11px] opacity-80 italic">
-                        Đặc điểm: {lastResult.detectedFeatures}
-                      </p>
-                    )}
-                  </div>
-                </div>
-              </div>
             </div>
           ) : (
             <div className="text-center py-8 text-slate-400">
               <Scan className="w-10 h-10 mx-auto mb-2 opacity-40 animate-pulse" />
               <p className="text-xs">
-                Chưa có lượt quét nào. Nhấn &quot;Quét Nhận Diện Ngay&quot; hoặc chọn mẫu thử bên dưới.
+                Chưa có dữ liệu quét. Nhấn &quot;Quét Toàn Khung Hình&quot; hoặc chọn mẫu thử nghiệm đa nhân viên.
               </p>
             </div>
           )}
@@ -646,19 +858,19 @@ export const FaceScanner: React.FC<FaceScannerProps> = ({
 
           <div className="space-y-2.5 text-xs">
             <div className="flex justify-between py-1 border-b border-slate-100">
-              <span className="text-slate-500">Thiết Bị Khóa:</span>
+              <span className="text-slate-500">Cửa Kiểm Soát:</span>
               <span className="font-medium text-slate-800">{lockState.doorName}</span>
             </div>
             <div className="flex justify-between py-1 border-b border-slate-100">
-              <span className="text-slate-500">Mã Khóa (ID):</span>
-              <span className="font-mono text-slate-800">{lockState.lockId}</span>
-            </div>
-            <div className="flex justify-between py-1 border-b border-slate-100">
-              <span className="text-slate-500">Giao Thức:</span>
+              <span className="text-slate-500">Giao Thức Khóa:</span>
               <span className="font-mono text-indigo-600 font-semibold">REST API / Zigbee 3.0</span>
             </div>
             <div className="flex justify-between py-1 border-b border-slate-100">
-              <span className="text-slate-500">Pin Thiết Bị:</span>
+              <span className="text-slate-500">Thời Gian Xử Lý:</span>
+              <span className="font-mono text-emerald-600 font-bold">~{lastLatencyMs}ms (Siêu tốc)</span>
+            </div>
+            <div className="flex justify-between py-1 border-b border-slate-100">
+              <span className="text-slate-500">Pin Khóa Thông Minh:</span>
               <span className="font-medium text-emerald-600">{lockState.batteryLevel}%</span>
             </div>
             <div className="flex justify-between py-1">

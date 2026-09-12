@@ -54,13 +54,62 @@ export interface MobileNotification {
   employeeName?: string;
 }
 
+export interface DetectedFace {
+  id: string;
+  box2d: [number, number, number, number]; // [ymin, xmin, ymax, xmax] in 0-1000 normalized coordinates
+  employeeId?: string;
+  employeeName?: string;
+  employeeCode?: string;
+  department?: string;
+  confidence: number;
+  livenessScore: number;
+  recognized: boolean;
+  message?: string;
+}
+
 export interface FaceRecognitionResult {
   recognized: boolean;
   employee?: Employee;
+  recognizedEmployees?: Employee[];
+  detectedFaces: DetectedFace[];
+  totalFacesDetected: number;
+  authorizedCount: number;
+  unauthorizedCount: number;
+  processingTimeMs: number;
   confidence: number;
   livenessScore: number;
   message: string;
   lockUnlocked: boolean;
   detectedFeatures?: string;
   log?: AccessLog;
+  logs?: AccessLog[];
+}
+
+export interface WebhookLog {
+  id: string;
+  timestamp: string;
+  url: string;
+  method: string;
+  payload: {
+    text: string;
+    attachments: Array<{
+      title: string;
+      [key: string]: any;
+    }>;
+  };
+  statusCode?: number;
+  statusText?: string;
+  responseBody?: string;
+  success: boolean;
+  error?: string;
+  scanType: ScanType;
+  userName: string;
+}
+
+export interface WebhookConfig {
+  enabled: boolean;
+  url: string;
+  gateInTitle: string;
+  gateOutTitle: string;
+  includeEmployeeCode: boolean;
 }

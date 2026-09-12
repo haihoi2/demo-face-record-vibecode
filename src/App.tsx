@@ -5,6 +5,7 @@ import { SmartLockCard } from "./components/SmartLockCard";
 import { EmployeeRegistration } from "./components/EmployeeRegistration";
 import { AccessLogs } from "./components/AccessLogs";
 import { MobileCompanion } from "./components/MobileCompanion";
+import { WebhookIntegration } from "./components/WebhookIntegration";
 import {
   Employee,
   AccessLog,
@@ -16,7 +17,7 @@ import { Bell, CheckCircle2, AlertTriangle } from "lucide-react";
 import { soundEffects } from "./utils/audio";
 
 export default function App() {
-  const [activeTab, setActiveTab] = useState<"scanner" | "register" | "logs" | "mobile">("scanner");
+  const [activeTab, setActiveTab] = useState<"scanner" | "register" | "logs" | "mobile" | "webhook">("scanner");
 
   const [employees, setEmployees] = useState<Employee[]>([]);
   const [accessLogs, setAccessLogs] = useState<AccessLog[]>([]);
@@ -152,7 +153,13 @@ export default function App() {
 
   // Recognition completion handler from FaceScanner
   const handleRecognitionComplete = (result: FaceRecognitionResult) => {
-    if (result.log) {
+    if (result.logs && result.logs.length > 0) {
+      setAccessLogs((prev) => {
+        const existingIds = new Set(prev.map((l) => l.id));
+        const newLogs = result.logs!.filter((l) => !existingIds.has(l.id));
+        return [...newLogs, ...prev];
+      });
+    } else if (result.log) {
       setAccessLogs((prev) => [result.log!, ...prev.filter((l) => l.id !== result.log?.id)]);
     }
   };
@@ -273,6 +280,10 @@ export default function App() {
             onMarkRead={handleMarkNotificationsRead}
             sseConnected={sseConnected}
           />
+        )}
+
+        {activeTab === "webhook" && (
+          <WebhookIntegration employees={employees} />
         )}
       </main>
 
