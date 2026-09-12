@@ -15,6 +15,7 @@ import {
 } from "./types";
 import { Bell, CheckCircle2, AlertTriangle } from "lucide-react";
 import { soundEffects } from "./utils/audio";
+import { safeJsonFetch } from "./utils/api";
 
 export default function App() {
   const [activeTab, setActiveTab] = useState<"scanner" | "register" | "logs" | "mobile" | "webhook">("scanner");
@@ -40,20 +41,20 @@ export default function App() {
   const [sseConnected, setSseConnected] = useState<boolean>(false);
   const [latestToast, setLatestToast] = useState<MobileNotification | null>(null);
 
-  // Fetch initial data
+  // Fetch initial data safely without JSON parse errors
   const fetchData = useCallback(async () => {
     try {
       const [empRes, logRes, lockRes, notifRes] = await Promise.all([
-        fetch("/api/employees"),
-        fetch("/api/logs"),
-        fetch("/api/lock/status"),
-        fetch("/api/notifications"),
+        safeJsonFetch<Employee[]>("/api/employees", undefined, []),
+        safeJsonFetch<AccessLog[]>("/api/logs", undefined, []),
+        safeJsonFetch<SmartLockState | null>("/api/lock/status", undefined, null),
+        safeJsonFetch<MobileNotification[]>("/api/notifications", undefined, []),
       ]);
 
-      if (empRes.ok) setEmployees(await empRes.json());
-      if (logRes.ok) setAccessLogs(await logRes.json());
-      if (lockRes.ok) setLockState(await lockRes.json());
-      if (notifRes.ok) setNotifications(await notifRes.json());
+      if (empRes.ok && Array.isArray(empRes.data)) setEmployees(empRes.data);
+      if (logRes.ok && Array.isArray(logRes.data)) setAccessLogs(logRes.data);
+      if (lockRes.ok && lockRes.data) setLockState(lockRes.data);
+      if (notifRes.ok && Array.isArray(notifRes.data)) setNotifications(notifRes.data);
     } catch (err) {
       console.error("Lỗi tải dữ liệu ban đầu:", err);
     }

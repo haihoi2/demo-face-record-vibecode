@@ -26,6 +26,7 @@ import {
   DetectedFace,
 } from "../types";
 import { soundEffects } from "../utils/audio";
+import { safeJsonFetch, compressImage } from "../utils/api";
 
 interface FaceScannerProps {
   employees: Employee[];
@@ -143,17 +144,25 @@ export const FaceScanner: React.FC<FaceScannerProps> = ({
     setCapturedSnapshot(imageToSend);
 
     try {
-      const res = await fetch("/api/recognize-face", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          imageBase64: imageToSend,
-          scanType,
-          testEmployeeId,
-        }),
-      });
+      const response = await safeJsonFetch<FaceRecognitionResult>(
+        "/api/recognize-face",
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            imageBase64: imageToSend,
+            scanType,
+            testEmployeeId,
+          }),
+        }
+      );
 
-      const data: FaceRecognitionResult = await res.json();
+      if (!response.ok || !response.data) {
+        console.warn("Lỗi nhận diện khuôn mặt:", response.error);
+        return;
+      }
+
+      const data = response.data;
       const latency = Date.now() - clientStartTime;
       setLastLatencyMs(data.processingTimeMs || latency);
 
@@ -192,17 +201,17 @@ export const FaceScanner: React.FC<FaceScannerProps> = ({
     };
   }, [scanMode, streamActive, isScanning]);
 
-  // Handle local file upload for testing
-  const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
+  // Handle local file upload for testing (with image compression to prevent 413 Payload Too Large)
+  const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
 
-    const reader = new FileReader();
-    reader.onload = (event) => {
-      const base64 = event.target?.result as string;
-      handleScan(base64);
-    };
-    reader.readAsDataURL(file);
+    try {
+      const compressed = await compressImage(file, 720, 720, 0.82);
+      handleScan(compressed);
+    } catch (err) {
+      console.error("Lỗi nén ảnh tải lên:", err);
+    }
   };
 
   return (

@@ -14,6 +14,7 @@ import {
   RefreshCw,
 } from "lucide-react";
 import { Employee } from "../types";
+import { safeJsonFetch, compressImage } from "../utils/api";
 
 interface EmployeeRegistrationProps {
   employees: Employee[];
@@ -84,15 +85,19 @@ export const EmployeeRegistration: React.FC<EmployeeRegistrationProps> = ({
     setIsCapturingCamera(false);
   };
 
-  const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
+  const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
 
-    const reader = new FileReader();
-    reader.onload = (event) => {
-      setPhotoBase64(event.target?.result as string);
-    };
-    reader.readAsDataURL(file);
+    try {
+      // Compress portrait image to ~640px, keeping size under 150KB
+      const compressed = await compressImage(file, 640, 640, 0.82);
+      setPhotoBase64(compressed);
+      setErrorMsg(null);
+    } catch (err: any) {
+      console.error("Lỗi nén ảnh:", err);
+      setErrorMsg("Không thể xử lý hình ảnh này. Vui lòng chọn ảnh khác.");
+    }
   };
 
   // Sample portrait presets for quick registration testing
@@ -149,7 +154,12 @@ export const EmployeeRegistration: React.FC<EmployeeRegistrationProps> = ({
 
     setIsSubmitting(true);
     try {
-      const res = await fetch("/api/employees", {
+      const response = await safeJsonFetch<{
+        success?: boolean;
+        message?: string;
+        employee?: Employee;
+        error?: string;
+      }>("/api/employees", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -162,13 +172,15 @@ export const EmployeeRegistration: React.FC<EmployeeRegistrationProps> = ({
         }),
       });
 
-      const data = await res.json();
-      if (!res.ok) {
-        throw new Error(data.error || "Lỗi đăng ký");
+      if (!response.ok || !response.data?.employee) {
+        throw new Error(
+          response.data?.error || response.error || "Lỗi đăng ký nhân viên"
+        );
       }
 
-      onEmployeeAdded(data.employee);
-      setSuccessMsg(`Đã đăng ký thành công nhân viên: ${data.employee.name} (${data.employee.employeeCode})`);
+      const emp = response.data.employee;
+      onEmployeeAdded(emp);
+      setSuccessMsg(`Đã đăng ký thành công nhân viên: ${emp.name} (${emp.employeeCode})`);
 
       // Reset form
       setName("");

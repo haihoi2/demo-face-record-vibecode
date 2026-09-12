@@ -1060,6 +1060,28 @@ Yêu cầu phân tích:
   }
 });
 
+// Catch-all for unhandled /api routes - ALWAYS return JSON, never HTML
+app.all("/api/*", (req, res) => {
+  console.warn(`[404] Unhandled API route: ${req.method} ${req.url}`);
+  res.status(404).json({
+    error: `Đường dẫn API không tồn tại: ${req.method} ${req.url}`,
+    status: 404,
+  });
+});
+
+// Global error handling middleware for Express (catches JSON parse errors, payload limits, etc.)
+app.use((err: any, _req: Request, res: Response, next: any) => {
+  console.error("[Server Error Handler]:", err?.message || err);
+  if (res.headersSent) {
+    return next(err);
+  }
+  const statusCode = err?.status || err?.statusCode || 500;
+  res.status(statusCode).json({
+    error: err?.message || "Lỗi máy chủ nội bộ",
+    statusCode,
+  });
+});
+
 // --- Mount Vite in dev or static files in production ---
 async function startServer() {
   if (process.env.NODE_ENV !== "production") {

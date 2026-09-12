@@ -19,6 +19,7 @@ import {
   Copy,
 } from "lucide-react";
 import { WebhookConfig, WebhookLog, Employee } from "../types";
+import { safeJsonFetch } from "../utils/api";
 
 interface WebhookIntegrationProps {
   employees: Employee[];
@@ -58,17 +59,15 @@ export const WebhookIntegration: React.FC<WebhookIntegrationProps> = ({
     setLoading(true);
     try {
       const [resConf, resLogs] = await Promise.all([
-        fetch("/api/webhook/config"),
-        fetch("/api/webhook/logs"),
+        safeJsonFetch<WebhookConfig>("/api/webhook/config", undefined, config),
+        safeJsonFetch<WebhookLog[]>("/api/webhook/logs", undefined, []),
       ]);
 
-      if (resConf.ok) {
-        const confData = await resConf.json();
-        setConfig(confData);
+      if (resConf.ok && resConf.data) {
+        setConfig(resConf.data);
       }
-      if (resLogs.ok) {
-        const logsData = await resLogs.json();
-        setLogs(logsData);
+      if (resLogs.ok && Array.isArray(resLogs.data)) {
+        setLogs(resLogs.data);
       }
     } catch (err) {
       console.error("Lỗi tải cấu hình webhook:", err);
@@ -84,7 +83,7 @@ export const WebhookIntegration: React.FC<WebhookIntegrationProps> = ({
   // Handle saving config
   const handleSaveConfig = async () => {
     try {
-      const res = await fetch("/api/webhook/config", {
+      const res = await safeJsonFetch("/api/webhook/config", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(config),
@@ -102,18 +101,21 @@ export const WebhookIntegration: React.FC<WebhookIntegrationProps> = ({
   const handleTestServer = async (type: "ENTRY" | "EXIT") => {
     setTesting(true);
     try {
-      const res = await fetch("/api/webhook/test", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          testScanType: type,
-          customUser: testUser,
-          customCode: testCode,
-        }),
-      });
-      const data = await res.json();
-      if (data.log) {
-        setLogs((prev) => [data.log, ...prev.filter((l) => l.id !== data.log.id)]);
+      const res = await safeJsonFetch<{ success: boolean; log: WebhookLog }>(
+        "/api/webhook/test",
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            testScanType: type,
+            customUser: testUser,
+            customCode: testCode,
+          }),
+        }
+      );
+      if (res.data?.log) {
+        const newLog = res.data.log;
+        setLogs((prev) => [newLog, ...prev.filter((l) => l.id !== newLog.id)]);
       }
     } catch (err) {
       console.error("Lỗi test webhook từ server:", err);
