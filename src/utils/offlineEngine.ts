@@ -8,7 +8,9 @@ import {
   ScanType,
   WebhookConfig,
   WebhookLog,
+  AiRecognitionConfig,
 } from "../types";
+import { runLocalFaceRecognition } from "./localBiometrics";
 
 export const DEFAULT_OFFLINE_EMPLOYEES: Employee[] = [
   {
@@ -296,6 +298,59 @@ export function saveStoredWebhookLogs(logs: WebhookLog[]): void {
   }
 }
 
+// AI & Local Face Recognition Configuration Storage
+const STORAGE_KEY_AI_CONFIG = "smartlock_ai_recognition_config_v2";
+
+export const DEFAULT_AI_CONFIG: AiRecognitionConfig = {
+  engineMode: "HYBRID_AUTO",
+  googleAi: {
+    model: "gemini-3.8-flash",
+    temperature: 0.1,
+    minConfidence: 75,
+    useSystemFallback: true,
+    customPrompt: "",
+  },
+  localModel: {
+    modelArchitecture: "blazeface-arcface-sota",
+    similarityThreshold: 0.72,
+    livenessSensitivity: "MEDIUM",
+    maxFaces: 4,
+    autoContrast: true,
+    antiSpoofing: true,
+  },
+  hybridSettings: {
+    localPreFilterThreshold: 0.85,
+    fallbackToCloudOnUnknown: true,
+  },
+};
+
+export function getStoredAiConfig(): AiRecognitionConfig {
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY_AI_CONFIG);
+    if (raw) {
+      const parsed = JSON.parse(raw);
+      if (parsed && parsed.engineMode) {
+        return {
+          ...DEFAULT_AI_CONFIG,
+          ...parsed,
+          googleAi: { ...DEFAULT_AI_CONFIG.googleAi, ...(parsed.googleAi || {}) },
+          localModel: { ...DEFAULT_AI_CONFIG.localModel, ...(parsed.localModel || {}) },
+          hybridSettings: { ...DEFAULT_AI_CONFIG.hybridSettings, ...(parsed.hybridSettings || {}) },
+        };
+      }
+    }
+  } catch {}
+  return DEFAULT_AI_CONFIG;
+}
+
+export function saveStoredAiConfig(config: AiRecognitionConfig): void {
+  try {
+    localStorage.setItem(STORAGE_KEY_AI_CONFIG, JSON.stringify(config));
+  } catch (e) {
+    console.warn("Lỗi lưu AI config vào localStorage:", e);
+  }
+}
+
 /**
  * Direct browser webhook dispatcher: multi-transport delivery bypassing CORS restrictions.
  */
@@ -459,6 +514,7 @@ interface ClientFaceRecognitionParams {
   scanType?: ScanType;
   testEmployeeId?: string;
   employees: Employee[];
+  config?: AiRecognitionConfig;
 }
 
 export function simulateClientFaceRecognition({
@@ -466,9 +522,128 @@ export function simulateClientFaceRecognition({
   scanType = "ENTRY",
   testEmployeeId,
   employees,
+  config,
 }: ClientFaceRecognitionParams): FaceRecognitionResult {
   const currentEmployees = employees.length > 0 ? employees : getStoredEmployees();
+  const activeConfig = config || getStoredAiConfig();
   const startTime = Date.now();
+
+  const isLocalEngine = activeConfig.engineMode === "LOCAL_BIOMETRIC";
+  const isHybrid = activeConfig.engineMode === "HYBRID_AUTO";
+  const engineUsed = isLocalEngine
+    ? "Local Edge Biometrics"
+    : isHybrid
+    ? "Hybrid Auto (Local Edge + Cloud AI)"
+    : "Google Cloud AI";
+
+  let modelUsed: string = activeConfig.googleAi.model;
+  if (isLocalEngine || isHybrid) {
+    if (activeConfig.localModel.modelArchitecture === "blazeface-arcface-sota") {
+      modelUsed = "BlazeFace V2 + ArcFace SOTA (512-D)";
+    } else if (activeConfig.localModel.modelArchitecture === "mediapipe-facemesh-dense") {
+      modelUsed = "MediaPipe FaceMesh (468 3D Landmarks)";
+    } else {
+      modelUsed = "MobileFaceNet INT8 Edge";
+    }
+  }
+
+  // If local engine is selected and not a multi-person test, run through local biometric engine
+  if (isLocalEngine && testEmployeeId !== "MULTI_EMPLOYEES" && testEmployeeId !== "MULTI_MIXED") {
+    const localRes = runLocalFaceRecognition({
+      imageBase64,
+      employees: currentEmployees,
+      modelArchitecture: activeConfig.localModel.modelArchitecture,
+      similarityThreshold: activeConfig.localModel.similarityThreshold,
+      livenessSensitivity: activeConfig.localModel.livenessSensitivity,
+      testEmployeeId,
+    });
+
+    if (localRes.recognized && localRes.bestMatch) {
+      const emp = localRes.bestMatch;
+      const log: AccessLog = {
+        id: `LOG-${Date.now()}`,
+        timestamp: new Date().toISOString(),
+        type: scanType,
+        status: "GRANTED",
+        employeeId: emp.id,
+        employeeName: emp.name,
+        employeeCode: emp.employeeCode,
+        department: emp.department,
+        photoSnapshot: emp.photoUrl || imageBase64,
+        confidence: localRes.overallConfidence,
+        livenessScore: localRes.overallLiveness,
+        lockAction: "Mở chốt tự động qua Local Biometrics SOTA",
+        doorName: "Cửa Chính Trụ Sở - Cổng A",
+        reason: `Khớp vector Cosine ${(localRes.cosineSimilarity * 100).toFixed(1)}% [${localRes.modelName}]`,
+      };
+
+      clientDoorUnlock("Local SOTA Biometrics", emp.name, emp.id);
+      saveStoredLogs([log, ...getStoredLogs()]);
+
+      const notif: MobileNotification = {
+        id: `NOTIF-${Date.now()}`,
+        title: "Mở cửa thành công (Local AI)",
+        body: `${emp.name} (${emp.employeeCode}) - Xác thực qua ${localRes.modelName}`,
+        timestamp: new Date().toISOString(),
+        type: "SUCCESS",
+        read: false,
+        employeeId: emp.id,
+        employeeName: emp.name,
+      };
+      saveStoredNotifications([notif, ...getStoredNotifications()]);
+      clientEventBus.emit("notification", notif);
+
+      return {
+        recognized: true,
+        employee: emp,
+        recognizedEmployees: [emp],
+        detectedFaces: localRes.detectedFaces,
+        totalFacesDetected: localRes.detectedFaces.length,
+        authorizedCount: 1,
+        unauthorizedCount: 0,
+        processingTimeMs: localRes.processingTimeMs,
+        confidence: localRes.overallConfidence,
+        livenessScore: localRes.overallLiveness,
+        message: `[Local SOTA] Đã nhận diện: ${emp.name} (${emp.employeeCode}) [${localRes.modelName}] - Cửa đã mở!`,
+        lockUnlocked: true,
+        log,
+        logs: [log],
+        engineUsed,
+        modelUsed,
+      };
+    } else {
+      const log: AccessLog = {
+        id: `LOG-${Date.now()}`,
+        timestamp: new Date().toISOString(),
+        type: scanType,
+        status: "DENIED",
+        photoSnapshot: imageBase64,
+        confidence: localRes.overallConfidence,
+        livenessScore: localRes.overallLiveness,
+        lockAction: "Khóa giữ nguyên trạng thái LOCKED",
+        doorName: "Cửa Chính Trụ Sở - Cổng A",
+        reason: "Vector đặc trưng không đạt ngưỡng Cosine threshold (" + activeConfig.localModel.similarityThreshold + ")",
+      };
+      saveStoredLogs([log, ...getStoredLogs()]);
+
+      return {
+        recognized: false,
+        detectedFaces: localRes.detectedFaces,
+        totalFacesDetected: localRes.detectedFaces.length,
+        authorizedCount: 0,
+        unauthorizedCount: localRes.detectedFaces.length,
+        processingTimeMs: localRes.processingTimeMs,
+        confidence: localRes.overallConfidence,
+        livenessScore: localRes.overallLiveness,
+        message: "Từ chối truy cập: Khoảng cách vector Cosine không đạt chuẩn (" + localRes.cosineSimilarity.toFixed(2) + " < " + activeConfig.localModel.similarityThreshold + ")",
+        lockUnlocked: false,
+        log,
+        logs: [log],
+        engineUsed,
+        modelUsed,
+      };
+    }
+  }
 
   // CASE 1: MULTI-EMPLOYEE TEST
   if (testEmployeeId === "MULTI_EMPLOYEES") {
@@ -540,6 +715,8 @@ export function simulateClientFaceRecognition({
       lockUnlocked: true,
       logs,
       log: logs[0],
+      engineUsed,
+      modelUsed,
     };
   }
 
@@ -595,6 +772,8 @@ export function simulateClientFaceRecognition({
       lockUnlocked: false,
       log,
       logs: [log],
+      engineUsed,
+      modelUsed,
     };
   }
 
@@ -678,10 +857,12 @@ export function simulateClientFaceRecognition({
       processingTimeMs: Date.now() - startTime + Math.round(70 + Math.random() * 40),
       confidence,
       livenessScore,
-      message: `Đã nhận diện: ${targetEmployee.name} (${targetEmployee.employeeCode}) - Cửa mở thành công!`,
+      message: `Đã nhận diện: ${targetEmployee.name} (${targetEmployee.employeeCode}) [${modelUsed}] - Cửa mở thành công!`,
       lockUnlocked: true,
       log,
       logs: [log],
+      engineUsed,
+      modelUsed,
     };
   }
 
@@ -697,5 +878,7 @@ export function simulateClientFaceRecognition({
     livenessScore: 0,
     message: "Hệ thống chưa có nhân viên đăng ký",
     lockUnlocked: false,
+    engineUsed,
+    modelUsed,
   };
 }

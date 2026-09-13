@@ -17,6 +17,8 @@ import {
   Timer,
   Eye,
   Send,
+  Cpu,
+  Sliders,
 } from "lucide-react";
 import {
   Employee,
@@ -24,10 +26,14 @@ import {
   ScanType,
   SmartLockState,
   DetectedFace,
+  AiRecognitionConfig,
 } from "../types";
 import { soundEffects } from "../utils/audio";
 import { safeJsonFetch, compressImage } from "../utils/api";
-import { simulateClientFaceRecognition } from "../utils/offlineEngine";
+import {
+  simulateClientFaceRecognition,
+  getStoredAiConfig,
+} from "../utils/offlineEngine";
 
 interface FaceScannerProps {
   employees: Employee[];
@@ -54,6 +60,18 @@ export const FaceScanner: React.FC<FaceScannerProps> = ({
   const [capturedSnapshot, setCapturedSnapshot] = useState<string | null>(null);
   const [activeFaces, setActiveFaces] = useState<DetectedFace[]>([]);
   const [lastLatencyMs, setLastLatencyMs] = useState<number>(140);
+  const [aiConfig, setAiConfig] = useState<AiRecognitionConfig>(getStoredAiConfig());
+
+  // Keep aiConfig synchronized with localStorage / other tabs
+  useEffect(() => {
+    const updateConfig = () => setAiConfig(getStoredAiConfig());
+    window.addEventListener("storage", updateConfig);
+    window.addEventListener("focus", updateConfig);
+    return () => {
+      window.removeEventListener("storage", updateConfig);
+      window.removeEventListener("focus", updateConfig);
+    };
+  }, []);
 
   // Initialize webcam
   const startCamera = async () => {
@@ -155,6 +173,7 @@ export const FaceScanner: React.FC<FaceScannerProps> = ({
             scanType,
             testEmployeeId,
             clientEmployees: employees,
+            config: aiConfig,
           }),
         }
       );
@@ -175,6 +194,7 @@ export const FaceScanner: React.FC<FaceScannerProps> = ({
           scanType,
           testEmployeeId,
           employees,
+          config: aiConfig,
         });
       }
 
@@ -203,6 +223,7 @@ export const FaceScanner: React.FC<FaceScannerProps> = ({
           scanType,
           testEmployeeId,
           employees,
+          config: aiConfig,
         });
         setLastLatencyMs(fallbackData.processingTimeMs || 120);
         setLastResult(fallbackData);
@@ -273,6 +294,28 @@ export const FaceScanner: React.FC<FaceScannerProps> = ({
 
             {/* Entry / Exit Mode Toggle & Speed Badge */}
             <div className="flex items-center gap-2">
+              {/* Active AI Model Pill */}
+              <div
+                className="hidden lg:flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-slate-800/90 border border-slate-700 text-slate-200 font-mono text-[11px]"
+                title="Mô hình nhận diện khuôn mặt đang kích hoạt"
+              >
+                {aiConfig.engineMode === "LOCAL_BIOMETRIC" ? (
+                  <Cpu className="w-3.5 h-3.5 text-emerald-400" />
+                ) : aiConfig.engineMode === "HYBRID_AUTO" ? (
+                  <Zap className="w-3.5 h-3.5 text-violet-400" />
+                ) : (
+                  <Sparkles className="w-3.5 h-3.5 text-indigo-400" />
+                )}
+                <span className="text-slate-400">AI:</span>
+                <span className="font-semibold text-white">
+                  {aiConfig.engineMode === "LOCAL_BIOMETRIC"
+                    ? "Local ArcFace SOTA"
+                    : aiConfig.engineMode === "HYBRID_AUTO"
+                    ? "Hybrid SOTA"
+                    : "Google Cloud AI"}
+                </span>
+              </div>
+
               {/* Speed latency pill */}
               <div className="hidden sm:flex items-center gap-1 px-2.5 py-1 rounded-lg bg-slate-800/80 border border-slate-700 text-slate-300 font-mono text-[11px]">
                 <Timer className="w-3 h-3 text-amber-400" />
@@ -786,6 +829,17 @@ export const FaceScanner: React.FC<FaceScannerProps> = ({
                   <p className="text-xs font-bold text-slate-800 line-clamp-2">
                     {lastResult.message}
                   </p>
+                  {(lastResult.engineUsed || lastResult.modelUsed) && (
+                    <div className="mt-2 pt-2 border-t border-slate-200/80 flex items-center justify-between text-[11px]">
+                      <span className="text-slate-500 flex items-center gap-1">
+                        <Cpu className="w-3 h-3 text-indigo-500" />
+                        Động cơ AI:
+                      </span>
+                      <span className="font-semibold text-slate-700">
+                        {lastResult.engineUsed || "AI Engine"} ({lastResult.modelUsed || "SOTA"})
+                      </span>
+                    </div>
+                  )}
                 </div>
               </div>
 

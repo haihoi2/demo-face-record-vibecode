@@ -17,6 +17,11 @@ import {
   ShieldCheck,
   Check,
   Copy,
+  Network,
+  Server,
+  ShieldAlert,
+  FileText,
+  Terminal,
 } from "lucide-react";
 import { WebhookConfig, WebhookLog, Employee, MobileNotification } from "../types";
 import { safeJsonFetch } from "../utils/api";
@@ -66,14 +71,67 @@ export const WebhookIntegration: React.FC<WebhookIntegrationProps> = ({
     msg: string;
   } | null>(null);
 
+  const [copiedIp, setCopiedIp] = useState<string | null>(null);
+  const [copiedEmail, setCopiedEmail] = useState<boolean>(false);
+  const [showNetworkDetails, setShowNetworkDetails] = useState<boolean>(true);
+  const [ipInfo, setIpInfo] = useState<{
+    backendHost: string;
+    destinationHost: string;
+    outbound: {
+      ipv4: string;
+      ipv4SubnetRecommended: string;
+      ipv6: string;
+      provider: string;
+      asNumber: string;
+      note: string;
+    };
+    inbound: {
+      domain: string;
+      ipv4: string[];
+      ipv6: string[];
+      note: string;
+    };
+    destination: {
+      domain: string;
+      resolvedIps: string[];
+    };
+    emailTemplate?: string;
+  }>({
+    backendHost: "ais-dev-oru4xhzwwq7ai4fnvomzyh-216092153311.asia-east1.run.app",
+    destinationHost: "chat-room.eton.vn",
+    outbound: {
+      ipv4: "34.34.244.150",
+      ipv4SubnetRecommended: "34.34.244.0/24",
+      ipv6: "2600:1900:0:3804::b00",
+      provider: "Google Cloud Platform (GCP) - asia-east1 (Taiwan)",
+      asNumber: "AS15169 Google LLC",
+      note: "Địa chỉ IP thực tế mà chat-room.eton.vn nhìn thấy khi backend gửi request",
+    },
+    inbound: {
+      domain: "ais-dev-oru4xhzwwq7ai4fnvomzyh-216092153311.asia-east1.run.app",
+      ipv4: ["34.143.77.2", "34.143.74.2", "34.143.78.2", "34.143.75.2", "34.143.72.2"],
+      ipv6: ["2600:1901:81d4:200::", "2600:1900:4240:200::"],
+      note: "Dải Anycast IP công khai của Google Cloud",
+    },
+    destination: {
+      domain: "chat-room.eton.vn",
+      resolvedIps: ["45.118.151.67"],
+    },
+  });
+
   // Fetch initial config & logs
   const fetchConfigAndLogs = async () => {
     setLoading(true);
     try {
-      const [resConf, resLogs] = await Promise.all([
+      const [resConf, resLogs, resIp] = await Promise.all([
         safeJsonFetch<WebhookConfig>("/api/webhook/config", undefined, config),
         safeJsonFetch<WebhookLog[]>("/api/webhook/logs", undefined, []),
+        safeJsonFetch<any>("/api/network/ip-info", undefined, null),
       ]);
+
+      if (resIp.ok && resIp.data && resIp.data.outbound) {
+        setIpInfo(resIp.data);
+      }
 
       if (resConf.ok && resConf.data) {
         setConfig(resConf.data);
@@ -710,6 +768,187 @@ export const WebhookIntegration: React.FC<WebhookIntegrationProps> = ({
                   Lưu Cấu Hình Webhook
                 </button>
               </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      {/* Network IP & Whitelist Guide for Network Team */}
+      <div className="bg-gradient-to-br from-slate-900 via-slate-800 to-indigo-950 rounded-2xl border border-slate-700 p-6 text-white shadow-lg">
+        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 border-b border-slate-700/80 pb-4 mb-5">
+          <div className="flex items-center gap-3">
+            <div className="p-2.5 rounded-xl bg-indigo-500/20 text-indigo-400 border border-indigo-500/30">
+              <Network className="w-5 h-5" />
+            </div>
+            <div>
+              <h3 className="text-base font-bold text-white flex items-center gap-2">
+                Thông Tin IP Của Backend (Cung Cấp Cho Team Network)
+                <span className="px-2 py-0.5 rounded text-[10px] font-semibold bg-emerald-500/20 text-emerald-300 border border-emerald-500/30">
+                  Live Detected
+                </span>
+              </h3>
+              <p className="text-xs text-slate-300 mt-0.5">
+                Địa chỉ IP nguồn Egress mà phía máy chủ <code className="text-indigo-300 font-mono">chat-room.eton.vn</code> nhìn thấy khi nhận Webhook
+              </p>
+            </div>
+          </div>
+
+          <button
+            onClick={() => {
+              const textToCopy = ipInfo.emailTemplate || `Kính gửi Team Network / Quản trị hệ thống chat-room.eton.vn,
+
+Hệ thống Camera AI Face ID (Smart Lock) cần gửi Webhook thông báo chấm công Vào/Ra tới hệ thống chat-room.eton.vn.
+Hiện tại các request từ Backend đang gặp phản hồi HTTP 403 Forbidden từ Firewall/WAF/Nginx của eton.vn.
+
+Kính nhờ Team Network hỗ trợ mở Whitelist cho địa chỉ IP Egress của Backend như sau:
+1. IP NGUỒN GỌI ĐI (Egress IPv4 - Quan trọng nhất):
+   - IP máy chủ gọi ra: ${ipInfo.outbound.ipv4}
+   - Dải IP dự phòng (Google Cloud asia-east1): ${ipInfo.outbound.ipv4SubnetRecommended} (AS15169 Google LLC)
+   - Egress IPv6: ${ipInfo.outbound.ipv6}
+2. TÊN MIỀN & INBOUND IP CỦA BACKEND:
+   - Domain Backend: https://${ipInfo.backendHost}
+   - Inbound Anycast IPs: ${ipInfo.inbound.ipv4.slice(0, 3).join(", ")}
+3. MỤC TIÊU GỌI ĐẾN (Destination):
+   - Host: ${ipInfo.destinationHost} (IP: ${ipInfo.destination.resolvedIps.join(", ") || "45.118.151.67"})
+   - Port: 443 (HTTPS) / 80 (HTTP)
+   - Phương thức: POST
+   - Content-Type: application/json
+   - User-Agent: Mozilla/5.0 ... EtonWebhookBot/1.0
+Trân trọng cảm ơn!`;
+
+              navigator.clipboard.writeText(textToCopy);
+              setCopiedEmail(true);
+              soundEffects.playSuccess();
+              setTimeout(() => setCopiedEmail(false), 3000);
+            }}
+            className="px-4 py-2 bg-indigo-600 hover:bg-indigo-500 text-white rounded-xl text-xs font-bold transition flex items-center gap-2 shadow-md cursor-pointer shrink-0"
+          >
+            {copiedEmail ? (
+              <>
+                <Check className="w-4 h-4 text-emerald-300" />
+                Đã Sao Chép Toàn Bộ Mẫu Tin!
+              </>
+            ) : (
+              <>
+                <Copy className="w-4 h-4" />
+                Sao Chép Mẫu Yêu Cầu Gửi Team Network
+              </>
+            )}
+          </button>
+        </div>
+
+        {/* Highlighted IP Grid */}
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-5">
+          {/* Card 1: Outbound IPv4 (Most Critical) */}
+          <div className="bg-slate-900/90 rounded-xl p-4 border border-indigo-500/40 relative">
+            <div className="flex items-center justify-between mb-1.5">
+              <span className="text-[11px] font-semibold uppercase tracking-wider text-indigo-300 flex items-center gap-1.5">
+                <Server className="w-3.5 h-3.5 text-indigo-400" />
+                IP Nguồn Gọi Đi (Egress IPv4)
+              </span>
+              <span className="px-1.5 py-0.5 rounded text-[10px] font-bold bg-indigo-500/20 text-indigo-300 border border-indigo-500/40">
+                QUAN TRỌNG NHẤT
+              </span>
+            </div>
+            <div className="flex items-center justify-between gap-2 mt-2">
+              <span className="font-mono text-xl font-black text-emerald-400">
+                {ipInfo.outbound.ipv4}
+              </span>
+              <button
+                onClick={() => {
+                  navigator.clipboard.writeText(ipInfo.outbound.ipv4);
+                  setCopiedIp("outbound");
+                  setTimeout(() => setCopiedIp(null), 2000);
+                }}
+                className="p-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-white transition cursor-pointer"
+                title="Sao chép IP này"
+              >
+                {copiedIp === "outbound" ? (
+                  <Check className="w-3.5 h-3.5 text-emerald-400" />
+                ) : (
+                  <Copy className="w-3.5 h-3.5" />
+                )}
+              </button>
+            </div>
+            <p className="text-[11px] text-slate-400 mt-2">
+              Subnet khuyên dùng:{" "}
+              <code className="text-amber-300 font-mono font-bold">
+                {ipInfo.outbound.ipv4SubnetRecommended}
+              </code>
+            </p>
+            <p className="text-[10px] text-slate-500 mt-0.5">
+              Khu vực: {ipInfo.outbound.provider}
+            </p>
+          </div>
+
+          {/* Card 2: Inbound Backend Domain & Edge IP */}
+          <div className="bg-slate-900/90 rounded-xl p-4 border border-slate-700/80">
+            <div className="flex items-center justify-between mb-1.5">
+              <span className="text-[11px] font-semibold uppercase tracking-wider text-slate-300 flex items-center gap-1.5">
+                <Globe className="w-3.5 h-3.5 text-sky-400" />
+                Tên Miền Backend & Inbound IP
+              </span>
+            </div>
+            <div className="mt-1">
+              <p className="font-mono text-xs text-sky-300 break-all select-all font-semibold">
+                {ipInfo.backendHost}
+              </p>
+            </div>
+            <div className="mt-2.5 pt-2 border-t border-slate-800 flex items-center justify-between text-[11px]">
+              <span className="text-slate-400">Anycast IPs:</span>
+              <span className="font-mono text-slate-300 text-[11px]">
+                {ipInfo.inbound.ipv4.slice(0, 2).join(", ")} ...
+              </span>
+            </div>
+            <p className="text-[10px] text-slate-500 mt-1">
+              Dải mạng Google Anycast: 34.143.72.0/21
+            </p>
+          </div>
+
+          {/* Card 3: Destination Host */}
+          <div className="bg-slate-900/90 rounded-xl p-4 border border-slate-700/80">
+            <div className="flex items-center justify-between mb-1.5">
+              <span className="text-[11px] font-semibold uppercase tracking-wider text-slate-300 flex items-center gap-1.5">
+                <ShieldCheck className="w-3.5 h-3.5 text-emerald-400" />
+                Máy Chủ Đích (Eton Chat Room)
+              </span>
+            </div>
+            <div className="mt-1 flex items-center justify-between">
+              <span className="font-mono text-sm font-bold text-slate-200">
+                {ipInfo.destinationHost}
+              </span>
+              <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-emerald-950 text-emerald-300 border border-emerald-800">
+                Port 443 (HTTPS)
+              </span>
+            </div>
+            <div className="mt-2.5 pt-2 border-t border-slate-800 text-[11px] flex items-center justify-between">
+              <span className="text-slate-400">IP Đích Resolved:</span>
+              <span className="font-mono text-emerald-400 font-bold">
+                {ipInfo.destination.resolvedIps.join(", ") || "45.118.151.67"}
+              </span>
+            </div>
+            <p className="text-[10px] text-slate-500 mt-1">
+              Giao thức: HTTP POST • JSON Payload
+            </p>
+          </div>
+        </div>
+
+        {/* Diagnostic Whitelist Explanation */}
+        <div className="bg-indigo-950/40 rounded-xl p-3.5 border border-indigo-500/30 text-xs text-slate-300 space-y-2">
+          <div className="flex items-start gap-2">
+            <ShieldAlert className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" />
+            <div>
+              <p className="font-semibold text-white">
+                Nguyên nhân lỗi HTTP 403 Forbidden & Hướng giải quyết của Team Network:
+              </p>
+              <ul className="list-disc list-inside text-slate-300 text-[11px] mt-1 space-y-1">
+                <li>
+                  <strong className="text-white">GeoIP / Cloud Datacenter Blocking:</strong> Nginx hoặc Firewall của máy chủ <code className="font-mono text-indigo-300">chat-room.eton.vn (45.118.151.67)</code> thường có chính sách chặn các kết nối đến từ IP ngoài lãnh thổ Việt Nam hoặc IP thuộc dải máy chủ đám mây công cộng (Google Cloud asia-east1).
+                </li>
+                <li>
+                  <strong className="text-white">Giải pháp cho Team Network:</strong> Thêm địa chỉ IP Egress <code className="font-mono font-bold text-emerald-400">34.34.244.150</code> (hoặc mở dải subnet <code className="font-mono font-bold text-amber-300">34.34.244.0/24</code>) vào danh sách Whitelist cho phép truy cập port 443/80 trên Nginx/Firewall.
+                </li>
+              </ul>
             </div>
           </div>
         </div>

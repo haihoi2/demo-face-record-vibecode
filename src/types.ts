@@ -83,6 +83,69 @@ export interface FaceRecognitionResult {
   detectedFeatures?: string;
   log?: AccessLog;
   logs?: AccessLog[];
+  engineUsed?: string;
+  modelUsed?: string;
+}
+
+export type RecognitionEngineMode = "GOOGLE_GEMINI" | "LOCAL_BIOMETRIC" | "HYBRID_AUTO";
+export type GoogleAiModel =
+  | "gemini-3.8-flash"
+  | "gemini-flash-latest"
+  | "gemini-3.1-flash-lite"
+  | "gemini-3.1-pro-preview";
+export type LocalBiometricModel =
+  | "blazeface-arcface-sota"
+  | "mediapipe-facemesh-dense"
+  | "mobilefacenet-quantized";
+
+export interface AiRecognitionConfig {
+  engineMode: RecognitionEngineMode;
+  googleAi: {
+    model: GoogleAiModel;
+    temperature: number;
+    minConfidence: number; // 50 - 99
+    useSystemFallback: boolean;
+    customPrompt?: string;
+  };
+  localModel: {
+    modelArchitecture: LocalBiometricModel;
+    similarityThreshold: number; // 0.50 - 0.95
+    livenessSensitivity: "LOW" | "MEDIUM" | "HIGH";
+    maxFaces: number; // 1 - 8
+    autoContrast: boolean;
+    antiSpoofing: boolean;
+  };
+  hybridSettings: {
+    localPreFilterThreshold: number; // e.g. 0.85
+    fallbackToCloudOnUnknown: boolean;
+  };
+}
+
+export interface BenchmarkResult {
+  googleAiResult?: {
+    model: string;
+    latencyMs: number;
+    recognized: boolean;
+    facesCount: number;
+    detectedEmployees: string[];
+    confidence: number;
+    livenessScore: number;
+    message: string;
+    error?: string;
+  };
+  localResult: {
+    model: string;
+    latencyMs: number;
+    recognized: boolean;
+    facesCount: number;
+    detectedEmployees: string[];
+    confidence: number;
+    livenessScore: number;
+    cosineSimilarity: number;
+    message: string;
+  };
+  speedDifference: string;
+  recommendation: string;
 }
 
 export interface WebhookLog {

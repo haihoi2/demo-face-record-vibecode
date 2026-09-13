@@ -6,6 +6,7 @@ import { EmployeeRegistration } from "./components/EmployeeRegistration";
 import { AccessLogs } from "./components/AccessLogs";
 import { MobileCompanion } from "./components/MobileCompanion";
 import { WebhookIntegration } from "./components/WebhookIntegration";
+import { AiConfigPage } from "./components/AiConfigPage";
 import {
   Employee,
   AccessLog,
@@ -31,7 +32,7 @@ import {
 } from "./utils/offlineEngine";
 
 export default function App() {
-  const [activeTab, setActiveTab] = useState<"scanner" | "register" | "logs" | "mobile" | "webhook">("scanner");
+  const [activeTab, setActiveTab] = useState<"scanner" | "register" | "logs" | "mobile" | "webhook" | "config">("scanner");
 
   const [employees, setEmployees] = useState<Employee[]>([]);
   const [accessLogs, setAccessLogs] = useState<AccessLog[]>([]);
@@ -467,6 +468,13 @@ export default function App() {
               setLatestToast(notif);
               setTimeout(() => setLatestToast(null), 4500);
             }}
+          />
+        )}
+
+        {activeTab === "config" && (
+          <AiConfigPage
+            employees={employees}
+            onNavigateToScanner={() => setActiveTab("scanner")}
           />
         )}
       </main>

@@ -10,12 +10,13 @@ import {
   Clock,
   ShieldCheck,
   Send,
+  Sliders,
 } from "lucide-react";
 import { SmartLockState } from "../types";
 
 interface NavbarProps {
-  activeTab: "scanner" | "register" | "logs" | "mobile" | "webhook";
-  setActiveTab: (tab: "scanner" | "register" | "logs" | "mobile" | "webhook") => void;
+  activeTab: "scanner" | "register" | "logs" | "mobile" | "webhook" | "config";
+  setActiveTab: (tab: "scanner" | "register" | "logs" | "mobile" | "webhook" | "config") => void;
   lockState: SmartLockState;
   unreadCount: number;
   sseConnected: boolean;
@@ -141,6 +142,19 @@ export const Navbar: React.FC<NavbarProps> = ({
             >
               <Send className="w-4 h-4 text-indigo-600" />
               <span className="hidden sm:inline">Webhook Eton</span>
+            </button>
+
+            <button
+              id="nav-tab-config"
+              onClick={() => setActiveTab("config")}
+              className={`flex items-center gap-2 px-3 py-2 rounded-lg text-sm font-medium transition-all ${
+                activeTab === "config"
+                  ? "bg-indigo-50 text-indigo-700 shadow-xs border border-indigo-100"
+                  : "text-slate-600 hover:text-slate-900 hover:bg-slate-100"
+              }`}
+            >
+              <Sliders className="w-4 h-4 text-indigo-600" />
+              <span className="hidden sm:inline">Cấu Hình AI</span>
             </button>
           </nav>
 
