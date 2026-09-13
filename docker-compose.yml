@@ -1,22 +1,69 @@
 services:
+  # =========================================================================
+  # 1. PostgreSQL Database Service for robust enterprise data persistence
+  # =========================================================================
+  postgres:
+    image: postgres:16-alpine
+    container_name: smartface-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-smartface_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-smartface_secret_pass}
+      POSTGRES_DB: ${POSTGRES_DB:-smartface_db}
+      PGDATA: /var/lib/postgresql/data/pgdata
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      # Persistent named volume for all PostgreSQL relational data
+      - postgres_data:/var/lib/postgresql/data
+      # Automated schema initialization script on first launch
+      - ./init-db.sql:/docker-entrypoint-initdb.d/init-db.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-smartface_user} -d ${POSTGRES_DB:-smartface_db}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    networks:
+      - smartface-network
+
+  # =========================================================================
+  # 2. Smart Face Recognition & SmartLock Gateway Backend/Frontend Service
+  # =========================================================================
   smartface-app:
     build:
       context: .
       dockerfile: Dockerfile
     container_name: smartface-lock-gateway
     restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
     ports:
       - "3000:3000"
     environment:
       - NODE_ENV=production
       - PORT=3000
       - GEMINI_API_KEY=${GEMINI_API_KEY:-}
+      # Database connection string to PostgreSQL container
+      - DATABASE_URL=postgresql://${POSTGRES_USER:-smartface_user}:${POSTGRES_PASSWORD:-smartface_secret_pass}@postgres:5432/${POSTGRES_DB:-smartface_db}
     volumes:
-      # Mount host ./data directory into container to persist SQLite database (smartface.db)
+      # SQLite volume mount as fallback/hybrid storage
       - ./data:/app/data
     healthcheck:
       test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:3000/api/health"]
       interval: 30s
       timeout: 5s
       retries: 3
-      start_period: 10s
+      start_period: 15s
+    networks:
+      - smartface-network
+
+volumes:
+  # Named persistent volume stored on Docker host disk
+  postgres_data:
+    driver: local
+
+networks:
+  smartface-network:
+    driver: bridge

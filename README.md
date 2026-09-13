@@ -2,39 +2,46 @@
 
 Hệ thống nhận diện khuôn mặt nhân viên đa đối tượng thời gian thực bằng mô hình **Gemini AI**, tự động điều khiển khóa cửa thông minh (Smart Lock API), ghi nhận lịch sử chấm công Vào/Ra, đồng bộ thông báo thời gian thực qua Server-Sent Events (SSE) và gửi Webhook tích hợp trực tiếp vào **Eton Chat Room**.
 
-Toàn bộ dữ liệu của phần Backend được lưu trữ bền vững vào cơ sở dữ liệu **SQLite 3 (`data/smartface.db`)**, không bị mất mát khi khởi động lại máy chủ hoặc nâng cấp hệ thống.
+Toàn bộ dữ liệu của phần Backend được lưu trữ bền vững với hỗ trợ **PostgreSQL (qua Docker Compose)** hoặc **SQLite 3 (`data/smartface.db`)**, không bị mất mát khi khởi động lại máy chủ hoặc nâng cấp hệ thống.
 
 ---
 
 ## 📑 Mục Lục
-1. [Kiến Trúc Lưu Trữ SQLite](#-kiến-trúc-lưu-trữ-sqlite)
-2. [Cấu Trúc Bảng Dữ Liệu SQLite](#-cấu-trúc-bảng-dữ-liệu-sqlite)
+1. [Kiến Trúc Lưu Trữ Dữ Liệu (PostgreSQL & SQLite)](#-kiến-trúc-lưu-trữ-dữ-liệu)
+2. [Cấu Trúc Bảng Dữ Liệu](#-cấu-trúc-bảng-dữ-liệu)
 3. [Yêu Cầu Hệ Thống (Prerequisites)](#-yêu-cầu-hệ-thống)
 4. [Hướng Dẫn Cài Đặt & Chạy Môi Trường Phát Triển (Dev)](#-hướng-dẫn-chạy-môi-trường-phát-triển)
 5. [Hướng Dẫn Biên Dịch (Build Production)](#-hướng-dẫn-biên-dịch-build-production)
 6. [Hướng Dẫn Deploy Production](#-hướng-dẫn-deploy-production)
    - [Cách 1: Deploy trên Máy Chủ Linux/Ubuntu với PM2](#cách-1-deploy-trực-tiếp-bằng-pm2-khuyên-dùng-cho-vps)
-   - [Cách 2: Deploy bằng Docker & Docker Compose (Volume Persist)](#cách-2-deploy-bằng-docker--docker-compose)
+   - [Cách 2: Deploy Bằng Docker Compose với PostgreSQL (Backend Database)](#cách-2-deploy-bằng-docker-compose-với-postgresql-backend-database)
    - [Cách 3: Cấu hình Nginx Reverse Proxy & Chứng Chỉ SSL HTTPS](#cách-3-cấu-hình-nginx-reverse-proxy--ssl-https)
-7. [Sao Lưu (Backup) & Phục Hồi (Restore) SQLite](#-sao-lưu-và-phục-hồi-cơ-sở-dữ-liệu-sqlite)
+7. [Sao Lưu (Backup) & Phục Hồi (Restore) Database](#-sao-lưu-và-phục-hồi-cơ-sở-dữ-liệu)
 8. [Tích Hợp Webhook Eton Chat Room](#-tích-hợp-webhook-eton-chat-room)
 9. [API Kiểm Tra Trạng Thái Database](#-api-kiểm-tra-trạng-thái-database)
 
 ---
 
-## 🗄️ Kiến Trúc Lưu Trữ SQLite
+## 🗄️ Kiến Trúc Lưu Trữ Dữ Liệu
 
-Hệ thống sử dụng cơ chế lưu trữ SQLite 3 với các đặc điểm tối ưu:
-* **Engine Native Node.js 22+ (`node:sqlite`)**: Sử dụng trực tiếp engine SQLite tích hợp sẵn trong Node.js runtime, mang lại tốc độ truy vấn tức thì (in-process microsecond latency), không phụ thuộc vào `node-gyp` hay trình biên dịch C++ phức tạp của hệ điều hành.
-* **Vị trí file dữ liệu**: `./data/smartface.db` (tự động tạo thư mục `data/` và khởi tạo bảng khi khởi chạy lần đầu).
-* **Cơ chế Fallback an toàn**: Nếu chạy trên phiên bản Node cũ hơn chưa hỗ trợ `node:sqlite`, hệ thống tự động kích hoạt bộ lưu trữ tệp atomic JSON (`data/smartface_data.json`) để ứng dụng luôn hoạt động thông suốt.
-* **Toàn vẹn dữ liệu**: Toàn bộ dữ liệu nhân viên, ảnh đại diện, lịch sử chấm công, cấu hình webhook và thông báo được ghi đĩa ngay khi có thay đổi.
+Hệ thống hỗ trợ cơ chế lưu trữ phân tầng linh hoạt giữa **PostgreSQL** (cho triển khai quy mô phân tán, Docker Compose, Cloud SQL) và **SQLite 3** (cho triển khai nhúng gọn nhẹ):
+
+* **PostgreSQL (Khuyên dùng cho Docker Compose & Doanh Nghiệp)**:
+  - Tự động kích hoạt khi biến môi trường `DATABASE_URL` được cấu hình (ví dụ: `postgresql://user:pass@postgres:5432/smartface_db`).
+  - Dữ liệu được lưu trữ trong volume Docker độc lập `postgres_data`, đảm bảo khả năng mở rộng, backup định kỳ qua `pg_dump` và tính toàn vẹn dữ liệu ACID.
+  - Tự động nạp cấu trúc bảng qua file `init-db.sql`.
+* **SQLite 3 Native Node.js 22+ (`node:sqlite`) (Chế độ mặc định độc lập)**:
+  - Tích hợp sẵn trong runtime Node.js, không cần cài đặt thêm phần mềm database ngoài.
+  - Vị trí file dữ liệu: `./data/smartface.db` (tự động tạo thư mục `data/` và khởi tạo bảng khi khởi chạy lần đầu).
+* **Cơ chế Fallback an toàn**:
+  - Nếu chạy trên phiên bản Node cũ hơn chưa hỗ trợ `node:sqlite`, hệ thống tự động kích hoạt bộ lưu trữ tệp atomic JSON (`data/smartface_data.json`) để ứng dụng luôn hoạt động thông suốt.
+* **Đồng bộ song song**: Khi kết nối PostgreSQL thành công, hệ thống tự động ghi nhận song song các thao tác vào PostgreSQL, sẵn sàng chuyển đổi linh hoạt mà không làm gián đoạn hệ thống.
 
 ---
 
-## 📊 Cấu Trúc Bảng Dữ Liệu SQLite
+## 📊 Cấu Trúc Bảng Dữ Liệu
 
-File `data/smartface.db` quản lý 6 bảng cơ bản:
+Cơ sở dữ liệu quản lý 6 bảng cơ bản:
 
 | Tên Bảng | Mô Tả | Các Trường Chính |
 | :--- | :--- | :--- |
@@ -182,29 +189,121 @@ pm2 restart smartface-gateway # Khởi động lại
 
 ---
 
-### Cách 2: Deploy Bằng Docker & Docker Compose
+### Cách 2: Deploy Bằng Docker Compose với PostgreSQL (Backend Database)
 
-Deploy bằng Docker giúp đóng gói toàn bộ môi trường Node 22 đồng nhất và gắn thư mục `./data` ra ngoài máy chủ chủ để bảo đảm dữ liệu SQLite không bao giờ bị mất khi cập nhật container.
+Hệ thống hỗ trợ cơ chế lưu trữ phân tầng doanh nghiệp với **PostgreSQL 16** chạy qua Docker Compose, đồng thời duy trì volume dự phòng cho SQLite. Mọi thay đổi dữ liệu nhân viên, lịch sử chấm công, cấu hình webhook và thông báo tức thời được lưu trực tiếp vào cơ sở dữ liệu PostgreSQL (`smartface_db`).
 
-#### Khởi chạy với Docker Compose (1 Lệnh duy nhất):
+#### 1. Kiến trúc dịch vụ Docker Compose:
+- **`smartface-postgres`**: Container PostgreSQL 16 Alpine, cấu hình volume bền vững `postgres_data` và tự động nạp bảng khởi tạo qua `init-db.sql`.
+- **`smartface-lock-gateway`**: Container ứng dụng Node.js, tự động kết nối qua mạng nội bộ Docker `smartface-network` với biến môi trường `DATABASE_URL`. Container tự kiểm tra trạng thái sức khỏe (`service_healthy`) của Postgres trước khi khởi động.
+
+#### 2. Cấu hình biến môi trường (`.env`):
+Tạo hoặc cập nhật file `.env` trên thư mục gốc:
+```env
+# Google Gemini API Key cho nhận diện khuôn mặt
+GEMINI_API_KEY=AIzaSy...
+
+# Cấu hình tài khoản PostgreSQL
+POSTGRES_USER=smartface_user
+POSTGRES_PASSWORD=smartface_secret_pass
+POSTGRES_DB=smartface_db
+POSTGRES_PORT=5432
+
+# Chuỗi kết nối Database URL
+DATABASE_URL=postgresql://smartface_user:smartface_secret_pass@postgres:5432/smartface_db
+```
+
+#### 3. Cấu hình file `docker-compose.yml`:
+```yaml
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: smartface-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-smartface_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-smartface_secret_pass}
+      POSTGRES_DB: ${POSTGRES_DB:-smartface_db}
+      PGDATA: /var/lib/postgresql/data/pgdata
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./init-db.sql:/docker-entrypoint-initdb.d/init-db.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-smartface_user} -d ${POSTGRES_DB:-smartface_db}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    networks:
+      - smartface-network
+
+  smartface-app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: smartface-lock-gateway
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "3000:3000"
+    environment:
+      - NODE_ENV=production
+      - PORT=3000
+      - GEMINI_API_KEY=${GEMINI_API_KEY:-}
+      - DATABASE_URL=postgresql://${POSTGRES_USER:-smartface_user}:${POSTGRES_PASSWORD:-smartface_secret_pass}@postgres:5432/${POSTGRES_DB:-smartface_db}
+    volumes:
+      - ./data:/app/data
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:3000/api/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    networks:
+      - smartface-network
+
+volumes:
+  postgres_data:
+    driver: local
+
+networks:
+  smartface-network:
+    driver: bridge
+```
+
+#### 4. Khởi chạy với Docker Compose (1 lệnh duy nhất):
 ```bash
-# Đặt biến môi trường nếu có
-export GEMINI_API_KEY="AIzaSy..."
-
-# Build image và chạy container ở chế độ nền (detached)
+# Build image và khởi động toàn bộ dịch vụ (PostgreSQL + SmartFace App)
 docker compose up -d --build
 ```
 
-#### Kiểm tra container:
+#### 5. Kiểm tra trạng thái và log kết nối:
 ```bash
-# Xem danh sách container đang chạy
+# Xem danh sách container và tình trạng healthcheck
 docker compose ps
 
-# Xem log khởi động
-docker compose logs -f
+# Xem log kết nối cơ sở dữ liệu của ứng dụng
+docker compose logs -f smartface-app
+```
+Khi ứng dụng khởi động thành công với PostgreSQL, bạn sẽ thấy log:
+```text
+[PostgreSQL] Đã kết nối cơ sở dữ liệu PostgreSQL thành công!
+[PostgreSQL] Các bảng dữ liệu đã sẵn sàng trên PostgreSQL!
+Server running on http://localhost:3000
 ```
 
-File cơ sở dữ liệu SQLite nằm tại thư mục `./data/smartface.db` trên máy chủ host, được đồng bộ trực tiếp hai chiều với `/app/data/smartface.db` bên trong container.
+#### 6. Thao tác sao lưu (Backup) và phục hồi (Restore) PostgreSQL:
+```bash
+# Sao lưu dữ liệu ra file SQL
+docker compose exec -t postgres pg_dump -U smartface_user -d smartface_db > smartface_backup.sql
+
+# Phục hồi dữ liệu từ file SQL
+cat smartface_backup.sql | docker compose exec -T postgres psql -U smartface_user -d smartface_db
+```
 
 ---
 
@@ -261,41 +360,46 @@ sudo certbot --nginx -d smartface.yourcompany.com
 
 ---
 
-## 💾 Sao Lưu và Phục Hồi Cơ Sở Dữ Liệu SQLite
+## 💾 Sao Lưu và Phục Hồi Cơ Sở Dữ Liệu (PostgreSQL & SQLite)
 
-Vì toàn bộ backend lưu trong file duy nhất `data/smartface.db`, việc sao lưu và di chuyển hệ thống cực kỳ đơn giản:
+### A. Đối với PostgreSQL (Triển khai Docker Compose)
 
-### 1. Sao lưu tự động định kỳ (Hot Backup không gián đoạn dịch vụ)
-Sử dụng công cụ `sqlite3` chính thống để tạo bản sao lưu an toàn ngay cả khi ứng dụng đang ghi log:
+#### 1. Sao lưu dữ liệu PostgreSQL (`pg_dump`):
 ```bash
-# Tạo bản sao lưu có gắn ngày giờ
+# Tạo bản sao lưu toàn bộ cơ sở dữ liệu có gắn ngày giờ
+docker compose exec -t postgres pg_dump -U smartface_user -d smartface_db > data/smartface_pg_$(date +%Y%m%d_%H%M%S).sql
+```
+
+#### 2. Phục hồi dữ liệu PostgreSQL (`psql`):
+```bash
+# Phục hồi dữ liệu từ bản sao lưu SQL
+cat data/smartface_pg_YYYYMMDD_HHMMSS.sql | docker compose exec -T postgres psql -U smartface_user -d smartface_db
+```
+
+#### 3. Thiết lập Cronjob tự động sao lưu PostgreSQL mỗi ngày:
+```bash
+0 2 * * * cd /duong-dan/du-an && docker compose exec -t postgres pg_dump -U smartface_user -d smartface_db > data/backup_pg_$(date +\%Y\%m\%d).sql && find data/backup_pg_*.sql -mtime +30 -delete
+```
+
+---
+
+### B. Đối với SQLite 3 (Triển khai File-based)
+
+#### 1. Sao lưu tự động định kỳ (Hot Backup không gián đoạn dịch vụ):
+```bash
 sqlite3 data/smartface.db ".backup 'data/smartface_backup_$(date +%Y%m%d_%H%M%S).db'"
 ```
 
-### 2. Thiết lập Cronjob sao lưu mỗi đêm (00:00 hàng ngày)
-Mở crontab:
-```bash
-crontab -e
-```
-Thêm dòng sau:
-```cron
-0 0 * * * sqlite3 /duong-dan/data/smartface.db ".backup '/duong-dan/data/backup_$(date +\%Y\%m\%d).db'" && find /duong-dan/data/backup_*.db -mtime +30 -delete
-```
-*(Lệnh trên tự động giữ lại bản sao lưu trong vòng 30 ngày gần nhất).*
-
-### 3. Phục hồi dữ liệu (Restore)
-Khi cần phục hồi lại một bản sao lưu trước đó:
+#### 2. Phục hồi dữ liệu SQLite:
 ```bash
 # 1. Dừng ứng dụng
-pm2 stop smartface-gateway
-# (hoặc: docker compose stop)
+pm2 stop smartface-gateway # hoặc: docker compose stop smartface-app
 
 # 2. Thay thế file cơ sở dữ liệu
 cp data/smartface_backup_YYYYMMDD.db data/smartface.db
 
 # 3. Khởi động lại ứng dụng
-pm2 start smartface-gateway
-# (hoặc: docker compose start)
+pm2 start smartface-gateway # hoặc: docker compose start smartface-app
 ```
 
 ---
@@ -474,13 +578,14 @@ GET /api/system/db-info HTTP/1.1
 Host: localhost:3000
 ```
 
-**Response mẫu:**
+**Response mẫu (Chế độ PostgreSQL qua Docker Compose):**
 ```json
 {
   "success": true,
   "storage": {
-    "engine": "SQLite 3 (Node.js native DatabaseSync)",
-    "dbPath": "/app/data/smartface.db",
+    "engine": "PostgreSQL (Docker/External) + SQLite 3 (Node.js native DatabaseSync)",
+    "postgresConnected": true,
+    "sqlitePath": "/app/data/smartface.db",
     "sizeBytes": 57344,
     "sizeFormatted": "56.00 KB"
   },
