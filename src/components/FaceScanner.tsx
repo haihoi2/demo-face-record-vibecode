@@ -220,7 +220,7 @@ export const FaceScanner: React.FC<FaceScannerProps> = ({
 
       let data: FaceRecognitionResult;
 
-      if (response.data) {
+      if (response.ok && response.data) {
         data = response.data;
       } else {
         // Fallback for Netlify Static Hosting or offline deployments where server returns 404

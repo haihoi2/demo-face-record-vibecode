@@ -393,13 +393,18 @@ export default function App() {
         }),
       });
       if (!res.ok) {
-        clientDoorUnlock("Bảo Vệ Mở Cửa Khẩn Cấp (Client Fallback)");
+        throw new Error(`Unlock request failed with status ${res.status}`);
       }
       soundEffects.playSuccess();
     } catch (err) {
-      console.warn("Mở cửa qua Client Fallback:", err);
-      clientDoorUnlock("Bảo Vệ Mở Cửa Khẩn Cấp (Client Fallback)");
-      soundEffects.playSuccess();
+      if (isNetlifyOrStaticHost() && !getApiBaseUrl()) {
+        console.warn("Mở cửa qua Client Fallback:", err);
+        clientDoorUnlock("Bảo Vệ Mở Cửa Khẩn Cấp (Client Fallback)");
+        soundEffects.playSuccess();
+      } else {
+        console.warn("Mở cửa khẩn cấp thất bại:", err);
+        soundEffects.playDenied();
+      }
     }
   };
 
