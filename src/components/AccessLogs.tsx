@@ -14,8 +14,12 @@ import {
   ShieldCheck,
   Clock,
   Scan,
+  BarChart3,
+  ChevronDown,
+  ChevronUp,
 } from "lucide-react";
 import { AccessLog } from "../types";
+import { EntryPatternAnalytics } from "./EntryPatternAnalytics";
 
 interface AccessLogsProps {
   logs: AccessLog[];
@@ -29,6 +33,7 @@ export const AccessLogs: React.FC<AccessLogsProps> = ({
   const [searchTerm, setSearchTerm] = useState<string>("");
   const [statusFilter, setStatusFilter] = useState<"ALL" | "GRANTED" | "DENIED">("ALL");
   const [typeFilter, setTypeFilter] = useState<"ALL" | "ENTRY" | "EXIT">("ALL");
+  const [showAnalytics, setShowAnalytics] = useState<boolean>(true);
 
   const filteredLogs = logs.filter((log) => {
     // Search filter
@@ -134,6 +139,40 @@ export const AccessLogs: React.FC<AccessLogsProps> = ({
           </div>
         </div>
       </div>
+
+      {/* Analytics Visibility Toggle & Header */}
+      <div className="flex items-center justify-between">
+        <div className="flex items-center gap-2">
+          <span className="text-sm font-bold text-slate-800 flex items-center gap-2">
+            <BarChart3 className="w-4 h-4 text-indigo-600" />
+            Biểu Đồ Xu Hướng Vào Ra Theo Giờ
+          </span>
+          <span className="text-xs text-slate-500 font-mono">({logs.length} bản ghi)</span>
+        </div>
+
+        <button
+          id="btn-toggle-analytics-section"
+          onClick={() => setShowAnalytics((prev) => !prev)}
+          className="px-3 py-1.5 bg-white hover:bg-slate-50 text-slate-700 border border-slate-200 rounded-xl text-xs font-semibold flex items-center gap-1.5 transition shadow-2xs cursor-pointer"
+        >
+          {showAnalytics ? (
+            <>
+              <ChevronUp className="w-3.5 h-3.5 text-slate-500" />
+              <span>Thu gọn biểu đồ</span>
+            </>
+          ) : (
+            <>
+              <ChevronDown className="w-3.5 h-3.5 text-slate-500" />
+              <span>Hiển thị biểu đồ phân tích</span>
+            </>
+          )}
+        </button>
+      </div>
+
+      {/* Entry Pattern Analytics Visualization Section */}
+      {showAnalytics && (
+        <EntryPatternAnalytics logs={logs} />
+      )}
 
       {/* Filter and Control Bar */}
       <div className="bg-white rounded-2xl border border-slate-200 p-4 shadow-xs flex flex-col md:flex-row items-center justify-between gap-4">

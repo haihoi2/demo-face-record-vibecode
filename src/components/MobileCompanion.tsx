@@ -18,6 +18,8 @@ import {
 } from "lucide-react";
 import { MobileNotification, SmartLockState } from "../types";
 import { soundEffects } from "../utils/audio";
+import { normalizeApiUrl } from "../utils/api";
+import { clientDoorUnlock } from "../utils/offlineEngine";
 
 interface MobileCompanionProps {
   notifications: MobileNotification[];
@@ -47,7 +49,7 @@ export const MobileCompanion: React.FC<MobileCompanionProps> = ({
     setIsUnlocking(true);
     try {
       soundEffects.playLockClick();
-      await fetch("/api/lock/unlock", {
+      const res = await fetch(normalizeApiUrl("/api/lock/unlock"), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -55,9 +57,14 @@ export const MobileCompanion: React.FC<MobileCompanionProps> = ({
           reason: "Người quản lý mở cửa từ xa qua điện thoại",
         }),
       });
+      if (!res.ok) {
+        clientDoorUnlock("Ứng Dụng Di Động (Client Fallback)");
+      }
       soundEffects.playSuccess();
     } catch (err) {
-      console.error("Lỗi mở cửa từ xa:", err);
+      console.warn("Mở cửa qua Client Fallback:", err);
+      clientDoorUnlock("Ứng Dụng Di Động (Client Fallback)");
+      soundEffects.playSuccess();
     } finally {
       setIsUnlocking(false);
     }

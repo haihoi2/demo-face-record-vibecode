@@ -1,0 +1,2 @@
+# Netlify SPA redirect: ensures all client-side paths route to index.html with HTTP 200
+/*    /index.html   200

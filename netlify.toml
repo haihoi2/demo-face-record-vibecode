@@ -1,0 +1,17 @@
+[build]
+  command = "npm run build"
+  publish = "dist"
+
+# Client-side SPA routing fallback
+[[redirects]]
+  from = "/*"
+  to = "/index.html"
+  status = 200
+
+# Optional: If you deploy your Node.js Express server (server.ts) to Render, Railway, Cloud Run or a VPS,
+# you can proxy all /api requests from Netlify to your backend by replacing the target URL below:
+# [[redirects]]
+#   from = "/api/*"
+#   to = "https://your-backend-service.onrender.com/api/:splat"
+#   status = 200
+#   force = true

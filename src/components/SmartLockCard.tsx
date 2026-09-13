@@ -15,6 +15,8 @@ import {
 } from "lucide-react";
 import { SmartLockState } from "../types";
 import { soundEffects } from "../utils/audio";
+import { normalizeApiUrl } from "../utils/api";
+import { clientDoorUnlock, clientDoorLock } from "../utils/offlineEngine";
 
 interface SmartLockCardProps {
   lockState: SmartLockState;
@@ -32,7 +34,7 @@ export const SmartLockCard: React.FC<SmartLockCardProps> = ({
     setIsTriggering(true);
     try {
       soundEffects.playLockClick();
-      await fetch("/api/lock/unlock", {
+      const res = await fetch(normalizeApiUrl("/api/lock/unlock"), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -40,9 +42,14 @@ export const SmartLockCard: React.FC<SmartLockCardProps> = ({
           reason: "Kích hoạt thủ công từ Dashboard Quản trị",
         }),
       });
+      if (!res.ok) {
+        clientDoorUnlock("Bảng Điều Khiển Khóa (Client Fallback)");
+      }
       soundEffects.playSuccess();
     } catch (err) {
-      console.error("Lỗi mở khóa:", err);
+      console.warn("Mở khóa qua Client Fallback:", err);
+      clientDoorUnlock("Bảng Điều Khiển Khóa (Client Fallback)");
+      soundEffects.playSuccess();
     } finally {
       setIsTriggering(false);
     }
@@ -52,15 +59,19 @@ export const SmartLockCard: React.FC<SmartLockCardProps> = ({
     setIsTriggering(true);
     try {
       soundEffects.playLockClick();
-      await fetch("/api/lock/lock", {
+      const res = await fetch(normalizeApiUrl("/api/lock/lock"), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           source: "Bảng Điều Khiển Khóa Thông Minh",
         }),
       });
+      if (!res.ok) {
+        clientDoorLock("Bảng Điều Khiển Khóa (Client Fallback)");
+      }
     } catch (err) {
-      console.error("Lỗi đóng khóa:", err);
+      console.warn("Khóa cửa qua Client Fallback:", err);
+      clientDoorLock("Bảng Điều Khiển Khóa (Client Fallback)");
     } finally {
       setIsTriggering(false);
     }

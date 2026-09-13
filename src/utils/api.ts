@@ -58,8 +58,21 @@ export async function parseJsonResponse<T = any>(
 }
 
 /**
+ * Retrieves the external backend API base URL if configured via VITE_API_URL,
+ * allowing the frontend on Netlify to proxy directly to a deployed Node.js Express server.
+ */
+export function getApiBaseUrl(): string {
+  const envUrl = (((import.meta as any).env?.VITE_API_URL as string) || "").trim();
+  if (envUrl) {
+    return envUrl.replace(/\/+$/, "");
+  }
+  return "";
+}
+
+/**
  * Normalizes API endpoint URLs ensuring correct leading slash and structure,
  * preventing relative path 404s when navigating or querying.
+ * Prepends VITE_API_URL if configured.
  */
 export function normalizeApiUrl(rawUrl: string): string {
   if (!rawUrl) return "/api/health";
@@ -72,7 +85,9 @@ export function normalizeApiUrl(rawUrl: string): string {
   } else if (!path.startsWith("/")) {
     path = "/" + path;
   }
-  return path;
+
+  const base = getApiBaseUrl();
+  return base ? `${base}${path}` : path;
 }
 
 export async function safeJsonFetch<T = any>(
