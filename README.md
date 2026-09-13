@@ -81,6 +81,9 @@ PORT=3000
 # Thư mục lưu SQLite cục bộ/persistent disk
 DATA_DIR="./data"
 
+# Trusted frontend origins gọi backend Render
+CORS_ALLOWED_ORIGINS="http://localhost:3000,https://your-site.netlify.app"
+
 # Frontend gọi backend cùng origin khi để trống.
 # Trên Netlify, gán thành URL Render backend.
 VITE_API_BASE_URL=""
@@ -260,6 +263,7 @@ Repository đã kèm sẵn:
 - Environment variables:
   - `PORT` (Render tự cấp)
   - `DATA_DIR=/var/data/smartface`
+  - `CORS_ALLOWED_ORIGINS=https://your-site.netlify.app`
   - `FACE_RECOGNITION_PROVIDER=local`
   - `LOCAL_FACE_RECOGNITION_MODEL=local-exact-match`
   - `LOCAL_FACE_RECOGNITION_URL=http://127.0.0.1:8000/recognize` (nếu có dịch vụ local)

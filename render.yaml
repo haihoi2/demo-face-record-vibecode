@@ -8,6 +8,8 @@ services:
     envVars:
       - key: NODE_VERSION
         value: 22
+      - key: CORS_ALLOWED_ORIGINS
+        value: https://your-site.netlify.app
       - key: FACE_RECOGNITION_PROVIDER
         value: local
       - key: DATA_DIR
