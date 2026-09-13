@@ -1,6 +1,3 @@
-# Netlify Backend Proxy: route all /api calls to the live Cloud Run backend with 200 proxy rewrite
-/api/*  https://ais-dev-oru4xhzwwq7ai4fnvomzyh-216092153311.asia-east1.run.app/api/:splat  200!
-
 # Netlify SPA redirect: ensures all client-side paths route to index.html with HTTP 200
 /*      /index.html                                                                       200
 

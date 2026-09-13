@@ -57,33 +57,60 @@ export async function parseJsonResponse<T = any>(
   }
 }
 
-export const DEFAULT_REMOTE_BACKEND_URL =
-  "https://ais-dev-oru4xhzwwq7ai4fnvomzyh-216092153311.asia-east1.run.app";
+export const STORAGE_KEY_CUSTOM_BACKEND = "smartlock_custom_backend_url";
 
 /**
- * Retrieves the external backend API base URL if configured via VITE_API_URL,
- * or automatically resolves to the live backend server when running on Netlify/static hosting.
+ * Retrieves user-defined custom backend URL from localStorage (if configured in UI).
+ */
+export function getCustomBackendUrl(): string {
+  if (typeof window === "undefined") return "";
+  try {
+    return (localStorage.getItem(STORAGE_KEY_CUSTOM_BACKEND) || "").trim().replace(/\/+$/, "");
+  } catch {
+    return "";
+  }
+}
+
+/**
+ * Persists user-defined custom backend URL in localStorage.
+ */
+export function setCustomBackendUrl(url: string): void {
+  if (typeof window === "undefined") return;
+  try {
+    const cleaned = url.trim().replace(/\/+$/, "");
+    if (cleaned) {
+      localStorage.setItem(STORAGE_KEY_CUSTOM_BACKEND, cleaned);
+    } else {
+      localStorage.removeItem(STORAGE_KEY_CUSTOM_BACKEND);
+    }
+  } catch {}
+}
+
+/**
+ * Retrieves the external backend API base URL.
+ * Priority:
+ * 1. User-configured custom URL in UI (stored in localStorage)
+ * 2. Environment variable VITE_API_URL (set on Netlify / build)
+ * 3. Default: empty string (same-origin relative paths)
+ *
+ * NOTE: When deployed to Netlify without a custom backend, returning empty string
+ * prevents the browser from sending unauthorized cross-origin preflight requests
+ * to private development sandbox containers (which cause CORS net::ERR_INVALID_REDIRECT).
  */
 export function getApiBaseUrl(): string {
+  // 1. Custom URL configured by user
+  const custom = getCustomBackendUrl();
+  if (custom) {
+    return custom;
+  }
+
+  // 2. VITE_API_URL environment variable
   const envUrl = (((import.meta as any).env?.VITE_API_URL as string) || "").trim();
   if (envUrl) {
     return envUrl.replace(/\/+$/, "");
   }
 
-  // When deployed to Netlify (e.g. demo-face-recognization.netlify.app) or other static hosts,
-  // automatically target the live Cloud Run backend instance if no custom env is defined.
-  if (typeof window !== "undefined") {
-    const hostname = window.location.hostname;
-    if (
-      hostname.includes("netlify.app") ||
-      hostname.includes("github.io") ||
-      hostname.includes("pages.dev") ||
-      hostname.includes("vercel.app")
-    ) {
-      return DEFAULT_REMOTE_BACKEND_URL;
-    }
-  }
-
+  // 3. Default to relative path (same-origin)
   return "";
 }
 

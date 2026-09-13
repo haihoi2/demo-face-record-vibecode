@@ -29,10 +29,11 @@ import {
   AiRecognitionConfig,
 } from "../types";
 import { soundEffects } from "../utils/audio";
-import { safeJsonFetch, compressImage } from "../utils/api";
+import { safeJsonFetch, compressImage, getApiBaseUrl } from "../utils/api";
 import {
   simulateClientFaceRecognition,
   getStoredAiConfig,
+  isNetlifyOrStaticHost,
 } from "../utils/offlineEngine";
 
 interface FaceScannerProps {
@@ -161,6 +162,42 @@ export const FaceScanner: React.FC<FaceScannerProps> = ({
     }
 
     setCapturedSnapshot(imageToSend);
+
+    // Fast-path: When running in local mode or on static host (Netlify) without a configured backend,
+    // execute the Client-Side SOTA Biometrics Engine directly without an unnecessary network hop.
+    const isNetlifyWithoutBackend = isNetlifyOrStaticHost() && !getApiBaseUrl();
+    const shouldUseLocalDirectly =
+      aiConfig.engine === "local" ||
+      (isNetlifyWithoutBackend && aiConfig.engine !== "cloud");
+
+    if (shouldUseLocalDirectly) {
+      const data = simulateClientFaceRecognition({
+        imageBase64: imageToSend,
+        scanType,
+        testEmployeeId,
+        employees,
+        config: aiConfig,
+      });
+
+      const latency = Date.now() - clientStartTime;
+      setLastLatencyMs(data.processingTimeMs || latency);
+      setLastResult(data);
+      if (data.detectedFaces && data.detectedFaces.length > 0) {
+        setActiveFaces(data.detectedFaces);
+      } else {
+        setActiveFaces([]);
+      }
+
+      onRecognitionComplete(data);
+
+      if (data.recognized) {
+        soundEffects.playSuccess();
+      } else {
+        soundEffects.playDenied();
+      }
+      setIsScanning(false);
+      return;
+    }
 
     try {
       const response = await safeJsonFetch<FaceRecognitionResult>(

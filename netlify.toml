@@ -2,12 +2,24 @@
   command = "npm run build"
   publish = "dist"
 
-# Proxy all /api/* calls to the live Cloud Run Express backend
-[[redirects]]
-  from = "/api/*"
-  to = "https://ais-dev-oru4xhzwwq7ai4fnvomzyh-216092153311.asia-east1.run.app/api/:splat"
-  status = 200
-  force = true
+# =========================================================================
+# Netlify Global CORS Headers: Allow Cross-Origin API & Asset requests
+# =========================================================================
+[[headers]]
+  for = "/*"
+  [headers.values]
+    Access-Control-Allow-Origin = "*"
+    Access-Control-Allow-Methods = "GET, POST, PUT, PATCH, DELETE, OPTIONS, HEAD"
+    Access-Control-Allow-Headers = "*"
+    Access-Control-Expose-Headers = "*"
+
+[[headers]]
+  for = "/api/*"
+  [headers.values]
+    Access-Control-Allow-Origin = "*"
+    Access-Control-Allow-Methods = "GET, POST, PUT, PATCH, DELETE, OPTIONS, HEAD"
+    Access-Control-Allow-Headers = "*"
+    Access-Control-Expose-Headers = "*"
 
 # Client-side SPA routing fallback
 [[redirects]]

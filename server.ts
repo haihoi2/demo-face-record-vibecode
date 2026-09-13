@@ -13,23 +13,55 @@ dotenv.config();
 const app = express();
 const PORT = 3000;
 
+// =========================================================================
+// 1. BULLETPROOF CORS & PREFLIGHT MIDDLEWARE (MUST BE VERY FIRST)
+// Fully compatible with Netlify, Vercel, Localhost, and any external client.
+// =========================================================================
+app.use((req, res, next) => {
+  const origin = req.headers.origin;
+  if (origin) {
+    res.setHeader("Access-Control-Allow-Origin", origin);
+  } else {
+    res.setHeader("Access-Control-Allow-Origin", "*");
+  }
+
+  res.setHeader("Access-Control-Allow-Credentials", "true");
+  res.setHeader(
+    "Access-Control-Allow-Methods",
+    "GET, POST, PUT, PATCH, DELETE, OPTIONS, HEAD"
+  );
+
+  const reqHeaders = req.headers["access-control-request-headers"];
+  if (reqHeaders) {
+    res.setHeader("Access-Control-Allow-Headers", reqHeaders);
+  } else {
+    res.setHeader(
+      "Access-Control-Allow-Headers",
+      "Origin, X-Requested-With, Content-Type, Accept, Authorization, Range, Cache-Control, Pragma, Baggage, Sentry-Trace, Sec-Ch-Ua, Sec-Ch-Ua-Mobile, Sec-Ch-Ua-Platform"
+    );
+  }
+
+  res.setHeader("Access-Control-Expose-Headers", "*");
+  res.setHeader("Access-Control-Max-Age", "86400");
+
+  // Handle all OPTIONS preflight requests immediately
+  if (req.method === "OPTIONS") {
+    res.status(204).end();
+    return;
+  }
+  next();
+});
+
+// Explicit OPTIONS preflight route handler for all paths
+app.options("*", (_req, res) => {
+  res.status(204).end();
+});
+
 // Increase payload limit for base64 camera frames, raw text, and binary images
 app.use(express.json({ limit: "50mb" }));
 app.use(express.urlencoded({ extended: true, limit: "50mb" }));
 app.use(express.text({ limit: "50mb", type: ["text/*", "application/octet-stream"] }));
 app.use(express.raw({ limit: "50mb", type: "image/*" }));
-
-// Enable CORS and preflight handling for all incoming requests
-app.use((req, res, next) => {
-  res.header("Access-Control-Allow-Origin", "*");
-  res.header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
-  res.header("Access-Control-Allow-Headers", "Origin, X-Requested-With, Content-Type, Accept, Authorization");
-  if (req.method === "OPTIONS") {
-    res.sendStatus(204);
-    return;
-  }
-  next();
-});
 
 // Incoming request logger for transparency and debugging
 app.use((req, _res, next) => {
@@ -1793,11 +1825,18 @@ app.all("/api/*", (req, res) => {
 });
 
 // Global error handling middleware for Express (catches JSON parse errors, payload limits, etc.)
-app.use((err: any, _req: Request, res: Response, next: any) => {
+app.use((err: any, req: Request, res: Response, next: any) => {
   console.error("[Server Error Handler]:", err?.message || err);
   if (res.headersSent) {
     return next(err);
   }
+  const origin = req.headers.origin;
+  if (origin) {
+    res.setHeader("Access-Control-Allow-Origin", origin);
+  } else {
+    res.setHeader("Access-Control-Allow-Origin", "*");
+  }
+  res.setHeader("Access-Control-Allow-Credentials", "true");
   const statusCode = err?.status || err?.statusCode || 500;
   res.status(statusCode).json({
     error: err?.message || "Lỗi máy chủ nội bộ",
