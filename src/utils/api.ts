@@ -75,12 +75,39 @@ export function normalizeApiUrl(rawUrl: string): string {
   return path;
 }
 
+export function getApiBaseUrl(): string {
+  const rawBaseUrl = import.meta.env.VITE_API_BASE_URL?.trim() || "";
+  if (!rawBaseUrl) return "";
+  return rawBaseUrl.replace(/\/+$/, "");
+}
+
+export function buildApiUrl(rawUrl: string): string {
+  const normalizedPath = normalizeApiUrl(rawUrl);
+  const baseUrl = getApiBaseUrl();
+  if (!baseUrl) return normalizedPath;
+  if (normalizedPath.startsWith("http://") || normalizedPath.startsWith("https://")) {
+    return normalizedPath;
+  }
+  return `${baseUrl}${normalizedPath}`;
+}
+
+export function buildEventSourceUrl(rawUrl: string): string {
+  return buildApiUrl(rawUrl);
+}
+
+export async function apiFetch(
+  url: string,
+  options?: RequestInit
+): Promise<Response> {
+  return fetch(buildApiUrl(url), options);
+}
+
 export async function safeJsonFetch<T = any>(
   url: string,
   options?: RequestInit,
   fallback?: T
 ): Promise<{ ok: boolean; status: number; data: T; error?: string }> {
-  const normalizedUrl = normalizeApiUrl(url);
+  const normalizedUrl = buildApiUrl(url);
 
   try {
     const res = await fetch(normalizedUrl, options);

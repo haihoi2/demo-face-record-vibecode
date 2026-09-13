@@ -1,6 +1,6 @@
 # Hệ Thống Điểm Danh Khuôn Mặt AI & Điều Khiển Khóa Thông Minh (SmartLock Gateway)
 
-Hệ thống nhận diện khuôn mặt nhân viên đa đối tượng thời gian thực bằng mô hình **Gemini AI**, tự động điều khiển khóa cửa thông minh (Smart Lock API), ghi nhận lịch sử chấm công Vào/Ra, đồng bộ thông báo thời gian thực qua Server-Sent Events (SSE) và gửi Webhook tích hợp trực tiếp vào **Eton Chat Room**.
+Hệ thống nhận diện khuôn mặt nhân viên đa đối tượng thời gian thực theo mô hình **local-first** (ưu tiên mô hình cục bộ/on-prem, tùy chọn Google Gemini fallback), tự động điều khiển khóa cửa thông minh (Smart Lock API), ghi nhận lịch sử chấm công Vào/Ra, đồng bộ thông báo thời gian thực qua Server-Sent Events (SSE) và gửi Webhook tích hợp trực tiếp vào **Eton Chat Room**.
 
 Toàn bộ dữ liệu của phần Backend được lưu trữ bền vững vào cơ sở dữ liệu **SQLite 3 (`data/smartface.db`)**, không bị mất mát khi khởi động lại máy chủ hoặc nâng cấp hệ thống.
 
@@ -15,7 +15,8 @@ Toàn bộ dữ liệu của phần Backend được lưu trữ bền vững và
 6. [Hướng Dẫn Deploy Production](#-hướng-dẫn-deploy-production)
    - [Cách 1: Deploy trên Máy Chủ Linux/Ubuntu với PM2](#cách-1-deploy-trực-tiếp-bằng-pm2-khuyên-dùng-cho-vps)
    - [Cách 2: Deploy bằng Docker & Docker Compose (Volume Persist)](#cách-2-deploy-bằng-docker--docker-compose)
-   - [Cách 3: Cấu hình Nginx Reverse Proxy & Chứng Chỉ SSL HTTPS](#cách-3-cấu-hình-nginx-reverse-proxy--ssl-https)
+   - [Cách 3: Frontend Netlify + Backend Render](#cách-3-frontend-netlify--backend-render)
+   - [Cách 4: Cấu Hình Nginx Reverse Proxy & SSL (HTTPS)](#cách-4-cấu-hình-nginx-reverse-proxy--ssl-https)
 7. [Sao Lưu (Backup) & Phục Hồi (Restore) SQLite](#-sao-lưu-và-phục-hồi-cơ-sở-dữ-liệu-sqlite)
 8. [Tích Hợp Webhook Eton Chat Room](#-tích-hợp-webhook-eton-chat-room)
 9. [API Kiểm Tra Trạng Thái Database](#-api-kiểm-tra-trạng-thái-database)
@@ -74,11 +75,28 @@ cp .env.example .env
 
 Chỉnh sửa nội dung file `.env`:
 ```env
-# Port ứng dụng (mặc định 3000)
+# Port ứng dụng cục bộ (Render tự cấp PORT khi deploy)
 PORT=3000
 
-# Khóa API Google Gemini (dùng cho nhận diện khuôn mặt AI & đánh giá độ sống thật)
-GEMINI_API_KEY="AIzaSy..."
+# Thư mục lưu SQLite cục bộ/persistent disk
+DATA_DIR="./data"
+
+# Frontend gọi backend cùng origin khi để trống.
+# Trên Netlify, gán thành URL Render backend.
+VITE_API_BASE_URL=""
+
+# Luồng nhận diện: local | google | auto
+FACE_RECOGNITION_PROVIDER="local"
+
+# Tên mô hình cục bộ hiển thị trong log / API status
+LOCAL_FACE_RECOGNITION_MODEL="local-exact-match"
+
+# URL dịch vụ nhận diện nội bộ/on-prem (nếu có)
+LOCAL_FACE_RECOGNITION_URL="http://127.0.0.1:8000/recognize"
+
+# Tùy chọn fallback sang Google Gemini
+GEMINI_API_KEY="MY_GEMINI_API_KEY"
+GOOGLE_GEMINI_MODEL="gemini-3.8-flash"
 ```
 
 ### 3. Chạy ứng dụng ở chế độ Dev
@@ -104,6 +122,12 @@ Lệnh build thực hiện 2 nhiệm vụ trong một bước duy nhất:
 Chạy lệnh build:
 ```bash
 npm run build
+```
+
+Hoặc build riêng từng phần:
+```bash
+npm run build:client   # chỉ build frontend cho Netlify
+npm run build:server   # chỉ build backend cho Render
 ```
 
 Sau khi hoàn tất, cấu trúc thư mục phát hành sẽ bao gồm:
@@ -156,7 +180,12 @@ module.exports = {
       env: {
         NODE_ENV: "production",
         PORT: 3000,
-        GEMINI_API_KEY: "AIzaSy..."
+        DATA_DIR: "./data",
+        FACE_RECOGNITION_PROVIDER: "local",
+        LOCAL_FACE_RECOGNITION_MODEL: "local-exact-match",
+        LOCAL_FACE_RECOGNITION_URL: "http://127.0.0.1:8000/recognize",
+        GEMINI_API_KEY: "MY_GEMINI_API_KEY",
+        GOOGLE_GEMINI_MODEL: "gemini-3.8-flash"
       }
     }
   ]
@@ -189,7 +218,11 @@ Deploy bằng Docker giúp đóng gói toàn bộ môi trường Node 22 đồng
 #### Khởi chạy với Docker Compose (1 Lệnh duy nhất):
 ```bash
 # Đặt biến môi trường nếu có
-export GEMINI_API_KEY="AIzaSy..."
+export VITE_API_BASE_URL=""
+export FACE_RECOGNITION_PROVIDER="local"
+export LOCAL_FACE_RECOGNITION_MODEL="local-exact-match"
+export LOCAL_FACE_RECOGNITION_URL="http://127.0.0.1:8000/recognize"
+export GEMINI_API_KEY="MY_GEMINI_API_KEY"
 
 # Build image và chạy container ở chế độ nền (detached)
 docker compose up -d --build
@@ -208,7 +241,40 @@ File cơ sở dữ liệu SQLite nằm tại thư mục `./data/smartface.db` tr
 
 ---
 
-### Cách 3: Cấu Hình Nginx Reverse Proxy & SSL (HTTPS)
+### Cách 3: Frontend Netlify + Backend Render
+
+Repository đã kèm sẵn:
+- `netlify.toml`
+- `render.yaml`
+
+#### Netlify
+- Build command: `npm run build:client`
+- Publish directory: `dist`
+- Environment variable:
+  - `VITE_API_BASE_URL=https://your-render-service.onrender.com`
+
+#### Render
+- Build command: `npm install && npm run build`
+- Start command: `npm run start`
+- Root directory: thư mục gốc repository
+- Environment variables:
+  - `PORT` (Render tự cấp)
+  - `DATA_DIR=/var/data/smartface`
+  - `FACE_RECOGNITION_PROVIDER=local`
+  - `LOCAL_FACE_RECOGNITION_MODEL=local-exact-match`
+  - `LOCAL_FACE_RECOGNITION_URL=http://127.0.0.1:8000/recognize` (nếu có dịch vụ local)
+  - `GEMINI_API_KEY` và `GOOGLE_GEMINI_MODEL` nếu bật fallback Google
+
+#### Persistent Disk trên Render
+- Gắn persistent disk vào service
+- mount path đề xuất: `/var/data`
+- giữ `DATA_DIR=/var/data/smartface`
+
+Khi tách Netlify/Render, frontend sẽ gọi backend qua `VITE_API_BASE_URL` thay vì dùng đường dẫn tương đối `/api/...`, và SSE cũng sẽ kết nối về Render backend.
+
+---
+
+### Cách 4: Cấu Hình Nginx Reverse Proxy & SSL (HTTPS)
 
 Trình duyệt yêu cầu kết nối an toàn **HTTPS** để cho phép người dùng cấp quyền truy cập Camera/Webcam (`navigator.mediaDevices.getUserMedia`). Dưới đây là cấu hình Nginx tiêu chuẩn:
 

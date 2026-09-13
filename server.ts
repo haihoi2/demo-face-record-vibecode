@@ -8,7 +8,7 @@ import { db } from "./src/server/db";
 dotenv.config();
 
 const app = express();
-const PORT = 3000;
+const PORT = Number(process.env.PORT || 3000);
 
 // Increase payload limit for base64 camera frames, raw text, and binary images
 app.use(express.json({ limit: "50mb" }));

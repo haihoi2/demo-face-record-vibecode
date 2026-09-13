@@ -18,6 +18,7 @@ import {
 } from "lucide-react";
 import { MobileNotification, SmartLockState } from "../types";
 import { soundEffects } from "../utils/audio";
+import { apiFetch } from "../utils/api";
 
 interface MobileCompanionProps {
   notifications: MobileNotification[];
@@ -47,7 +48,7 @@ export const MobileCompanion: React.FC<MobileCompanionProps> = ({
     setIsUnlocking(true);
     try {
       soundEffects.playLockClick();
-      await fetch("/api/lock/unlock", {
+      await apiFetch("/api/lock/unlock", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({

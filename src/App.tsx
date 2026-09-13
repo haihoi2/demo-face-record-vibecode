@@ -15,7 +15,7 @@ import {
 } from "./types";
 import { Bell, CheckCircle2, AlertTriangle } from "lucide-react";
 import { soundEffects } from "./utils/audio";
-import { safeJsonFetch } from "./utils/api";
+import { apiFetch, buildEventSourceUrl, safeJsonFetch } from "./utils/api";
 
 export default function App() {
   const [activeTab, setActiveTab] = useState<"scanner" | "register" | "logs" | "mobile" | "webhook">("scanner");
@@ -101,7 +101,7 @@ export default function App() {
     function connect() {
       if (!isMounted) return;
       try {
-        eventSource = new EventSource("/api/events");
+        eventSource = new EventSource(buildEventSourceUrl("/api/events"));
 
         eventSource.onopen = () => {
           if (isMounted) {
@@ -229,7 +229,7 @@ export default function App() {
   const handleManualUnlock = async () => {
     soundEffects.playLockClick();
     try {
-      await fetch("/api/lock/unlock", {
+      await apiFetch("/api/lock/unlock", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -250,7 +250,7 @@ export default function App() {
 
   const handleEmployeeDeleted = async (id: string) => {
     try {
-      await fetch(`/api/employees/${id}`, { method: "DELETE" });
+      await apiFetch(`/api/employees/${id}`, { method: "DELETE" });
       setEmployees((prev) => prev.filter((e) => e.id !== id));
     } catch (err) {
       console.error("Lỗi xóa nhân viên:", err);
@@ -259,7 +259,7 @@ export default function App() {
 
   const handleClearLogs = async () => {
     try {
-      await fetch("/api/logs/clear", { method: "POST" });
+      await apiFetch("/api/logs/clear", { method: "POST" });
       setAccessLogs([]);
     } catch (err) {
       console.error("Lỗi xóa logs:", err);
@@ -268,7 +268,7 @@ export default function App() {
 
   const handleClearNotifications = async () => {
     try {
-      await fetch("/api/notifications/clear", { method: "POST" });
+      await apiFetch("/api/notifications/clear", { method: "POST" });
       setNotifications([]);
     } catch (err) {
       console.error("Lỗi xóa thông báo:", err);
@@ -277,7 +277,7 @@ export default function App() {
 
   const handleMarkNotificationsRead = async () => {
     try {
-      await fetch("/api/notifications/mark-read", { method: "POST" });
+      await apiFetch("/api/notifications/mark-read", { method: "POST" });
       setNotifications((prev) => prev.map((n) => ({ ...n, read: true })));
     } catch (err) {
       console.error("Lỗi đánh dấu đã đọc:", err);

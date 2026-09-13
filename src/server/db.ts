@@ -18,7 +18,7 @@ function getDatabaseSyncClass(): any {
 }
 
 // Ensure data directory exists
-const DATA_DIR = path.join(process.cwd(), "data");
+const DATA_DIR = path.resolve(process.env.DATA_DIR || path.join(process.cwd(), "data"));
 if (!fs.existsSync(DATA_DIR)) {
   fs.mkdirSync(DATA_DIR, { recursive: true });
 }

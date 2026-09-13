@@ -15,6 +15,7 @@ import {
 } from "lucide-react";
 import { SmartLockState } from "../types";
 import { soundEffects } from "../utils/audio";
+import { apiFetch } from "../utils/api";
 
 interface SmartLockCardProps {
   lockState: SmartLockState;
@@ -32,7 +33,7 @@ export const SmartLockCard: React.FC<SmartLockCardProps> = ({
     setIsTriggering(true);
     try {
       soundEffects.playLockClick();
-      await fetch("/api/lock/unlock", {
+      await apiFetch("/api/lock/unlock", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -52,7 +53,7 @@ export const SmartLockCard: React.FC<SmartLockCardProps> = ({
     setIsTriggering(true);
     try {
       soundEffects.playLockClick();
-      await fetch("/api/lock/lock", {
+      await apiFetch("/api/lock/lock", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
