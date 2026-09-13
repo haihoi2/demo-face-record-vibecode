@@ -6,6 +6,8 @@ import {
   FaceRecognitionResult,
   DetectedFace,
   ScanType,
+  WebhookConfig,
+  WebhookLog,
 } from "../types";
 
 export const DEFAULT_OFFLINE_EMPLOYEES: Employee[] = [
@@ -223,6 +225,139 @@ export function saveStoredNotifications(notifs: MobileNotification[]): void {
   } catch (e) {
     console.warn("Lỗi lưu notifications vào localStorage:", e);
   }
+}
+
+// Webhook Local Storage & Direct Dispatcher
+const STORAGE_KEY_WEBHOOK_CONFIG = "smartlock_offline_webhook_config_v2";
+const STORAGE_KEY_WEBHOOK_LOGS = "smartlock_offline_webhook_logs_v2";
+
+export const DEFAULT_OFFLINE_WEBHOOK_CONFIG: WebhookConfig = {
+  enabled: true,
+  url: "https://chat-room.eton.vn/hooks/6aa4dfb6928518a18ba27a13/mguNArZoWHY7AegnWFw7d7TwyfnoT4JZWpmwvxtLmfi7iGuY",
+  gateInTitle: "[[CỔNG VÀO]]",
+  gateOutTitle: "[[CỔNG RA]]",
+  includeEmployeeCode: true,
+};
+
+export const DEFAULT_OFFLINE_WEBHOOK_LOGS: WebhookLog[] = [
+  {
+    id: "WH-OFFLINE-INIT",
+    timestamp: new Date(Date.now() - 45 * 60 * 1000).toISOString(),
+    url: DEFAULT_OFFLINE_WEBHOOK_CONFIG.url,
+    method: "POST",
+    payload: {
+      text: "Nguyễn Hoàng Minh (NV-1082) - " + new Date(Date.now() - 45 * 60 * 1000).toLocaleString("vi-VN"),
+      attachments: [{ title: "[[CỔNG VÀO]]" }],
+    },
+    statusCode: 200,
+    statusText: "OK",
+    responseBody: "ok",
+    success: true,
+    scanType: "ENTRY",
+    userName: "Nguyễn Hoàng Minh",
+  },
+];
+
+export function getStoredWebhookConfig(): WebhookConfig {
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY_WEBHOOK_CONFIG);
+    if (raw) {
+      const parsed = JSON.parse(raw);
+      if (parsed && typeof parsed.url === "string") return parsed;
+    }
+  } catch {}
+  return DEFAULT_OFFLINE_WEBHOOK_CONFIG;
+}
+
+export function saveStoredWebhookConfig(config: WebhookConfig): void {
+  try {
+    localStorage.setItem(STORAGE_KEY_WEBHOOK_CONFIG, JSON.stringify(config));
+  } catch (e) {
+    console.warn("Lỗi lưu webhook config vào localStorage:", e);
+  }
+}
+
+export function getStoredWebhookLogs(): WebhookLog[] {
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY_WEBHOOK_LOGS);
+    if (raw) {
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed)) return parsed;
+    }
+  } catch {}
+  return DEFAULT_OFFLINE_WEBHOOK_LOGS;
+}
+
+export function saveStoredWebhookLogs(logs: WebhookLog[]): void {
+  try {
+    localStorage.setItem(STORAGE_KEY_WEBHOOK_LOGS, JSON.stringify(logs.slice(0, 60)));
+  } catch (e) {
+    console.warn("Lỗi lưu webhook logs vào localStorage:", e);
+  }
+}
+
+/**
+ * Direct browser webhook dispatcher: multi-transport delivery bypassing CORS restrictions.
+ */
+export function dispatchDirectWebhook(url: string, payload: any): void {
+  if (!url) return;
+  // Method 1: fetch no-cors
+  try {
+    fetch(url, {
+      method: "POST",
+      mode: "no-cors",
+      headers: {
+        "Content-Type": "text/plain;charset=UTF-8",
+      },
+      body: JSON.stringify(payload),
+    }).catch(() => {});
+  } catch {}
+
+  // Method 2: navigator.sendBeacon
+  try {
+    if (typeof navigator !== "undefined" && navigator.sendBeacon) {
+      const blob = new Blob([JSON.stringify(payload)], {
+        type: "text/plain;charset=UTF-8",
+      });
+      navigator.sendBeacon(url, blob);
+    }
+  } catch {}
+
+  // Method 3: Hidden form in hidden iframe
+  try {
+    if (typeof document !== "undefined") {
+      let iframe = document.getElementById("webhook-target-iframe") as HTMLIFrameElement;
+      if (!iframe) {
+        iframe = document.createElement("iframe");
+        iframe.id = "webhook-target-iframe";
+        iframe.name = "webhook-target-iframe";
+        iframe.style.display = "none";
+        iframe.style.position = "absolute";
+        iframe.style.width = "0";
+        iframe.style.height = "0";
+        iframe.style.border = "none";
+        document.body.appendChild(iframe);
+      }
+
+      const form = document.createElement("form");
+      form.method = "POST";
+      form.action = url;
+      form.target = "webhook-target-iframe";
+      form.style.display = "none";
+
+      const input = document.createElement("input");
+      input.type = "hidden";
+      input.name = "payload";
+      input.value = JSON.stringify(payload);
+      form.appendChild(input);
+
+      document.body.appendChild(form);
+      form.submit();
+      setTimeout(() => {
+        if (form.parentNode) form.parentNode.removeChild(form);
+      }, 1500);
+    }
+  } catch {}
 }
 
 // In-Browser Client Event Bus to simulate SSE when running on Netlify

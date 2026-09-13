@@ -525,12 +525,41 @@ app.post("/api/lock/lock", (req, res) => {
 });
 
 // --- Webhook Endpoints (Eton Chat Room) ---
-app.get("/api/webhook/config", (_req, res) => {
+const WEBHOOK_CONFIG_ROUTES = [
+  "/api/webhook/config",
+  "/api/webhook/config/",
+  "/webhook/config",
+  "/webhook/config/",
+];
+
+const WEBHOOK_LOGS_ROUTES = [
+  "/api/webhook/logs",
+  "/api/webhook/logs/",
+  "/webhook/logs",
+  "/webhook/logs/",
+];
+
+const WEBHOOK_TEST_ROUTES = [
+  "/api/webhook/test",
+  "/api/webhook/test/",
+  "/webhook/test",
+  "/webhook/test/",
+];
+
+const WEBHOOK_CLIENT_LOG_ROUTES = [
+  "/api/webhook/client-log",
+  "/api/webhook/client-log/",
+  "/webhook/client-log",
+  "/webhook/client-log/",
+];
+
+app.get(WEBHOOK_CONFIG_ROUTES, (_req, res) => {
   res.json(webhookConfig);
 });
 
-app.post("/api/webhook/config", (req, res) => {
-  const { enabled, url, gateInTitle, gateOutTitle, includeEmployeeCode } = req.body;
+app.post(WEBHOOK_CONFIG_ROUTES, (req, res) => {
+  const body = req.body || {};
+  const { enabled, url, gateInTitle, gateOutTitle, includeEmployeeCode } = body;
   if (typeof enabled === "boolean") webhookConfig.enabled = enabled;
   if (url && typeof url === "string") webhookConfig.url = url.trim();
   if (gateInTitle && typeof gateInTitle === "string") webhookConfig.gateInTitle = gateInTitle.trim();
@@ -554,16 +583,23 @@ app.get("/api/system/db-info", (_req, res) => {
   });
 });
 
-app.get("/api/webhook/logs", (_req, res) => {
+app.get(WEBHOOK_LOGS_ROUTES, (_req, res) => {
   res.json(webhookLogs);
 });
 
-app.post("/api/webhook/test", async (req, res) => {
+app.post(WEBHOOK_TEST_ROUTES, async (req, res) => {
+  let body = req.body || {};
+  if (typeof body === "string") {
+    try {
+      body = JSON.parse(body);
+    } catch {}
+  }
+
   const {
     testScanType = "ENTRY",
     customUser = "Nguyễn Hoàng Minh",
     customCode = "NV-1082",
-  } = req.body;
+  } = body;
 
   const result = await sendEtonWebhook({
     userName: customUser,
@@ -593,8 +629,17 @@ app.post("/api/webhook/test", async (req, res) => {
   });
 });
 
-app.post("/api/webhook/client-log", (req, res) => {
-  const { log, notification } = req.body || {};
+app.post(WEBHOOK_CLIENT_LOG_ROUTES, (req, res) => {
+  let body = req.body || {};
+  if (typeof body === "string") {
+    try {
+      body = JSON.parse(body);
+    } catch {}
+  }
+
+  const log = body.log || (body.url && body.payload ? body : undefined);
+  const notification = body.notification;
+
   if (log) {
     // Avoid duplicate log IDs
     if (!webhookLogs.some((l) => l.id === log.id)) {

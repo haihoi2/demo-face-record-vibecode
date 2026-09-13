@@ -57,15 +57,33 @@ export async function parseJsonResponse<T = any>(
   }
 }
 
+export const DEFAULT_REMOTE_BACKEND_URL =
+  "https://ais-dev-oru4xhzwwq7ai4fnvomzyh-216092153311.asia-east1.run.app";
+
 /**
  * Retrieves the external backend API base URL if configured via VITE_API_URL,
- * allowing the frontend on Netlify to proxy directly to a deployed Node.js Express server.
+ * or automatically resolves to the live backend server when running on Netlify/static hosting.
  */
 export function getApiBaseUrl(): string {
   const envUrl = (((import.meta as any).env?.VITE_API_URL as string) || "").trim();
   if (envUrl) {
     return envUrl.replace(/\/+$/, "");
   }
+
+  // When deployed to Netlify (e.g. demo-face-recognization.netlify.app) or other static hosts,
+  // automatically target the live Cloud Run backend instance if no custom env is defined.
+  if (typeof window !== "undefined") {
+    const hostname = window.location.hostname;
+    if (
+      hostname.includes("netlify.app") ||
+      hostname.includes("github.io") ||
+      hostname.includes("pages.dev") ||
+      hostname.includes("vercel.app")
+    ) {
+      return DEFAULT_REMOTE_BACKEND_URL;
+    }
+  }
+
   return "";
 }
 

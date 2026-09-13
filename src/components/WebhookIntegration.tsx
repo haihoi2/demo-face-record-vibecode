@@ -21,67 +21,15 @@ import {
 import { WebhookConfig, WebhookLog, Employee, MobileNotification } from "../types";
 import { safeJsonFetch } from "../utils/api";
 import { soundEffects } from "../utils/audio";
+import {
+  getStoredWebhookConfig,
+  saveStoredWebhookConfig,
+  getStoredWebhookLogs,
+  saveStoredWebhookLogs,
+  dispatchDirectWebhook,
+} from "../utils/offlineEngine";
 
-// Direct browser webhook dispatcher: bypasses CORS restrictions to deliver payload to Eton Chat Room
-export function dispatchDirectWebhook(url: string, payload: any) {
-  // Method 1: fetch with mode: 'no-cors' and text/plain (avoids CORS preflight OPTIONS)
-  try {
-    fetch(url, {
-      method: "POST",
-      mode: "no-cors",
-      headers: {
-        "Content-Type": "text/plain;charset=UTF-8",
-      },
-      body: JSON.stringify(payload),
-    }).catch(() => {});
-  } catch {}
-
-  // Method 2: navigator.sendBeacon (standard browser telemetry/webhook API)
-  try {
-    if (typeof navigator !== "undefined" && navigator.sendBeacon) {
-      const blob = new Blob([JSON.stringify(payload)], {
-        type: "text/plain;charset=UTF-8",
-      });
-      navigator.sendBeacon(url, blob);
-    }
-  } catch {}
-
-  // Method 3: Form POST in a hidden iframe (classic, zero-CORS transport)
-  try {
-    if (typeof document !== "undefined") {
-      let iframe = document.getElementById("webhook-target-iframe") as HTMLIFrameElement;
-      if (!iframe) {
-        iframe = document.createElement("iframe");
-        iframe.id = "webhook-target-iframe";
-        iframe.name = "webhook-target-iframe";
-        iframe.style.display = "none";
-        iframe.style.position = "absolute";
-        iframe.style.width = "0";
-        iframe.style.height = "0";
-        iframe.style.border = "none";
-        document.body.appendChild(iframe);
-      }
-
-      const form = document.createElement("form");
-      form.method = "POST";
-      form.action = url;
-      form.target = "webhook-target-iframe";
-      form.style.display = "none";
-
-      const input = document.createElement("input");
-      input.type = "hidden";
-      input.name = "payload";
-      input.value = JSON.stringify(payload);
-      form.appendChild(input);
-
-      document.body.appendChild(form);
-      form.submit();
-      setTimeout(() => {
-        if (form.parentNode) form.parentNode.removeChild(form);
-      }, 1500);
-    }
-  } catch {}
-}
+export { dispatchDirectWebhook };
 
 interface WebhookIntegrationProps {
   employees: Employee[];
@@ -129,12 +77,27 @@ export const WebhookIntegration: React.FC<WebhookIntegrationProps> = ({
 
       if (resConf.ok && resConf.data) {
         setConfig(resConf.data);
+        saveStoredWebhookConfig(resConf.data);
+      } else {
+        const storedConf = getStoredWebhookConfig();
+        if (storedConf) setConfig(storedConf);
       }
-      if (resLogs.ok && Array.isArray(resLogs.data)) {
+
+      if (resLogs.ok && Array.isArray(resLogs.data) && resLogs.data.length > 0) {
         setLogs(resLogs.data);
+        saveStoredWebhookLogs(resLogs.data);
+      } else {
+        const storedLogs = getStoredWebhookLogs();
+        if (storedLogs && storedLogs.length > 0) {
+          setLogs(storedLogs);
+        }
       }
     } catch (err) {
       console.error("Lỗi tải cấu hình webhook:", err);
+      const storedConf = getStoredWebhookConfig();
+      if (storedConf) setConfig(storedConf);
+      const storedLogs = getStoredWebhookLogs();
+      if (storedLogs && storedLogs.length > 0) setLogs(storedLogs);
     } finally {
       setLoading(false);
     }
@@ -146,18 +109,18 @@ export const WebhookIntegration: React.FC<WebhookIntegrationProps> = ({
 
   // Handle saving config
   const handleSaveConfig = async () => {
+    saveStoredWebhookConfig(config);
+    setSaveSuccess(true);
+    setTimeout(() => setSaveSuccess(false), 2500);
+
     try {
-      const res = await safeJsonFetch("/api/webhook/config", {
+      await safeJsonFetch("/api/webhook/config", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(config),
       });
-      if (res.ok) {
-        setSaveSuccess(true);
-        setTimeout(() => setSaveSuccess(false), 2500);
-      }
     } catch (err) {
-      console.error("Lỗi lưu webhook config:", err);
+      console.warn("Lưu webhook config lên server ngoại tuyến:", err);
     }
   };
 
@@ -219,9 +182,16 @@ export const WebhookIntegration: React.FC<WebhookIntegrationProps> = ({
         }),
       });
 
+      if (!res.ok) {
+        console.warn("[Webhook] Server returned status", res.status, "- running direct client fallback");
+        await handleTestClientDirect(type);
+        return;
+      }
+
       if (res.data?.log) {
         const newLog = res.data.log;
         setLogs((prev) => [newLog, ...prev.filter((l) => l.id !== newLog.id)]);
+        saveStoredWebhookLogs([newLog, ...getStoredWebhookLogs()]);
       }
 
       const notif: MobileNotification = res.data?.notification || {
@@ -244,9 +214,8 @@ export const WebhookIntegration: React.FC<WebhookIntegrationProps> = ({
         msg: `Đã phát Webhook ${gateTitle} thành công cho ${testUser} (${testCode})! Đã chuyển tiếp đến Eton Chat Room.`,
       });
     } catch (err) {
-      console.error("Lỗi test webhook từ server:", err);
-      // Fallback direct dispatch
-      handleTestClientDirect(type);
+      console.warn("Lỗi test webhook từ server, kích hoạt gửi trực tiếp:", err);
+      await handleTestClientDirect(type);
     } finally {
       setTesting(false);
     }
@@ -279,6 +248,7 @@ export const WebhookIntegration: React.FC<WebhookIntegrationProps> = ({
       };
 
       setLogs((prev) => [clientLog, ...prev.filter((l) => l.id !== clientLog.id)]);
+      saveStoredWebhookLogs([clientLog, ...getStoredWebhookLogs()]);
 
       const notif: MobileNotification = {
         id: "NOTIF-" + Date.now(),
@@ -295,12 +265,14 @@ export const WebhookIntegration: React.FC<WebhookIntegrationProps> = ({
       }
       soundEffects.playSuccess();
 
-      // Sync log & notification to backend in background
-      safeJsonFetch("/api/webhook/client-log", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ log: clientLog, notification: notif }),
-      }).catch(() => {});
+      // Sync log & notification to backend in background (silent on failure)
+      try {
+        safeJsonFetch("/api/webhook/client-log", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ log: clientLog, notification: notif }),
+        }).catch(() => {});
+      } catch {}
 
       setClientTestResult({
         status: "SUCCESS",
