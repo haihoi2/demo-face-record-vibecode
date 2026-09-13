@@ -127,6 +127,7 @@ export const WebhookIntegration: React.FC<WebhookIntegrationProps> = ({
   );
   const [testScanType, setTestScanType] = useState<"ENTRY" | "EXIT">("ENTRY");
   const [saveSuccess, setSaveSuccess] = useState<boolean>(false);
+  const [saveError, setSaveError] = useState<string | null>(null);
   const [copiedPayload, setCopiedPayload] = useState<boolean>(false);
   const [clientTestResult, setClientTestResult] = useState<{
     status: string;
@@ -162,6 +163,7 @@ export const WebhookIntegration: React.FC<WebhookIntegrationProps> = ({
   // Handle saving config
   const handleSaveConfig = async () => {
     try {
+      setSaveError(null);
       const res = await safeJsonFetch("/api/webhook/config", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -170,9 +172,14 @@ export const WebhookIntegration: React.FC<WebhookIntegrationProps> = ({
       if (res.ok) {
         setSaveSuccess(true);
         setTimeout(() => setSaveSuccess(false), 2500);
+      } else {
+        setSaveSuccess(false);
+        setSaveError(res.error || "Không thể lưu cấu hình webhook");
       }
     } catch (err) {
       console.error("Lỗi lưu webhook config:", err);
+      setSaveSuccess(false);
+      setSaveError("Không thể lưu cấu hình webhook");
     }
   };
 
@@ -586,6 +593,11 @@ export const WebhookIntegration: React.FC<WebhookIntegrationProps> = ({
 
             <div className="space-y-4 text-xs">
               {/* Webhook Enable Toggle */}
+              {saveError && (
+                <div className="rounded-xl border border-rose-200 bg-rose-50 px-3 py-2 text-rose-700">
+                  {saveError}
+                </div>
+              )}
               <div className="flex items-center justify-between p-3 bg-slate-50 rounded-xl border border-slate-200">
                 <div>
                   <p className="font-bold text-slate-800">Tự động phát Webhook</p>

@@ -9,12 +9,7 @@ dotenv.config();
 
 const app = express();
 const PORT = Number(process.env.PORT || 3000);
-const WEBHOOK_ALLOWED_HOSTS = new Set(
-  String(process.env.WEBHOOK_ALLOWED_HOSTS || "chat-room.eton.vn")
-    .split(",")
-    .map((host) => host.trim().toLowerCase())
-    .filter(Boolean)
-);
+const ETON_WEBHOOK_HOSTNAME = "chat-room.eton.vn";
 
 // Increase payload limit for base64 camera frames, raw text, and binary images
 app.use(express.json({ limit: "50mb" }));
@@ -48,7 +43,7 @@ function getAllowedWebhookUrl(rawUrl: string): URL | null {
       return null;
     }
 
-    if (!WEBHOOK_ALLOWED_HOSTS.has(parsed.hostname.toLowerCase())) {
+    if (parsed.hostname.toLowerCase() !== ETON_WEBHOOK_HOSTNAME) {
       return null;
     }
 
@@ -1056,17 +1051,20 @@ app.post(RECOGNIZE_FACE_ROUTES, async (req, res) => {
     if (detectedFaces.length === 0 && base64Data && ai && employees.length > 0) {
       try {
         const employeeProfilesSummary = employees
+          .slice(0, 25)
           .map(
             (e, i) =>
-              `[${i + 1}] ID: "${e.id}", Code: "${e.employeeCode}", Name: "${e.name}", Department: "${e.department}"`
+              `[${i + 1}] ID: "${e.id}", Code: "${e.employeeCode}", Name: "${e.name}"`
           )
           .join("\n");
+        const omittedEmployeeCount = Math.max(0, employees.length - 25);
 
         const prompt = `Bạn là hệ thống AI đa mục tiêu siêu tốc (Multi-Face High-Speed Access Control).
 Nhiệm vụ: Phát hiện và nhận diện TẤT CẢ các khuôn mặt người xuất hiện trong TOÀN BỘ khung hình này (không giới hạn vị trí hay số lượng người).
 
 Danh sách nhân viên hợp lệ đã đăng ký trong hệ thống:
 ${employeeProfilesSummary}
+${omittedEmployeeCount > 0 ? `\nCòn ${omittedEmployeeCount} nhân viên khác không liệt kê đầy đủ; chỉ kết luận khớp khi thực sự chắc chắn.` : ""}
 
 Yêu cầu phân tích:
 1. Quét toàn bộ khung hình, tìm tất cả các khuôn mặt.

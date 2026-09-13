@@ -17,6 +17,11 @@ import { Bell, CheckCircle2, AlertTriangle } from "lucide-react";
 import { soundEffects } from "./utils/audio";
 import { apiFetch, buildEventSourceUrl, safeJsonFetch } from "./utils/api";
 
+const OFFLINE_EMPLOYEE_STORAGE_KEYS = [
+  "smartlock_offline_employees",
+  "smartlock_offline_employees_v2",
+] as const;
+
 export default function App() {
   const [activeTab, setActiveTab] = useState<"scanner" | "register" | "logs" | "mobile" | "webhook">("scanner");
 
@@ -41,28 +46,55 @@ export default function App() {
   const [sseConnected, setSseConnected] = useState<boolean>(false);
   const [latestToast, setLatestToast] = useState<MobileNotification | null>(null);
 
+  const readOfflineEmployees = (): Employee[] => {
+    for (const key of OFFLINE_EMPLOYEE_STORAGE_KEYS) {
+      try {
+        const raw = localStorage.getItem(key);
+        if (raw) return JSON.parse(raw);
+      } catch {}
+    }
+    return [];
+  };
+
+  const removeOfflineEmployee = (id: string, employeeCode?: string) => {
+    for (const key of OFFLINE_EMPLOYEE_STORAGE_KEYS) {
+      try {
+        const raw = localStorage.getItem(key);
+        if (!raw) continue;
+        const parsed = JSON.parse(raw) as Employee[];
+        localStorage.setItem(
+          key,
+          JSON.stringify(
+            parsed.filter(
+              (employee) =>
+                employee.id !== id &&
+                (!employeeCode || employee.employeeCode !== employeeCode)
+            )
+          )
+        );
+      } catch {}
+    }
+  };
+
   // Fetch initial data safely without JSON parse errors
   const fetchData = useCallback(async () => {
     try {
-      const [empRes, logRes, lockRes, notifRes] = await Promise.all([
+      const [empRes, logRes, lockRes, notifRes] = await Promise.allSettled([
         safeJsonFetch<Employee[]>("/api/employees", undefined, []),
         safeJsonFetch<AccessLog[]>("/api/logs", undefined, []),
         safeJsonFetch<SmartLockState | null>("/api/lock/status", undefined, null),
         safeJsonFetch<MobileNotification[]>("/api/notifications", undefined, []),
       ]);
 
-      // Read local offline employees
-      let localEmps: Employee[] = [];
-      try {
-        const raw =
-          localStorage.getItem("smartlock_offline_employees") ||
-          localStorage.getItem("smartlock_offline_employees_v2");
-        if (raw) localEmps = JSON.parse(raw);
-      } catch {}
+      const localEmps = readOfflineEmployees();
+      const employeeResponse = empRes.status === "fulfilled" ? empRes.value : null;
+      const logResponse = logRes.status === "fulfilled" ? logRes.value : null;
+      const lockResponse = lockRes.status === "fulfilled" ? lockRes.value : null;
+      const notificationResponse = notifRes.status === "fulfilled" ? notifRes.value : null;
 
-      if (empRes.ok && Array.isArray(empRes.data)) {
+      if (employeeResponse?.ok && Array.isArray(employeeResponse.data)) {
         // Merge server and local employees
-        const merged = [...empRes.data];
+        const merged = [...employeeResponse.data];
         for (const localEmp of localEmps) {
           if (!merged.some((m) => m.id === localEmp.id || m.employeeCode === localEmp.employeeCode)) {
             merged.unshift(localEmp);
@@ -70,22 +102,20 @@ export default function App() {
         }
         setEmployees(merged);
       } else if (localEmps.length > 0) {
-        setEmployees((prev) => {
-          const merged = [...prev];
-          for (const localEmp of localEmps) {
-            if (!merged.some((m) => m.id === localEmp.id || m.employeeCode === localEmp.employeeCode)) {
-              merged.unshift(localEmp);
-            }
-          }
-          return merged;
-        });
+        setEmployees(localEmps);
       }
 
-      if (logRes.ok && Array.isArray(logRes.data)) setAccessLogs(logRes.data);
-      if (lockRes.ok && lockRes.data) setLockState(lockRes.data);
-      if (notifRes.ok && Array.isArray(notifRes.data)) setNotifications(notifRes.data);
+      if (logResponse?.ok && Array.isArray(logResponse.data)) setAccessLogs(logResponse.data);
+      if (lockResponse?.ok && lockResponse.data) setLockState(lockResponse.data);
+      if (notificationResponse?.ok && Array.isArray(notificationResponse.data)) {
+        setNotifications(notificationResponse.data);
+      }
     } catch (err) {
       console.error("Lỗi tải dữ liệu ban đầu:", err);
+      const localEmps = readOfflineEmployees();
+      if (localEmps.length > 0) {
+        setEmployees(localEmps);
+      }
     }
   }, []);
 
@@ -254,8 +284,10 @@ export default function App() {
 
   const handleEmployeeDeleted = async (id: string) => {
     try {
+      const employeeToDelete = employees.find((employee) => employee.id === id);
       const response = await apiFetch(`/api/employees/${id}`, { method: "DELETE" });
       if (response.ok) {
+        removeOfflineEmployee(id, employeeToDelete?.employeeCode);
         setEmployees((prev) => prev.filter((e) => e.id !== id));
       }
     } catch (err) {

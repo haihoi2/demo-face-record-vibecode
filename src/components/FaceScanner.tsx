@@ -160,6 +160,22 @@ export const FaceScanner: React.FC<FaceScannerProps> = ({
 
       if (!response.ok || !response.data) {
         console.warn("Lỗi nhận diện khuôn mặt:", response.error);
+        const failureResult: FaceRecognitionResult = {
+          recognized: false,
+          detectedFaces: [],
+          totalFacesDetected: 0,
+          authorizedCount: 0,
+          unauthorizedCount: 0,
+          processingTimeMs: Date.now() - clientStartTime,
+          confidence: 0,
+          livenessScore: 0,
+          message: response.error || "Không thể nhận diện khuôn mặt từ máy chủ",
+          lockUnlocked: false,
+        };
+        setLastLatencyMs(failureResult.processingTimeMs);
+        setActiveFaces([]);
+        setLastResult(failureResult);
+        onRecognitionComplete(failureResult);
         return;
       }
 
