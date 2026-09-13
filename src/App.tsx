@@ -21,6 +21,20 @@ const OFFLINE_EMPLOYEE_STORAGE_KEYS = [
   "smartlock_offline_employees",
   "smartlock_offline_employees_v2",
 ] as const;
+const DEFAULT_LOCK_STATE: SmartLockState = {
+  lockId: "SL-HQ-01",
+  doorName: "Cửa Chính Trụ Sở - Cổng A",
+  state: "LOCKED",
+  isLocked: true,
+  batteryLevel: 96,
+  signalDbm: -54,
+  firmwareVersion: "v2.5.8-Zigbee/IP",
+  lastActionAt: new Date().toISOString(),
+  lastActionBy: "Khởi động hệ thống",
+  autoRelockSeconds: 6,
+  remainingRelockSeconds: 0,
+  status: "ONLINE",
+};
 
 export default function App() {
   const [activeTab, setActiveTab] = useState<"scanner" | "register" | "logs" | "mobile" | "webhook">("scanner");
@@ -28,20 +42,7 @@ export default function App() {
   const [employees, setEmployees] = useState<Employee[]>([]);
   const [accessLogs, setAccessLogs] = useState<AccessLog[]>([]);
   const [notifications, setNotifications] = useState<MobileNotification[]>([]);
-  const [lockState, setLockState] = useState<SmartLockState>({
-    lockId: "SL-HQ-01",
-    doorName: "Cửa Chính Trụ Sở - Cổng A",
-    state: "LOCKED",
-    isLocked: true,
-    batteryLevel: 96,
-    signalDbm: -54,
-    firmwareVersion: "v2.5.8-Zigbee/IP",
-    lastActionAt: new Date().toISOString(),
-    lastActionBy: "Khởi động hệ thống",
-    autoRelockSeconds: 6,
-    remainingRelockSeconds: 0,
-    status: "ONLINE",
-  });
+  const [lockState, setLockState] = useState<SmartLockState>(DEFAULT_LOCK_STATE);
 
   const [sseConnected, setSseConnected] = useState<boolean>(false);
   const [latestToast, setLatestToast] = useState<MobileNotification | null>(null);
@@ -103,19 +104,38 @@ export default function App() {
         setEmployees(merged);
       } else if (localEmps.length > 0) {
         setEmployees(localEmps);
+      } else {
+        setEmployees([]);
       }
 
-      if (logResponse?.ok && Array.isArray(logResponse.data)) setAccessLogs(logResponse.data);
-      if (lockResponse?.ok && lockResponse.data) setLockState(lockResponse.data);
+      if (logResponse?.ok && Array.isArray(logResponse.data)) {
+        setAccessLogs(logResponse.data);
+      } else {
+        setAccessLogs([]);
+      }
+      if (lockResponse?.ok && lockResponse.data) {
+        setLockState(lockResponse.data);
+      } else {
+        setLockState({
+          ...DEFAULT_LOCK_STATE,
+          lastActionAt: new Date().toISOString(),
+        });
+      }
       if (notificationResponse?.ok && Array.isArray(notificationResponse.data)) {
         setNotifications(notificationResponse.data);
+      } else {
+        setNotifications([]);
       }
     } catch (err) {
       console.error("Lỗi tải dữ liệu ban đầu:", err);
       const localEmps = readOfflineEmployees();
-      if (localEmps.length > 0) {
-        setEmployees(localEmps);
-      }
+      setEmployees(localEmps);
+      setAccessLogs([]);
+      setNotifications([]);
+      setLockState({
+        ...DEFAULT_LOCK_STATE,
+        lastActionAt: new Date().toISOString(),
+      });
     }
   }, []);
 

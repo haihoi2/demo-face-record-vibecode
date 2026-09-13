@@ -175,6 +175,7 @@ export const FaceScanner: React.FC<FaceScannerProps> = ({
         setLastLatencyMs(failureResult.processingTimeMs);
         setActiveFaces([]);
         setLastResult(failureResult);
+        soundEffects.playDenied();
         onRecognitionComplete(failureResult);
         return;
       }

@@ -10,6 +10,17 @@ dotenv.config();
 const app = express();
 const PORT = Number(process.env.PORT || 3000);
 const ETON_WEBHOOK_HOSTNAME = "chat-room.eton.vn";
+const TRUSTED_CORS_ORIGINS = new Set(
+  [
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+    process.env.APP_URL,
+    process.env.FRONTEND_APP_URL,
+    ...(process.env.CORS_ALLOWED_ORIGINS || "").split(","),
+  ]
+    .map((origin) => origin?.trim())
+    .filter((origin): origin is string => Boolean(origin))
+);
 
 // Increase payload limit for base64 camera frames, raw text, and binary images
 app.use(express.json({ limit: "50mb" }));
@@ -19,7 +30,11 @@ app.use(express.raw({ limit: "50mb", type: "image/*" }));
 
 // Enable CORS and preflight handling for all incoming requests
 app.use((req, res, next) => {
-  res.header("Access-Control-Allow-Origin", "*");
+  const requestOrigin = req.header("Origin");
+  if (requestOrigin && TRUSTED_CORS_ORIGINS.has(requestOrigin)) {
+    res.header("Access-Control-Allow-Origin", requestOrigin);
+    res.header("Vary", "Origin");
+  }
   res.header(
     "Access-Control-Allow-Methods",
     req.header("Access-Control-Request-Method") || "GET, POST, PUT, PATCH, DELETE, OPTIONS, HEAD"
@@ -30,13 +45,17 @@ app.use((req, res, next) => {
       "Origin, X-Requested-With, Content-Type, Accept, Authorization"
   );
   if (req.method === "OPTIONS") {
+    if (requestOrigin && !TRUSTED_CORS_ORIGINS.has(requestOrigin)) {
+      res.sendStatus(403);
+      return;
+    }
     res.sendStatus(204);
     return;
   }
   next();
 });
 
-function getAllowedWebhookUrl(rawUrl: string): URL | null {
+function getAllowedWebhookPath(rawUrl: string): string | null {
   try {
     const parsed = new URL(rawUrl);
     if (parsed.protocol !== "https:") {
@@ -47,7 +66,11 @@ function getAllowedWebhookUrl(rawUrl: string): URL | null {
       return null;
     }
 
-    return parsed;
+    if (parsed.username || parsed.password || !parsed.pathname.startsWith("/hooks/")) {
+      return null;
+    }
+
+    return `${parsed.pathname}${parsed.search}`;
   } catch {
     return null;
   }
@@ -301,8 +324,8 @@ async function sendEtonWebhook({
   timestamp?: string;
 }): Promise<WebhookLogRecord | null> {
   if (!webhookConfig.enabled) return null;
-  const safeWebhookUrl = getAllowedWebhookUrl(webhookConfig.url);
-  if (!safeWebhookUrl) {
+  const safeWebhookPath = getAllowedWebhookPath(webhookConfig.url);
+  if (!safeWebhookPath) {
     return {
       id: "WH-" + Date.now() + "-" + Math.floor(Math.random() * 1000),
       timestamp: new Date().toISOString(),
@@ -356,7 +379,7 @@ async function sendEtonWebhook({
   const logEntry: WebhookLogRecord = {
     id: "WH-" + Date.now() + "-" + Math.floor(Math.random() * 1000),
     timestamp: new Date().toISOString(),
-    url: safeWebhookUrl.toString(),
+    url: `https://${ETON_WEBHOOK_HOSTNAME}${safeWebhookPath}`,
     method: "POST",
     payload,
     success: false,
@@ -368,7 +391,7 @@ async function sendEtonWebhook({
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), 7000);
 
-    const response = await fetch(safeWebhookUrl, {
+    const response = await fetch(`https://${ETON_WEBHOOK_HOSTNAME}${safeWebhookPath}`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -575,15 +598,15 @@ app.post("/api/webhook/config", (req, res) => {
   const { enabled, url, gateInTitle, gateOutTitle, includeEmployeeCode } = req.body;
   if (typeof enabled === "boolean") webhookConfig.enabled = enabled;
   if (url && typeof url === "string") {
-    const safeWebhookUrl = getAllowedWebhookUrl(url.trim());
-    if (!safeWebhookUrl) {
+    const safeWebhookPath = getAllowedWebhookPath(url.trim());
+    if (!safeWebhookPath) {
       res.status(400).json({
         success: false,
-        error: "Webhook URL phải dùng HTTPS và thuộc hostname được cho phép",
+        error: "Webhook URL phải dùng HTTPS, đúng host chat-room.eton.vn và có đường dẫn /hooks/...",
       });
       return;
     }
-    webhookConfig.url = safeWebhookUrl.toString();
+    webhookConfig.url = `https://${ETON_WEBHOOK_HOSTNAME}${safeWebhookPath}`;
   }
   if (gateInTitle && typeof gateInTitle === "string") webhookConfig.gateInTitle = gateInTitle.trim();
   if (gateOutTitle && typeof gateOutTitle === "string") webhookConfig.gateOutTitle = gateOutTitle.trim();
