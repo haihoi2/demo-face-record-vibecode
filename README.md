@@ -84,6 +84,9 @@ DATA_DIR="./data"
 # Trusted frontend origins gọi backend Render
 CORS_ALLOWED_ORIGINS="http://localhost:3000,https://your-site.netlify.app"
 
+# Server-side Eton webhook endpoint
+ETON_WEBHOOK_URL="https://chat-room.eton.vn/hooks/YOUR_WEBHOOK_TOKEN"
+
 # Frontend gọi backend cùng origin khi để trống.
 # Trên Netlify, gán thành URL Render backend.
 VITE_API_BASE_URL=""
@@ -257,13 +260,14 @@ Repository đã kèm sẵn:
   - `VITE_API_BASE_URL=https://your-render-service.onrender.com`
 
 #### Render
-- Build command: `npm install && npm run build`
+- Build command: `npm ci && npm run build`
 - Start command: `npm run start`
 - Root directory: thư mục gốc repository
 - Environment variables:
   - `PORT` (Render tự cấp)
   - `DATA_DIR=/var/data/smartface`
   - `CORS_ALLOWED_ORIGINS=https://your-site.netlify.app`
+  - `ETON_WEBHOOK_URL=https://chat-room.eton.vn/hooks/YOUR_WEBHOOK_TOKEN`
   - `FACE_RECOGNITION_PROVIDER=local`
   - `LOCAL_FACE_RECOGNITION_MODEL=local-exact-match`
   - `LOCAL_FACE_RECOGNITION_URL=http://127.0.0.1:8000/recognize` (nếu có dịch vụ local)

@@ -158,7 +158,7 @@ export const FaceScanner: React.FC<FaceScannerProps> = ({
         }
       );
 
-      if (!response.ok || !response.data) {
+      if (!response.data) {
         console.warn("Lỗi nhận diện khuôn mặt:", response.error);
         const failureResult: FaceRecognitionResult = {
           recognized: false,
@@ -193,7 +193,7 @@ export const FaceScanner: React.FC<FaceScannerProps> = ({
 
       onRecognitionComplete(data);
 
-      if (data.recognized) {
+      if (data.recognized && response.ok) {
         soundEffects.playSuccess();
       } else {
         soundEffects.playDenied();

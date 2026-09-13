@@ -10,6 +10,9 @@ dotenv.config();
 const app = express();
 const PORT = Number(process.env.PORT || 3000);
 const ETON_WEBHOOK_HOSTNAME = "chat-room.eton.vn";
+const ETON_WEBHOOK_URL =
+  process.env.ETON_WEBHOOK_URL?.trim() ||
+  `https://${ETON_WEBHOOK_HOSTNAME}/hooks/YOUR_WEBHOOK_TOKEN`;
 const TRUSTED_CORS_ORIGINS = new Set(
   [
     "http://localhost:3000",
@@ -78,6 +81,11 @@ function getAllowedWebhookPath(rawUrl: string): string | null {
   } catch {
     return null;
   }
+}
+
+function getConfiguredServerWebhookUrl(): string | null {
+  const safeWebhookPath = getAllowedWebhookPath(ETON_WEBHOOK_URL);
+  return safeWebhookPath ? `https://${ETON_WEBHOOK_HOSTNAME}${safeWebhookPath}` : null;
 }
 
 // Incoming request logger for transparency and debugging
@@ -302,7 +310,7 @@ export interface WebhookLogRecord {
 
 const DEFAULT_WEBHOOK_CONFIG = {
   enabled: false,
-  url: "https://chat-room.eton.vn/hooks/YOUR_WEBHOOK_TOKEN",
+  url: getConfiguredServerWebhookUrl() || `https://${ETON_WEBHOOK_HOSTNAME}/hooks/YOUR_WEBHOOK_TOKEN`,
   gateInTitle: "[[CỔNG VÀO]]",
   gateOutTitle: "[[CỔNG RA]]",
   includeEmployeeCode: true,
@@ -314,6 +322,7 @@ let accessLogs: AccessLogRecord[] = db.getAccessLogs(DEFAULT_ACCESS_LOGS);
 let mobileNotifications: MobileNotificationRecord[] = db.getNotifications(DEFAULT_NOTIFICATIONS);
 let smartLockState = db.getSmartLockState(DEFAULT_SMART_LOCK_STATE);
 let webhookConfig = db.getWebhookConfig(DEFAULT_WEBHOOK_CONFIG);
+webhookConfig.url = getConfiguredServerWebhookUrl() || DEFAULT_WEBHOOK_CONFIG.url;
 let webhookLogs: WebhookLogRecord[] = db.getWebhookLogs();
 
 async function sendEtonWebhook({
@@ -328,8 +337,8 @@ async function sendEtonWebhook({
   timestamp?: string;
 }): Promise<WebhookLogRecord | null> {
   if (!webhookConfig.enabled) return null;
-  const safeWebhookPath = getAllowedWebhookPath(webhookConfig.url);
-  if (!safeWebhookPath) {
+  const safeWebhookUrl = getConfiguredServerWebhookUrl();
+  if (!safeWebhookUrl) {
     return {
       id: "WH-" + Date.now() + "-" + Math.floor(Math.random() * 1000),
       timestamp: new Date().toISOString(),
@@ -383,7 +392,7 @@ async function sendEtonWebhook({
   const logEntry: WebhookLogRecord = {
     id: "WH-" + Date.now() + "-" + Math.floor(Math.random() * 1000),
     timestamp: new Date().toISOString(),
-    url: `https://${ETON_WEBHOOK_HOSTNAME}${safeWebhookPath}`,
+    url: safeWebhookUrl,
     method: "POST",
     payload,
     success: false,
@@ -395,7 +404,7 @@ async function sendEtonWebhook({
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), 7000);
 
-    const response = await fetch(`https://${ETON_WEBHOOK_HOSTNAME}${safeWebhookPath}`, {
+    const response = await fetch(safeWebhookUrl, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -602,15 +611,15 @@ app.post("/api/webhook/config", (req, res) => {
   const { enabled, url, gateInTitle, gateOutTitle, includeEmployeeCode } = req.body;
   if (typeof enabled === "boolean") webhookConfig.enabled = enabled;
   if (url && typeof url === "string") {
-    const safeWebhookPath = getAllowedWebhookPath(url.trim());
-    if (!safeWebhookPath) {
+    const currentServerWebhookUrl = getConfiguredServerWebhookUrl();
+    if (!currentServerWebhookUrl || url.trim() !== currentServerWebhookUrl) {
       res.status(400).json({
         success: false,
-        error: "Webhook URL phải dùng HTTPS, đúng host chat-room.eton.vn và có đường dẫn /hooks/...",
+        error: "Webhook URL phía server được khóa qua biến môi trường ETON_WEBHOOK_URL và phải dùng host chat-room.eton.vn",
       });
       return;
     }
-    webhookConfig.url = `https://${ETON_WEBHOOK_HOSTNAME}${safeWebhookPath}`;
+    webhookConfig.url = currentServerWebhookUrl;
   }
   if (gateInTitle && typeof gateInTitle === "string") webhookConfig.gateInTitle = gateInTitle.trim();
   if (gateOutTitle && typeof gateOutTitle === "string") webhookConfig.gateOutTitle = gateOutTitle.trim();

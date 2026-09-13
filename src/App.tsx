@@ -305,7 +305,7 @@ export default function App() {
   const handleEmployeeDeleted = async (id: string) => {
     try {
       const employeeToDelete = employees.find((employee) => employee.id === id);
-      const response = await apiFetch(`/api/employees/${id}`, { method: "DELETE" });
+      const response = await apiFetch(`/api/employees/${encodeURIComponent(id)}`, { method: "DELETE" });
       if (response.ok) {
         removeOfflineEmployee(id, employeeToDelete?.employeeCode);
         setEmployees((prev) => prev.filter((e) => e.id !== id));
