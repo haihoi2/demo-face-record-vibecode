@@ -1,6 +1,7 @@
 import fs from "fs";
 import path from "path";
 import { createRequire } from "module";
+import { Pool } from "pg";
 
 // Safe dynamic loader for Node 22 native sqlite DatabaseSync
 function getDatabaseSyncClass(): any {
@@ -103,13 +104,395 @@ export interface MobileNotificationRecord {
   employeeName?: string;
 }
 
-// Database wrapper supporting native Node 22 SQLite
+// Database wrapper supporting PostgreSQL (via DATABASE_URL), native Node 22 SQLite, and fallback JSON
 class SQLiteStorage {
   private db: any = null;
   private isNativeSqlite = false;
+  private pgPool: Pool | null = null;
+  private isPostgres = false;
+  private postgresConnected = false;
+  private postgresHost = "";
+  private postgresDatabase = "";
+  private postgresCounts: Record<string, number> = {};
+  private onSyncCallbacks: Array<() => void> = [];
 
   constructor() {
     this.init();
+    this.initPostgres();
+  }
+
+  public onSync(cb: () => void) {
+    this.onSyncCallbacks.push(cb);
+  }
+
+  private notifySync() {
+    for (const cb of this.onSyncCallbacks) {
+      try {
+        cb();
+      } catch (e: any) {
+        console.error("[PostgreSQL Sync Callback Error]:", e?.message);
+      }
+    }
+  }
+
+  private async initPostgres() {
+    const databaseUrl = process.env.DATABASE_URL;
+    if (!databaseUrl || !databaseUrl.startsWith("postgres")) {
+      return;
+    }
+
+    try {
+      try {
+        const parsed = new URL(databaseUrl.replace(/^postgres(ql)?:\/\//, "http://"));
+        this.postgresHost = parsed.hostname;
+        this.postgresDatabase = parsed.pathname.replace(/^\//, "");
+      } catch {}
+
+      this.pgPool = new Pool({
+        connectionString: databaseUrl,
+        connectionTimeoutMillis: 7000,
+        idleTimeoutMillis: 30000,
+        max: 10,
+      });
+
+      // Test connection
+      const client = await this.pgPool.connect();
+      try {
+        await client.query("SELECT 1");
+        this.postgresConnected = true;
+        this.isPostgres = true;
+        console.log(`[PostgreSQL] Đã kết nối cơ sở dữ liệu PostgreSQL thành công (${this.postgresHost}/${this.postgresDatabase})!`);
+        await this.createPostgresTables();
+        await this.syncWithPostgres();
+      } finally {
+        client.release();
+      }
+    } catch (err: any) {
+      console.warn(`[PostgreSQL] Không thể kết nối PostgreSQL (${err?.message}). Tiếp tục với SQLite/JSON.`);
+      this.isPostgres = false;
+      this.postgresConnected = false;
+    }
+  }
+
+  private async syncWithPostgres() {
+    if (!this.pgPool || !this.isPostgres) return;
+    try {
+      // 1. Employees sync
+      const empCountRes = await this.pgPool.query('SELECT count(*) as count FROM employees');
+      const empCount = parseInt(empCountRes.rows[0]?.count || "0", 10);
+      if (empCount === 0) {
+        const existingEmps = this.getEmployees([]);
+        for (const emp of existingEmps) {
+          await this.pgPool.query(`
+            INSERT INTO employees (id, name, "employeeCode", department, position, "photoUrl", "registeredAt", "accessLevel")
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+            ON CONFLICT (id) DO UPDATE SET
+              name = EXCLUDED.name,
+              "employeeCode" = EXCLUDED."employeeCode",
+              department = EXCLUDED.department,
+              position = EXCLUDED.position,
+              "photoUrl" = EXCLUDED."photoUrl",
+              "accessLevel" = EXCLUDED."accessLevel"
+          `, [emp.id, emp.name, emp.employeeCode, emp.department, emp.position, emp.photoUrl, emp.registeredAt, emp.accessLevel]);
+        }
+        console.log(`[PostgreSQL] Đã khởi tạo và đồng bộ ${existingEmps.length} nhân viên vào PostgreSQL!`);
+      } else {
+        const pgEmps = await this.pgPool.query(`
+          SELECT id, name, "employeeCode", department, position, "photoUrl", "registeredAt", "accessLevel"
+          FROM employees ORDER BY "registeredAt" DESC
+        `);
+        for (const row of pgEmps.rows) {
+          if (this.isNativeSqlite && this.db) {
+            try {
+              const stmt = this.db.prepare(`
+                INSERT INTO employees (id, name, employeeCode, department, position, photoUrl, registeredAt, accessLevel)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                  name = excluded.name,
+                  employeeCode = excluded.employeeCode,
+                  department = excluded.department,
+                  position = excluded.position,
+                  photoUrl = excluded.photoUrl,
+                  accessLevel = excluded.accessLevel
+              `);
+              stmt.run(row.id, row.name, row.employeeCode, row.department, row.position, row.photoUrl, row.registeredAt, row.accessLevel);
+            } catch {}
+          }
+        }
+        console.log(`[PostgreSQL] Đã tải ${pgEmps.rows.length} nhân viên từ PostgreSQL vào cache hệ thống!`);
+      }
+
+      // 2. Access logs sync
+      const logCountRes = await this.pgPool.query('SELECT count(*) as count FROM access_logs');
+      const logCount = parseInt(logCountRes.rows[0]?.count || "0", 10);
+      if (logCount === 0) {
+        const existingLogs = this.getAccessLogs([]);
+        for (const log of existingLogs) {
+          await this.pgPool.query(`
+            INSERT INTO access_logs (
+              id, timestamp, type, status, "employeeId", "employeeName", "employeeCode",
+              department, "photoSnapshot", confidence, "livenessScore", "lockAction", "doorName", reason
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+            ON CONFLICT (id) DO NOTHING
+          `, [
+            log.id, log.timestamp, log.type, log.status,
+            log.employeeId || null, log.employeeName || null, log.employeeCode || null,
+            log.department || null, log.photoSnapshot, log.confidence,
+            log.livenessScore || null, log.lockAction, log.doorName, log.reason || null
+          ]);
+        }
+        console.log(`[PostgreSQL] Đã khởi tạo và đồng bộ ${existingLogs.length} bản ghi truy cập vào PostgreSQL!`);
+      } else {
+        const pgLogs = await this.pgPool.query(`
+          SELECT id, timestamp, type, status, "employeeId", "employeeName", "employeeCode",
+                 department, "photoSnapshot", confidence, "livenessScore", "lockAction", "doorName", reason
+          FROM access_logs ORDER BY timestamp DESC LIMIT 100
+        `);
+        for (const r of pgLogs.rows) {
+          if (this.isNativeSqlite && this.db) {
+            try {
+              const stmt = this.db.prepare(`
+                INSERT INTO access_logs (
+                  id, timestamp, type, status, employeeId, employeeName, employeeCode,
+                  department, photoSnapshot, confidence, livenessScore, lockAction, doorName, reason
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO NOTHING
+              `);
+              stmt.run(
+                r.id, r.timestamp, r.type, r.status,
+                r.employeeId || null, r.employeeName || null, r.employeeCode || null,
+                r.department || null, r.photoSnapshot, r.confidence,
+                r.livenessScore || null, r.lockAction, r.doorName, r.reason || null
+              );
+            } catch {}
+          }
+        }
+      }
+
+      // 3. Smart lock state sync
+      const lockCountRes = await this.pgPool.query('SELECT count(*) as count FROM smart_lock_state');
+      const lockCount = parseInt(lockCountRes.rows[0]?.count || "0", 10);
+      if (lockCount === 0) {
+        const currentLock = this.getSmartLockState({
+          lockId: "SL-HQ-01",
+          doorName: "Cửa Chính Trụ Sở - Cổng A",
+          state: "LOCKED",
+          isLocked: true,
+          batteryLevel: 96,
+          signalDbm: -54,
+          firmwareVersion: "v2.5.8-Zigbee/IP",
+          lastActionAt: new Date().toISOString(),
+          lastActionBy: "Hệ thống bảo mật tự động",
+          autoRelockSeconds: 6,
+          remainingRelockSeconds: 0,
+          status: "ONLINE",
+        });
+        await this.pgPool.query(`
+          INSERT INTO smart_lock_state (
+            "lockId", "doorName", state, "isLocked", "batteryLevel", "signalDbm",
+            "firmwareVersion", "lastActionAt", "lastActionBy", "autoRelockSeconds", status
+          ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+          ON CONFLICT ("lockId") DO NOTHING
+        `, [
+          currentLock.lockId, currentLock.doorName, currentLock.state, currentLock.isLocked,
+          currentLock.batteryLevel, currentLock.signalDbm, currentLock.firmwareVersion,
+          currentLock.lastActionAt, currentLock.lastActionBy, currentLock.autoRelockSeconds, currentLock.status
+        ]);
+      } else {
+        const pgLock = await this.pgPool.query('SELECT * FROM smart_lock_state LIMIT 1');
+        if (pgLock.rows[0] && this.isNativeSqlite && this.db) {
+          const row = pgLock.rows[0];
+          try {
+            const stmt = this.db.prepare(`
+              INSERT INTO smart_lock_state (
+                lockId, doorName, state, isLocked, batteryLevel, signalDbm,
+                firmwareVersion, lastActionAt, lastActionBy, autoRelockSeconds, status
+              ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+              ON CONFLICT(lockId) DO UPDATE SET
+                doorName = excluded.doorName,
+                state = excluded.state,
+                isLocked = excluded.isLocked,
+                batteryLevel = excluded.batteryLevel,
+                signalDbm = excluded.signalDbm,
+                lastActionAt = excluded.lastActionAt,
+                lastActionBy = excluded.lastActionBy,
+                status = excluded.status
+            `);
+            stmt.run(
+              row.lockId, row.doorName, row.state, row.isLocked ? 1 : 0,
+              row.batteryLevel, row.signalDbm, row.firmwareVersion,
+              row.lastActionAt, row.lastActionBy, row.autoRelockSeconds, row.status
+            );
+          } catch {}
+        }
+      }
+
+      // 4. Webhook config sync
+      const hookCountRes = await this.pgPool.query('SELECT count(*) as count FROM webhook_config');
+      const hookCount = parseInt(hookCountRes.rows[0]?.count || "0", 10);
+      if (hookCount === 0) {
+        const currentHook = this.getWebhookConfig({
+          enabled: false,
+          url: "https://chat-room.eton.vn/hooks/YOUR_WEBHOOK_TOKEN",
+          gateInTitle: "[[CỔNG VÀO]]",
+          gateOutTitle: "[[CỔNG RA]]",
+          includeEmployeeCode: true,
+        });
+        await this.pgPool.query(`
+          INSERT INTO webhook_config (id, enabled, url, "gateInTitle", "gateOutTitle", "includeEmployeeCode")
+          VALUES ('default', $1, $2, $3, $4, $5)
+          ON CONFLICT (id) DO NOTHING
+        `, [currentHook.enabled, currentHook.url, currentHook.gateInTitle, currentHook.gateOutTitle, currentHook.includeEmployeeCode]);
+      } else {
+        const pgHook = await this.pgPool.query('SELECT * FROM webhook_config WHERE id = $1', ['default']);
+        if (pgHook.rows[0] && this.isNativeSqlite && this.db) {
+          const row = pgHook.rows[0];
+          try {
+            const stmt = this.db.prepare(`
+              INSERT INTO webhook_config (id, enabled, url, gateInTitle, gateOutTitle, includeEmployeeCode)
+              VALUES ('default', ?, ?, ?, ?, ?)
+              ON CONFLICT(id) DO UPDATE SET
+                enabled = excluded.enabled,
+                url = excluded.url,
+                gateInTitle = excluded.gateInTitle,
+                gateOutTitle = excluded.gateOutTitle,
+                includeEmployeeCode = excluded.includeEmployeeCode
+            `);
+            stmt.run(row.enabled ? 1 : 0, row.url, row.gateInTitle, row.gateOutTitle, row.includeEmployeeCode ? 1 : 0);
+          } catch {}
+        }
+      }
+
+      // 5. Mobile notifications sync
+      const notifCountRes = await this.pgPool.query('SELECT count(*) as count FROM mobile_notifications');
+      const notifCount = parseInt(notifCountRes.rows[0]?.count || "0", 10);
+      if (notifCount === 0) {
+        const currentNotifs = this.getNotifications([]);
+        for (const notif of currentNotifs) {
+          await this.pgPool.query(`
+            INSERT INTO mobile_notifications (id, title, body, timestamp, type, read, "employeeId", "employeeName")
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+            ON CONFLICT (id) DO NOTHING
+          `, [
+            notif.id, notif.title, notif.body, notif.timestamp, notif.type,
+            notif.read, notif.employeeId || null, notif.employeeName || null
+          ]);
+        }
+      }
+
+      // Update count statistics
+      await this.refreshPostgresCounts();
+      this.notifySync();
+    } catch (err: any) {
+      console.error("[PostgreSQL] Lỗi đồng bộ dữ liệu ban đầu:", err?.message);
+    }
+  }
+
+  public async refreshPostgresCounts() {
+    if (!this.pgPool || !this.isPostgres) return;
+    try {
+      const [emp, log, notif, hook, lock] = await Promise.all([
+        this.pgPool.query('SELECT count(*) as c FROM employees'),
+        this.pgPool.query('SELECT count(*) as c FROM access_logs'),
+        this.pgPool.query('SELECT count(*) as c FROM mobile_notifications'),
+        this.pgPool.query('SELECT count(*) as c FROM webhook_logs'),
+        this.pgPool.query('SELECT count(*) as c FROM smart_lock_state'),
+      ]);
+      this.postgresCounts = {
+        employees: parseInt(emp.rows[0]?.c || "0", 10),
+        accessLogs: parseInt(log.rows[0]?.c || "0", 10),
+        notifications: parseInt(notif.rows[0]?.c || "0", 10),
+        webhookLogs: parseInt(hook.rows[0]?.c || "0", 10),
+        smartLockState: parseInt(lock.rows[0]?.c || "0", 10),
+      };
+    } catch {}
+  }
+
+  private async createPostgresTables() {
+    if (!this.pgPool) return;
+    try {
+      await this.pgPool.query(`
+        CREATE TABLE IF NOT EXISTS employees (
+          id VARCHAR(64) PRIMARY KEY,
+          name VARCHAR(255) NOT NULL,
+          "employeeCode" VARCHAR(64) UNIQUE NOT NULL,
+          department VARCHAR(255),
+          position VARCHAR(255),
+          "photoUrl" TEXT,
+          "registeredAt" VARCHAR(64),
+          "accessLevel" VARCHAR(32) DEFAULT 'ALL_ACCESS'
+        );
+
+        CREATE TABLE IF NOT EXISTS access_logs (
+          id VARCHAR(64) PRIMARY KEY,
+          timestamp VARCHAR(64) NOT NULL,
+          type VARCHAR(16) NOT NULL,
+          status VARCHAR(16) NOT NULL,
+          "employeeId" VARCHAR(64),
+          "employeeName" VARCHAR(255),
+          "employeeCode" VARCHAR(64),
+          department VARCHAR(255),
+          "photoSnapshot" TEXT,
+          confidence NUMERIC(5, 2),
+          "livenessScore" NUMERIC(5, 2),
+          "lockAction" TEXT,
+          "doorName" VARCHAR(255),
+          reason TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS smart_lock_state (
+          "lockId" VARCHAR(64) PRIMARY KEY,
+          "doorName" VARCHAR(255),
+          state VARCHAR(32),
+          "isLocked" BOOLEAN,
+          "batteryLevel" INTEGER,
+          "signalDbm" INTEGER,
+          "firmwareVersion" VARCHAR(64),
+          "lastActionAt" VARCHAR(64),
+          "lastActionBy" VARCHAR(255),
+          "autoRelockSeconds" INTEGER,
+          status VARCHAR(32)
+        );
+
+        CREATE TABLE IF NOT EXISTS webhook_config (
+          id VARCHAR(64) PRIMARY KEY,
+          enabled BOOLEAN,
+          url TEXT,
+          "gateInTitle" VARCHAR(255),
+          "gateOutTitle" VARCHAR(255),
+          "includeEmployeeCode" BOOLEAN
+        );
+
+        CREATE TABLE IF NOT EXISTS webhook_logs (
+          id VARCHAR(64) PRIMARY KEY,
+          timestamp VARCHAR(64) NOT NULL,
+          url TEXT,
+          method VARCHAR(16),
+          payload TEXT,
+          "statusCode" INTEGER,
+          "statusText" VARCHAR(128),
+          "responseBody" TEXT,
+          success BOOLEAN,
+          error TEXT,
+          "scanType" VARCHAR(16),
+          "userName" VARCHAR(255)
+        );
+
+        CREATE TABLE IF NOT EXISTS mobile_notifications (
+          id VARCHAR(64) PRIMARY KEY,
+          title VARCHAR(255) NOT NULL,
+          body TEXT NOT NULL,
+          timestamp VARCHAR(64) NOT NULL,
+          type VARCHAR(32),
+          read BOOLEAN DEFAULT FALSE,
+          "employeeId" VARCHAR(64),
+          "employeeName" VARCHAR(255)
+        );
+      `);
+      console.log("[PostgreSQL] Các bảng dữ liệu đã sẵn sàng trên PostgreSQL!");
+    } catch (err) {
+      console.error("[PostgreSQL] Lỗi khởi tạo bảng:", err);
+    }
   }
 
   private init() {
@@ -269,6 +652,21 @@ class SQLiteStorage {
   }
 
   saveEmployee(emp: EmployeeRecord) {
+    if (this.pgPool && this.isPostgres) {
+      this.pgPool.query(`
+        INSERT INTO employees (id, name, "employeeCode", department, position, "photoUrl", "registeredAt", "accessLevel")
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+        ON CONFLICT (id) DO UPDATE SET
+          name = EXCLUDED.name,
+          "employeeCode" = EXCLUDED."employeeCode",
+          department = EXCLUDED.department,
+          position = EXCLUDED.position,
+          "photoUrl" = EXCLUDED."photoUrl",
+          "accessLevel" = EXCLUDED."accessLevel"
+      `, [emp.id, emp.name, emp.employeeCode, emp.department, emp.position, emp.photoUrl, emp.registeredAt, emp.accessLevel])
+      .catch((e) => console.error("[PostgreSQL] Lỗi saveEmployee:", e.message));
+    }
+
     if (this.isNativeSqlite && this.db) {
       try {
         const stmt = this.db.prepare(`
@@ -307,6 +705,11 @@ class SQLiteStorage {
   }
 
   deleteEmployee(id: string) {
+    if (this.pgPool && this.isPostgres) {
+      this.pgPool.query("DELETE FROM employees WHERE id = $1", [id])
+        .catch((e) => console.error("[PostgreSQL] Lỗi deleteEmployee:", e.message));
+    }
+
     if (this.isNativeSqlite && this.db) {
       try {
         const stmt = this.db.prepare("DELETE FROM employees WHERE id = ?");
@@ -344,6 +747,30 @@ class SQLiteStorage {
   }
 
   saveAccessLog(log: AccessLogRecord) {
+    if (this.pgPool && this.isPostgres) {
+      this.pgPool.query(`
+        INSERT INTO access_logs (
+          id, timestamp, type, status, "employeeId", "employeeName", "employeeCode",
+          department, "photoSnapshot", confidence, "livenessScore", "lockAction", "doorName", reason
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+        ON CONFLICT (id) DO UPDATE SET
+          status = EXCLUDED.status,
+          confidence = EXCLUDED.confidence,
+          "employeeId" = EXCLUDED."employeeId",
+          "employeeName" = EXCLUDED."employeeName",
+          "employeeCode" = EXCLUDED."employeeCode",
+          department = EXCLUDED.department,
+          reason = EXCLUDED.reason,
+          "lockAction" = EXCLUDED."lockAction",
+          "photoSnapshot" = EXCLUDED."photoSnapshot"
+      `, [
+        log.id, log.timestamp, log.type, log.status,
+        log.employeeId || null, log.employeeName || null, log.employeeCode || null,
+        log.department || null, log.photoSnapshot, log.confidence,
+        log.livenessScore || null, log.lockAction, log.doorName, log.reason || null
+      ]).catch((e) => console.error("[PostgreSQL] Lỗi saveAccessLog:", e.message));
+    }
+
     if (this.isNativeSqlite && this.db) {
       try {
         const stmt = this.db.prepare(`
@@ -353,7 +780,14 @@ class SQLiteStorage {
           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
           ON CONFLICT(id) DO UPDATE SET
             status = excluded.status,
-            confidence = excluded.confidence
+            confidence = excluded.confidence,
+            employeeId = excluded.employeeId,
+            employeeName = excluded.employeeName,
+            employeeCode = excluded.employeeCode,
+            department = excluded.department,
+            reason = excluded.reason,
+            lockAction = excluded.lockAction,
+            photoSnapshot = excluded.photoSnapshot
         `);
         stmt.run(
           log.id,
@@ -384,6 +818,11 @@ class SQLiteStorage {
   }
 
   clearAccessLogs() {
+    if (this.pgPool && this.isPostgres) {
+      this.pgPool.query("DELETE FROM access_logs")
+        .catch((e) => console.error("[PostgreSQL] Lỗi clearAccessLogs:", e.message));
+    }
+
     if (this.isNativeSqlite && this.db) {
       try {
         this.db.exec("DELETE FROM access_logs");
@@ -418,6 +857,28 @@ class SQLiteStorage {
   }
 
   saveSmartLockState(state: SmartLockStateRecord) {
+    if (this.pgPool && this.isPostgres) {
+      this.pgPool.query(`
+        INSERT INTO smart_lock_state (
+          "lockId", "doorName", state, "isLocked", "batteryLevel", "signalDbm",
+          "firmwareVersion", "lastActionAt", "lastActionBy", "autoRelockSeconds", status
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+        ON CONFLICT ("lockId") DO UPDATE SET
+          "doorName" = EXCLUDED."doorName",
+          state = EXCLUDED.state,
+          "isLocked" = EXCLUDED."isLocked",
+          "batteryLevel" = EXCLUDED."batteryLevel",
+          "signalDbm" = EXCLUDED."signalDbm",
+          "lastActionAt" = EXCLUDED."lastActionAt",
+          "lastActionBy" = EXCLUDED."lastActionBy",
+          status = EXCLUDED.status
+      `, [
+        state.lockId, state.doorName, state.state, state.isLocked,
+        state.batteryLevel, state.signalDbm, state.firmwareVersion,
+        state.lastActionAt, state.lastActionBy, state.autoRelockSeconds, state.status
+      ]).catch((e) => console.error("[PostgreSQL] Lỗi saveSmartLockState:", e.message));
+    }
+
     if (this.isNativeSqlite && this.db) {
       try {
         const stmt = this.db.prepare(`
@@ -481,6 +942,20 @@ class SQLiteStorage {
   }
 
   saveWebhookConfig(config: WebhookConfigRecord) {
+    if (this.pgPool && this.isPostgres) {
+      this.pgPool.query(`
+        INSERT INTO webhook_config (id, enabled, url, "gateInTitle", "gateOutTitle", "includeEmployeeCode")
+        VALUES ('default', $1, $2, $3, $4, $5)
+        ON CONFLICT (id) DO UPDATE SET
+          enabled = EXCLUDED.enabled,
+          url = EXCLUDED.url,
+          "gateInTitle" = EXCLUDED."gateInTitle",
+          "gateOutTitle" = EXCLUDED."gateOutTitle",
+          "includeEmployeeCode" = EXCLUDED."includeEmployeeCode"
+      `, [config.enabled, config.url, config.gateInTitle, config.gateOutTitle, config.includeEmployeeCode])
+      .catch((e) => console.error("[PostgreSQL] Lỗi saveWebhookConfig:", e.message));
+    }
+
     if (this.isNativeSqlite && this.db) {
       try {
         const stmt = this.db.prepare(`
@@ -529,6 +1004,20 @@ class SQLiteStorage {
   }
 
   saveWebhookLog(log: WebhookLogRecord) {
+    if (this.pgPool && this.isPostgres) {
+      this.pgPool.query(`
+        INSERT INTO webhook_logs (
+          id, timestamp, url, method, payload, "statusCode", "statusText", "responseBody", success, error, "scanType", "userName"
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+        ON CONFLICT (id) DO NOTHING
+      `, [
+        log.id, log.timestamp, log.url, log.method,
+        typeof log.payload === "string" ? log.payload : JSON.stringify(log.payload),
+        log.statusCode || null, log.statusText || null, log.responseBody || null,
+        log.success, log.error || null, log.scanType, log.userName
+      ]).catch((e) => console.error("[PostgreSQL] Lỗi saveWebhookLog:", e.message));
+    }
+
     if (this.isNativeSqlite && this.db) {
       try {
         const stmt = this.db.prepare(`
@@ -590,6 +1079,18 @@ class SQLiteStorage {
   }
 
   saveNotification(notif: MobileNotificationRecord) {
+    if (this.pgPool && this.isPostgres) {
+      this.pgPool.query(`
+        INSERT INTO mobile_notifications (id, title, body, timestamp, type, read, "employeeId", "employeeName")
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+        ON CONFLICT (id) DO UPDATE SET
+          read = EXCLUDED.read
+      `, [
+        notif.id, notif.title, notif.body, notif.timestamp, notif.type,
+        notif.read, notif.employeeId || null, notif.employeeName || null
+      ]).catch((e) => console.error("[PostgreSQL] Lỗi saveNotification:", e.message));
+    }
+
     if (this.isNativeSqlite && this.db) {
       try {
         const stmt = this.db.prepare(`
@@ -623,6 +1124,11 @@ class SQLiteStorage {
   }
 
   clearNotifications() {
+    if (this.pgPool && this.isPostgres) {
+      this.pgPool.query("DELETE FROM mobile_notifications")
+        .catch((e) => console.error("[PostgreSQL] Lỗi clearNotifications:", e.message));
+    }
+
     if (this.isNativeSqlite && this.db) {
       try {
         this.db.exec("DELETE FROM mobile_notifications");
@@ -636,6 +1142,11 @@ class SQLiteStorage {
   }
 
   markNotificationsRead() {
+    if (this.pgPool && this.isPostgres) {
+      this.pgPool.query("UPDATE mobile_notifications SET read = true")
+        .catch((e) => console.error("[PostgreSQL] Lỗi markNotificationsRead:", e.message));
+    }
+
     if (this.isNativeSqlite && this.db) {
       try {
         this.db.exec("UPDATE mobile_notifications SET read = 1");
@@ -657,9 +1168,24 @@ class SQLiteStorage {
       }
     } catch {}
 
+    const engineNames = [];
+    if (this.postgresConnected) {
+      engineNames.push("PostgreSQL (Docker/External)");
+    }
+    if (this.isNativeSqlite) {
+      engineNames.push("SQLite 3 (Node.js native DatabaseSync)");
+    }
+    if (engineNames.length === 0) {
+      engineNames.push("JSON File Persistence Fallback");
+    }
+
     return {
-      engine: this.isNativeSqlite ? "SQLite 3 (Node.js native DatabaseSync)" : "JSON File Persistence Fallback",
-      dbPath: DB_PATH,
+      engine: engineNames.join(" + "),
+      postgresConnected: this.postgresConnected,
+      postgresHost: this.postgresHost,
+      postgresDatabase: this.postgresDatabase,
+      postgresCounts: this.postgresCounts,
+      sqlitePath: DB_PATH,
       sizeBytes,
       sizeFormatted: (sizeBytes / 1024).toFixed(2) + " KB",
     };

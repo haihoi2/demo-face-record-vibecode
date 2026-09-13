@@ -12,6 +12,7 @@ import {
   Building,
   BadgeCheck,
   RefreshCw,
+  UserX,
 } from "lucide-react";
 import { Employee } from "../types";
 import { safeJsonFetch, compressImage } from "../utils/api";
@@ -21,6 +22,7 @@ interface EmployeeRegistrationProps {
   onEmployeeAdded: (employee: Employee) => void;
   onEmployeeDeleted: (id: string) => void;
   onTestEmployee: (employee: Employee) => void;
+  onOpenStrangerClusters?: () => void;
 }
 
 export const EmployeeRegistration: React.FC<EmployeeRegistrationProps> = ({
@@ -28,6 +30,7 @@ export const EmployeeRegistration: React.FC<EmployeeRegistrationProps> = ({
   onEmployeeAdded,
   onEmployeeDeleted,
   onTestEmployee,
+  onOpenStrangerClusters,
 }) => {
   const [name, setName] = useState<string>("");
   const [employeeCode, setEmployeeCode] = useState<string>("");
@@ -243,7 +246,36 @@ export const EmployeeRegistration: React.FC<EmployeeRegistrationProps> = ({
   };
 
   return (
-    <div className="space-y-8">
+    <div className="space-y-6">
+      {/* Stranger Warning & Quick Registration Callout Banner */}
+      {onOpenStrangerClusters && (
+        <div className="bg-gradient-to-r from-amber-500/10 via-rose-500/10 to-indigo-500/10 border border-amber-300 rounded-2xl p-4 flex flex-col sm:flex-row sm:items-center justify-between gap-3 shadow-2xs">
+          <div className="flex items-center gap-3">
+            <div className="w-10 h-10 rounded-xl bg-amber-600 text-white flex items-center justify-center shrink-0 shadow-xs">
+              <UserX className="w-5 h-5" />
+            </div>
+            <div>
+              <h3 className="text-sm font-bold text-slate-900">
+                Phát hiện người lạ chụp hình tại cửa cần khai báo
+              </h3>
+              <p className="text-xs text-slate-600">
+                Hệ thống tự động gom các ảnh chụp góc tương đồng của cùng một người lạ để bạn có thể thêm nhanh với 1 chạm.
+              </p>
+            </div>
+          </div>
+
+          <button
+            type="button"
+            id="btn-open-strangers-from-register"
+            onClick={onOpenStrangerClusters}
+            className="px-4 py-2 bg-gradient-to-r from-amber-600 to-rose-600 hover:opacity-95 text-white rounded-xl text-xs font-bold shadow-sm shadow-amber-200 flex items-center gap-1.5 shrink-0 transition cursor-pointer"
+          >
+            <Sparkles className="w-3.5 h-3.5" />
+            <span>Mở Cụm Ảnh &amp; Khai Báo Nhanh</span>
+          </button>
+        </div>
+      )}
+
       {/* Registration Form & Biometric Acquisition Card */}
       <div className="bg-white rounded-2xl border border-slate-200 p-6 shadow-xs">
         <div className="flex items-center justify-between border-b border-slate-100 pb-4 mb-6">

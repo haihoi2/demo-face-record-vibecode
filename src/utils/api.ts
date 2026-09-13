@@ -57,9 +57,65 @@ export async function parseJsonResponse<T = any>(
   }
 }
 
+export const STORAGE_KEY_CUSTOM_BACKEND = "smartlock_custom_backend_url";
+
+/**
+ * Retrieves user-defined custom backend URL from localStorage (if configured in UI).
+ */
+export function getCustomBackendUrl(): string {
+  if (typeof window === "undefined") return "";
+  try {
+    return (localStorage.getItem(STORAGE_KEY_CUSTOM_BACKEND) || "").trim().replace(/\/+$/, "");
+  } catch {
+    return "";
+  }
+}
+
+/**
+ * Persists user-defined custom backend URL in localStorage.
+ */
+export function setCustomBackendUrl(url: string): void {
+  if (typeof window === "undefined") return;
+  try {
+    const cleaned = url.trim().replace(/\/+$/, "");
+    if (cleaned) {
+      localStorage.setItem(STORAGE_KEY_CUSTOM_BACKEND, cleaned);
+    } else {
+      localStorage.removeItem(STORAGE_KEY_CUSTOM_BACKEND);
+    }
+  } catch {}
+}
+
+/**
+ * Retrieves the external backend API base URL.
+ * Priority:
+ * 1. User-configured custom URL in UI (stored in localStorage)
+ * 2. Environment variable VITE_API_URL (set on Netlify / build)
+ * 3. Default: empty string (same-origin relative paths)
+ *
+ * NOTE: When deployed to Netlify without a custom backend, returning empty string
+ * prevents the browser from sending unauthorized cross-origin preflight requests
+ * to private development sandbox containers (which cause CORS net::ERR_INVALID_REDIRECT).
+ */
+export function getApiBaseUrl(): string {
+  const custom = getCustomBackendUrl();
+  if (custom) {
+    return custom;
+  }
+
+  const env = (import.meta as any).env || {};
+  const envUrl = String(env.VITE_API_BASE_URL || env.VITE_API_URL || "").trim();
+  if (envUrl) {
+    return envUrl.replace(/\/+$/, "");
+  }
+
+  return "";
+}
+
 /**
  * Normalizes API endpoint URLs ensuring correct leading slash and structure,
  * preventing relative path 404s when navigating or querying.
+ * Prepends the configured external API base URL if present.
  */
 export function normalizeApiUrl(rawUrl: string): string {
   if (!rawUrl) return "/api/health";
@@ -72,34 +128,20 @@ export function normalizeApiUrl(rawUrl: string): string {
   } else if (!path.startsWith("/")) {
     path = "/" + path;
   }
-  return path;
-}
 
-export function getApiBaseUrl(): string {
-  const rawBaseUrl = import.meta.env.VITE_API_BASE_URL?.trim() || "";
-  if (!rawBaseUrl) return "";
-  return rawBaseUrl.replace(/\/+$/, "");
-}
-
-export function buildApiUrl(rawUrl: string): string {
-  const normalizedPath = normalizeApiUrl(rawUrl);
-  const baseUrl = getApiBaseUrl();
-  if (!baseUrl) return normalizedPath;
-  if (normalizedPath.startsWith("http://") || normalizedPath.startsWith("https://")) {
-    return normalizedPath;
-  }
-  return `${baseUrl}${normalizedPath}`;
+  const base = getApiBaseUrl();
+  return base ? `${base}${path}` : path;
 }
 
 export function buildEventSourceUrl(rawUrl: string): string {
-  return buildApiUrl(rawUrl);
+  return normalizeApiUrl(rawUrl);
 }
 
 export async function apiFetch(
   url: string,
   options?: RequestInit
 ): Promise<Response> {
-  return fetch(buildApiUrl(url), options);
+  return fetch(normalizeApiUrl(url), options);
 }
 
 export async function safeJsonFetch<T = any>(
@@ -107,7 +149,7 @@ export async function safeJsonFetch<T = any>(
   options?: RequestInit,
   fallback?: T
 ): Promise<{ ok: boolean; status: number; data: T; error?: string }> {
-  const normalizedUrl = buildApiUrl(url);
+  const normalizedUrl = normalizeApiUrl(url);
 
   try {
     const res = await fetch(normalizedUrl, options);
