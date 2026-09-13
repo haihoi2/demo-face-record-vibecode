@@ -48,7 +48,7 @@ export const MobileCompanion: React.FC<MobileCompanionProps> = ({
     setIsUnlocking(true);
     try {
       soundEffects.playLockClick();
-      await apiFetch("/api/lock/unlock", {
+      const response = await apiFetch("/api/lock/unlock", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -56,7 +56,9 @@ export const MobileCompanion: React.FC<MobileCompanionProps> = ({
           reason: "Người quản lý mở cửa từ xa qua điện thoại",
         }),
       });
-      soundEffects.playSuccess();
+      if (response.ok) {
+        soundEffects.playSuccess();
+      }
     } catch (err) {
       console.error("Lỗi mở cửa từ xa:", err);
     } finally {

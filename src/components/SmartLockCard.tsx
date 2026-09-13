@@ -33,7 +33,7 @@ export const SmartLockCard: React.FC<SmartLockCardProps> = ({
     setIsTriggering(true);
     try {
       soundEffects.playLockClick();
-      await apiFetch("/api/lock/unlock", {
+      const response = await apiFetch("/api/lock/unlock", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -41,7 +41,9 @@ export const SmartLockCard: React.FC<SmartLockCardProps> = ({
           reason: "Kích hoạt thủ công từ Dashboard Quản trị",
         }),
       });
-      soundEffects.playSuccess();
+      if (response.ok) {
+        soundEffects.playSuccess();
+      }
     } catch (err) {
       console.error("Lỗi mở khóa:", err);
     } finally {

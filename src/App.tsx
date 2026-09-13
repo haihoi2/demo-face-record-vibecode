@@ -54,7 +54,9 @@ export default function App() {
       // Read local offline employees
       let localEmps: Employee[] = [];
       try {
-        const raw = localStorage.getItem("smartlock_offline_employees");
+        const raw =
+          localStorage.getItem("smartlock_offline_employees") ||
+          localStorage.getItem("smartlock_offline_employees_v2");
         if (raw) localEmps = JSON.parse(raw);
       } catch {}
 
@@ -229,7 +231,7 @@ export default function App() {
   const handleManualUnlock = async () => {
     soundEffects.playLockClick();
     try {
-      await apiFetch("/api/lock/unlock", {
+      const response = await apiFetch("/api/lock/unlock", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -237,7 +239,9 @@ export default function App() {
           reason: "Kích hoạt trực tiếp từ trung tâm điều khiển",
         }),
       });
-      soundEffects.playSuccess();
+      if (response.ok) {
+        soundEffects.playSuccess();
+      }
     } catch (err) {
       console.error("Lỗi gửi lệnh mở khóa:", err);
     }
@@ -250,8 +254,10 @@ export default function App() {
 
   const handleEmployeeDeleted = async (id: string) => {
     try {
-      await apiFetch(`/api/employees/${id}`, { method: "DELETE" });
-      setEmployees((prev) => prev.filter((e) => e.id !== id));
+      const response = await apiFetch(`/api/employees/${id}`, { method: "DELETE" });
+      if (response.ok) {
+        setEmployees((prev) => prev.filter((e) => e.id !== id));
+      }
     } catch (err) {
       console.error("Lỗi xóa nhân viên:", err);
     }
@@ -259,8 +265,10 @@ export default function App() {
 
   const handleClearLogs = async () => {
     try {
-      await apiFetch("/api/logs/clear", { method: "POST" });
-      setAccessLogs([]);
+      const response = await apiFetch("/api/logs/clear", { method: "POST" });
+      if (response.ok) {
+        setAccessLogs([]);
+      }
     } catch (err) {
       console.error("Lỗi xóa logs:", err);
     }
@@ -268,8 +276,10 @@ export default function App() {
 
   const handleClearNotifications = async () => {
     try {
-      await apiFetch("/api/notifications/clear", { method: "POST" });
-      setNotifications([]);
+      const response = await apiFetch("/api/notifications/clear", { method: "POST" });
+      if (response.ok) {
+        setNotifications([]);
+      }
     } catch (err) {
       console.error("Lỗi xóa thông báo:", err);
     }
@@ -277,8 +287,10 @@ export default function App() {
 
   const handleMarkNotificationsRead = async () => {
     try {
-      await apiFetch("/api/notifications/mark-read", { method: "POST" });
-      setNotifications((prev) => prev.map((n) => ({ ...n, read: true })));
+      const response = await apiFetch("/api/notifications/mark-read", { method: "POST" });
+      if (response.ok) {
+        setNotifications((prev) => prev.map((n) => ({ ...n, read: true })));
+      }
     } catch (err) {
       console.error("Lỗi đánh dấu đã đọc:", err);
     }

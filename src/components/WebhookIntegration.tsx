@@ -22,11 +22,26 @@ import { WebhookConfig, WebhookLog, Employee, MobileNotification } from "../type
 import { safeJsonFetch } from "../utils/api";
 import { soundEffects } from "../utils/audio";
 
+function getSafeWebhookUrl(rawUrl: string): string | null {
+  try {
+    const parsed = new URL(rawUrl);
+    if (parsed.protocol !== "https:") {
+      return null;
+    }
+    return parsed.toString();
+  } catch {
+    return null;
+  }
+}
+
 // Direct browser webhook dispatcher: bypasses CORS restrictions to deliver payload to Eton Chat Room
 export function dispatchDirectWebhook(url: string, payload: any) {
+  const safeUrl = getSafeWebhookUrl(url);
+  if (!safeUrl) return;
+
   // Method 1: fetch with mode: 'no-cors' and text/plain (avoids CORS preflight OPTIONS)
   try {
-    fetch(url, {
+    fetch(safeUrl, {
       method: "POST",
       mode: "no-cors",
       headers: {
@@ -42,7 +57,7 @@ export function dispatchDirectWebhook(url: string, payload: any) {
       const blob = new Blob([JSON.stringify(payload)], {
         type: "text/plain;charset=UTF-8",
       });
-      navigator.sendBeacon(url, blob);
+      navigator.sendBeacon(safeUrl, blob);
     }
   } catch {}
 
@@ -64,7 +79,7 @@ export function dispatchDirectWebhook(url: string, payload: any) {
 
       const form = document.createElement("form");
       form.method = "POST";
-      form.action = url;
+      form.action = safeUrl;
       form.target = "webhook-target-iframe";
       form.style.display = "none";
 
@@ -93,8 +108,8 @@ export const WebhookIntegration: React.FC<WebhookIntegrationProps> = ({
   onNewNotification,
 }) => {
   const [config, setConfig] = useState<WebhookConfig>({
-    enabled: true,
-    url: "https://chat-room.eton.vn/hooks/6aa4dfb6928518a18ba27a13/mguNArZoWHY7AegnWFw7d7TwyfnoT4JZWpmwvxtLmfi7iGuY",
+    enabled: false,
+    url: "https://chat-room.eton.vn/hooks/YOUR_WEBHOOK_TOKEN",
     gateInTitle: "[[CỔNG VÀO]]",
     gateOutTitle: "[[CỔNG RA]]",
     includeEmployeeCode: true,

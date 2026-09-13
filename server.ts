@@ -9,6 +9,12 @@ dotenv.config();
 
 const app = express();
 const PORT = Number(process.env.PORT || 3000);
+const WEBHOOK_ALLOWED_HOSTS = new Set(
+  String(process.env.WEBHOOK_ALLOWED_HOSTS || "chat-room.eton.vn")
+    .split(",")
+    .map((host) => host.trim().toLowerCase())
+    .filter(Boolean)
+);
 
 // Increase payload limit for base64 camera frames, raw text, and binary images
 app.use(express.json({ limit: "50mb" }));
@@ -19,14 +25,38 @@ app.use(express.raw({ limit: "50mb", type: "image/*" }));
 // Enable CORS and preflight handling for all incoming requests
 app.use((req, res, next) => {
   res.header("Access-Control-Allow-Origin", "*");
-  res.header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
-  res.header("Access-Control-Allow-Headers", "Origin, X-Requested-With, Content-Type, Accept, Authorization");
+  res.header(
+    "Access-Control-Allow-Methods",
+    req.header("Access-Control-Request-Method") || "GET, POST, PUT, PATCH, DELETE, OPTIONS, HEAD"
+  );
+  res.header(
+    "Access-Control-Allow-Headers",
+    req.header("Access-Control-Request-Headers") ||
+      "Origin, X-Requested-With, Content-Type, Accept, Authorization"
+  );
   if (req.method === "OPTIONS") {
     res.sendStatus(204);
     return;
   }
   next();
 });
+
+function getAllowedWebhookUrl(rawUrl: string): URL | null {
+  try {
+    const parsed = new URL(rawUrl);
+    if (parsed.protocol !== "https:") {
+      return null;
+    }
+
+    if (!WEBHOOK_ALLOWED_HOSTS.has(parsed.hostname.toLowerCase())) {
+      return null;
+    }
+
+    return parsed;
+  } catch {
+    return null;
+  }
+}
 
 // Incoming request logger for transparency and debugging
 app.use((req, _res, next) => {
@@ -249,8 +279,8 @@ export interface WebhookLogRecord {
 }
 
 const DEFAULT_WEBHOOK_CONFIG = {
-  enabled: true,
-  url: "https://chat-room.eton.vn/hooks/6aa4dfb6928518a18ba27a13/mguNArZoWHY7AegnWFw7d7TwyfnoT4JZWpmwvxtLmfi7iGuY",
+  enabled: false,
+  url: "https://chat-room.eton.vn/hooks/YOUR_WEBHOOK_TOKEN",
   gateInTitle: "[[CỔNG VÀO]]",
   gateOutTitle: "[[CỔNG RA]]",
   includeEmployeeCode: true,
@@ -276,6 +306,23 @@ async function sendEtonWebhook({
   timestamp?: string;
 }): Promise<WebhookLogRecord | null> {
   if (!webhookConfig.enabled) return null;
+  const safeWebhookUrl = getAllowedWebhookUrl(webhookConfig.url);
+  if (!safeWebhookUrl) {
+    return {
+      id: "WH-" + Date.now() + "-" + Math.floor(Math.random() * 1000),
+      timestamp: new Date().toISOString(),
+      url: webhookConfig.url,
+      method: "POST",
+      payload: {
+        text: "",
+        attachments: [],
+      },
+      success: false,
+      error: "Webhook URL không hợp lệ hoặc không nằm trong danh sách hostname cho phép",
+      scanType,
+      userName,
+    };
+  }
 
   const now = new Date();
   // Formatted date-time in Vietnamese format: DD/MM/YYYY, HH:mm:ss
@@ -314,7 +361,7 @@ async function sendEtonWebhook({
   const logEntry: WebhookLogRecord = {
     id: "WH-" + Date.now() + "-" + Math.floor(Math.random() * 1000),
     timestamp: new Date().toISOString(),
-    url: webhookConfig.url,
+    url: safeWebhookUrl.toString(),
     method: "POST",
     payload,
     success: false,
@@ -326,7 +373,7 @@ async function sendEtonWebhook({
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), 7000);
 
-    const response = await fetch(webhookConfig.url, {
+    const response = await fetch(safeWebhookUrl, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -532,7 +579,17 @@ app.get("/api/webhook/config", (_req, res) => {
 app.post("/api/webhook/config", (req, res) => {
   const { enabled, url, gateInTitle, gateOutTitle, includeEmployeeCode } = req.body;
   if (typeof enabled === "boolean") webhookConfig.enabled = enabled;
-  if (url && typeof url === "string") webhookConfig.url = url.trim();
+  if (url && typeof url === "string") {
+    const safeWebhookUrl = getAllowedWebhookUrl(url.trim());
+    if (!safeWebhookUrl) {
+      res.status(400).json({
+        success: false,
+        error: "Webhook URL phải dùng HTTPS và thuộc hostname được cho phép",
+      });
+      return;
+    }
+    webhookConfig.url = safeWebhookUrl.toString();
+  }
   if (gateInTitle && typeof gateInTitle === "string") webhookConfig.gateInTitle = gateInTitle.trim();
   if (gateOutTitle && typeof gateOutTitle === "string") webhookConfig.gateOutTitle = gateOutTitle.trim();
   if (typeof includeEmployeeCode === "boolean") webhookConfig.includeEmployeeCode = includeEmployeeCode;
