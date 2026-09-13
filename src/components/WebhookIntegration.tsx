@@ -46,8 +46,8 @@ export const WebhookIntegration: React.FC<WebhookIntegrationProps> = ({
   onNewNotification,
 }) => {
   const [config, setConfig] = useState<WebhookConfig>({
-    enabled: true,
-    url: "https://chat-room.eton.vn/hooks/6aa4dfb6928518a18ba27a13/mguNArZoWHY7AegnWFw7d7TwyfnoT4JZWpmwvxtLmfi7iGuY",
+    enabled: false,
+    url: "https://chat-room.eton.vn/hooks/YOUR_WEBHOOK_TOKEN",
     gateInTitle: "[[CỔNG VÀO]]",
     gateOutTitle: "[[CỔNG RA]]",
     includeEmployeeCode: true,
@@ -65,6 +65,7 @@ export const WebhookIntegration: React.FC<WebhookIntegrationProps> = ({
   );
   const [testScanType, setTestScanType] = useState<"ENTRY" | "EXIT">("ENTRY");
   const [saveSuccess, setSaveSuccess] = useState<boolean>(false);
+  const [saveError, setSaveError] = useState<string | null>(null);
   const [copiedPayload, setCopiedPayload] = useState<boolean>(false);
   const [clientTestResult, setClientTestResult] = useState<{
     status: string;
@@ -169,16 +170,23 @@ export const WebhookIntegration: React.FC<WebhookIntegrationProps> = ({
   const handleSaveConfig = async () => {
     saveStoredWebhookConfig(config);
     setSaveSuccess(true);
+    setSaveError(null);
     setTimeout(() => setSaveSuccess(false), 2500);
 
     try {
-      await safeJsonFetch("/api/webhook/config", {
+      const res = await safeJsonFetch("/api/webhook/config", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(config),
       });
+      if (!res.ok) {
+        setSaveSuccess(false);
+        setSaveError(res.error || "Không thể lưu cấu hình webhook");
+      }
     } catch (err) {
       console.warn("Lưu webhook config lên server ngoại tuyến:", err);
+      setSaveSuccess(false);
+      setSaveError("Không thể lưu cấu hình webhook");
     }
   };
 
@@ -600,6 +608,11 @@ export const WebhookIntegration: React.FC<WebhookIntegrationProps> = ({
             </div>
 
             <div className="space-y-4 text-xs">
+              {saveError && (
+                <div className="rounded-xl border border-rose-200 bg-rose-50 px-3 py-2 text-rose-700">
+                  {saveError}
+                </div>
+              )}
               {/* Webhook Enable Toggle */}
               <div className="flex items-center justify-between p-3 bg-slate-50 rounded-xl border border-slate-200">
                 <div>

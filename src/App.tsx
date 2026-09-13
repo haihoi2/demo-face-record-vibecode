@@ -203,7 +203,7 @@ export default function App() {
       }
     });
 
-    // If running on Netlify and no external VITE_API_URL is configured,
+    // If running on Netlify and no external backend base URL is configured,
     // do not flood console with 404s from EventSource("/api/events")
     const isNetlifyWithoutBackend = isNetlifyOrStaticHost() && !getApiBaseUrl();
     if (isNetlifyWithoutBackend) {
@@ -393,13 +393,18 @@ export default function App() {
         }),
       });
       if (!res.ok) {
-        clientDoorUnlock("Bảo Vệ Mở Cửa Khẩn Cấp (Client Fallback)");
+        throw new Error(`Unlock request failed with status ${res.status}`);
       }
       soundEffects.playSuccess();
     } catch (err) {
-      console.warn("Mở cửa qua Client Fallback:", err);
-      clientDoorUnlock("Bảo Vệ Mở Cửa Khẩn Cấp (Client Fallback)");
-      soundEffects.playSuccess();
+      if (isNetlifyOrStaticHost() && !getApiBaseUrl()) {
+        console.warn("Mở cửa qua Client Fallback:", err);
+        clientDoorUnlock("Bảo Vệ Mở Cửa Khẩn Cấp (Client Fallback)");
+        soundEffects.playSuccess();
+      } else {
+        console.warn("Mở cửa khẩn cấp thất bại:", err);
+        soundEffects.playDenied();
+      }
     }
   };
 
@@ -410,7 +415,7 @@ export default function App() {
 
   const handleEmployeeDeleted = async (id: string) => {
     try {
-      await fetch(normalizeApiUrl(`/api/employees/${id}`), { method: "DELETE" });
+      await fetch(normalizeApiUrl(`/api/employees/${encodeURIComponent(id)}`), { method: "DELETE" });
     } catch (err) {
       console.warn("Xóa nhân viên trên máy chủ thất bại, cập nhật local:", err);
     }
@@ -717,7 +722,7 @@ export default function App() {
                   <p className="text-slate-400"># Bước 1: Deploy server.ts lên Render, Railway, Cloud Run hoặc VPS</p>
                   <p className="text-emerald-400">npm run build &amp;&amp; npm start</p>
                   <p className="text-slate-400"># Bước 2: Thiết lập biến môi trường trên Netlify Dashboard:</p>
-                  <p className="text-indigo-300">VITE_API_URL=https://your-express-backend.onrender.com</p>
+                  <p className="text-indigo-300">VITE_API_BASE_URL=https://your-express-backend.onrender.com</p>
                 </div>
               </div>
 

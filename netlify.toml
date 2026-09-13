@@ -1,29 +1,8 @@
 [build]
-  command = "npm run build"
+  command = "npm run build:client"
   publish = "dist"
-
-# =========================================================================
-# Netlify Global CORS Headers: Allow Cross-Origin API & Asset requests
-# =========================================================================
-[[headers]]
-  for = "/*"
-  [headers.values]
-    Access-Control-Allow-Origin = "*"
-    Access-Control-Allow-Methods = "GET, POST, PUT, PATCH, DELETE, OPTIONS, HEAD"
-    Access-Control-Allow-Headers = "*"
-    Access-Control-Expose-Headers = "*"
-
-[[headers]]
-  for = "/api/*"
-  [headers.values]
-    Access-Control-Allow-Origin = "*"
-    Access-Control-Allow-Methods = "GET, POST, PUT, PATCH, DELETE, OPTIONS, HEAD"
-    Access-Control-Allow-Headers = "*"
-    Access-Control-Expose-Headers = "*"
-
-# Client-side SPA routing fallback
+ 
 [[redirects]]
   from = "/*"
   to = "/index.html"
   status = 200
-

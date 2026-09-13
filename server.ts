@@ -12,46 +12,79 @@ import { clusterStrangerFaces } from "./src/server/strangers";
 dotenv.config();
 
 const app = express();
-const PORT = 3000;
+const PORT = Number(process.env.PORT || 3000);
+const ETON_WEBHOOK_HOSTNAME = "chat-room.eton.vn";
+const ETON_WEBHOOK_URL =
+  process.env.ETON_WEBHOOK_URL?.trim() ||
+  `https://${ETON_WEBHOOK_HOSTNAME}/hooks/YOUR_WEBHOOK_TOKEN`;
+const TRUSTED_CORS_ORIGINS = new Set(
+  [
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+    "http://localhost:4173",
+    "http://127.0.0.1:4173",
+    process.env.APP_URL,
+    process.env.FRONTEND_APP_URL,
+    ...(process.env.CORS_ALLOWED_ORIGINS || "").split(","),
+  ]
+    .map((origin) => origin?.trim())
+    .filter((origin): origin is string => Boolean(origin))
+);
 
-// =========================================================================
-// 1. BULLETPROOF CORS & PREFLIGHT MIDDLEWARE (MUST BE VERY FIRST)
-// Fully compatible with Netlify, Vercel, Localhost, and any external client.
-// =========================================================================
+// Enable CORS and preflight handling for all incoming requests
 app.use((req, res, next) => {
-  const origin = req.headers.origin;
-  if (origin) {
-    res.setHeader("Access-Control-Allow-Origin", origin);
-  } else {
-    res.setHeader("Access-Control-Allow-Origin", "*");
+  const requestOrigin = req.header("Origin");
+  if (requestOrigin && TRUSTED_CORS_ORIGINS.has(requestOrigin)) {
+    res.header("Access-Control-Allow-Origin", requestOrigin);
+    res.header("Vary", "Origin");
   }
-
-  res.setHeader("Access-Control-Allow-Credentials", "true");
-  res.setHeader(
+  res.header(
     "Access-Control-Allow-Methods",
-    "GET, POST, PUT, PATCH, DELETE, OPTIONS, HEAD"
+    req.header("Access-Control-Request-Method") || "GET, POST, PUT, PATCH, DELETE, OPTIONS, HEAD"
   );
-
-  const reqHeaders = req.headers["access-control-request-headers"];
-  if (reqHeaders) {
-    res.setHeader("Access-Control-Allow-Headers", reqHeaders);
-  } else {
-    res.setHeader(
-      "Access-Control-Allow-Headers",
-      "Origin, X-Requested-With, Content-Type, Accept, Authorization, Range, Cache-Control, Pragma, Baggage, Sentry-Trace, Sec-Ch-Ua, Sec-Ch-Ua-Mobile, Sec-Ch-Ua-Platform"
-    );
-  }
-
-  res.setHeader("Access-Control-Expose-Headers", "*");
-  res.setHeader("Access-Control-Max-Age", "86400");
-
-  // Handle all OPTIONS preflight requests immediately
+  res.header(
+    "Access-Control-Allow-Headers",
+    req.header("Access-Control-Request-Headers") ||
+      "Origin, X-Requested-With, Content-Type, Accept, Authorization"
+  );
   if (req.method === "OPTIONS") {
-    res.status(204).end();
+    if (requestOrigin && !TRUSTED_CORS_ORIGINS.has(requestOrigin)) {
+      res.sendStatus(403);
+      return;
+    }
+    res.sendStatus(204);
     return;
   }
   next();
 });
+
+function getAllowedWebhookPath(rawUrl: string): string | null {
+  try {
+    const parsed = new URL(rawUrl);
+    if (parsed.protocol !== "https:") {
+      return null;
+    }
+
+    if (parsed.hostname.toLowerCase() !== ETON_WEBHOOK_HOSTNAME) {
+      return null;
+    }
+
+    if (parsed.username || parsed.password || !parsed.pathname.startsWith("/hooks/")) {
+      return null;
+    }
+
+    return `${parsed.pathname}${parsed.search}`;
+  } catch {
+    return null;
+  }
+}
+
+function getConfiguredServerWebhookUrl(): string | null {
+  const safeWebhookPath = getAllowedWebhookPath(ETON_WEBHOOK_URL);
+  return safeWebhookPath ? `https://${ETON_WEBHOOK_HOSTNAME}${safeWebhookPath}` : null;
+}
 
 // Explicit OPTIONS preflight route handler for all paths
 app.options("*", (_req, res) => {
@@ -63,7 +96,6 @@ app.use(express.json({ limit: "50mb" }));
 app.use(express.urlencoded({ extended: true, limit: "50mb" }));
 app.use(express.text({ limit: "50mb", type: ["text/*", "application/octet-stream"] }));
 app.use(express.raw({ limit: "50mb", type: "image/*" }));
-
 // Incoming request logger for transparency and debugging
 app.use((req, _res, next) => {
   if (
@@ -285,8 +317,8 @@ export interface WebhookLogRecord {
 }
 
 const DEFAULT_WEBHOOK_CONFIG = {
-  enabled: true,
-  url: "https://chat-room.eton.vn/hooks/6aa4dfb6928518a18ba27a13/mguNArZoWHY7AegnWFw7d7TwyfnoT4JZWpmwvxtLmfi7iGuY",
+  enabled: false,
+  url: getConfiguredServerWebhookUrl() || `https://${ETON_WEBHOOK_HOSTNAME}/hooks/YOUR_WEBHOOK_TOKEN`,
   gateInTitle: "[[CỔNG VÀO]]",
   gateOutTitle: "[[CỔNG RA]]",
   includeEmployeeCode: true,
@@ -298,6 +330,7 @@ let accessLogs: AccessLogRecord[] = db.getAccessLogs(DEFAULT_ACCESS_LOGS);
 let mobileNotifications: MobileNotificationRecord[] = db.getNotifications(DEFAULT_NOTIFICATIONS);
 let smartLockState = db.getSmartLockState(DEFAULT_SMART_LOCK_STATE);
 let webhookConfig = db.getWebhookConfig(DEFAULT_WEBHOOK_CONFIG);
+webhookConfig.url = getConfiguredServerWebhookUrl() || DEFAULT_WEBHOOK_CONFIG.url;
 let webhookLogs: WebhookLogRecord[] = db.getWebhookLogs();
 
 // Listen to Postgres sync events to refresh memory models
@@ -323,6 +356,23 @@ async function sendEtonWebhook({
   timestamp?: string;
 }): Promise<WebhookLogRecord | null> {
   if (!webhookConfig.enabled) return null;
+  const safeWebhookUrl = getConfiguredServerWebhookUrl();
+  if (!safeWebhookUrl) {
+    return {
+      id: "WH-" + Date.now() + "-" + Math.floor(Math.random() * 1000),
+      timestamp: new Date().toISOString(),
+      url: webhookConfig.url,
+      method: "POST",
+      payload: {
+        text: "",
+        attachments: [],
+      },
+      success: false,
+      error: "Webhook URL không hợp lệ hoặc không nằm trong danh sách hostname cho phép",
+      scanType,
+      userName,
+    };
+  }
 
   const now = new Date();
   // Formatted date-time in Vietnamese format: DD/MM/YYYY, HH:mm:ss
@@ -361,7 +411,7 @@ async function sendEtonWebhook({
   const logEntry: WebhookLogRecord = {
     id: "WH-" + Date.now() + "-" + Math.floor(Math.random() * 1000),
     timestamp: new Date().toISOString(),
-    url: webhookConfig.url,
+    url: safeWebhookUrl,
     method: "POST",
     payload,
     success: false,
@@ -373,7 +423,7 @@ async function sendEtonWebhook({
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), 7000);
 
-    const response = await fetch(webhookConfig.url, {
+    const response = await fetch(safeWebhookUrl, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -608,7 +658,17 @@ app.post(WEBHOOK_CONFIG_ROUTES, (req, res) => {
   const body = req.body || {};
   const { enabled, url, gateInTitle, gateOutTitle, includeEmployeeCode } = body;
   if (typeof enabled === "boolean") webhookConfig.enabled = enabled;
-  if (url && typeof url === "string") webhookConfig.url = url.trim();
+  if (url && typeof url === "string") {
+    const currentServerWebhookUrl = getConfiguredServerWebhookUrl();
+    if (!currentServerWebhookUrl || url.trim() !== currentServerWebhookUrl) {
+      res.status(400).json({
+        success: false,
+        error: "Webhook URL phía server được khóa qua biến môi trường ETON_WEBHOOK_URL và phải dùng host chat-room.eton.vn",
+      });
+      return;
+    }
+    webhookConfig.url = currentServerWebhookUrl;
+  }
   if (gateInTitle && typeof gateInTitle === "string") webhookConfig.gateInTitle = gateInTitle.trim();
   if (gateOutTitle && typeof gateOutTitle === "string") webhookConfig.gateOutTitle = gateOutTitle.trim();
   if (typeof includeEmployeeCode === "boolean") webhookConfig.includeEmployeeCode = includeEmployeeCode;
@@ -1569,17 +1629,20 @@ app.post(RECOGNIZE_FACE_ROUTES, async (req, res) => {
     const ai = getGeminiClient();
     if (detectedFaces.length === 0 && base64Data && ai && employees.length > 0 && activeEngineMode !== "LOCAL_BIOMETRIC") {
       const employeeProfilesSummary = employees
+        .slice(0, 25)
         .map(
           (e, i) =>
             `[${i + 1}] ID: "${e.id}", Code: "${e.employeeCode}", Name: "${e.name}", Department: "${e.department}"`
         )
         .join("\n");
+      const omittedEmployeeCount = Math.max(0, employees.length - 25);
 
       const prompt = `Bạn là hệ thống AI đa mục tiêu siêu tốc (Multi-Face High-Speed Access Control).
 Nhiệm vụ: Phát hiện và nhận diện TẤT CẢ các khuôn mặt người xuất hiện trong TOÀN BỘ khung hình này (không giới hạn vị trí hay số lượng người).
 
 Danh sách nhân viên hợp lệ đã đăng ký trong hệ thống:
 ${employeeProfilesSummary}
+${omittedEmployeeCount > 0 ? `\nCòn ${omittedEmployeeCount} nhân viên khác không liệt kê đầy đủ; chỉ kết luận khớp khi thực sự chắc chắn.` : ""}
 
 Yêu cầu phân tích:
 1. Quét toàn bộ khung hình, tìm tất cả các khuôn mặt.

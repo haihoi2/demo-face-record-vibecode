@@ -18,8 +18,8 @@ import {
 } from "lucide-react";
 import { MobileNotification, SmartLockState } from "../types";
 import { soundEffects } from "../utils/audio";
-import { normalizeApiUrl } from "../utils/api";
-import { clientDoorUnlock } from "../utils/offlineEngine";
+import { normalizeApiUrl, getApiBaseUrl } from "../utils/api";
+import { clientDoorUnlock, isNetlifyOrStaticHost } from "../utils/offlineEngine";
 
 interface MobileCompanionProps {
   notifications: MobileNotification[];
@@ -38,6 +38,7 @@ export const MobileCompanion: React.FC<MobileCompanionProps> = ({
 }) => {
   const [filter, setFilter] = useState<"ALL" | "SUCCESS" | "WARNING">("ALL");
   const [isUnlocking, setIsUnlocking] = useState<boolean>(false);
+  const shouldUseClientFallback = isNetlifyOrStaticHost() && !getApiBaseUrl();
 
   const filteredNotifications = notifications.filter((notif) => {
     if (filter === "SUCCESS") return notif.type === "SUCCESS";
@@ -58,13 +59,18 @@ export const MobileCompanion: React.FC<MobileCompanionProps> = ({
         }),
       });
       if (!res.ok) {
-        clientDoorUnlock("Ứng Dụng Di Động (Client Fallback)");
+        throw new Error(`Unlock request failed with status ${res.status}`);
       }
       soundEffects.playSuccess();
     } catch (err) {
-      console.warn("Mở cửa qua Client Fallback:", err);
-      clientDoorUnlock("Ứng Dụng Di Động (Client Fallback)");
-      soundEffects.playSuccess();
+      if (shouldUseClientFallback) {
+        console.warn("Mở cửa qua Client Fallback:", err);
+        clientDoorUnlock("Ứng Dụng Di Động (Client Fallback)");
+        soundEffects.playSuccess();
+      } else {
+        console.warn("Mở cửa từ xa thất bại:", err);
+        soundEffects.playDenied();
+      }
     } finally {
       setIsUnlocking(false);
     }

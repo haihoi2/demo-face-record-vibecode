@@ -98,26 +98,24 @@ export function setCustomBackendUrl(url: string): void {
  * to private development sandbox containers (which cause CORS net::ERR_INVALID_REDIRECT).
  */
 export function getApiBaseUrl(): string {
-  // 1. Custom URL configured by user
   const custom = getCustomBackendUrl();
   if (custom) {
     return custom;
   }
 
-  // 2. VITE_API_URL environment variable
-  const envUrl = (((import.meta as any).env?.VITE_API_URL as string) || "").trim();
+  const env = (import.meta as any).env || {};
+  const envUrl = String(env.VITE_API_BASE_URL || env.VITE_API_URL || "").trim();
   if (envUrl) {
     return envUrl.replace(/\/+$/, "");
   }
 
-  // 3. Default to relative path (same-origin)
   return "";
 }
 
 /**
  * Normalizes API endpoint URLs ensuring correct leading slash and structure,
  * preventing relative path 404s when navigating or querying.
- * Prepends VITE_API_URL if configured.
+ * Prepends the configured external API base URL if present.
  */
 export function normalizeApiUrl(rawUrl: string): string {
   if (!rawUrl) return "/api/health";
@@ -133,6 +131,17 @@ export function normalizeApiUrl(rawUrl: string): string {
 
   const base = getApiBaseUrl();
   return base ? `${base}${path}` : path;
+}
+
+export function buildEventSourceUrl(rawUrl: string): string {
+  return normalizeApiUrl(rawUrl);
+}
+
+export async function apiFetch(
+  url: string,
+  options?: RequestInit
+): Promise<Response> {
+  return fetch(normalizeApiUrl(url), options);
 }
 
 export async function safeJsonFetch<T = any>(

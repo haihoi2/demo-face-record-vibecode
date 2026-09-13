@@ -234,8 +234,8 @@ const STORAGE_KEY_WEBHOOK_CONFIG = "smartlock_offline_webhook_config_v2";
 const STORAGE_KEY_WEBHOOK_LOGS = "smartlock_offline_webhook_logs_v2";
 
 export const DEFAULT_OFFLINE_WEBHOOK_CONFIG: WebhookConfig = {
-  enabled: true,
-  url: "https://chat-room.eton.vn/hooks/6aa4dfb6928518a18ba27a13/mguNArZoWHY7AegnWFw7d7TwyfnoT4JZWpmwvxtLmfi7iGuY",
+  enabled: false,
+  url: "https://chat-room.eton.vn/hooks/YOUR_WEBHOOK_TOKEN",
   gateInTitle: "[[CỔNG VÀO]]",
   gateOutTitle: "[[CỔNG RA]]",
   includeEmployeeCode: true,

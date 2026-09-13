@@ -15,8 +15,8 @@ import {
 } from "lucide-react";
 import { SmartLockState } from "../types";
 import { soundEffects } from "../utils/audio";
-import { normalizeApiUrl } from "../utils/api";
-import { clientDoorUnlock, clientDoorLock } from "../utils/offlineEngine";
+import { normalizeApiUrl, getApiBaseUrl } from "../utils/api";
+import { clientDoorUnlock, clientDoorLock, isNetlifyOrStaticHost } from "../utils/offlineEngine";
 
 interface SmartLockCardProps {
   lockState: SmartLockState;
@@ -29,6 +29,7 @@ export const SmartLockCard: React.FC<SmartLockCardProps> = ({
 }) => {
   const [copiedIndex, setCopiedIndex] = useState<number | null>(null);
   const [isTriggering, setIsTriggering] = useState<boolean>(false);
+  const shouldUseClientFallback = isNetlifyOrStaticHost() && !getApiBaseUrl();
 
   const handleManualUnlock = async () => {
     setIsTriggering(true);
@@ -43,13 +44,18 @@ export const SmartLockCard: React.FC<SmartLockCardProps> = ({
         }),
       });
       if (!res.ok) {
-        clientDoorUnlock("Bảng Điều Khiển Khóa (Client Fallback)");
+        throw new Error(`Unlock request failed with status ${res.status}`);
       }
       soundEffects.playSuccess();
     } catch (err) {
-      console.warn("Mở khóa qua Client Fallback:", err);
-      clientDoorUnlock("Bảng Điều Khiển Khóa (Client Fallback)");
-      soundEffects.playSuccess();
+      if (shouldUseClientFallback) {
+        console.warn("Mở khóa qua Client Fallback:", err);
+        clientDoorUnlock("Bảng Điều Khiển Khóa (Client Fallback)");
+        soundEffects.playSuccess();
+      } else {
+        console.warn("Mở khóa cửa thất bại:", err);
+        soundEffects.playDenied();
+      }
     } finally {
       setIsTriggering(false);
     }
@@ -67,11 +73,16 @@ export const SmartLockCard: React.FC<SmartLockCardProps> = ({
         }),
       });
       if (!res.ok) {
-        clientDoorLock("Bảng Điều Khiển Khóa (Client Fallback)");
+        throw new Error(`Lock request failed with status ${res.status}`);
       }
     } catch (err) {
-      console.warn("Khóa cửa qua Client Fallback:", err);
-      clientDoorLock("Bảng Điều Khiển Khóa (Client Fallback)");
+      if (shouldUseClientFallback) {
+        console.warn("Khóa cửa qua Client Fallback:", err);
+        clientDoorLock("Bảng Điều Khiển Khóa (Client Fallback)");
+      } else {
+        console.warn("Khóa cửa thất bại:", err);
+        soundEffects.playDenied();
+      }
     } finally {
       setIsTriggering(false);
     }

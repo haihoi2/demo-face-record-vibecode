@@ -19,7 +19,7 @@ function getDatabaseSyncClass(): any {
 }
 
 // Ensure data directory exists
-const DATA_DIR = path.join(process.cwd(), "data");
+const DATA_DIR = path.resolve(process.env.DATA_DIR || path.join(process.cwd(), "data"));
 if (!fs.existsSync(DATA_DIR)) {
   fs.mkdirSync(DATA_DIR, { recursive: true });
 }
@@ -332,8 +332,8 @@ class SQLiteStorage {
       const hookCount = parseInt(hookCountRes.rows[0]?.count || "0", 10);
       if (hookCount === 0) {
         const currentHook = this.getWebhookConfig({
-          enabled: true,
-          url: "https://chat-room.eton.vn/hooks/6aa4dfb6928518a18ba27a13/mguNArZoWHY7AegnWFw7d7TwyfnoT4JZWpmwvxtLmfi7iGuY",
+          enabled: false,
+          url: "https://chat-room.eton.vn/hooks/YOUR_WEBHOOK_TOKEN",
           gateInTitle: "[[CỔNG VÀO]]",
           gateOutTitle: "[[CỔNG RA]]",
           includeEmployeeCode: true,
