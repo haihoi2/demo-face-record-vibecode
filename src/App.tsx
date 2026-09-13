@@ -7,6 +7,7 @@ import { AccessLogs } from "./components/AccessLogs";
 import { MobileCompanion } from "./components/MobileCompanion";
 import { WebhookIntegration } from "./components/WebhookIntegration";
 import { AiConfigPage } from "./components/AiConfigPage";
+import { StrangerClusterModal } from "./components/StrangerClusterModal";
 import {
   Employee,
   AccessLog,
@@ -58,6 +59,13 @@ export default function App() {
   const [copiedCode, setCopiedCode] = useState<string | null>(null);
   const [customBackendInput, setCustomBackendInput] = useState<string>(getCustomBackendUrl());
   const [pingStatus, setPingStatus] = useState<{ testing: boolean; success?: boolean; message?: string } | null>(null);
+  const [isStrangerModalOpen, setIsStrangerModalOpen] = useState<boolean>(false);
+  const [preselectedStrangerPhoto, setPreselectedStrangerPhoto] = useState<string | null>(null);
+
+  const handleOpenStrangerModal = (photo?: string) => {
+    setPreselectedStrangerPhoto(photo || null);
+    setIsStrangerModalOpen(true);
+  };
 
   const handleSaveBackendUrl = (url: string) => {
     setCustomBackendUrl(url);
@@ -291,6 +299,28 @@ export default function App() {
           } catch {}
         });
 
+        // Stranger Detected Event (Real-time warning & snapshot capture)
+        eventSource.addEventListener("stranger_detected", (e: MessageEvent) => {
+          try {
+            const data = JSON.parse(e.data);
+            if (data.log) {
+              setAccessLogs((prev) => [data.log, ...prev.filter((l) => l.id !== data.log.id)]);
+            }
+            soundEffects.playStrangerAlert();
+            setLatestToast({
+              id: `NOTIF-STRANGER-${Date.now()}`,
+              timestamp: new Date().toISOString(),
+              type: "ALERT",
+              title: "🚨 CẢNH BÁO: PHÁT HIỆN NGƯỜI LẠ CHỤP HÌNH",
+              body: data.message || "Phát hiện khuôn mặt người lạ tại cửa. Hệ thống đã lưu hình an ninh.",
+              priority: "HIGH",
+              read: false,
+              photoSnapshot: data.photoSnapshot || data.log?.photoSnapshot,
+            });
+            setTimeout(() => setLatestToast(null), 6000);
+          } catch {}
+        });
+
         // Employee Registered
         eventSource.addEventListener("employee_registered", (e: MessageEvent) => {
           try {
@@ -435,6 +465,8 @@ export default function App() {
         lockState={lockState}
         unreadCount={unreadNotificationsCount}
         sseConnected={sseConnected}
+        onOpenStrangers={() => handleOpenStrangerModal()}
+        strangerCount={accessLogs.filter((l) => l.status === "DENIED" || !l.employeeId).length || 2}
       />
 
       {/* Main Content Area */}
@@ -481,6 +513,7 @@ export default function App() {
               lockState={lockState}
               onRecognitionComplete={handleRecognitionComplete}
               onTriggerManualUnlock={handleManualUnlock}
+              onOpenStrangerClusters={(photo) => handleOpenStrangerModal(photo)}
             />
 
             {/* Smart Lock Hardware & API Section */}
@@ -497,6 +530,7 @@ export default function App() {
             onEmployeeAdded={(emp) => setEmployees((prev) => [emp, ...prev])}
             onEmployeeDeleted={handleEmployeeDeleted}
             onTestEmployee={handleTestEmployee}
+            onOpenStrangerClusters={() => handleOpenStrangerModal()}
           />
         )}
 
@@ -504,6 +538,7 @@ export default function App() {
           <AccessLogs
             logs={accessLogs}
             onClearLogs={handleClearLogs}
+            onOpenStrangerClusters={(photo) => handleOpenStrangerModal(photo)}
           />
         )}
 
@@ -535,6 +570,22 @@ export default function App() {
           />
         )}
       </main>
+
+      {/* Stranger Cluster Management & Quick Registration Modal */}
+      <StrangerClusterModal
+        isOpen={isStrangerModalOpen}
+        onClose={() => {
+          setIsStrangerModalOpen(false);
+          setPreselectedStrangerPhoto(null);
+        }}
+        initialPreselectedPhoto={preselectedStrangerPhoto}
+        onEmployeeAdded={(emp) => {
+          setEmployees((prev) => [emp, ...prev.filter((e) => e.id !== emp.id)]);
+        }}
+        onLogsUpdated={() => {
+          fetchData();
+        }}
+      />
 
       {/* Deployment & Backend Connection Guide Modal */}
       {showDeploymentGuide && (

@@ -11,6 +11,7 @@ import {
   ShieldCheck,
   Send,
   Sliders,
+  UserX,
 } from "lucide-react";
 import { SmartLockState } from "../types";
 
@@ -20,6 +21,8 @@ interface NavbarProps {
   lockState: SmartLockState;
   unreadCount: number;
   sseConnected: boolean;
+  onOpenStrangers?: () => void;
+  strangerCount?: number;
 }
 
 export const Navbar: React.FC<NavbarProps> = ({
@@ -28,6 +31,8 @@ export const Navbar: React.FC<NavbarProps> = ({
   lockState,
   unreadCount,
   sseConnected,
+  onOpenStrangers,
+  strangerCount,
 }) => {
   const [currentTime, setCurrentTime] = useState<string>("");
 
@@ -159,7 +164,23 @@ export const Navbar: React.FC<NavbarProps> = ({
           </nav>
 
           {/* Real-time status & Door lock widget badge */}
-          <div className="flex items-center gap-3">
+          <div className="flex items-center gap-2 sm:gap-3">
+            {/* Quick Stranger Clusters Button */}
+            {onOpenStrangers && (
+              <button
+                id="nav-btn-strangers"
+                onClick={onOpenStrangers}
+                className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-semibold bg-amber-50 text-amber-900 border border-amber-300 hover:bg-amber-100 transition-colors shadow-2xs cursor-pointer"
+                title="Quản lý cụm ảnh người lạ và khai báo nhanh nhân viên"
+              >
+                <UserX className="w-3.5 h-3.5 text-amber-600 shrink-0" />
+                <span className="hidden sm:inline">Cụm Người Lạ</span>
+                <span className="px-1.5 py-0.2 rounded-full bg-amber-600 text-white font-mono text-[10px] font-bold">
+                  {strangerCount !== undefined ? strangerCount : 2}
+                </span>
+              </button>
+            )}
+
             {/* Live Clock */}
             <div className="hidden lg:flex items-center gap-1.5 text-xs font-mono text-slate-500 bg-slate-50 px-2.5 py-1.5 rounded-lg border border-slate-200">
               <Clock className="w-3.5 h-3.5 text-slate-400" />

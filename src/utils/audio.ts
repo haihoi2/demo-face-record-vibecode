@@ -15,6 +15,37 @@ class SoundEffects {
     }
   }
 
+  // Urgent oscillating two-tone security alarm for stranger detected
+  playStrangerAlert() {
+    try {
+      this.initCtx();
+      if (!this.ctx) return;
+
+      const now = this.ctx.currentTime;
+      const osc = this.ctx.createOscillator();
+      const gain = this.ctx.createGain();
+
+      osc.type = "sawtooth";
+      // Oscillate between 780Hz and 520Hz in rapid alert pulses
+      osc.frequency.setValueAtTime(820, now);
+      osc.frequency.setValueAtTime(560, now + 0.12);
+      osc.frequency.setValueAtTime(820, now + 0.24);
+      osc.frequency.setValueAtTime(560, now + 0.36);
+      osc.frequency.setValueAtTime(820, now + 0.48);
+
+      gain.gain.setValueAtTime(0.25, now);
+      gain.gain.exponentialRampToValueAtTime(0.01, now + 0.65);
+
+      osc.connect(gain);
+      gain.connect(this.ctx.destination);
+
+      osc.start(now);
+      osc.stop(now + 0.65);
+    } catch {
+      // Audio autoplay policy fallback
+    }
+  }
+
   // Two pleasant rising harmonic tones for access granted
   playSuccess() {
     try {

@@ -1,6 +1,6 @@
 {
   "name": "Hệ Thống Mở Cửa Khuôn Mặt AI & Khóa Thông Minh",
-  "description": "Hệ thống nhận diện khuôn mặt nhân viên đa mục tiêu với tùy chọn Google Cloud AI (Gemini Vision) và Mô hình Sinh trắc học Cục bộ SOTA (ArcFace 512-D & BlazeFace V2), tự động mở khóa cửa thông minh, gửi Webhook thời gian thực và ghi log chấm công.",
+  "description": "Hệ thống nhận diện khuôn mặt nhân viên AI với cảnh báo an ninh người lạ chụp hình, phân cụm khuôn mặt tương đồng để khai báo nhanh nhân viên, tự động mở khóa cửa thông minh, gửi Webhook thời gian thực và ghi log chấm công.",
   "requestFramePermissions": ["camera"],
   "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
 }

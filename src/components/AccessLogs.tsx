@@ -17,6 +17,8 @@ import {
   BarChart3,
   ChevronDown,
   ChevronUp,
+  UserX,
+  UserPlus,
 } from "lucide-react";
 import { AccessLog } from "../types";
 import { EntryPatternAnalytics } from "./EntryPatternAnalytics";
@@ -24,11 +26,13 @@ import { EntryPatternAnalytics } from "./EntryPatternAnalytics";
 interface AccessLogsProps {
   logs: AccessLog[];
   onClearLogs: () => void;
+  onOpenStrangerClusters?: (preselectedPhoto?: string) => void;
 }
 
 export const AccessLogs: React.FC<AccessLogsProps> = ({
   logs,
   onClearLogs,
+  onOpenStrangerClusters,
 }) => {
   const [searchTerm, setSearchTerm] = useState<string>("");
   const [statusFilter, setStatusFilter] = useState<"ALL" | "GRANTED" | "DENIED">("ALL");
@@ -247,6 +251,18 @@ export const AccessLogs: React.FC<AccessLogsProps> = ({
             </button>
           </div>
 
+          {/* Stranger Clusters Action Button */}
+          {onOpenStrangerClusters && (
+            <button
+              id="btn-open-strangers-from-logs"
+              onClick={() => onOpenStrangerClusters()}
+              className="px-3 py-1.5 bg-amber-50 hover:bg-amber-100 text-amber-900 border border-amber-300 rounded-xl text-xs font-bold flex items-center gap-1.5 transition cursor-pointer shadow-2xs"
+            >
+              <UserX className="w-3.5 h-3.5 text-amber-600 shrink-0" />
+              <span>Cụm Người Lạ ({deniedCount})</span>
+            </button>
+          )}
+
           {/* Export CSV */}
           <button
             id="btn-export-csv"
@@ -339,9 +355,22 @@ export const AccessLogs: React.FC<AccessLogsProps> = ({
                             </div>
                           </div>
                         ) : (
-                          <span className="inline-flex items-center gap-1 text-rose-600 font-semibold">
-                            <XCircle className="w-3.5 h-3.5" /> Không xác định
-                          </span>
+                          <div>
+                            <span className="inline-flex items-center gap-1 text-rose-600 font-semibold">
+                              <XCircle className="w-3.5 h-3.5" /> Người lạ chưa đăng ký
+                            </span>
+                            {onOpenStrangerClusters && (
+                              <button
+                                id={`btn-quick-reg-log-${log.id}`}
+                                onClick={() => onOpenStrangerClusters(log.photoSnapshot)}
+                                className="mt-1 inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-gradient-to-r from-amber-500 to-rose-500 hover:from-amber-600 hover:to-rose-600 text-white text-[10px] font-bold shadow-2xs transition cursor-pointer"
+                                title="Khai báo nhanh người lạ này thành nhân viên"
+                              >
+                                <UserPlus className="w-2.5 h-2.5" />
+                                <span>Khai Báo NV</span>
+                              </button>
+                            )}
+                          </div>
                         )}
                       </td>
 

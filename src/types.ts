@@ -28,6 +28,41 @@ export interface AccessLog {
   reason?: string;
 }
 
+export interface StrangerPhoto {
+  logId: string;
+  photoSnapshot: string;
+  timestamp: string;
+  confidence: number;
+  doorName: string;
+  reason?: string;
+  faceEmbeddingHash?: string;
+}
+
+export interface StrangerCluster {
+  clusterId: string;
+  label: string;
+  photos: StrangerPhoto[];
+  firstSeen: string;
+  lastSeen: string;
+  totalSightings: number;
+  primaryPhoto: string;
+  estimatedGender?: string;
+  similarityScore: number;
+  suggestedName?: string;
+  notes?: string;
+}
+
+export interface QuickRegisterStrangerPayload {
+  name: string;
+  employeeCode: string;
+  department: string;
+  position: string;
+  accessLevel: 'ALL_ACCESS' | 'OFFICE_HOURS' | 'RESTRICTED';
+  photoUrl: string;
+  clusterLogIds: string[];
+  retroUpdateLogs?: boolean;
+}
+
 export interface SmartLockState {
   lockId: string;
   doorName: string;

@@ -7,6 +7,7 @@ import { GoogleGenAI, Type } from "@google/genai";
 import dotenv from "dotenv";
 import { db } from "./src/server/db";
 import { runLocalFaceRecognition } from "./src/utils/localBiometrics";
+import { clusterStrangerFaces } from "./src/server/strangers";
 
 dotenv.config();
 
@@ -291,13 +292,24 @@ const DEFAULT_WEBHOOK_CONFIG = {
   includeEmployeeCode: true,
 };
 
-// Persistent instances loaded from SQLite database
+// Persistent instances loaded from database (PostgreSQL / SQLite)
 let employees: EmployeeRecord[] = db.getEmployees(DEFAULT_EMPLOYEES);
 let accessLogs: AccessLogRecord[] = db.getAccessLogs(DEFAULT_ACCESS_LOGS);
 let mobileNotifications: MobileNotificationRecord[] = db.getNotifications(DEFAULT_NOTIFICATIONS);
 let smartLockState = db.getSmartLockState(DEFAULT_SMART_LOCK_STATE);
 let webhookConfig = db.getWebhookConfig(DEFAULT_WEBHOOK_CONFIG);
 let webhookLogs: WebhookLogRecord[] = db.getWebhookLogs();
+
+// Listen to Postgres sync events to refresh memory models
+db.onSync(() => {
+  employees = db.getEmployees(DEFAULT_EMPLOYEES);
+  accessLogs = db.getAccessLogs(DEFAULT_ACCESS_LOGS);
+  mobileNotifications = db.getNotifications(DEFAULT_NOTIFICATIONS);
+  smartLockState = db.getSmartLockState(DEFAULT_SMART_LOCK_STATE);
+  webhookConfig = db.getWebhookConfig(DEFAULT_WEBHOOK_CONFIG);
+  webhookLogs = db.getWebhookLogs();
+  console.log(`[Server] Bộ nhớ In-Memory đã tự động đồng bộ từ PostgreSQL: ${employees.length} NV, ${accessLogs.length} logs, ${mobileNotifications.length} thông báo.`);
+});
 
 async function sendEtonWebhook({
   userName,
@@ -1145,6 +1157,115 @@ app.post(["/api/notifications/mark-read", "/notifications/mark-read"], (_req, re
   res.json({ success: true });
 });
 
+// --- Stranger Face Alerts & Clustered Face Quick Registration ---
+app.get(["/api/strangers/clusters", "/api/strangers", "/api/strangers/"], (_req, res) => {
+  try {
+    const clusters = clusterStrangerFaces(accessLogs);
+    const deniedLogsCount = accessLogs.filter(
+      (l) => l.status === "DENIED" || !l.employeeId || l.employeeName === "Không xác định"
+    ).length;
+
+    res.json({
+      success: true,
+      clusters,
+      totalUnregisteredLogs: deniedLogsCount,
+      totalClusters: clusters.length,
+    });
+  } catch (err: any) {
+    console.error("[Strangers] Lỗi gom cụm ảnh khuôn mặt người lạ:", err);
+    res.status(500).json({ success: false, error: err?.message || "Lỗi xử lý phân cụm ảnh người lạ" });
+  }
+});
+
+app.post(["/api/strangers/quick-register", "/api/strangers/register"], (req, res) => {
+  try {
+    const {
+      name,
+      employeeCode,
+      department,
+      position,
+      accessLevel = "ALL_ACCESS",
+      photoUrl,
+      clusterLogIds = [],
+      retroUpdateLogs = true,
+    } = req.body;
+
+    if (!name || !name.trim()) {
+      res.status(400).json({ success: false, error: "Họ và tên nhân viên không được để trống" });
+      return;
+    }
+
+    const newEmpId = "EMP-" + Math.floor(1000 + Math.random() * 9000);
+    const autoCode = employeeCode?.trim() || `NV-${Math.floor(1000 + Math.random() * 9000)}`;
+
+    const newEmployee: EmployeeRecord = {
+      id: newEmpId,
+      name: name.trim(),
+      employeeCode: autoCode,
+      department: department?.trim() || "Phòng Kỹ Thuật AI",
+      position: position?.trim() || "Nhân viên mới",
+      photoUrl: photoUrl || "https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=400",
+      registeredAt: new Date().toISOString(),
+      accessLevel,
+    };
+
+    employees.unshift(newEmployee);
+    db.saveEmployee(newEmployee);
+
+    let updatedLogsCount = 0;
+    if (retroUpdateLogs && Array.isArray(clusterLogIds) && clusterLogIds.length > 0) {
+      for (const logId of clusterLogIds) {
+        const log = accessLogs.find((l) => l.id === logId);
+        if (log) {
+          log.status = "GRANTED";
+          log.employeeId = newEmployee.id;
+          log.employeeName = newEmployee.name;
+          log.employeeCode = newEmployee.employeeCode;
+          log.department = newEmployee.department;
+          log.reason = `Đã khai báo nhanh từ cụm ảnh người lạ (Xác thực hợp lệ)`;
+          log.lockAction = "Mở chốt tự động qua API";
+          log.confidence = 96;
+          db.saveAccessLog(log);
+          updatedLogsCount++;
+        }
+      }
+    }
+
+    const notif: MobileNotificationRecord = {
+      id: "NOTIF-" + Date.now(),
+      title: "Khai báo nhân viên thành công",
+      body: `Đã chuyển đổi cụm ảnh người lạ thành nhân viên: ${newEmployee.name} (${newEmployee.employeeCode}). Khóa cửa giờ đây sẽ nhận diện mở tự động.`,
+      timestamp: new Date().toISOString(),
+      type: "SUCCESS",
+      read: false,
+      employeeId: newEmployee.id,
+      employeeName: newEmployee.name,
+    };
+    mobileNotifications.unshift(notif);
+    db.saveNotification(notif);
+
+    broadcastSSE("employee_added", newEmployee);
+    broadcastSSE("notification", notif);
+    broadcastSSE("stranger_registered", {
+      employee: newEmployee,
+      updatedLogsCount,
+      clusterLogIds,
+    });
+
+    console.log(`[Strangers] Đã thêm nhanh nhân viên ${newEmployee.name} (${newEmployee.employeeCode}) từ cụm ảnh, cập nhật ${updatedLogsCount} nhật ký cũ.`);
+
+    res.json({
+      success: true,
+      message: `Đã khai báo thành công nhân viên ${newEmployee.name}`,
+      employee: newEmployee,
+      updatedLogsCount,
+    });
+  } catch (err: any) {
+    console.error("[Strangers] Lỗi khai báo nhanh nhân viên:", err);
+    res.status(500).json({ success: false, error: err?.message || "Lỗi xử lý khai báo nhanh" });
+  }
+});
+
 // --- AI Face Recognition Routes (Multi-Face & High-Speed Recognition) ---
 const RECOGNIZE_FACE_ROUTES = [
   "/api/recognize-face",
@@ -1210,7 +1331,7 @@ app.post(RECOGNIZE_FACE_ROUTES, async (req, res) => {
       body = { imageBase64: "data:image/jpeg;base64," + body.toString("base64") };
     }
 
-    const imageBase64: string | undefined =
+    let imageBase64: string | undefined =
       body.imageBase64 ||
       body.image ||
       body.photo ||
@@ -1353,7 +1474,10 @@ app.post(RECOGNIZE_FACE_ROUTES, async (req, res) => {
           message: "Không tìm thấy dữ liệu khuôn mặt trong danh mục nhân viên",
         },
       ];
-      overallMessage = "Từ chối truy cập: Phát hiện người lạ chưa đăng ký.";
+      overallMessage = "🚨 CẢNH BÁO AN NINH: Phát hiện người lạ chụp hình tại cổng. Khóa cửa giữ an toàn.";
+      if (!base64Data) {
+        imageBase64 = "https://images.unsplash.com/photo-1544005313-94ddf0286df2?w=450&auto=format&fit=crop&q=80";
+      }
     } else if (testEmployeeId) {
       // Single specific employee test (supports ID, Code, Name, or TEST/PING)
       const matched =
@@ -1765,10 +1889,10 @@ Yêu cầu phân tích:
 
       const mobileNotif: MobileNotificationRecord = {
         id: "NOTIF-" + Date.now(),
-        title: "Cảnh báo truy cập không hợp lệ",
-        body: `Phát hiện ${detectedFaces.length} khuôn mặt không xác định tại ${smartLockState.doorName} (Khóa cửa giữ an toàn)`,
+        title: "🚨 Cảnh báo an ninh: Phát hiện người lạ chụp hình",
+        body: `Phát hiện khuôn mặt không xác định tại ${smartLockState.doorName} (Khóa cửa giữ an toàn). Đã tự động lưu trữ ảnh vào cụm giám sát người lạ.`,
         timestamp: new Date().toISOString(),
-        type: "WARNING",
+        type: "ALERT",
         read: false,
       };
       mobileNotifications.unshift(mobileNotif);
@@ -1778,10 +1902,19 @@ Yêu cầu phân tích:
         log: accessLog,
         notification: mobileNotif,
       });
+      broadcastSSE("stranger_detected", {
+        log: accessLog,
+        notification: mobileNotif,
+        snapshot: imageBase64,
+        doorName: smartLockState.doorName,
+        timestamp: accessLog.timestamp,
+      });
       broadcastSSE("notification", mobileNotif);
 
       res.json({
         recognized: false,
+        strangerAlert: true,
+        alertLevel: "HIGH",
         detectedFaces,
         totalFacesDetected: detectedFaces.length,
         authorizedCount: 0,
@@ -1791,7 +1924,7 @@ Yêu cầu phân tích:
         livenessScore: detectedFaces[0]?.livenessScore || 85,
         message:
           overallMessage ||
-          "Từ chối: Không nhận diện được nhân viên nào trong khung hình",
+          "🚨 CẢNH BÁO AN NINH: Phát hiện người lạ chụp hình tại cổng! Không nhận diện được trong danh mục nhân viên.",
         lockUnlocked: false,
         detectedFeatures: `Quét toàn khung hình (${detectedFaces.length} người) trong ${processingTimeMs}ms - Không khớp`,
         log: accessLog,
