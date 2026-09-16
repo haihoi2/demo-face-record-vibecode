@@ -31,8 +31,10 @@ services:
     container_name: smartface-local-gateway
     restart: unless-stopped
     ports:
-      # Cổng truy cập Web App (Mặc định 3000)
-      - "${APP_PORT:-3000}:3000"
+      # Cổng truy cập Web App trên máy host (mặc định 8080).
+      # Container luôn lắng nghe cổng 3000 bên trong; cổng 80 do k3d chiếm giữ,
+      # nginx reverse proxy sẽ trỏ về cổng này.
+      - "${APP_PORT:-8080}:3000"
     environment:
       - NODE_ENV=production
       - PORT=3000
@@ -58,7 +60,7 @@ services:
       # -----------------------------------------------------------------------
       - DATABASE_URL=${DATABASE_URL:-postgresql://${POSTGRES_USER:-smartface_user}:${POSTGRES_PASSWORD:-smartface_secret_pass}@postgres:5432/${POSTGRES_DB:-smartface_db}}
 
-      - CORS_ALLOWED_ORIGINS=${CORS_ALLOWED_ORIGINS:-http://localhost:3000,http://127.0.0.1:3000,http://gate-watch.vota.local:3000}
+      - CORS_ALLOWED_ORIGINS=${CORS_ALLOWED_ORIGINS:-http://localhost:8080,http://127.0.0.1:8080,http://gate-watch.vota.local:8080,http://gate-watch.vota.local}
     volumes:
       # Dữ liệu ảnh nhân viên, SQLite fallback, cấu hình luồng camera
       - ./data:/app/data

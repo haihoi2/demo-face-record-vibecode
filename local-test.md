@@ -12,7 +12,7 @@ A plain `docker compose up -d --build` starts two services:
 
 | Service | Container | Image | Exposed |
 | :--- | :--- | :--- | :--- |
-| `smartface-app` | `smartface-local-gateway` | `smartface-app:latest` (built from `Dockerfile`) | `3000` |
+| `smartface-app` | `smartface-local-gateway` | `smartface-app:latest` (built from `Dockerfile`) | `8080` -> container `3000` |
 | `postgres` | `smartface-postgres-18` | `postgres:18-alpine` | `5432` |
 
 A third service, `tests`, is behind the `test` profile and is never started by
@@ -40,8 +40,8 @@ app container.
 
 ```bash
 docker compose ps                                   # both must read (healthy)
-curl -s http://localhost:3000/api/health            # {"status":"ok", ...}
-curl -s http://localhost:3000/api/employees | head
+curl -s http://localhost:8080/api/health            # {"status":"ok", ...}
+curl -s http://localhost:8080/api/employees | head
 docker exec smartface-postgres-18 \
   psql -U smartface_user -d smartface_db -c '\dt'   # 8 tables
 ```
@@ -49,9 +49,9 @@ docker exec smartface-postgres-18 \
 Expected steady state:
 
 ```
-NAME                      IMAGE                  STATUS
-smartface-local-gateway   smartface-app:latest   Up (healthy)
-smartface-postgres-18     postgres:18-alpine     Up (healthy)
+NAME                      STATUS           PORTS
+smartface-local-gateway   Up (healthy)     0.0.0.0:8080->3000/tcp
+smartface-postgres-18     Up (healthy)     0.0.0.0:5432->5432/tcp
 ```
 
 On a healthy start the app log reports the PostgreSQL handshake:
@@ -150,19 +150,26 @@ On Windows the file is `C:\Windows\System32\drivers\etc\hosts`.
 
 ### 4.2 Port
 
-The app is reached at **`http://gate-watch.vota.local:3000`** — the port is
-required. Port 80 on this host is already bound by the k3d load balancer
-(`k3d-dev-grab-serverlb`), so the domain cannot be served on the default HTTP
-port without either stopping that container or adding a reverse proxy on a
-different port.
+The app publishes on host port **8080** (`APP_PORT` in `.env`); the container
+itself always listens on 3000. So it is reached at
+**`http://gate-watch.vota.local:8080`**.
+
+Port 80 is held by the k3d load balancer (`k3d-dev-grab-serverlb`) and this
+stack deliberately does not compete for it. An nginx reverse proxy is expected
+to own port 80 later and forward to `127.0.0.1:8080` — see §4.6.
+
+To use a different host port, set `APP_PORT` in `.env` and re-run
+`docker compose up -d`. Nothing else needs to change.
 
 ### 4.3 CORS
 
 The origin must be in `CORS_ALLOWED_ORIGINS`, otherwise the browser blocks API
-calls. Both `.env.example` and the compose fallback now ship with it:
+calls. Both `.env.example` and the compose fallback ship with the direct
+`:8080` origins plus the bare `http://gate-watch.vota.local` for the future
+nginx proxy on port 80:
 
 ```
-CORS_ALLOWED_ORIGINS="http://localhost:3000,http://127.0.0.1:3000,http://gate-watch.vota.local:3000"
+CORS_ALLOWED_ORIGINS="http://localhost:8080,http://127.0.0.1:8080,http://gate-watch.vota.local:8080,http://gate-watch.vota.local"
 ```
 
 After changing it, restart so the container picks up the new value:
@@ -174,10 +181,10 @@ docker compose up -d
 ### 4.4 Verify
 
 ```bash
-curl -s http://gate-watch.vota.local:3000/api/health
+curl -s http://gate-watch.vota.local:8080/api/health
 
-curl -s -i -X OPTIONS http://gate-watch.vota.local:3000/api/employees \
-  -H 'Origin: http://gate-watch.vota.local:3000' \
+curl -s -i -X OPTIONS http://gate-watch.vota.local:8080/api/employees \
+  -H 'Origin: http://gate-watch.vota.local:8080' \
   -H 'Access-Control-Request-Method: GET' | grep -i access-control-allow-origin
 ```
 
@@ -185,19 +192,73 @@ Expected:
 
 ```
 {"status":"ok","time":"..."}
-Access-Control-Allow-Origin: http://gate-watch.vota.local:3000
+Access-Control-Allow-Origin: http://gate-watch.vota.local:8080
 ```
 
 ### 4.5 Camera access caveat
 
 `getUserMedia` (webcam capture for face scanning) requires a secure context.
 Browsers treat `localhost` / `127.0.0.1` as secure, but **not** a custom
-hostname over plain HTTP. Face scanning via `http://gate-watch.vota.local:3000`
+hostname over plain HTTP. Face scanning via `http://gate-watch.vota.local:8080`
 will therefore fail in Chrome unless one of the following applies:
 
-- use `http://localhost:3000` for camera work, or
+- use `http://localhost:8080` for camera work, or
 - serve the domain over HTTPS with a locally trusted certificate, or
 - allowlist the origin under `chrome://flags/#unsafely-treat-insecure-origin-as-secure`.
+
+### 4.6 Mapping the domain to an IP
+
+`/etc/hosts` is per-machine. To reach the app from other devices, point the
+name at this host's LAN IP instead of `127.0.0.1`:
+
+```
+192.168.6.52 gate-watch.vota.local
+```
+
+For network-wide resolution without editing every client, add an A record on
+the LAN DNS server (dnsmasq / Pi-hole / router static DNS):
+
+```
+address=/gate-watch.vota.local/192.168.6.52
+```
+
+> **`.local` caveat:** RFC 6762 reserves `.local` for mDNS, so some systems
+> (macOS especially) route it to multicast DNS and ignore the hosts entry.
+> This host is fine — `/etc/nsswitch.conf` has `hosts: files dns` and
+> `avahi-daemon` is inactive. Check a client with
+> `grep '^hosts:' /etc/nsswitch.conf`. For a wider rollout, `.lan` or
+> `.internal` avoids the problem entirely.
+
+### 4.7 Planned nginx reverse proxy
+
+nginx will own port 80 and forward to the published app port, which removes
+the `:8080` from the URL:
+
+```nginx
+server {
+    listen 80;
+    server_name gate-watch.vota.local;
+
+    location / {
+        proxy_pass http://127.0.0.1:8080;
+        proxy_set_header Host              $host;
+        proxy_set_header X-Real-IP         $remote_addr;
+        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+
+        # /api/events is Server-Sent Events - buffering must stay off
+        proxy_http_version 1.1;
+        proxy_set_header Connection "";
+        proxy_buffering off;
+        proxy_read_timeout 24h;
+    }
+}
+```
+
+Port 80 is currently taken by `k3d-dev-grab-serverlb`, so nginx needs that
+freed, a different port, or a host with the port available. Once nginx is in
+front, consider narrowing the compose port binding to `127.0.0.1:8080:3000` so
+the app is no longer directly reachable from the LAN.
 
 ---
 
@@ -226,7 +287,7 @@ will therefore fail in Chrome unless one of the following applies:
 | Container stays `unhealthy` but `curl` works | The healthcheck must target `127.0.0.1`, not `localhost`: BusyBox `wget` resolves `localhost` to `::1` while the server binds IPv4 `0.0.0.0`. |
 | `npm ci` fails during build | No `package-lock.json` is committed (only `bun.lock`). The Dockerfile falls back to `npm install`; commit a lockfile for reproducible builds. |
 | Port 5432 already allocated | A host PostgreSQL is running. Either set `POSTGRES_PORT=5433` in `.env`, or start only the app: `docker compose up -d --build smartface-app`. |
-| Port 3000 already allocated | Set `APP_PORT=3001` in `.env`. |
+| Port 8080 already allocated | Set `APP_PORT` to a free port in `.env`, then `docker compose up -d`. |
 | Browser blocks API calls from the local domain | The origin is missing from `CORS_ALLOWED_ORIGINS` — see §4.3. |
 | Webcam not available on the local domain | Insecure-context restriction — see §4.5. |
 | Database empty after restart | `docker compose down -v` was used, which drops `smartface_postgres18_data`. |
