@@ -1,7 +1,93 @@
+# =============================================================================
+# AI SmartFace & SmartLock Gateway - Docker Compose for Local Machine Deployment
+# =============================================================================
+#
+# QUICK START ON LOCAL MACHINE:
+#
+#   Option A: Full Stack with PostgreSQL (Recommended for Enterprise / Production)
+#     docker compose up -d --build
+#
+#   Option B: Ultra-Lightweight Standalone with SQLite (Zero external dependencies)
+#     docker compose up -d --build smartface-app
+#
+#   To stop:
+#     docker compose down
+#
+#   To view logs:
+#     docker compose logs -f smartface-app
+# =============================================================================
+
 services:
-  # =========================================================================
-  # 1. PostgreSQL Database Service for robust enterprise data persistence
-  # =========================================================================
+  # ===========================================================================
+  # 1. Main SmartFace AI & SmartLock Gateway Web Service
+  # ===========================================================================
+  smartface-app:
+    image: smartface-app:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: smartface-local-gateway
+    restart: unless-stopped
+    ports:
+      # Format: "HOST_PORT:CONTAINER_PORT"
+      - "${APP_PORT:-3000}:3000"
+    environment:
+      - NODE_ENV=production
+      - PORT=3000
+      - TZ=${TZ:-Asia/Ho_Chi_Minh}
+      - DATA_DIR=/app/data
+
+      # Face Recognition Provider: "local" (Exact/cosine match) or "google" (Gemini AI)
+      - FACE_RECOGNITION_PROVIDER=${FACE_RECOGNITION_PROVIDER:-local}
+      - LOCAL_FACE_RECOGNITION_MODEL=${LOCAL_FACE_RECOGNITION_MODEL:-local-exact-match}
+      - GEMINI_API_KEY=${GEMINI_API_KEY:-}
+      - GOOGLE_GEMINI_MODEL=${GOOGLE_GEMINI_MODEL:-gemini-3.8-flash}
+
+      # Eton Webhook notification endpoint
+      - ETON_WEBHOOK_URL=${ETON_WEBHOOK_URL:-https://chat-room.eton.vn/hooks/YOUR_WEBHOOK_TOKEN}
+
+      # Database Configuration:
+      # - If DATABASE_URL is set, the server connects to PostgreSQL (with SQLite sync fallback).
+      # - If DATABASE_URL is empty, the server runs completely standalone with SQLite 3 (./data/smartface.db).
+      - DATABASE_URL=${DATABASE_URL:-postgresql://${POSTGRES_USER:-smartface_user}:${POSTGRES_PASSWORD:-smartface_secret_pass}@postgres:5432/${POSTGRES_DB:-smartface_db}}
+
+      # CORS & Frontend Origins
+      - CORS_ALLOWED_ORIGINS=${CORS_ALLOWED_ORIGINS:-http://localhost:3000,http://127.0.0.1:3000}
+    volumes:
+      # Persistent local storage for SQLite database (smartface.db), employee face images, and configs
+      - ./data:/app/data
+      # Synchronize host timezone
+      - /etc/localtime:/etc/localtime:ro
+      - /etc/timezone:/etc/timezone:ro
+
+    # Linux USB Camera (UVC) Passthrough:
+    # If using USB cameras directly connected to the local machine host:
+    # devices:
+    #   - /dev/video0:/dev/video0
+    #   - /dev/video1:/dev/video1
+
+    # Enables container to easily communicate with host machine LAN / local IP cameras (e.g. 192.168.60.2)
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+    depends_on:
+      postgres:
+        condition: service_healthy
+        required: false
+
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:3000/api/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+    networks:
+      - smartface-network
+
+  # ===========================================================================
+  # 2. PostgreSQL Enterprise Relational Database (Optional / Included)
+  # ===========================================================================
   postgres:
     image: postgres:16-alpine
     container_name: smartface-postgres
@@ -11,13 +97,16 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-smartface_secret_pass}
       POSTGRES_DB: ${POSTGRES_DB:-smartface_db}
       PGDATA: /var/lib/postgresql/data/pgdata
+      TZ: ${TZ:-Asia/Ho_Chi_Minh}
     ports:
+      # Expose PostgreSQL port to local machine (default 5432)
       - "${POSTGRES_PORT:-5432}:5432"
     volumes:
-      # Persistent named volume for all PostgreSQL relational data
+      # Named persistent volume for PostgreSQL files
       - postgres_data:/var/lib/postgresql/data
-      # Automated schema initialization script on first launch
+      # Auto-run SQL initialization script on initial launch
       - ./init-db.sql:/docker-entrypoint-initdb.d/init-db.sql:ro
+      - /etc/localtime:/etc/localtime:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-smartface_user} -d ${POSTGRES_DB:-smartface_db}"]
       interval: 10s
@@ -27,43 +116,15 @@ services:
     networks:
       - smartface-network
 
-  # =========================================================================
-  # 2. Smart Face Recognition & SmartLock Gateway Backend/Frontend Service
-  # =========================================================================
-  smartface-app:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    container_name: smartface-lock-gateway
-    restart: unless-stopped
-    depends_on:
-      postgres:
-        condition: service_healthy
-    ports:
-      - "3000:3000"
-    environment:
-      - NODE_ENV=production
-      - PORT=3000
-      - GEMINI_API_KEY=${GEMINI_API_KEY:-}
-      # Database connection string to PostgreSQL container
-      - DATABASE_URL=postgresql://${POSTGRES_USER:-smartface_user}:${POSTGRES_PASSWORD:-smartface_secret_pass}@postgres:5432/${POSTGRES_DB:-smartface_db}
-    volumes:
-      # SQLite volume mount as fallback/hybrid storage
-      - ./data:/app/data
-    healthcheck:
-      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:3000/api/health"]
-      interval: 30s
-      timeout: 5s
-      retries: 3
-      start_period: 15s
-    networks:
-      - smartface-network
-
+# =============================================================================
+# Persistent Volumes & Network Definitions
+# =============================================================================
 volumes:
-  # Named persistent volume stored on Docker host disk
+  # Named volume for PostgreSQL database storage
   postgres_data:
     driver: local
 
 networks:
   smartface-network:
+    name: smartface-network
     driver: bridge

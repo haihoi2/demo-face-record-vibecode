@@ -24,6 +24,12 @@ WORKDIR /app
 ENV NODE_ENV=production
 ENV PORT=3000
 
+# Install runtime dependencies:
+# - ffmpeg: required for RTSP video stream transcoding, snapshot capture, and frame extraction
+# - ca-certificates: required for secure HTTPS webhooks and external APIs
+# - tzdata: ensures correct timezone timestamps (e.g. Asia/Ho_Chi_Minh)
+RUN apk add --no-cache ffmpeg ca-certificates tzdata
+
 # Copy package files
 COPY package*.json ./
 

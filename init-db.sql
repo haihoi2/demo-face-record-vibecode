@@ -78,6 +78,18 @@ CREATE TABLE IF NOT EXISTS mobile_notifications (
   "employeeName" VARCHAR(255)
 );
 
+CREATE TABLE IF NOT EXISTS camera_streams_config (
+  id VARCHAR(64) PRIMARY KEY,
+  data JSONB NOT NULL,
+  "updatedAt" VARCHAR(64)
+);
+
+CREATE TABLE IF NOT EXISTS door_controller_config (
+  id VARCHAR(64) PRIMARY KEY,
+  data JSONB NOT NULL,
+  "updatedAt" VARCHAR(64)
+);
+
 -- Indices for rapid query performance
 CREATE INDEX IF NOT EXISTS idx_access_logs_timestamp ON access_logs (timestamp DESC);
 CREATE INDEX IF NOT EXISTS idx_notifications_timestamp ON mobile_notifications (timestamp DESC);
