@@ -262,7 +262,46 @@ the app is no longer directly reachable from the LAN.
 
 ---
 
-## 5. Useful Endpoints
+## 5. Camera Streams (RTSP)
+
+Entry gate is configured for the Hikvision camera on the LAN:
+
+| Gate | Channel | URL |
+| :--- | :--- | :--- |
+| Entry (Cổng Vào) | 101 (main, 1920x1080 HEVC) | `rtsp://<user>:<pass>@192.168.60.2:554/Streaming/Channels/101` |
+| Exit (Cổng Ra) | 102 (substream) | `rtsp://<user>:<pass>@192.168.60.2:554/Streaming/Channels/102` |
+
+Set or change a gate through the API:
+
+```bash
+curl -X POST http://localhost:8080/api/camera-streams/config \
+  -H 'Content-Type: application/json' \
+  -d '{"entryGate":{"sourceType":"RTSP","rtspUrl":"rtsp://user:pass@192.168.60.2:554/Streaming/Channels/101","rtspTransport":"TCP","enabled":true,"autoStart":true}}'
+```
+
+Verify the stream:
+
+```bash
+# TCP reachability probe
+curl -X POST http://localhost:8080/api/camera-streams/test-stream \
+  -H 'Content-Type: application/json' \
+  -d '{"url":"rtsp://user:pass@192.168.60.2:554/Streaming/Channels/101","sourceType":"RTSP","transport":"TCP"}'
+
+# Single frame (real JPEG when the camera is reachable)
+curl -o frame.jpg 'http://localhost:8080/api/camera-streams/snapshot?gate=entry'
+
+# Live MJPEG proxy, ~15 fps
+curl -o live.mjpeg 'http://localhost:8080/api/camera-streams/mjpeg?gate=entry'
+```
+
+> If `snapshot` returns `image/svg+xml` instead of `image/jpeg`, ffmpeg failed
+> and the handler fell back to the diagnostic placeholder. Reproduce the real
+> error with:
+> `docker exec smartface-local-gateway ffmpeg -rtsp_transport tcp -i "<url>" -vframes 1 -f image2 -update 1 /tmp/x.jpg`
+
+---
+
+## 6. Useful Endpoints
 
 | Endpoint | Purpose |
 | :--- | :--- |
@@ -280,7 +319,7 @@ the app is no longer directly reachable from the LAN.
 
 ---
 
-## 6. Troubleshooting
+## 7. Troubleshooting
 
 | Symptom | Cause / Fix |
 | :--- | :--- |
@@ -288,6 +327,7 @@ the app is no longer directly reachable from the LAN.
 | `npm ci` fails during build | No `package-lock.json` is committed (only `bun.lock`). The Dockerfile falls back to `npm install`; commit a lockfile for reproducible builds. |
 | Port 5432 already allocated | A host PostgreSQL is running. Either set `POSTGRES_PORT=5433` in `.env`, or start only the app: `docker compose up -d --build smartface-app`. |
 | Port 8080 already allocated | Set `APP_PORT` to a free port in `.env`, then `docker compose up -d`. |
-| Browser blocks API calls from the local domain | The origin is missing from `CORS_ALLOWED_ORIGINS` — see §4.3. |
+| Browser blocks API calls / preflight returns 403 | The origin is missing from `CORS_ALLOWED_ORIGINS` — see §4.3. An empty list disables the allowlist and reflects any origin. |
 | Webcam not available on the local domain | Insecure-context restriction — see §4.5. |
+| `snapshot` returns an SVG placeholder | ffmpeg could not pull the stream — see §5. |
 | Database empty after restart | `docker compose down -v` was used, which drops `smartface_postgres18_data`. |

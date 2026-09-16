@@ -60,7 +60,7 @@ services:
       # -----------------------------------------------------------------------
       - DATABASE_URL=${DATABASE_URL:-postgresql://${POSTGRES_USER:-smartface_user}:${POSTGRES_PASSWORD:-smartface_secret_pass}@postgres:5432/${POSTGRES_DB:-smartface_db}}
 
-      - CORS_ALLOWED_ORIGINS=${CORS_ALLOWED_ORIGINS:-http://localhost:8080,http://127.0.0.1:8080,http://gate-watch.vota.local:8080,http://gate-watch.vota.local}
+      - CORS_ALLOWED_ORIGINS=${CORS_ALLOWED_ORIGINS:-http://localhost:8080,http://127.0.0.1:8080,http://gate-watch.vota.local:8080,http://gate-watch.vota.local,http://192.168.6.52:8080}
     volumes:
       # Dữ liệu ảnh nhân viên, SQLite fallback, cấu hình luồng camera
       - ./data:/app/data
