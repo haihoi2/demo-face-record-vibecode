@@ -16,6 +16,16 @@ COPY . .
 # Build Vite frontend & Bundle backend into dist/server.cjs
 RUN npm run build
 
+# ----------------- Test Stage -----------------
+# Unit tests reuse the builder stage, which already has devDependencies (tsx)
+# installed, so no separate install is needed. This stage deliberately sits
+# BEFORE the runner stage so that a plain `docker build` still targets runner.
+#   docker compose --profile test run --rm tests
+#   docker build --target tester -t smartface-tests . && docker run --rm smartface-tests
+FROM builder AS tester
+ENV NODE_ENV=test
+CMD ["npm", "test"]
+
 # ----------------- Production Stage -----------------
 FROM node:22-alpine AS runner
 
