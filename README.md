@@ -224,29 +224,32 @@ pm2 restart smartface-gateway # Khởi động lại
 
 ---
 
-### Cách 2: Deploy Bằng Docker Compose với PostgreSQL (Backend Database)
+### Cách 2: Deploy Bằng Docker Compose với PostgreSQL 18 (Local Machine)
 
-Hệ thống hỗ trợ cơ chế lưu trữ phân tầng doanh nghiệp với **PostgreSQL 16** chạy qua Docker Compose, đồng thời duy trì volume dự phòng cho SQLite. Mọi thay đổi dữ liệu nhân viên, lịch sử chấm công, cấu hình webhook và thông báo tức thời được lưu trực tiếp vào cơ sở dữ liệu PostgreSQL (`smartface_db`).
+Hệ thống hỗ trợ cơ chế lưu trữ phân tầng doanh nghiệp với **PostgreSQL 18** (chạy qua Docker Compose hoặc kết nối trực tiếp PostgreSQL 18 cài trên máy Host), đồng thời duy trì volume dự phòng cho SQLite. Mọi thay đổi dữ liệu nhân viên, lịch sử chấm công, cấu hình webhook và thông báo tức thời được lưu trực tiếp vào cơ sở dữ liệu PostgreSQL (`smartface_db`).
 
 #### 1. Kiến trúc dịch vụ Docker Compose:
-- **`smartface-postgres`**: Container PostgreSQL 16 Alpine, cấu hình volume bền vững `postgres_data` và tự động nạp bảng khởi tạo qua `init-db.sql`.
-- **`smartface-lock-gateway`**: Container ứng dụng Node.js, tự động kết nối qua mạng nội bộ Docker `smartface-network` với biến môi trường `DATABASE_URL`. Container tự kiểm tra trạng thái sức khỏe (`service_healthy`) của Postgres trước khi khởi động.
+- **`smartface-postgres-18`**: Container PostgreSQL 18 Alpine (`postgres:18-alpine`), cấu hình volume bền vững `postgres18_data` và tự động nạp bảng khởi tạo qua `init-db.sql`.
+- **`smartface-local-gateway`**: Container ứng dụng Node.js 22 + React, tự động kết nối qua biến môi trường `DATABASE_URL`. Hỗ trợ kết nối PostgreSQL 18 container hoặc PostgreSQL 18 cài trên máy chủ thông qua `host.docker.internal:5432`.
 
 #### 2. Cấu hình biến môi trường (`.env`):
 Tạo hoặc cập nhật file `.env` trên thư mục gốc:
-```env
-# Google Gemini API Key cho nhận diện khuôn mặt
-GEMINI_API_KEY=MY_GEMINI_API_KEY
 
-# Cấu hình tài khoản PostgreSQL
+**Trường hợp A: Sử dụng PostgreSQL 18 chạy bằng Docker Container**
+```env
+POSTGRES_IMAGE=postgres:18-alpine
 POSTGRES_USER=smartface_user
 POSTGRES_PASSWORD=smartface_secret_pass
 POSTGRES_DB=smartface_db
 POSTGRES_PORT=5432
-
-# Chuỗi kết nối Database URL
 DATABASE_URL=postgresql://smartface_user:smartface_secret_pass@postgres:5432/smartface_db
 ```
+
+**Trường hợp B: Kết nối tới PostgreSQL 18 đã cài sẵn trên máy Local (Host OS / localhost:5432)**
+```env
+DATABASE_URL=postgresql://postgres:mat_khau_cua_ban@host.docker.internal:5432/smartface_db
+```
+*(Khi dùng PostgreSQL cài trên host, chỉ cần chạy lệnh `docker compose up -d --build smartface-app` để tránh xung đột cổng 5432).*
 
 #### 3. Cấu hình file `docker-compose.yml`:
 ```yaml

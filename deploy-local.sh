@@ -46,8 +46,24 @@ else
 fi
 
 # 5. Build and launch Docker Compose services
-echo -e "\n${BLUE}➜ Đang biên dịch Docker image và khởi động dịch vụ trên máy cục bộ...${NC}"
-docker compose up -d --build
+echo -e "\n${BLUE}➜ Đang kiểm tra cổng cơ sở dữ liệu và cấu hình PostgreSQL 18...${NC}"
+
+# Check if port 5432 is already bound by a local PostgreSQL service on host
+HOST_PG_RUNNING=false
+if command -v nc &> /dev/null && nc -z 127.0.0.1 5432 2>/dev/null; then
+  HOST_PG_RUNNING=true
+elif command -v lsof &> /dev/null && lsof -i :5432 &> /dev/null; then
+  HOST_PG_RUNNING=true
+fi
+
+if [ "$HOST_PG_RUNNING" = true ]; then
+  echo -e "${YELLOW}ℹ Phát hiện cổng 5432 đang được sử dụng bởi PostgreSQL 18 cài sẵn trên máy chủ (Host).${NC}"
+  echo -e "${YELLOW}➜ Khởi động container SmartFace App kết nối tới PostgreSQL 18 của máy Host (host.docker.internal)...${NC}"
+  docker compose up -d --build smartface-app
+else
+  echo -e "${GREEN}✓ Khởi động toàn bộ cụm dịch vụ với PostgreSQL 18 container qua Docker Compose...${NC}"
+  docker compose up -d --build
+fi
 
 # 6. Wait for service to become healthy
 echo -e "\n${YELLOW}➜ Đang kiểm tra trạng thái khởi động của SmartFace Gateway (tối đa 40s)...${NC}"
