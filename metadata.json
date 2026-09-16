@@ -1,6 +1,6 @@
 {
   "name": "Hệ Thống Mở Cửa Khuôn Mặt AI & Khóa Thông Minh",
-  "description": "Hệ thống nhận diện khuôn mặt nhân viên AI với cảnh báo an ninh người lạ chụp hình, phân cụm khuôn mặt tương đồng để khai báo nhanh nhân viên, tự động mở khóa cửa thông minh, gửi Webhook thời gian thực và ghi log chấm công.",
+  "description": "Hệ thống nhận diện khuôn mặt nhân viên AI với luồng camera RTSP/UVC cho Cổng Vào & Cổng Ra, tách xử lý đa luồng (Multi-Thread Worker Pool) tại backend, tự động kích hoạt API mở cửa, phát hiện người lạ và đồng bộ thời gian thực.",
   "requestFramePermissions": ["camera"],
   "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
 }

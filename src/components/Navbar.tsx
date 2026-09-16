@@ -12,12 +12,14 @@ import {
   Send,
   Sliders,
   UserX,
+  KeyRound,
+  Video,
 } from "lucide-react";
 import { SmartLockState } from "../types";
 
 interface NavbarProps {
-  activeTab: "scanner" | "register" | "logs" | "mobile" | "webhook" | "config";
-  setActiveTab: (tab: "scanner" | "register" | "logs" | "mobile" | "webhook" | "config") => void;
+  activeTab: "scanner" | "register" | "logs" | "mobile" | "webhook" | "door" | "cameras" | "config";
+  setActiveTab: (tab: "scanner" | "register" | "logs" | "mobile" | "webhook" | "door" | "cameras" | "config") => void;
   lockState: SmartLockState;
   unreadCount: number;
   sseConnected: boolean;
@@ -147,6 +149,32 @@ export const Navbar: React.FC<NavbarProps> = ({
             >
               <Send className="w-4 h-4 text-indigo-600" />
               <span className="hidden sm:inline">Webhook Eton</span>
+            </button>
+
+            <button
+              id="nav-tab-door"
+              onClick={() => setActiveTab("door")}
+              className={`flex items-center gap-2 px-3 py-2 rounded-lg text-sm font-medium transition-all ${
+                activeTab === "door"
+                  ? "bg-emerald-50 text-emerald-700 shadow-xs border border-emerald-200 font-semibold"
+                  : "text-slate-600 hover:text-slate-900 hover:bg-slate-100"
+              }`}
+            >
+              <KeyRound className="w-4 h-4 text-emerald-600" />
+              <span className="hidden sm:inline">API Mở Cửa</span>
+            </button>
+
+            <button
+              id="nav-tab-cameras"
+              onClick={() => setActiveTab("cameras")}
+              className={`flex items-center gap-2 px-3 py-2 rounded-lg text-sm font-medium transition-all ${
+                activeTab === "cameras"
+                  ? "bg-blue-50 text-blue-700 shadow-xs border border-blue-200 font-semibold"
+                  : "text-slate-600 hover:text-slate-900 hover:bg-slate-100"
+              }`}
+            >
+              <Video className="w-4 h-4 text-blue-600" />
+              <span className="hidden sm:inline">Luồng Camera</span>
             </button>
 
             <button

@@ -363,6 +363,17 @@ export const FaceScanner: React.FC<FaceScannerProps> = ({
                 <span className="text-emerald-400 font-bold">{lastLatencyMs}ms</span>
               </div>
 
+              {/* Multi-thread worker badge */}
+              {lastResult?.multiThreadUsed && (
+                <div
+                  className="hidden xl:flex items-center gap-1 px-2 py-1 rounded-lg bg-emerald-950/70 border border-emerald-500/30 text-emerald-300 text-[11px] font-mono"
+                  title="Đã xử lý trên Worker Thread độc lập tại Backend"
+                >
+                  <Cpu className="w-3 h-3 text-emerald-400" />
+                  <span>Worker #{lastResult.workerId} ({lastResult.threadLatencyMs}ms)</span>
+                </div>
+              )}
+
               {/* Webhook Status pill */}
               <div
                 className="hidden md:flex items-center gap-1 px-2 py-1 rounded-lg bg-indigo-950/70 border border-indigo-500/30 text-indigo-300 text-[11px] font-medium"

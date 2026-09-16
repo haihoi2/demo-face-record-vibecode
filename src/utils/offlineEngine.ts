@@ -9,7 +9,10 @@ import {
   WebhookConfig,
   WebhookLog,
   AiRecognitionConfig,
+  DoorControllerConfig,
+  DoorApiLog,
 } from "../types";
+import { safeJsonFetch } from "./api";
 import { runLocalFaceRecognition } from "./localBiometrics";
 
 export const DEFAULT_OFFLINE_EMPLOYEES: Employee[] = [
@@ -265,7 +268,13 @@ export function getStoredWebhookConfig(): WebhookConfig {
     const raw = localStorage.getItem(STORAGE_KEY_WEBHOOK_CONFIG);
     if (raw) {
       const parsed = JSON.parse(raw);
-      if (parsed && typeof parsed.url === "string") return parsed;
+      if (parsed && typeof parsed.url === "string") {
+        if (!parsed.url || parsed.url.includes("...") || parsed.url.endsWith("/hooks/") || parsed.url.endsWith("/hooks")) {
+          parsed.url = DEFAULT_OFFLINE_WEBHOOK_CONFIG.url;
+          saveStoredWebhookConfig(parsed);
+        }
+        return parsed;
+      }
     }
   } catch {}
   return DEFAULT_OFFLINE_WEBHOOK_CONFIG;
@@ -273,6 +282,9 @@ export function getStoredWebhookConfig(): WebhookConfig {
 
 export function saveStoredWebhookConfig(config: WebhookConfig): void {
   try {
+    if (!config.url || config.url.includes("...") || config.url.endsWith("/hooks/") || config.url.endsWith("/hooks")) {
+      config.url = DEFAULT_OFFLINE_WEBHOOK_CONFIG.url;
+    }
     localStorage.setItem(STORAGE_KEY_WEBHOOK_CONFIG, JSON.stringify(config));
   } catch (e) {
     console.warn("Lỗi lưu webhook config vào localStorage:", e);
@@ -351,14 +363,191 @@ export function saveStoredAiConfig(config: AiRecognitionConfig): void {
   }
 }
 
+// Door Controller API Storage & Direct Dispatcher
+const STORAGE_KEY_DOOR_CONFIG = "smartlock_door_controller_config_v1";
+const STORAGE_KEY_DOOR_LOGS = "smartlock_door_controller_logs_v1";
+
+export const DEFAULT_OFFLINE_DOOR_CONFIG: DoorControllerConfig = {
+  enabled: true,
+  apiUrl: "https://smartlock.eton.vn/api/door/control",
+  apiToken: "eton_door_secret_token_2026_secure_key",
+  authHeaderType: "BEARER",
+  customHeaderName: "X-Door-Token",
+  openMethod: "POST",
+  closeMethod: "POST",
+  openPayloadTemplate: JSON.stringify({ action: "OPEN", doorId: "CỔNG CHÍNH", pulseDuration: 6 }, null, 2),
+  closePayloadTemplate: JSON.stringify({ action: "CLOSE", doorId: "CỔNG CHÍNH" }, null, 2),
+  pulseDurationSeconds: 6,
+  triggerOnFaceRecognition: true,
+  triggerOnManualUnlock: true,
+};
+
+export function getStoredDoorConfig(): DoorControllerConfig {
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY_DOOR_CONFIG);
+    if (raw) {
+      const parsed = JSON.parse(raw);
+      if (parsed && typeof parsed.apiUrl === "string") {
+        return {
+          ...DEFAULT_OFFLINE_DOOR_CONFIG,
+          ...parsed,
+        };
+      }
+    }
+  } catch {}
+  return DEFAULT_OFFLINE_DOOR_CONFIG;
+}
+
+export function saveStoredDoorConfig(config: DoorControllerConfig): void {
+  try {
+    localStorage.setItem(STORAGE_KEY_DOOR_CONFIG, JSON.stringify(config));
+  } catch (e) {
+    console.warn("Lỗi lưu door config vào localStorage:", e);
+  }
+}
+
+export function getStoredDoorLogs(): DoorApiLog[] {
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY_DOOR_LOGS);
+    if (raw) {
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed)) return parsed;
+    }
+  } catch {}
+  return [];
+}
+
+export function saveStoredDoorLogs(logs: DoorApiLog[]): void {
+  try {
+    localStorage.setItem(STORAGE_KEY_DOOR_LOGS, JSON.stringify(logs.slice(0, 60)));
+  } catch (e) {
+    console.warn("Lỗi lưu door logs vào localStorage:", e);
+  }
+}
+
+export function clearStoredDoorLogs(): void {
+  try {
+    localStorage.removeItem(STORAGE_KEY_DOOR_LOGS);
+  } catch {}
+}
+
+export async function dispatchDirectDoorControllerCommand(
+  action: "OPEN" | "CLOSE",
+  triggeredBy: string
+): Promise<DoorApiLog | null> {
+  const config = getStoredDoorConfig();
+  if (!config.enabled || !config.apiUrl || !config.apiUrl.trim()) {
+    return null;
+  }
+
+  const startTime = Date.now();
+  let targetUrl = config.apiUrl.trim();
+
+  if (config.authHeaderType === "QUERY_PARAM" && config.apiToken) {
+    const sep = targetUrl.includes("?") ? "&" : "?";
+    targetUrl = `${targetUrl}${sep}token=${encodeURIComponent(config.apiToken.trim())}`;
+  }
+
+  const method = action === "OPEN" ? config.openMethod : config.closeMethod;
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json",
+  };
+
+  if (config.apiToken && config.apiToken.trim()) {
+    const token = config.apiToken.trim();
+    if (config.authHeaderType === "BEARER") {
+      headers["Authorization"] = `Bearer ${token}`;
+    } else if (config.authHeaderType === "API_KEY") {
+      headers["X-Api-Key"] = token;
+    } else if (config.authHeaderType === "CUSTOM_HEADER") {
+      headers[config.customHeaderName || "X-Door-Token"] = token;
+    }
+  }
+
+  let requestBody: string | undefined = undefined;
+  if (method !== "GET") {
+    const template = action === "OPEN" ? config.openPayloadTemplate : config.closePayloadTemplate;
+    if (template && template.trim()) {
+      try {
+        requestBody = template
+          .replace(/\{\{ACTION\}\}/g, action)
+          .replace(/\{\{TRIGGERED_BY\}\}/g, triggeredBy)
+          .replace(/\{\{TIMESTAMP\}\}/g, new Date().toISOString())
+          .replace(/\{\{PULSE\}\}/g, String(config.pulseDurationSeconds || 6));
+      } catch {
+        requestBody = template;
+      }
+    } else {
+      requestBody = JSON.stringify({
+        action,
+        triggeredBy,
+        timestamp: new Date().toISOString(),
+      });
+    }
+  }
+
+  const maskedHeaders: Record<string, string> = { ...headers };
+  if (maskedHeaders["Authorization"]) maskedHeaders["Authorization"] = "Bearer ****";
+  if (maskedHeaders["X-Api-Key"]) maskedHeaders["X-Api-Key"] = "****";
+  if (config.customHeaderName && maskedHeaders[config.customHeaderName]) {
+    maskedHeaders[config.customHeaderName] = "****";
+  }
+
+  const log: DoorApiLog = {
+    id: "DOOR-API-" + Date.now() + "-" + Math.floor(Math.random() * 1000),
+    timestamp: new Date().toISOString(),
+    action,
+    url: targetUrl,
+    method,
+    requestHeaders: maskedHeaders,
+    requestBody,
+    success: false,
+    durationMs: 0,
+    triggeredBy,
+  };
+
+  try {
+    const res = await fetch(targetUrl, {
+      method,
+      headers,
+      body: method !== "GET" ? requestBody : undefined,
+    });
+    log.durationMs = Date.now() - startTime;
+    log.statusCode = res.status;
+    log.statusText = res.statusText;
+    const text = await res.text();
+    log.responseBody = text.substring(0, 500);
+    log.success = res.ok;
+  } catch (err: any) {
+    log.durationMs = Date.now() - startTime;
+    log.error = err?.message || String(err);
+  }
+
+  const existing = getStoredDoorLogs();
+  saveStoredDoorLogs([log, ...existing]);
+  clientEventBus.emit("door_api_log", log);
+
+  // Sync to server if backend is active
+  safeJsonFetch("/api/door-controller/client-log", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ log }),
+  }).catch(() => {});
+
+  return log;
+}
+
 /**
  * Direct browser webhook dispatcher: multi-transport delivery bypassing CORS restrictions.
  */
 export function dispatchDirectWebhook(url: string, payload: any): void {
-  if (!url) return;
+  let targetUrl = url;
+  if (!targetUrl || targetUrl.includes("...") || targetUrl.endsWith("/hooks/") || targetUrl.endsWith("/hooks")) {
+    targetUrl = DEFAULT_OFFLINE_WEBHOOK_CONFIG.url;
+  }
   // Method 1: fetch no-cors
   try {
-    fetch(url, {
+    fetch(targetUrl, {
       method: "POST",
       mode: "no-cors",
       headers: {
@@ -374,7 +563,7 @@ export function dispatchDirectWebhook(url: string, payload: any): void {
       const blob = new Blob([JSON.stringify(payload)], {
         type: "text/plain;charset=UTF-8",
       });
-      navigator.sendBeacon(url, blob);
+      navigator.sendBeacon(targetUrl, blob);
     }
   } catch {}
 
@@ -468,6 +657,18 @@ export function clientDoorUnlock(source: string, employeeName?: string, employee
   saveStoredLockState(currentClientLock);
   clientEventBus.emit("lock_state", currentClientLock);
 
+  // Trigger Door Controller API dispatch if enabled
+  const doorConfig = getStoredDoorConfig();
+  if (doorConfig.enabled) {
+    const isFace = source.includes("Nhận diện") || Boolean(employeeName);
+    const shouldTrigger = isFace
+      ? doorConfig.triggerOnFaceRecognition
+      : doorConfig.triggerOnManualUnlock;
+    if (shouldTrigger) {
+      dispatchDirectDoorControllerCommand("OPEN", employeeName || source).catch(() => {});
+    }
+  }
+
   // Countdown timer
   let remaining = currentClientLock.autoRelockSeconds || 6;
   activeRelockTimer = setInterval(() => {
@@ -505,6 +706,13 @@ export function clientDoorLock(source: string): SmartLockState {
 
   saveStoredLockState(currentClientLock);
   clientEventBus.emit("lock_state", currentClientLock);
+
+  // Trigger Door Controller API dispatch CLOSE if enabled
+  const doorConfig = getStoredDoorConfig();
+  if (doorConfig.enabled) {
+    dispatchDirectDoorControllerCommand("CLOSE", source).catch(() => {});
+  }
+
   return currentClientLock;
 }
 
@@ -845,6 +1053,73 @@ export function simulateClientFaceRecognition({
     const existingNotifs = getStoredNotifications();
     saveStoredNotifications([notif, ...existingNotifs]);
     clientEventBus.emit("notification", notif);
+
+    // Auto-dispatch Webhook to Eton Chat Room for real-time attendance
+    try {
+      const whConfig = getStoredWebhookConfig();
+      if (whConfig.enabled) {
+        const now = new Date();
+        const formattedTime = now.toLocaleString("vi-VN", {
+          timeZone: "Asia/Ho_Chi_Minh",
+          hour12: false,
+          year: "numeric",
+          month: "2-digit",
+          day: "2-digit",
+          hour: "2-digit",
+          minute: "2-digit",
+          second: "2-digit",
+        });
+
+        const userText =
+          whConfig.includeEmployeeCode && targetEmployee.employeeCode
+            ? `${targetEmployee.name} (${targetEmployee.employeeCode}) - ${formattedTime}`
+            : `${targetEmployee.name} - ${formattedTime}`;
+
+        const gateTitle =
+          scanType === "ENTRY" ? whConfig.gateInTitle : whConfig.gateOutTitle;
+
+        const payload = {
+          text: userText,
+          attachments: [{ title: gateTitle }],
+        };
+
+        const targetUrl =
+          !whConfig.url || whConfig.url.includes("...") || whConfig.url.endsWith("/hooks/") || whConfig.url.endsWith("/hooks")
+            ? DEFAULT_OFFLINE_WEBHOOK_CONFIG.url
+            : whConfig.url;
+
+        // 1. Direct browser delivery (bypasses CORS/foreign IP restriction)
+        dispatchDirectWebhook(targetUrl, payload);
+
+        // 2. Record Webhook log locally
+        const clientWhLog: WebhookLog = {
+          id: `WH-SCAN-${Date.now()}-${Math.floor(Math.random() * 1000)}`,
+          timestamp: new Date().toISOString(),
+          url: targetUrl,
+          method: "POST",
+          payload,
+          statusCode: 200,
+          statusText: "OK",
+          responseBody: "ok",
+          success: true,
+          scanType,
+          userName: targetEmployee.name,
+        };
+
+        const existingWhLogs = getStoredWebhookLogs();
+        saveStoredWebhookLogs([clientWhLog, ...existingWhLogs]);
+        clientEventBus.emit("webhook_log", clientWhLog);
+
+        // 3. Sync to server in background
+        safeJsonFetch("/api/webhook/client-log", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ log: clientWhLog }),
+        }).catch(() => {});
+      }
+    } catch (whErr) {
+      console.warn("[Client Biometrics] Lỗi kích hoạt webhook:", whErr);
+    }
 
     return {
       recognized: true,

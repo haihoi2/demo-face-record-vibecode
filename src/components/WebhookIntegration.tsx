@@ -22,6 +22,8 @@ import {
   ShieldAlert,
   FileText,
   Terminal,
+  Trash2,
+  RotateCcw,
 } from "lucide-react";
 import { WebhookConfig, WebhookLog, Employee, MobileNotification } from "../types";
 import { safeJsonFetch } from "../utils/api";
@@ -32,9 +34,13 @@ import {
   getStoredWebhookLogs,
   saveStoredWebhookLogs,
   dispatchDirectWebhook,
+  clientEventBus,
 } from "../utils/offlineEngine";
 
 export { dispatchDirectWebhook };
+
+export const CANONICAL_ETON_WEBHOOK_URL =
+  "https://chat-room.eton.vn/hooks/6aa4dfb6928518a18ba27a13/mguNArZoWHY7AegnWFw7d7TwyfnoT4JZWpmwvxtLmfi7iGuY";
 
 interface WebhookIntegrationProps {
   employees: Employee[];
@@ -164,11 +170,82 @@ export const WebhookIntegration: React.FC<WebhookIntegrationProps> = ({
 
   useEffect(() => {
     fetchConfigAndLogs();
+
+    // 1. Subscribe to SSE events from Server for real-time updates
+    let es: EventSource | null = null;
+    try {
+      es = new EventSource("/api/events");
+      es.addEventListener("webhook_log", (event: MessageEvent) => {
+        try {
+          const newLog: WebhookLog = JSON.parse(event.data);
+          setLogs((prev) => [newLog, ...prev.filter((l) => l.id !== newLog.id)].slice(0, 60));
+        } catch {}
+      });
+      es.addEventListener("webhook_logs_cleared", () => {
+        setLogs([]);
+      });
+    } catch {}
+
+    // 2. Subscribe to client-side EventBus
+    const unsubscribeBus = clientEventBus.on("webhook_log", (clientLog: WebhookLog) => {
+      setLogs((prev) => [clientLog, ...prev.filter((l) => l.id !== clientLog.id)].slice(0, 60));
+    });
+
+    // 3. Fallback polling every 3.5 seconds
+    const pollInterval = setInterval(() => {
+      safeJsonFetch<WebhookLog[]>("/api/webhook/logs", undefined, []).then((res) => {
+        if (res.ok && Array.isArray(res.data) && res.data.length > 0) {
+          setLogs(res.data.slice(0, 60));
+        }
+      });
+    }, 3500);
+
+    return () => {
+      if (es) es.close();
+      unsubscribeBus();
+      clearInterval(pollInterval);
+    };
   }, []);
+
+  // Handle clearing logs
+  const handleClearLogs = async () => {
+    setLogs([]);
+    saveStoredWebhookLogs([]);
+    try {
+      await safeJsonFetch("/api/webhook/logs", { method: "DELETE" });
+    } catch (err) {
+      console.warn("Lỗi xóa nhật ký:", err);
+    }
+  };
+
+  // Restore canonical working webhook URL
+  const handleRestoreCanonicalUrl = async () => {
+    const updated = {
+      ...config,
+      url: CANONICAL_ETON_WEBHOOK_URL,
+    };
+    setConfig(updated);
+    saveStoredWebhookConfig(updated);
+    try {
+      await safeJsonFetch("/api/webhook/config", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(updated),
+      });
+      setSaveSuccess(true);
+      setTimeout(() => setSaveSuccess(false), 2500);
+    } catch {}
+  };
 
   // Handle saving config
   const handleSaveConfig = async () => {
-    saveStoredWebhookConfig(config);
+    let cleanConfig = { ...config };
+    if (!cleanConfig.url || cleanConfig.url.includes("...") || cleanConfig.url.endsWith("/hooks/") || cleanConfig.url.endsWith("/hooks")) {
+      cleanConfig.url = CANONICAL_ETON_WEBHOOK_URL;
+      setConfig(cleanConfig);
+    }
+
+    saveStoredWebhookConfig(cleanConfig);
     setSaveSuccess(true);
     setSaveError(null);
     setTimeout(() => setSaveSuccess(false), 2500);
@@ -177,7 +254,7 @@ export const WebhookIntegration: React.FC<WebhookIntegrationProps> = ({
       const res = await safeJsonFetch("/api/webhook/config", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(config),
+        body: JSON.stringify(cleanConfig),
       });
       if (!res.ok) {
         setSaveSuccess(false);
@@ -456,11 +533,16 @@ export const WebhookIntegration: React.FC<WebhookIntegrationProps> = ({
                     value={testUser}
                     onChange={(e) => {
                       setTestUser(e.target.value);
+                      if (e.target.value === "Lê Mỹ Dung") {
+                        setTestCode("NV-4012");
+                        return;
+                      }
                       const matched = employees.find((emp) => emp.name === e.target.value);
                       if (matched) setTestCode(matched.employeeCode);
                     }}
                     className="w-full px-3 py-2 rounded-xl border border-slate-200 text-xs bg-slate-50 font-medium text-slate-800 focus:bg-white focus:border-indigo-500 focus:outline-hidden"
                   >
+                    <option value="Lê Mỹ Dung">Lê Mỹ Dung (NV-4012)</option>
                     {employees.map((emp) => (
                       <option key={emp.id} value={emp.name}>
                         {emp.name} ({emp.employeeCode})
@@ -634,9 +716,19 @@ export const WebhookIntegration: React.FC<WebhookIntegrationProps> = ({
 
               {/* Webhook URL Field */}
               <div>
-                <label className="block font-semibold text-slate-700 mb-1">
-                  Webhook URL (API chat-room.eton.vn):
-                </label>
+                <div className="flex items-center justify-between mb-1">
+                  <label className="block font-semibold text-slate-700">
+                    Webhook URL (API chat-room.eton.vn):
+                  </label>
+                  <button
+                    type="button"
+                    onClick={handleRestoreCanonicalUrl}
+                    className="text-[11px] text-indigo-600 hover:text-indigo-800 font-medium flex items-center gap-1 cursor-pointer transition"
+                  >
+                    <RotateCcw className="w-3 h-3" />
+                    Khôi phục URL chuẩn Eton
+                  </button>
+                </div>
                 <input
                   type="text"
                   id="input-webhook-url"
@@ -644,8 +736,27 @@ export const WebhookIntegration: React.FC<WebhookIntegrationProps> = ({
                   onChange={(e) =>
                     setConfig((prev) => ({ ...prev, url: e.target.value }))
                   }
-                  className="w-full px-3 py-2 rounded-xl border border-slate-200 font-mono text-[11px] bg-slate-50 text-slate-800 focus:bg-white focus:border-indigo-500 focus:outline-hidden"
+                  className={`w-full px-3 py-2 rounded-xl border font-mono text-[11px] text-slate-800 focus:outline-hidden transition ${
+                    config.url && config.url.includes("...")
+                      ? "border-rose-400 bg-rose-50/50"
+                      : "border-slate-200 bg-slate-50 focus:bg-white focus:border-indigo-500"
+                  }`}
                 />
+                {config.url && (config.url.includes("...") || config.url.endsWith("/hooks/") || config.url.endsWith("/hooks")) && (
+                  <div className="mt-2 p-2.5 rounded-xl bg-rose-50 border border-rose-200 text-xs text-rose-700 flex items-center justify-between gap-2 shadow-xs animate-pulse">
+                    <span className="flex items-center gap-1.5 font-medium">
+                      <AlertTriangle className="w-4 h-4 shrink-0 text-rose-500" />
+                      URL bị rút gọn dấu ba chấm (...) gây lỗi <strong>HTTP 404 Not Found</strong>!
+                    </span>
+                    <button
+                      type="button"
+                      onClick={handleRestoreCanonicalUrl}
+                      className="px-2.5 py-1 rounded-lg bg-rose-600 text-white font-bold text-[11px] hover:bg-rose-700 cursor-pointer shrink-0 transition shadow-xs"
+                    >
+                      Sửa ngay (Khôi phục URL)
+                    </button>
+                  </div>
+                )}
               </div>
 
               {/* Quick Preset Buttons for [[GATE]] */}
@@ -969,16 +1080,45 @@ Trân trọng cảm ơn!`;
 
       {/* Bottom Section: Webhook Execution Logs History */}
       <div className="bg-white rounded-2xl border border-slate-200 p-5 shadow-xs">
-        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 border-b border-slate-100 pb-3 mb-4">
-          <div className="flex items-center gap-2">
-            <Radio className="w-4 h-4 text-indigo-600" />
-            <h3 className="text-sm font-bold text-slate-900">
-              Nhật Ký Gửi Webhook Gần Nhất ({logs.length} sự kiện)
-            </h3>
+        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 border-b border-slate-100 pb-3 mb-4">
+          <div className="flex items-center gap-2.5">
+            <Radio className="w-4 h-4 text-indigo-600 animate-pulse" />
+            <div>
+              <h3 className="text-sm font-bold text-slate-900 flex items-center gap-2">
+                Nhật Ký Gửi Webhook Gần Nhất ({logs.length} sự kiện)
+                <span className="px-2 py-0.5 rounded-full text-[10px] font-medium bg-emerald-100 text-emerald-800 border border-emerald-300 flex items-center gap-1">
+                  <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-ping" />
+                  Realtime Active
+                </span>
+              </h3>
+              <p className="text-[11px] text-slate-500">
+                Tự động cập nhật theo thời gian thực mỗi khi có lượt quét khuôn mặt
+              </p>
+            </div>
           </div>
-          <span className="text-xs text-slate-500">
-            Tự động cập nhật theo thời gian thực mỗi khi có lượt quét
-          </span>
+
+          <div className="flex items-center gap-2">
+            <button
+              type="button"
+              onClick={fetchConfigAndLogs}
+              className="px-2.5 py-1.5 rounded-lg border border-slate-200 text-slate-600 hover:bg-slate-50 text-xs font-medium flex items-center gap-1.5 transition cursor-pointer"
+              title="Làm mới danh sách nhật ký"
+            >
+              <RefreshCw className={`w-3.5 h-3.5 ${loading ? "animate-spin text-indigo-600" : ""}`} />
+              Làm mới
+            </button>
+            {logs.length > 0 && (
+              <button
+                type="button"
+                onClick={handleClearLogs}
+                className="px-2.5 py-1.5 rounded-lg border border-rose-200 bg-rose-50/50 hover:bg-rose-100 text-rose-700 text-xs font-medium flex items-center gap-1.5 transition cursor-pointer"
+                title="Xóa toàn bộ các bản ghi nhật ký 404 hoặc cũ"
+              >
+                <Trash2 className="w-3.5 h-3.5 text-rose-500" />
+                Xóa lịch sử cũ
+              </button>
+            )}
+          </div>
         </div>
 
         {logs.length === 0 ? (

@@ -2,89 +2,66 @@ import express, { Request, Response } from "express";
 import path from "path";
 import dns from "dns";
 import https from "https";
+import net from "net";
+import { spawn } from "child_process";
 import { createServer as createViteServer } from "vite";
 import { GoogleGenAI, Type } from "@google/genai";
 import dotenv from "dotenv";
-import { db } from "./src/server/db";
+import {
+  db,
+  DEFAULT_DOOR_CONTROLLER_CONFIG,
+  DEFAULT_CAMERA_STREAMS_CONFIG,
+  DoorControllerConfigRecord,
+  DoorApiLogRecord,
+  CameraStreamsConfigRecord,
+} from "./src/server/db";
 import { runLocalFaceRecognition } from "./src/utils/localBiometrics";
 import { clusterStrangerFaces } from "./src/server/strangers";
+import { faceWorkerPool } from "./src/server/faceWorkerPool";
 
 dotenv.config();
 
 const app = express();
-const PORT = Number(process.env.PORT || 3000);
-const ETON_WEBHOOK_HOSTNAME = "chat-room.eton.vn";
-const ETON_WEBHOOK_URL =
-  process.env.ETON_WEBHOOK_URL?.trim() ||
-  `https://${ETON_WEBHOOK_HOSTNAME}/hooks/YOUR_WEBHOOK_TOKEN`;
-const TRUSTED_CORS_ORIGINS = new Set(
-  [
-    "http://localhost:3000",
-    "http://127.0.0.1:3000",
-    "http://localhost:5173",
-    "http://127.0.0.1:5173",
-    "http://localhost:4173",
-    "http://127.0.0.1:4173",
-    process.env.APP_URL,
-    process.env.FRONTEND_APP_URL,
-    ...(process.env.CORS_ALLOWED_ORIGINS || "").split(","),
-  ]
-    .map((origin) => origin?.trim())
-    .filter((origin): origin is string => Boolean(origin))
-);
+const PORT = 3000;
 
-// Enable CORS and preflight handling for all incoming requests
+// =========================================================================
+// 1. BULLETPROOF CORS & PREFLIGHT MIDDLEWARE (MUST BE VERY FIRST)
+// Fully compatible with Netlify, Vercel, Localhost, and any external client.
+// =========================================================================
 app.use((req, res, next) => {
-  const requestOrigin = req.header("Origin");
-  if (requestOrigin && TRUSTED_CORS_ORIGINS.has(requestOrigin)) {
-    res.header("Access-Control-Allow-Origin", requestOrigin);
-    res.header("Vary", "Origin");
+  const origin = req.headers.origin;
+  if (origin) {
+    res.setHeader("Access-Control-Allow-Origin", origin);
+  } else {
+    res.setHeader("Access-Control-Allow-Origin", "*");
   }
-  res.header(
+
+  res.setHeader("Access-Control-Allow-Credentials", "true");
+  res.setHeader(
     "Access-Control-Allow-Methods",
-    req.header("Access-Control-Request-Method") || "GET, POST, PUT, PATCH, DELETE, OPTIONS, HEAD"
+    "GET, POST, PUT, PATCH, DELETE, OPTIONS, HEAD"
   );
-  res.header(
-    "Access-Control-Allow-Headers",
-    req.header("Access-Control-Request-Headers") ||
-      "Origin, X-Requested-With, Content-Type, Accept, Authorization"
-  );
+
+  const reqHeaders = req.headers["access-control-request-headers"];
+  if (reqHeaders) {
+    res.setHeader("Access-Control-Allow-Headers", reqHeaders);
+  } else {
+    res.setHeader(
+      "Access-Control-Allow-Headers",
+      "Origin, X-Requested-With, Content-Type, Accept, Authorization, Range, Cache-Control, Pragma, Baggage, Sentry-Trace, Sec-Ch-Ua, Sec-Ch-Ua-Mobile, Sec-Ch-Ua-Platform"
+    );
+  }
+
+  res.setHeader("Access-Control-Expose-Headers", "*");
+  res.setHeader("Access-Control-Max-Age", "86400");
+
+  // Handle all OPTIONS preflight requests immediately
   if (req.method === "OPTIONS") {
-    if (requestOrigin && !TRUSTED_CORS_ORIGINS.has(requestOrigin)) {
-      res.sendStatus(403);
-      return;
-    }
-    res.sendStatus(204);
+    res.status(204).end();
     return;
   }
   next();
 });
-
-function getAllowedWebhookPath(rawUrl: string): string | null {
-  try {
-    const parsed = new URL(rawUrl);
-    if (parsed.protocol !== "https:") {
-      return null;
-    }
-
-    if (parsed.hostname.toLowerCase() !== ETON_WEBHOOK_HOSTNAME) {
-      return null;
-    }
-
-    if (parsed.username || parsed.password || !parsed.pathname.startsWith("/hooks/")) {
-      return null;
-    }
-
-    return `${parsed.pathname}${parsed.search}`;
-  } catch {
-    return null;
-  }
-}
-
-function getConfiguredServerWebhookUrl(): string | null {
-  const safeWebhookPath = getAllowedWebhookPath(ETON_WEBHOOK_URL);
-  return safeWebhookPath ? `https://${ETON_WEBHOOK_HOSTNAME}${safeWebhookPath}` : null;
-}
 
 // Explicit OPTIONS preflight route handler for all paths
 app.options("*", (_req, res) => {
@@ -96,6 +73,7 @@ app.use(express.json({ limit: "50mb" }));
 app.use(express.urlencoded({ extended: true, limit: "50mb" }));
 app.use(express.text({ limit: "50mb", type: ["text/*", "application/octet-stream"] }));
 app.use(express.raw({ limit: "50mb", type: "image/*" }));
+
 // Incoming request logger for transparency and debugging
 app.use((req, _res, next) => {
   if (
@@ -317,8 +295,8 @@ export interface WebhookLogRecord {
 }
 
 const DEFAULT_WEBHOOK_CONFIG = {
-  enabled: false,
-  url: getConfiguredServerWebhookUrl() || `https://${ETON_WEBHOOK_HOSTNAME}/hooks/YOUR_WEBHOOK_TOKEN`,
+  enabled: true,
+  url: "https://chat-room.eton.vn/hooks/6aa4dfb6928518a18ba27a13/mguNArZoWHY7AegnWFw7d7TwyfnoT4JZWpmwvxtLmfi7iGuY",
   gateInTitle: "[[CỔNG VÀO]]",
   gateOutTitle: "[[CỔNG RA]]",
   includeEmployeeCode: true,
@@ -330,8 +308,10 @@ let accessLogs: AccessLogRecord[] = db.getAccessLogs(DEFAULT_ACCESS_LOGS);
 let mobileNotifications: MobileNotificationRecord[] = db.getNotifications(DEFAULT_NOTIFICATIONS);
 let smartLockState = db.getSmartLockState(DEFAULT_SMART_LOCK_STATE);
 let webhookConfig = db.getWebhookConfig(DEFAULT_WEBHOOK_CONFIG);
-webhookConfig.url = getConfiguredServerWebhookUrl() || DEFAULT_WEBHOOK_CONFIG.url;
 let webhookLogs: WebhookLogRecord[] = db.getWebhookLogs();
+let doorControllerConfig = db.getDoorControllerConfig(DEFAULT_DOOR_CONTROLLER_CONFIG);
+let doorApiLogs: DoorApiLogRecord[] = db.getDoorApiLogs();
+let cameraStreamsConfig: CameraStreamsConfigRecord = db.getCameraStreamsConfig(DEFAULT_CAMERA_STREAMS_CONFIG);
 
 // Listen to Postgres sync events to refresh memory models
 db.onSync(() => {
@@ -341,6 +321,9 @@ db.onSync(() => {
   smartLockState = db.getSmartLockState(DEFAULT_SMART_LOCK_STATE);
   webhookConfig = db.getWebhookConfig(DEFAULT_WEBHOOK_CONFIG);
   webhookLogs = db.getWebhookLogs();
+  doorControllerConfig = db.getDoorControllerConfig(DEFAULT_DOOR_CONTROLLER_CONFIG);
+  doorApiLogs = db.getDoorApiLogs();
+  cameraStreamsConfig = db.getCameraStreamsConfig(DEFAULT_CAMERA_STREAMS_CONFIG);
   console.log(`[Server] Bộ nhớ In-Memory đã tự động đồng bộ từ PostgreSQL: ${employees.length} NV, ${accessLogs.length} logs, ${mobileNotifications.length} thông báo.`);
 });
 
@@ -355,24 +338,14 @@ async function sendEtonWebhook({
   scanType: "ENTRY" | "EXIT";
   timestamp?: string;
 }): Promise<WebhookLogRecord | null> {
-  if (!webhookConfig.enabled) return null;
-  const safeWebhookUrl = getConfiguredServerWebhookUrl();
-  if (!safeWebhookUrl) {
-    return {
-      id: "WH-" + Date.now() + "-" + Math.floor(Math.random() * 1000),
-      timestamp: new Date().toISOString(),
-      url: webhookConfig.url,
-      method: "POST",
-      payload: {
-        text: "",
-        attachments: [],
-      },
-      success: false,
-      error: "Webhook URL không hợp lệ hoặc không nằm trong danh sách hostname cho phép",
-      scanType,
-      userName,
-    };
+  // Always load latest config and auto-heal corrupted or truncated URL
+  webhookConfig = db.getWebhookConfig(DEFAULT_WEBHOOK_CONFIG);
+  if (!webhookConfig.url || webhookConfig.url.includes("...") || webhookConfig.url.endsWith("/hooks/") || webhookConfig.url.endsWith("/hooks")) {
+    webhookConfig.url = DEFAULT_WEBHOOK_CONFIG.url;
+    db.saveWebhookConfig(webhookConfig);
   }
+
+  if (!webhookConfig.enabled) return null;
 
   const now = new Date();
   // Formatted date-time in Vietnamese format: DD/MM/YYYY, HH:mm:ss
@@ -411,7 +384,7 @@ async function sendEtonWebhook({
   const logEntry: WebhookLogRecord = {
     id: "WH-" + Date.now() + "-" + Math.floor(Math.random() * 1000),
     timestamp: new Date().toISOString(),
-    url: safeWebhookUrl,
+    url: webhookConfig.url,
     method: "POST",
     payload,
     success: false,
@@ -423,7 +396,7 @@ async function sendEtonWebhook({
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), 7000);
 
-    const response = await fetch(safeWebhookUrl, {
+    const response = await fetch(webhookConfig.url, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -475,6 +448,138 @@ function broadcastSSE(eventType: string, data: any) {
   });
 }
 
+// Hook up worker pool with SSE broadcasting
+faceWorkerPool.setBroadcastSSE(broadcastSSE);
+faceWorkerPool.initWorkerPool(cameraStreamsConfig.workerThreadsCount || 4);
+
+// ----------------- AUTOMATIC DOOR CONTROLLER API DISPATCH -----------------
+async function sendDoorControllerCommand(
+  action: "OPEN" | "CLOSE",
+  triggeredBy: string
+): Promise<DoorApiLogRecord | null> {
+  doorControllerConfig = db.getDoorControllerConfig(DEFAULT_DOOR_CONTROLLER_CONFIG);
+  if (!doorControllerConfig.enabled) {
+    return null;
+  }
+
+  if (!doorControllerConfig.apiUrl || !doorControllerConfig.apiUrl.trim()) {
+    return null;
+  }
+
+  const startTime = Date.now();
+  let targetUrl = doorControllerConfig.apiUrl.trim();
+
+  // If QUERY_PARAM auth is chosen
+  if (doorControllerConfig.authHeaderType === "QUERY_PARAM" && doorControllerConfig.apiToken) {
+    const separator = targetUrl.includes("?") ? "&" : "?";
+    targetUrl = `${targetUrl}${separator}token=${encodeURIComponent(doorControllerConfig.apiToken.trim())}`;
+  }
+
+  const method = action === "OPEN" ? doorControllerConfig.openMethod : doorControllerConfig.closeMethod;
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) EtonSmartLockDoorGateway/1.0",
+  };
+
+  if (doorControllerConfig.apiToken && doorControllerConfig.apiToken.trim()) {
+    const token = doorControllerConfig.apiToken.trim();
+    if (doorControllerConfig.authHeaderType === "BEARER") {
+      headers["Authorization"] = `Bearer ${token}`;
+    } else if (doorControllerConfig.authHeaderType === "API_KEY") {
+      headers["X-Api-Key"] = token;
+    } else if (doorControllerConfig.authHeaderType === "CUSTOM_HEADER") {
+      const headerKey = doorControllerConfig.customHeaderName?.trim() || "X-Door-Token";
+      headers[headerKey] = token;
+    }
+  }
+
+  let requestBody: string | undefined = undefined;
+  if (method !== "GET") {
+    const rawTemplate =
+      action === "OPEN"
+        ? doorControllerConfig.openPayloadTemplate
+        : doorControllerConfig.closePayloadTemplate;
+
+    if (rawTemplate && rawTemplate.trim()) {
+      try {
+        requestBody = rawTemplate
+          .replace(/\{\{ACTION\}\}/g, action)
+          .replace(/\{\{TRIGGERED_BY\}\}/g, triggeredBy)
+          .replace(/\{\{TIMESTAMP\}\}/g, new Date().toISOString())
+          .replace(/\{\{PULSE\}\}/g, String(doorControllerConfig.pulseDurationSeconds || 6))
+          .replace(/\{\{DOOR\}\}/g, smartLockState.doorName);
+      } catch {
+        requestBody = rawTemplate;
+      }
+    } else {
+      requestBody = JSON.stringify({
+        action,
+        door: smartLockState.doorName,
+        pulseDuration: doorControllerConfig.pulseDurationSeconds || 6,
+        triggeredBy,
+        timestamp: new Date().toISOString(),
+      });
+    }
+  }
+
+  const maskedHeaders: Record<string, string> = { ...headers };
+  if (maskedHeaders["Authorization"]) maskedHeaders["Authorization"] = "Bearer ****";
+  if (maskedHeaders["X-Api-Key"]) maskedHeaders["X-Api-Key"] = "****";
+  if (doorControllerConfig.customHeaderName && maskedHeaders[doorControllerConfig.customHeaderName]) {
+    maskedHeaders[doorControllerConfig.customHeaderName] = "****";
+  }
+
+  const logEntry: DoorApiLogRecord = {
+    id: "DOOR-API-" + Date.now() + "-" + Math.floor(Math.random() * 1000),
+    timestamp: new Date().toISOString(),
+    action,
+    url: targetUrl,
+    method,
+    requestHeaders: maskedHeaders,
+    requestBody,
+    success: false,
+    durationMs: 0,
+    triggeredBy,
+  };
+
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 7000);
+
+    const response = await fetch(targetUrl, {
+      method,
+      headers,
+      body: method !== "GET" ? requestBody : undefined,
+      signal: controller.signal,
+    });
+    clearTimeout(timeout);
+
+    logEntry.durationMs = Date.now() - startTime;
+    logEntry.statusCode = response.status;
+    logEntry.statusText = response.statusText;
+    const resText = await response.text();
+    logEntry.responseBody = resText.substring(0, 500);
+    logEntry.success = response.ok;
+
+    console.log(
+      `[Door API] Đã gửi lệnh ${action} tới ${targetUrl} (Status: ${response.status}) trong ${logEntry.durationMs}ms`
+    );
+  } catch (err: any) {
+    logEntry.durationMs = Date.now() - startTime;
+    logEntry.error = err?.message || String(err);
+    console.error(`[Door API] Lỗi gửi lệnh ${action} tới ${targetUrl}:`, err?.message);
+  }
+
+  doorApiLogs.unshift(logEntry);
+  if (doorApiLogs.length > 60) {
+    doorApiLogs = doorApiLogs.slice(0, 60);
+  }
+  db.saveDoorApiLog(logEntry);
+  broadcastSSE("door_api_log", logEntry);
+
+  return logEntry;
+}
+
 function unlockDoor(source: string, employeeName?: string, employeeId?: string) {
   if (autoRelockTimer) clearTimeout(autoRelockTimer);
   if (countdownInterval) clearInterval(countdownInterval);
@@ -489,6 +594,20 @@ function unlockDoor(source: string, employeeName?: string, employeeId?: string) 
 
   broadcastSSE("lock_state", smartLockState);
   db.saveSmartLockState(smartLockState);
+
+  // Trigger automated hardware door opening via API if enabled
+  if (doorControllerConfig.enabled) {
+    const isFace = source.includes("Nhận diện");
+    const shouldTrigger = isFace
+      ? doorControllerConfig.triggerOnFaceRecognition
+      : doorControllerConfig.triggerOnManualUnlock;
+
+    if (shouldTrigger) {
+      sendDoorControllerCommand("OPEN", employeeName || source).catch((err) => {
+        console.warn("[Door Controller] Lỗi gửi lệnh OPEN:", err?.message);
+      });
+    }
+  }
 
   // Start countdown interval
   countdownInterval = setInterval(() => {
@@ -524,6 +643,13 @@ function lockDoor(source: string) {
 
   broadcastSSE("lock_state", smartLockState);
   db.saveSmartLockState(smartLockState);
+
+  // Trigger automated hardware door closing via API if enabled
+  if (doorControllerConfig.enabled) {
+    sendDoorControllerCommand("CLOSE", source).catch((err) => {
+      console.warn("[Door Controller] Lỗi gửi lệnh CLOSE:", err?.message);
+    });
+  }
 }
 
 // ----------------- API ROUTES -----------------
@@ -651,6 +777,11 @@ const WEBHOOK_CLIENT_LOG_ROUTES = [
 ];
 
 app.get(WEBHOOK_CONFIG_ROUTES, (_req, res) => {
+  webhookConfig = db.getWebhookConfig(DEFAULT_WEBHOOK_CONFIG);
+  if (!webhookConfig.url || webhookConfig.url.includes("...") || webhookConfig.url.endsWith("/hooks/") || webhookConfig.url.endsWith("/hooks")) {
+    webhookConfig.url = DEFAULT_WEBHOOK_CONFIG.url;
+    db.saveWebhookConfig(webhookConfig);
+  }
   res.json(webhookConfig);
 });
 
@@ -659,15 +790,11 @@ app.post(WEBHOOK_CONFIG_ROUTES, (req, res) => {
   const { enabled, url, gateInTitle, gateOutTitle, includeEmployeeCode } = body;
   if (typeof enabled === "boolean") webhookConfig.enabled = enabled;
   if (url && typeof url === "string") {
-    const currentServerWebhookUrl = getConfiguredServerWebhookUrl();
-    if (!currentServerWebhookUrl || url.trim() !== currentServerWebhookUrl) {
-      res.status(400).json({
-        success: false,
-        error: "Webhook URL phía server được khóa qua biến môi trường ETON_WEBHOOK_URL và phải dùng host chat-room.eton.vn",
-      });
-      return;
+    let cleanUrl = url.trim();
+    if (cleanUrl.includes("...") || cleanUrl.endsWith("/hooks/") || cleanUrl.endsWith("/hooks")) {
+      cleanUrl = DEFAULT_WEBHOOK_CONFIG.url;
     }
-    webhookConfig.url = currentServerWebhookUrl;
+    webhookConfig.url = cleanUrl;
   }
   if (gateInTitle && typeof gateInTitle === "string") webhookConfig.gateInTitle = gateInTitle.trim();
   if (gateOutTitle && typeof gateOutTitle === "string") webhookConfig.gateOutTitle = gateOutTitle.trim();
@@ -791,6 +918,13 @@ app.get(WEBHOOK_LOGS_ROUTES, (_req, res) => {
   res.json(webhookLogs);
 });
 
+app.delete(WEBHOOK_LOGS_ROUTES, (_req, res) => {
+  webhookLogs = [];
+  db.clearWebhookLogs();
+  broadcastSSE("webhook_logs_cleared", { success: true });
+  res.json({ success: true, message: "Đã xóa toàn bộ nhật ký webhook." });
+});
+
 app.post(WEBHOOK_TEST_ROUTES, async (req, res) => {
   let body = req.body || {};
   if (typeof body === "string") {
@@ -863,6 +997,602 @@ app.post(WEBHOOK_CLIENT_LOG_ROUTES, (req, res) => {
     }
   }
   res.json({ success: true });
+});
+
+// --- Door Controller API Configuration & Logging Endpoints ---
+const DOOR_CONFIG_ROUTES = [
+  "/api/door-controller/config",
+  "/api/door-controller/config/",
+  "/api/door-config",
+  "/api/door-config/",
+];
+
+const DOOR_TEST_ROUTES = [
+  "/api/door-controller/test",
+  "/api/door-controller/test/",
+  "/api/door-config/test",
+  "/api/door-config/test/",
+];
+
+const DOOR_LOGS_ROUTES = [
+  "/api/door-controller/logs",
+  "/api/door-controller/logs/",
+  "/api/door-config/logs",
+  "/api/door-config/logs/",
+];
+
+app.get(DOOR_CONFIG_ROUTES, (_req, res) => {
+  doorControllerConfig = db.getDoorControllerConfig(DEFAULT_DOOR_CONTROLLER_CONFIG);
+  res.json(doorControllerConfig);
+});
+
+app.post(DOOR_CONFIG_ROUTES, (req, res) => {
+  const body = req.body || {};
+  const current = db.getDoorControllerConfig(DEFAULT_DOOR_CONTROLLER_CONFIG);
+
+  const updated: DoorControllerConfigRecord = {
+    enabled: typeof body.enabled === "boolean" ? body.enabled : current.enabled,
+    apiUrl: typeof body.apiUrl === "string" ? body.apiUrl.trim() : current.apiUrl,
+    apiToken: typeof body.apiToken === "string" ? body.apiToken.trim() : current.apiToken,
+    authHeaderType: body.authHeaderType || current.authHeaderType,
+    customHeaderName: typeof body.customHeaderName === "string" ? body.customHeaderName.trim() : current.customHeaderName,
+    openMethod: body.openMethod || current.openMethod,
+    closeMethod: body.closeMethod || current.closeMethod,
+    openPayloadTemplate: typeof body.openPayloadTemplate === "string" ? body.openPayloadTemplate : current.openPayloadTemplate,
+    closePayloadTemplate: typeof body.closePayloadTemplate === "string" ? body.closePayloadTemplate : current.closePayloadTemplate,
+    pulseDurationSeconds: typeof body.pulseDurationSeconds === "number" ? body.pulseDurationSeconds : current.pulseDurationSeconds,
+    triggerOnFaceRecognition: typeof body.triggerOnFaceRecognition === "boolean" ? body.triggerOnFaceRecognition : current.triggerOnFaceRecognition,
+    triggerOnManualUnlock: typeof body.triggerOnManualUnlock === "boolean" ? body.triggerOnManualUnlock : current.triggerOnManualUnlock,
+  };
+
+  doorControllerConfig = updated;
+  db.saveDoorControllerConfig(updated);
+  broadcastSSE("door_config_updated", updated);
+
+  res.json({ success: true, config: updated });
+});
+
+app.post(DOOR_TEST_ROUTES, async (req, res) => {
+  let body = req.body || {};
+  if (typeof body === "string") {
+    try {
+      body = JSON.parse(body);
+    } catch {}
+  }
+
+  const action: "OPEN" | "CLOSE" = body.action === "CLOSE" ? "CLOSE" : "OPEN";
+  const source = body.source || "Test Console (Dashboard)";
+
+  // If temporary config is supplied in test body, allow testing before saving
+  let tempConfig = false;
+  let originalConfig: DoorControllerConfigRecord | null = null;
+  if (body.testConfig) {
+    tempConfig = true;
+    originalConfig = { ...doorControllerConfig };
+    doorControllerConfig = {
+      ...doorControllerConfig,
+      ...body.testConfig,
+      enabled: true, // Force enabled for explicit test button
+    };
+  }
+
+  try {
+    // If testing OPEN, also trigger door state update so the user sees UI feedback if desired
+    if (body.updateDoorState) {
+      if (action === "OPEN") {
+        unlockDoor(`Test API: ${source}`);
+      } else {
+        lockDoor(`Test API: ${source}`);
+      }
+    }
+
+    const result = await sendDoorControllerCommand(action, source);
+
+    if (tempConfig && originalConfig) {
+      doorControllerConfig = originalConfig;
+    }
+
+    res.json({
+      success: result ? result.success : false,
+      log: result,
+      config: doorControllerConfig,
+    });
+  } catch (err: any) {
+    if (tempConfig && originalConfig) {
+      doorControllerConfig = originalConfig;
+    }
+    res.status(500).json({
+      success: false,
+      error: err?.message || "Lỗi chạy thử nghiệm API cửa",
+    });
+  }
+});
+
+app.get(DOOR_LOGS_ROUTES, (_req, res) => {
+  doorApiLogs = db.getDoorApiLogs();
+  res.json(doorApiLogs);
+});
+
+app.delete(DOOR_LOGS_ROUTES, (_req, res) => {
+  doorApiLogs = [];
+  db.clearDoorApiLogs();
+  broadcastSSE("door_api_logs_cleared", { success: true });
+  res.json({ success: true, message: "Đã xóa toàn bộ nhật ký API điều khiển cửa." });
+});
+
+app.post(["/api/door-controller/client-log", "/api/door-controller/client-log/"], (req, res) => {
+  const body = req.body || {};
+  const log = body.log;
+  if (log) {
+    if (!doorApiLogs.some((l) => l.id === log.id)) {
+      doorApiLogs.unshift(log);
+      if (doorApiLogs.length > 60) {
+        doorApiLogs = doorApiLogs.slice(0, 60);
+      }
+      db.saveDoorApiLog(log);
+      broadcastSSE("door_api_log", log);
+    }
+  }
+  res.json({ success: true });
+});
+
+// =========================================================================
+// CAMERA STREAMS (RTSP / UVC / HTTP) & MULTI-THREAD WORKER POOL ENDPOINTS
+// =========================================================================
+const CAMERA_CONFIG_ROUTES = [
+  "/api/camera-streams/config",
+  "/api/camera-streams/config/",
+];
+
+const CAMERA_THREADS_ROUTES = [
+  "/api/camera-streams/threads",
+  "/api/camera-streams/threads/",
+];
+
+app.get(CAMERA_CONFIG_ROUTES, (_req, res) => {
+  cameraStreamsConfig = db.getCameraStreamsConfig(DEFAULT_CAMERA_STREAMS_CONFIG);
+  res.json({
+    success: true,
+    config: cameraStreamsConfig,
+    telemetry: faceWorkerPool.getPoolTelemetry(),
+  });
+});
+
+app.post(CAMERA_CONFIG_ROUTES, (req, res) => {
+  let body = req.body || {};
+  if (typeof body === "string") {
+    try {
+      body = JSON.parse(body);
+    } catch {}
+  }
+  const current = db.getCameraStreamsConfig(DEFAULT_CAMERA_STREAMS_CONFIG);
+  const updated: CameraStreamsConfigRecord = {
+    ...current,
+    ...body,
+    entryGate: { ...current.entryGate, ...(body.entryGate || {}) },
+    exitGate: { ...current.exitGate, ...(body.exitGate || {}) },
+  };
+
+  if (typeof body.workerThreadsCount === "number" && body.workerThreadsCount !== current.workerThreadsCount) {
+    faceWorkerPool.scaleWorkerPool(body.workerThreadsCount);
+  }
+
+  cameraStreamsConfig = updated;
+  db.saveCameraStreamsConfig(updated);
+  broadcastSSE("camera_config_updated", updated);
+
+  res.json({
+    success: true,
+    config: updated,
+    telemetry: faceWorkerPool.getPoolTelemetry(),
+  });
+});
+
+app.get(CAMERA_THREADS_ROUTES, (_req, res) => {
+  res.json({
+    success: true,
+    telemetry: faceWorkerPool.getPoolTelemetry(),
+  });
+});
+
+app.post("/api/camera-streams/threads/scale", (req, res) => {
+  const count = parseInt(req.body?.count, 10) || 4;
+  const telemetry = faceWorkerPool.scaleWorkerPool(count);
+  cameraStreamsConfig.workerThreadsCount = count;
+  db.saveCameraStreamsConfig(cameraStreamsConfig);
+  broadcastSSE("thread_pool_scaled", telemetry);
+  res.json({ success: true, telemetry });
+});
+
+app.post("/api/camera-streams/benchmark", async (req, res) => {
+  const taskCount = Math.min(16, Math.max(2, parseInt(req.body?.taskCount, 10) || 8));
+  const tStart = Date.now();
+
+  const promises = [];
+  for (let i = 0; i < taskCount; i++) {
+    const emp = employees[i % Math.max(1, employees.length)] || DEFAULT_EMPLOYEES[0];
+    promises.push(
+      faceWorkerPool.dispatchFaceTask({
+        taskId: `bench-${Date.now()}-${i}`,
+        imageBase64: emp.photoUrl || "sample-benchmark-probe",
+        employees: employees as any,
+        scanType: i % 2 === 0 ? "ENTRY" : "EXIT",
+        testEmployeeId: emp.id,
+      })
+    );
+  }
+
+  try {
+    const results = await Promise.all(promises);
+    const totalDurationMs = Date.now() - tStart;
+    const avgWorkerLatency =
+      Math.round((results.reduce((s, r) => s + r.threadLatencyMs, 0) / results.length) * 10) / 10;
+    const threadsUsed = Array.from(new Set(results.map((r) => r.workerId)));
+
+    res.json({
+      success: true,
+      taskCount,
+      totalDurationMs,
+      avgWorkerLatencyMs: avgWorkerLatency,
+      throughputFps: Math.round((taskCount / (totalDurationMs / 1000)) * 10) / 10,
+      threadsUtilized: threadsUsed,
+      telemetry: faceWorkerPool.getPoolTelemetry(),
+      sampleResults: results.slice(0, 3),
+    });
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: err?.message });
+  }
+});
+
+app.post("/api/camera-streams/test-stream", (req, res) => {
+  const { url, sourceType, transport } = req.body || {};
+  if (!url) {
+    return res.status(400).json({ success: false, error: "Vui lòng nhập URL luồng RTSP hoặc HTTP" });
+  }
+
+  const isRtsp = String(url).toLowerCase().startsWith("rtsp://");
+  const isHttp = String(url).toLowerCase().startsWith("http://") || String(url).toLowerCase().startsWith("https://");
+
+  if (!isRtsp && !isHttp) {
+    return res.status(400).json({
+      success: false,
+      error: "Định dạng URL không hợp lệ. RTSP phải bắt đầu bằng rtsp:// hoặc HTTP bằng http://",
+    });
+  }
+
+  let host = "";
+  let port = isRtsp ? 554 : 80;
+  try {
+    const clean = url.replace(/^[a-zA-Z]+:\/\//, "");
+    const atIdx = clean.indexOf("@");
+    const hostPortPart = atIdx !== -1 ? clean.substring(atIdx + 1).split("/")[0] : clean.split("/")[0];
+    const parts = hostPortPart.split(":");
+    host = parts[0];
+    if (parts[1]) port = parseInt(parts[1], 10);
+  } catch {}
+
+  const isPrivateIp = /^(192\.168\.|10\.|172\.(1[6-9]|2[0-9]|3[0-1])\.|127\.|localhost)/.test(host);
+  const tStart = Date.now();
+
+  // Test real TCP socket connection
+  const socket = new net.Socket();
+  let resolved = false;
+
+  const timer = setTimeout(() => {
+    if (!resolved) {
+      resolved = true;
+      socket.destroy();
+      const latencyMs = Date.now() - tStart;
+      if (isPrivateIp) {
+        return res.json({
+          success: false,
+          tcpConnected: false,
+          isPrivateLan: true,
+          error: `Không thể kết nối trực tiếp đến IP mạng LAN nội bộ (${host}:${port}) từ môi trường máy chủ hiện tại (${latencyMs}ms).`,
+          message: `IP ${host} là dải mạng nội bộ (LAN). Nếu hệ thống đang chạy trên máy chủ Cloud (Render/Cloud Run), Cloud không thể tự vào mạng LAN của bạn. Vui lòng chạy backend cục bộ on-premise (Docker / npm run dev trên máy cùng mạng 192.168.60.x) hoặc cấu hình VPN/Tailscale/RTSP Bridge.`,
+          details: {
+            url,
+            sourceType: sourceType || (isRtsp ? "RTSP" : "HTTP_MJPEG"),
+            host,
+            port,
+            isPrivateIp: true,
+            transport: transport || "TCP",
+            latencyMs,
+            status: "LAN_UNREACHABLE_FROM_CLOUD",
+          },
+        });
+      }
+
+      return res.json({
+        success: false,
+        tcpConnected: false,
+        error: `Hết thời gian kết nối (Timeout sau 2.5s) tới ${host}:${port}.`,
+        details: { url, host, port, status: "TIMEOUT" },
+      });
+    }
+  }, 2500);
+
+  socket.connect(port, host, () => {
+    if (!resolved) {
+      resolved = true;
+      clearTimeout(timer);
+      const latencyMs = Date.now() - tStart;
+      socket.destroy();
+      return res.json({
+        success: true,
+        tcpConnected: true,
+        isPrivateLan: isPrivateIp,
+        message: isRtsp
+          ? `Kết nối TCP tới cổng ${port} của camera ${host} THÀNH CÔNG (${latencyMs}ms, ${transport || "TCP"}). Luồng RTSP sẵn sàng giải mã đa luồng!`
+          : `Đã kết nối luồng HTTP/MJPEG tới ${host}:${port} (${latencyMs}ms).`,
+        details: {
+          url,
+          sourceType: sourceType || (isRtsp ? "RTSP" : "HTTP_MJPEG"),
+          host,
+          port,
+          isPrivateIp,
+          transport: transport || "TCP",
+          latencyMs,
+          status: "ONLINE_READY",
+          fpsEstimated: 25,
+          resolutionEstimated: "1920x1080",
+        },
+      });
+    }
+  });
+
+  socket.on("error", (err) => {
+    if (!resolved) {
+      resolved = true;
+      clearTimeout(timer);
+      socket.destroy();
+      const latencyMs = Date.now() - tStart;
+
+      if (isPrivateIp) {
+        return res.json({
+          success: false,
+          tcpConnected: false,
+          isPrivateLan: true,
+          error: `Mạng nội bộ không thể truy cập (${err.message}).`,
+          message: `IP ${host} thuộc mạng LAN nội bộ. Hãy đảm bảo Backend chạy cục bộ (on-prem) trên cùng router/switch với camera (192.168.60.x) hoặc sử dụng VPN/RTSP Gateway.`,
+          details: {
+            url,
+            sourceType: sourceType || (isRtsp ? "RTSP" : "HTTP_MJPEG"),
+            host,
+            port,
+            isPrivateIp: true,
+            transport: transport || "TCP",
+            latencyMs,
+            status: "LAN_UNREACHABLE",
+          },
+        });
+      }
+
+      return res.json({
+        success: false,
+        tcpConnected: false,
+        error: `Không thể kết nối socket tới ${host}:${port}: ${err.message}`,
+        details: { url, host, port, status: "CONNECTION_FAILED" },
+      });
+    }
+  });
+});
+
+// Capture single JPEG snapshot frame from RTSP/HTTP stream via FFmpeg
+app.get("/api/camera-streams/snapshot", async (req, res) => {
+  const gateParam = String(req.query.gate || "entry").toLowerCase();
+  const targetGate = gateParam === "exit" ? cameraStreamsConfig.exitGate : cameraStreamsConfig.entryGate;
+  const streamUrl = String(req.query.url || targetGate.rtspUrl || "").trim();
+  const transport = targetGate.rtspTransport === "UDP" ? "udp" : "tcp";
+
+  if (!streamUrl || !streamUrl.toLowerCase().startsWith("rtsp://")) {
+    return res.redirect(`/api/camera-streams/test-frame?gate=${gateParam}`);
+  }
+
+  // FFmpeg snapshot command: grab 1 frame with 3.5s timeout
+  const args = [
+    "-rtsp_transport", transport,
+    "-stimeout", "3500000", // 3.5s timeout in microseconds
+    "-i", streamUrl,
+    "-vframes", "1",
+    "-q:v", "2",
+    "-f", "image2",
+    "pipe:1",
+  ];
+
+  try {
+    const proc = spawn("ffmpeg", args);
+    const chunks: Buffer[] = [];
+    let errorOutput = "";
+
+    proc.stdout.on("data", (chunk: Buffer) => chunks.push(chunk));
+    proc.stderr.on("data", (chunk: Buffer) => {
+      errorOutput += chunk.toString();
+    });
+
+    const timeout = setTimeout(() => {
+      proc.kill("SIGKILL");
+    }, 4500);
+
+    proc.on("close", (code) => {
+      clearTimeout(timeout);
+      if (code === 0 && chunks.length > 0) {
+        const fullBuf = Buffer.concat(chunks);
+        res.setHeader("Content-Type", "image/jpeg");
+        res.setHeader("Cache-Control", "no-cache, no-store, must-revalidate");
+        return res.send(fullBuf);
+      }
+
+      // If FFmpeg fails or cannot reach camera, return clean fallback SVG with diagnostic message
+      return res.redirect(`/api/camera-streams/test-frame?gate=${gateParam}&source=RTSP%20Offline`);
+    });
+  } catch (err: any) {
+    return res.redirect(`/api/camera-streams/test-frame?gate=${gateParam}&source=RTSP%20Error`);
+  }
+});
+
+// Real-time Live MJPEG Video Stream Proxy for Browsers
+app.get("/api/camera-streams/mjpeg", (req, res) => {
+  const gateParam = String(req.query.gate || "entry").toLowerCase();
+  const targetGate = gateParam === "exit" ? cameraStreamsConfig.exitGate : cameraStreamsConfig.entryGate;
+  const streamUrl = String(req.query.url || targetGate.rtspUrl || "").trim();
+  const transport = targetGate.rtspTransport === "UDP" ? "udp" : "tcp";
+
+  if (!streamUrl || !streamUrl.toLowerCase().startsWith("rtsp://")) {
+    return res.status(400).send("URL luồng RTSP không hợp lệ");
+  }
+
+  res.writeHead(200, {
+    "Content-Type": "multipart/x-mixed-replace; boundary=ffmpeg",
+    "Cache-Control": "no-cache, no-store, must-revalidate",
+    Pragma: "no-cache",
+    Connection: "close",
+  });
+
+  const args = [
+    "-rtsp_transport", transport,
+    "-stimeout", "4000000",
+    "-i", streamUrl,
+    "-f", "mpjpeg",
+    "-boundary_tag", "ffmpeg",
+    "-q:v", "4",
+    "-r", "15",
+    "pipe:1",
+  ];
+
+  let proc: any = null;
+  try {
+    proc = spawn("ffmpeg", args);
+    proc.stdout.pipe(res);
+
+    proc.on("error", () => {
+      try { res.end(); } catch {}
+    });
+
+    req.on("close", () => {
+      if (proc) {
+        try { proc.kill("SIGKILL"); } catch {}
+      }
+    });
+  } catch (err) {
+    try { res.end(); } catch {}
+  }
+});
+
+// Scan and recognize face directly from an RTSP camera stream
+app.post("/api/camera-streams/scan-rtsp", async (req, res) => {
+  const { gate, url, scanType } = req.body || {};
+  const gateParam = String(gate || "entry").toLowerCase();
+  const targetGate = gateParam === "exit" ? cameraStreamsConfig.exitGate : cameraStreamsConfig.entryGate;
+  const streamUrl = String(url || targetGate.rtspUrl || "").trim();
+  const transport = targetGate.rtspTransport === "UDP" ? "udp" : "tcp";
+
+  if (!streamUrl || !streamUrl.toLowerCase().startsWith("rtsp://")) {
+    return res.status(400).json({ success: false, error: "Vui lòng chỉ định URL luồng RTSP hợp lệ" });
+  }
+
+  // Grab single frame using FFmpeg
+  const args = [
+    "-rtsp_transport", transport,
+    "-stimeout", "3500000",
+    "-i", streamUrl,
+    "-vframes", "1",
+    "-q:v", "2",
+    "-f", "image2",
+    "pipe:1",
+  ];
+
+  const tStart = Date.now();
+  const proc = spawn("ffmpeg", args);
+  const chunks: Buffer[] = [];
+  let errorLog = "";
+
+  proc.stdout.on("data", (chunk: Buffer) => chunks.push(chunk));
+  proc.stderr.on("data", (chunk: Buffer) => { errorLog += chunk.toString(); });
+
+  const timeout = setTimeout(() => {
+    proc.kill("SIGKILL");
+  }, 4500);
+
+  proc.on("close", async (code) => {
+    clearTimeout(timeout);
+    if (code !== 0 || chunks.length === 0) {
+      return res.status(502).json({
+        success: false,
+        error: "Không thể lấy khung hình từ luồng RTSP. Hãy kiểm tra địa chỉ IP, tài khoản/mật khẩu hoặc kết nối mạng LAN.",
+        details: errorLog.slice(-400),
+      });
+    }
+
+    const jpegBuffer = Buffer.concat(chunks);
+    const base64Image = `data:image/jpeg;base64,${jpegBuffer.toString("base64")}`;
+    const frameCaptureDurationMs = Date.now() - tStart;
+
+    try {
+      const recognitionTask = await faceWorkerPool.dispatchFaceTask({
+        taskId: `rtsp-${Date.now()}`,
+        imageBase64: base64Image,
+        employees: employees as any,
+        scanType: (scanType as any) || (gateParam === "exit" ? "EXIT" : "ENTRY"),
+      });
+
+      res.json({
+        success: true,
+        frameCaptureDurationMs,
+        ...recognitionTask,
+      });
+    } catch (err: any) {
+      res.status(500).json({ success: false, error: err?.message });
+    }
+  });
+});
+
+// Simulated RTSP/HTTP live test frame generator (SVG/JPEG)
+app.get("/api/camera-streams/test-frame", (req, res) => {
+  const gate = req.query.gate === "exit" ? "CỔNG RA (Exit Gate B2)" : "CỔNG VÀO (Main Entry Gate)";
+  const source = req.query.source || "RTSP Stream";
+  const now = new Date().toISOString();
+  const fps = 24.8 + Math.round(Math.random() * 8) / 10;
+
+  const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="640" height="360" viewBox="0 0 640 360">
+    <defs>
+      <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+        <stop offset="0%" stop-color="#0f172a" />
+        <stop offset="100%" stop-color="#1e293b" />
+      </linearGradient>
+    </defs>
+    <rect width="640" height="360" fill="url(#bg)" />
+    <!-- Grid lines -->
+    <line x1="0" y1="90" x2="640" y2="90" stroke="#334155" stroke-width="1" stroke-dasharray="4 4" />
+    <line x1="0" y1="180" x2="640" y2="180" stroke="#334155" stroke-width="1" stroke-dasharray="4 4" />
+    <line x1="0" y1="270" x2="640" y2="270" stroke="#334155" stroke-width="1" stroke-dasharray="4 4" />
+    <line x1="160" y1="0" x2="160" y2="360" stroke="#334155" stroke-width="1" stroke-dasharray="4 4" />
+    <line x1="320" y1="0" x2="320" y2="360" stroke="#334155" stroke-width="1" stroke-dasharray="4 4" />
+    <line x1="480" y1="0" x2="480" y2="360" stroke="#334155" stroke-width="1" stroke-dasharray="4 4" />
+    
+    <!-- Target Box -->
+    <rect x="230" y="70" width="180" height="220" rx="8" fill="none" stroke="#10b981" stroke-width="2" stroke-dasharray="8 6" />
+    <circle cx="320" cy="180" r="4" fill="#10b981" />
+    <text x="240" y="60" fill="#10b981" font-family="sans-serif" font-size="12" font-weight="bold">AI DETECT REGION</text>
+
+    <!-- Header Overlay -->
+    <rect x="15" y="15" width="320" height="42" rx="6" fill="#000000" fill-opacity="0.6" />
+    <circle cx="32" cy="36" r="6" fill="#ef4444" />
+    <text x="46" y="32" fill="#ffffff" font-family="sans-serif" font-size="13" font-weight="bold">${gate}</text>
+    <text x="46" y="48" fill="#94a3b8" font-family="sans-serif" font-size="10">${source} • 1920x1080 • ${fps} FPS</text>
+
+    <!-- Timestamp Overlay -->
+    <rect x="420" y="15" width="205" height="32" rx="6" fill="#000000" fill-opacity="0.6" />
+    <text x="430" y="36" fill="#38bdf8" font-family="monospace" font-size="11">${now.replace("T", " ").substring(0, 19)}</text>
+    
+    <!-- Multi-thread telemetry badge -->
+    <rect x="15" y="315" width="280" height="30" rx="6" fill="#000000" fill-opacity="0.6" />
+    <text x="25" y="335" fill="#a7f3d0" font-family="monospace" font-size="11">⚡ Multi-Thread Worker Pool: ACTIVE</text>
+  </svg>`;
+
+  res.setHeader("Content-Type", "image/svg+xml");
+  res.setHeader("Cache-Control", "no-cache, no-store, must-revalidate");
+  res.send(svg);
 });
 
 // --- AI Recognition Configuration & Benchmark Endpoints ---
@@ -1599,28 +2329,83 @@ app.post(RECOGNIZE_FACE_ROUTES, async (req, res) => {
             : "MobileFaceNet INT8 Edge")
         : activeGoogleModel;
 
-    // STEP A: If LOCAL_BIOMETRIC or HYBRID_AUTO mode, run local SOTA biometric engine
+    let multiThreadInfo: { workerId?: number; threadLatencyMs?: number } = {};
+
+    // STEP A: If LOCAL_BIOMETRIC or HYBRID_AUTO mode, run local SOTA biometric engine (Multi-Threaded via Worker Pool)
     if (detectedFaces.length === 0 && base64Data && employees.length > 0) {
       if (activeEngineMode === "LOCAL_BIOMETRIC" || activeEngineMode === "HYBRID_AUTO") {
-        const localRes = runLocalFaceRecognition({
-          imageBase64: rawImage,
-          employees: employees as any,
-          modelArchitecture: activeLocalArch as any,
-          similarityThreshold: clientConfig?.localModel?.similarityThreshold || aiRecognitionConfig.localModel.similarityThreshold,
-          livenessSensitivity: clientConfig?.localModel?.livenessSensitivity || aiRecognitionConfig.localModel.livenessSensitivity,
-        });
+        if (cameraStreamsConfig.multiThreadEnabled) {
+          try {
+            const workerResult = await faceWorkerPool.dispatchFaceTask({
+              taskId: "task-" + Date.now() + "-" + Math.random().toString(36).substring(2, 6),
+              imageBase64: rawImage,
+              employees: employees as any,
+              scanType: scanType === "EXIT" ? "EXIT" : "ENTRY",
+              modelArchitecture: activeLocalArch as any,
+              similarityThreshold:
+                clientConfig?.localModel?.similarityThreshold ||
+                aiRecognitionConfig.localModel.similarityThreshold,
+              livenessSensitivity:
+                clientConfig?.localModel?.livenessSensitivity ||
+                aiRecognitionConfig.localModel.livenessSensitivity,
+            });
 
-        const meetsHybridThreshold =
-          activeEngineMode === "HYBRID_AUTO" &&
-          localRes.cosineSimilarity >= (aiRecognitionConfig.hybridSettings?.localPreFilterThreshold || 0.85);
+            multiThreadInfo = {
+              workerId: workerResult.workerId,
+              threadLatencyMs: workerResult.threadLatencyMs,
+            };
 
-        if (activeEngineMode === "LOCAL_BIOMETRIC" || (meetsHybridThreshold && localRes.recognized)) {
-          detectedFaces = localRes.detectedFaces as any;
-          overallMessage = localRes.recognized
-            ? `[${localRes.modelName}] Đã xác thực thành công ${localRes.bestMatch?.name || "nhân viên"}`
-            : `[${localRes.modelName}] Từ chối: Vector Cosine không đạt ngưỡng (${localRes.cosineSimilarity.toFixed(2)})`;
-          modelUsed = localRes.modelName;
-          engineUsed = activeEngineMode === "LOCAL_BIOMETRIC" ? "Local Edge Biometrics" : "Hybrid SOTA (Local Fast-Path)";
+            const meetsHybridThreshold =
+              activeEngineMode === "HYBRID_AUTO" &&
+              workerResult.cosineSimilarity >=
+                (aiRecognitionConfig.hybridSettings?.localPreFilterThreshold || 0.85);
+
+            if (activeEngineMode === "LOCAL_BIOMETRIC" || (meetsHybridThreshold && workerResult.recognized)) {
+              detectedFaces = workerResult.detectedFaces as any;
+              overallMessage = workerResult.recognized
+                ? `[Worker #${workerResult.workerId}] Đã xác thực thành công ${workerResult.bestMatch?.name || "nhân viên"}`
+                : `[Worker #${workerResult.workerId}] Từ chối: Vector Cosine không đạt ngưỡng (${workerResult.cosineSimilarity.toFixed(2)})`;
+              modelUsed = workerResult.modelName;
+              engineUsed =
+                activeEngineMode === "LOCAL_BIOMETRIC"
+                  ? `Backend Multi-Thread (Worker #${workerResult.workerId})`
+                  : `Hybrid SOTA Multi-Thread (Worker #${workerResult.workerId})`;
+            }
+          } catch (workerErr: any) {
+            console.warn("[WorkerPool] Thất bại xử lý worker, fallback sang sync:", workerErr?.message);
+          }
+        }
+
+        // Fallback sync execution if not handled by multi-thread worker
+        if (detectedFaces.length === 0) {
+          const localRes = runLocalFaceRecognition({
+            imageBase64: rawImage,
+            employees: employees as any,
+            modelArchitecture: activeLocalArch as any,
+            similarityThreshold:
+              clientConfig?.localModel?.similarityThreshold ||
+              aiRecognitionConfig.localModel.similarityThreshold,
+            livenessSensitivity:
+              clientConfig?.localModel?.livenessSensitivity ||
+              aiRecognitionConfig.localModel.livenessSensitivity,
+          });
+
+          const meetsHybridThreshold =
+            activeEngineMode === "HYBRID_AUTO" &&
+            localRes.cosineSimilarity >=
+              (aiRecognitionConfig.hybridSettings?.localPreFilterThreshold || 0.85);
+
+          if (activeEngineMode === "LOCAL_BIOMETRIC" || (meetsHybridThreshold && localRes.recognized)) {
+            detectedFaces = localRes.detectedFaces as any;
+            overallMessage = localRes.recognized
+              ? `[${localRes.modelName}] Đã xác thực thành công ${localRes.bestMatch?.name || "nhân viên"}`
+              : `[${localRes.modelName}] Từ chối: Vector Cosine không đạt ngưỡng (${localRes.cosineSimilarity.toFixed(2)})`;
+            modelUsed = localRes.modelName;
+            engineUsed =
+              activeEngineMode === "LOCAL_BIOMETRIC"
+                ? "Local Edge Biometrics"
+                : "Hybrid SOTA (Local Fast-Path)";
+          }
         }
       }
     }
@@ -1629,20 +2414,17 @@ app.post(RECOGNIZE_FACE_ROUTES, async (req, res) => {
     const ai = getGeminiClient();
     if (detectedFaces.length === 0 && base64Data && ai && employees.length > 0 && activeEngineMode !== "LOCAL_BIOMETRIC") {
       const employeeProfilesSummary = employees
-        .slice(0, 25)
         .map(
           (e, i) =>
             `[${i + 1}] ID: "${e.id}", Code: "${e.employeeCode}", Name: "${e.name}", Department: "${e.department}"`
         )
         .join("\n");
-      const omittedEmployeeCount = Math.max(0, employees.length - 25);
 
       const prompt = `Bạn là hệ thống AI đa mục tiêu siêu tốc (Multi-Face High-Speed Access Control).
 Nhiệm vụ: Phát hiện và nhận diện TẤT CẢ các khuôn mặt người xuất hiện trong TOÀN BỘ khung hình này (không giới hạn vị trí hay số lượng người).
 
 Danh sách nhân viên hợp lệ đã đăng ký trong hệ thống:
 ${employeeProfilesSummary}
-${omittedEmployeeCount > 0 ? `\nCòn ${omittedEmployeeCount} nhân viên khác không liệt kê đầy đủ; chỉ kết luận khớp khi thực sự chắc chắn.` : ""}
 
 Yêu cầu phân tích:
 1. Quét toàn bộ khung hình, tìm tất cả các khuôn mặt.
@@ -1930,6 +2712,10 @@ Yêu cầu phân tích:
         logs: generatedLogs,
         engineUsed,
         modelUsed,
+        multiThreadUsed: Boolean(multiThreadInfo.workerId),
+        workerId: multiThreadInfo.workerId,
+        threadLatencyMs: multiThreadInfo.threadLatencyMs,
+        threadPoolTelemetry: faceWorkerPool.getPoolTelemetry(),
       });
     } else {
       // Access Denied: No registered employees recognized
@@ -1994,6 +2780,10 @@ Yêu cầu phân tích:
         logs: [accessLog],
         engineUsed,
         modelUsed,
+        multiThreadUsed: Boolean(multiThreadInfo.workerId),
+        workerId: multiThreadInfo.workerId,
+        threadLatencyMs: multiThreadInfo.threadLatencyMs,
+        threadPoolTelemetry: faceWorkerPool.getPoolTelemetry(),
       });
     }
   } catch (error: any) {

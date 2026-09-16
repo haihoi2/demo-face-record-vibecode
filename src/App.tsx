@@ -7,6 +7,8 @@ import { AccessLogs } from "./components/AccessLogs";
 import { MobileCompanion } from "./components/MobileCompanion";
 import { WebhookIntegration } from "./components/WebhookIntegration";
 import { AiConfigPage } from "./components/AiConfigPage";
+import { DoorConfigPage } from "./components/DoorConfigPage";
+import { CameraStreamConfigPage } from "./components/CameraStreamConfigPage";
 import { StrangerClusterModal } from "./components/StrangerClusterModal";
 import {
   Employee,
@@ -33,7 +35,7 @@ import {
 } from "./utils/offlineEngine";
 
 export default function App() {
-  const [activeTab, setActiveTab] = useState<"scanner" | "register" | "logs" | "mobile" | "webhook" | "config">("scanner");
+  const [activeTab, setActiveTab] = useState<"scanner" | "register" | "logs" | "mobile" | "webhook" | "door" | "cameras" | "config">("scanner");
 
   const [employees, setEmployees] = useState<Employee[]>([]);
   const [accessLogs, setAccessLogs] = useState<AccessLog[]>([]);
@@ -566,6 +568,17 @@ export default function App() {
               setTimeout(() => setLatestToast(null), 4500);
             }}
           />
+        )}
+
+        {activeTab === "door" && (
+          <DoorConfigPage
+            lockState={lockState}
+            onRefreshLockState={fetchData}
+          />
+        )}
+
+        {activeTab === "cameras" && (
+          <CameraStreamConfigPage />
         )}
 
         {activeTab === "config" && (

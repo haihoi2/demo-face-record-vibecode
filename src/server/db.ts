@@ -104,6 +104,122 @@ export interface MobileNotificationRecord {
   employeeName?: string;
 }
 
+export type DoorAuthHeaderType = "BEARER" | "API_KEY" | "CUSTOM_HEADER" | "QUERY_PARAM";
+
+export interface DoorControllerConfigRecord {
+  enabled: boolean;
+  apiUrl: string;
+  apiToken: string;
+  authHeaderType: DoorAuthHeaderType;
+  customHeaderName?: string;
+  openMethod: "POST" | "GET" | "PUT";
+  closeMethod: "POST" | "GET" | "PUT";
+  openPayloadTemplate?: string;
+  closePayloadTemplate?: string;
+  pulseDurationSeconds: number;
+  triggerOnFaceRecognition: boolean;
+  triggerOnManualUnlock: boolean;
+}
+
+export interface DoorApiLogRecord {
+  id: string;
+  timestamp: string;
+  action: "OPEN" | "CLOSE";
+  url: string;
+  method: string;
+  requestHeaders?: Record<string, string>;
+  requestBody?: string;
+  statusCode?: number;
+  statusText?: string;
+  responseBody?: string;
+  success: boolean;
+  error?: string;
+  durationMs: number;
+  triggeredBy: string;
+}
+
+export const DEFAULT_DOOR_CONTROLLER_CONFIG: DoorControllerConfigRecord = {
+  enabled: true,
+  apiUrl: "https://smartlock.eton.vn/api/door/control",
+  apiToken: "eton_door_secret_token_2026_secure_key",
+  authHeaderType: "BEARER",
+  customHeaderName: "X-Door-Token",
+  openMethod: "POST",
+  closeMethod: "POST",
+  openPayloadTemplate: JSON.stringify({ action: "OPEN", doorId: "CỔNG CHÍNH", pulseDuration: 6 }, null, 2),
+  closePayloadTemplate: JSON.stringify({ action: "CLOSE", doorId: "CỔNG CHÍNH" }, null, 2),
+  pulseDurationSeconds: 6,
+  triggerOnFaceRecognition: true,
+  triggerOnManualUnlock: true,
+};
+
+export interface GateStreamConfigRecord {
+  gateType: "ENTRY" | "EXIT";
+  name: string;
+  enabled: boolean;
+  sourceType: "CLIENT_UVC" | "RTSP" | "HTTP_MJPEG" | "BACKEND_UVC";
+  rtspUrl?: string;
+  rtspTransport?: "TCP" | "UDP";
+  httpUrl?: string;
+  uvcDeviceId?: string;
+  uvcDeviceLabel?: string;
+  resolution?: "1920x1080" | "1280x720" | "640x480" | "AUTO";
+  fps?: number;
+  backendDevicePath?: string;
+  autoStart: boolean;
+  reconnectIntervalSeconds: number;
+}
+
+export interface CameraStreamsConfigRecord {
+  entryGate: GateStreamConfigRecord;
+  exitGate: GateStreamConfigRecord;
+  workerThreadsCount: number;
+  multiThreadEnabled: boolean;
+  autoFailoverToClientUvc: boolean;
+  maxFpsPerStream: number;
+  backendCaptureFps: number;
+}
+
+export const DEFAULT_CAMERA_STREAMS_CONFIG: CameraStreamsConfigRecord = {
+  entryGate: {
+    gateType: "ENTRY",
+    name: "Camera Cổng Vào (Main Entry Gate)",
+    enabled: true,
+    sourceType: "RTSP",
+    rtspUrl: "rtsp://viewCam:1234abcd@192.168.60.2:554/Streaming/Channels/101",
+    rtspTransport: "TCP",
+    httpUrl: "http://192.168.60.2/stream",
+    uvcDeviceId: "default",
+    uvcDeviceLabel: "Camera UVC Mặc Định Trình Duyệt",
+    resolution: "1920x1080",
+    fps: 25,
+    backendDevicePath: "/dev/video0",
+    autoStart: true,
+    reconnectIntervalSeconds: 5,
+  },
+  exitGate: {
+    gateType: "EXIT",
+    name: "Camera Cổng Ra (Exit Gate B2)",
+    enabled: true,
+    sourceType: "RTSP",
+    rtspUrl: "rtsp://viewCam:1234abcd@192.168.60.2:554/Streaming/Channels/102",
+    rtspTransport: "TCP",
+    httpUrl: "http://192.168.60.2/substream",
+    uvcDeviceId: "default",
+    uvcDeviceLabel: "Camera UVC Mặc Định Trình Duyệt",
+    resolution: "1280x720",
+    fps: 25,
+    backendDevicePath: "/dev/video1",
+    autoStart: true,
+    reconnectIntervalSeconds: 5,
+  },
+  workerThreadsCount: 4,
+  multiThreadEnabled: true,
+  autoFailoverToClientUvc: true,
+  maxFpsPerStream: 30,
+  backendCaptureFps: 15,
+};
+
 // Database wrapper supporting PostgreSQL (via DATABASE_URL), native Node 22 SQLite, and fallback JSON
 class SQLiteStorage {
   private db: any = null;
@@ -592,6 +708,44 @@ class SQLiteStorage {
         employeeId TEXT,
         employeeName TEXT
       );
+
+      CREATE TABLE IF NOT EXISTS door_controller_config (
+        id TEXT PRIMARY KEY,
+        enabled INTEGER,
+        apiUrl TEXT,
+        apiToken TEXT,
+        authHeaderType TEXT,
+        customHeaderName TEXT,
+        openMethod TEXT,
+        closeMethod TEXT,
+        openPayloadTemplate TEXT,
+        closePayloadTemplate TEXT,
+        pulseDurationSeconds INTEGER,
+        triggerOnFaceRecognition INTEGER,
+        triggerOnManualUnlock INTEGER
+      );
+
+      CREATE TABLE IF NOT EXISTS door_api_logs (
+        id TEXT PRIMARY KEY,
+        timestamp TEXT NOT NULL,
+        action TEXT NOT NULL,
+        url TEXT NOT NULL,
+        method TEXT NOT NULL,
+        requestHeaders TEXT,
+        requestBody TEXT,
+        statusCode INTEGER,
+        statusText TEXT,
+        responseBody TEXT,
+        success INTEGER,
+        error TEXT,
+        durationMs INTEGER,
+        triggeredBy TEXT
+      );
+
+      CREATE TABLE IF NOT EXISTS camera_streams_config (
+        id TEXT PRIMARY KEY,
+        config_json TEXT NOT NULL
+      );
     `);
   }
 
@@ -603,11 +757,15 @@ class SQLiteStorage {
     webhook_config?: WebhookConfigRecord;
     webhook_logs: WebhookLogRecord[];
     mobile_notifications: MobileNotificationRecord[];
+    door_controller_config?: DoorControllerConfigRecord;
+    door_api_logs: DoorApiLogRecord[];
+    camera_streams_config?: CameraStreamsConfigRecord;
   } = {
     employees: [],
     access_logs: [],
     webhook_logs: [],
     mobile_notifications: [],
+    door_api_logs: [],
   };
 
   private fallbackFile = path.join(DATA_DIR, "smartface_data.json");
@@ -924,11 +1082,23 @@ class SQLiteStorage {
       try {
         const row = this.db.prepare("SELECT * FROM webhook_config WHERE id = 'default'").get();
         if (row) {
+          let url = row.url;
+          // Auto-heal truncated URL with ellipsis or incomplete hook path
+          if (!url || typeof url !== "string" || url.includes("...") || url.endsWith("/hooks/") || url.endsWith("/hooks")) {
+            url = defaultConfig.url;
+            this.saveWebhookConfig({
+              enabled: Boolean(row.enabled),
+              url: defaultConfig.url,
+              gateInTitle: row.gateInTitle || defaultConfig.gateInTitle,
+              gateOutTitle: row.gateOutTitle || defaultConfig.gateOutTitle,
+              includeEmployeeCode: Boolean(row.includeEmployeeCode),
+            });
+          }
           return {
             enabled: Boolean(row.enabled),
-            url: row.url,
-            gateInTitle: row.gateInTitle,
-            gateOutTitle: row.gateOutTitle,
+            url: url,
+            gateInTitle: row.gateInTitle || defaultConfig.gateInTitle,
+            gateOutTitle: row.gateOutTitle || defaultConfig.gateOutTitle,
             includeEmployeeCode: Boolean(row.includeEmployeeCode),
           };
         }
@@ -938,7 +1108,13 @@ class SQLiteStorage {
         console.error("[SQLite] Lỗi getWebhookConfig:", err);
       }
     }
-    return this.fallbackData.webhook_config || defaultConfig;
+    const current = this.fallbackData.webhook_config || defaultConfig;
+    if (!current.url || current.url.includes("...") || current.url.endsWith("/hooks/") || current.url.endsWith("/hooks")) {
+      current.url = defaultConfig.url;
+      this.fallbackData.webhook_config = current;
+      this.saveFallback();
+    }
+    return current;
   }
 
   saveWebhookConfig(config: WebhookConfigRecord) {
@@ -1052,6 +1228,21 @@ class SQLiteStorage {
     this.saveFallback();
   }
 
+  clearWebhookLogs(): void {
+    if (this.pgPool && this.isPostgres) {
+      this.pgPool.query("DELETE FROM webhook_logs").catch((e) => console.error("[PostgreSQL] Lỗi clearWebhookLogs:", e.message));
+    }
+    if (this.isNativeSqlite && this.db) {
+      try {
+        this.db.prepare("DELETE FROM webhook_logs").run();
+      } catch (err) {
+        console.error("[SQLite] Lỗi clearWebhookLogs:", err);
+      }
+    }
+    this.fallbackData.webhook_logs = [];
+    this.saveFallback();
+  }
+
   // ================= MOBILE NOTIFICATIONS =================
   getNotifications(defaults: MobileNotificationRecord[]): MobileNotificationRecord[] {
     if (this.isNativeSqlite && this.db) {
@@ -1156,6 +1347,189 @@ class SQLiteStorage {
       }
     }
     this.fallbackData.mobile_notifications.forEach((n) => (n.read = true));
+    this.saveFallback();
+  }
+
+  // ================= DOOR CONTROLLER API CONFIG =================
+  getDoorControllerConfig(defaults: DoorControllerConfigRecord): DoorControllerConfigRecord {
+    if (this.isNativeSqlite && this.db) {
+      try {
+        const row: any = this.db.prepare("SELECT * FROM door_controller_config WHERE id = 'default'").get();
+        if (row) {
+          return {
+            enabled: Boolean(row.enabled),
+            apiUrl: row.apiUrl || defaults.apiUrl,
+            apiToken: row.apiToken !== undefined ? row.apiToken : defaults.apiToken,
+            authHeaderType: (row.authHeaderType as DoorAuthHeaderType) || defaults.authHeaderType,
+            customHeaderName: row.customHeaderName || defaults.customHeaderName,
+            openMethod: row.openMethod || defaults.openMethod,
+            closeMethod: row.closeMethod || defaults.closeMethod,
+            openPayloadTemplate: row.openPayloadTemplate || defaults.openPayloadTemplate,
+            closePayloadTemplate: row.closePayloadTemplate || defaults.closePayloadTemplate,
+            pulseDurationSeconds: Number(row.pulseDurationSeconds) || defaults.pulseDurationSeconds,
+            triggerOnFaceRecognition: row.triggerOnFaceRecognition !== undefined ? Boolean(row.triggerOnFaceRecognition) : defaults.triggerOnFaceRecognition,
+            triggerOnManualUnlock: row.triggerOnManualUnlock !== undefined ? Boolean(row.triggerOnManualUnlock) : defaults.triggerOnManualUnlock,
+          };
+        }
+        this.saveDoorControllerConfig(defaults);
+        return defaults;
+      } catch (err) {
+        console.error("[SQLite] Lỗi getDoorControllerConfig:", err);
+      }
+    }
+    if (!this.fallbackData.door_controller_config) {
+      this.fallbackData.door_controller_config = defaults;
+      this.saveFallback();
+    }
+    return this.fallbackData.door_controller_config;
+  }
+
+  saveDoorControllerConfig(config: DoorControllerConfigRecord) {
+    if (this.isNativeSqlite && this.db) {
+      try {
+        const stmt = this.db.prepare(`
+          INSERT INTO door_controller_config (
+            id, enabled, apiUrl, apiToken, authHeaderType, customHeaderName,
+            openMethod, closeMethod, openPayloadTemplate, closePayloadTemplate,
+            pulseDurationSeconds, triggerOnFaceRecognition, triggerOnManualUnlock
+          ) VALUES ('default', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          ON CONFLICT(id) DO UPDATE SET
+            enabled = excluded.enabled,
+            apiUrl = excluded.apiUrl,
+            apiToken = excluded.apiToken,
+            authHeaderType = excluded.authHeaderType,
+            customHeaderName = excluded.customHeaderName,
+            openMethod = excluded.openMethod,
+            closeMethod = excluded.closeMethod,
+            openPayloadTemplate = excluded.openPayloadTemplate,
+            closePayloadTemplate = excluded.closePayloadTemplate,
+            pulseDurationSeconds = excluded.pulseDurationSeconds,
+            triggerOnFaceRecognition = excluded.triggerOnFaceRecognition,
+            triggerOnManualUnlock = excluded.triggerOnManualUnlock
+        `);
+        stmt.run(
+          config.enabled ? 1 : 0,
+          config.apiUrl,
+          config.apiToken,
+          config.authHeaderType,
+          config.customHeaderName || "",
+          config.openMethod,
+          config.closeMethod,
+          config.openPayloadTemplate || "",
+          config.closePayloadTemplate || "",
+          config.pulseDurationSeconds,
+          config.triggerOnFaceRecognition ? 1 : 0,
+          config.triggerOnManualUnlock ? 1 : 0
+        );
+        return;
+      } catch (err) {
+        console.error("[SQLite] Lỗi saveDoorControllerConfig:", err);
+      }
+    }
+    this.fallbackData.door_controller_config = config;
+    this.saveFallback();
+  }
+
+  // ================= DOOR API LOGS =================
+  getDoorApiLogs(): DoorApiLogRecord[] {
+    if (this.isNativeSqlite && this.db) {
+      try {
+        const rows = this.db.prepare("SELECT * FROM door_api_logs ORDER BY timestamp DESC LIMIT 60").all();
+        if (rows) {
+          return rows.map((r: any) => ({
+            ...r,
+            requestHeaders: r.requestHeaders ? JSON.parse(r.requestHeaders) : undefined,
+            success: Boolean(r.success),
+          }));
+        }
+      } catch (err) {
+        console.error("[SQLite] Lỗi getDoorApiLogs:", err);
+      }
+    }
+    return this.fallbackData.door_api_logs || [];
+  }
+
+  saveDoorApiLog(log: DoorApiLogRecord) {
+    if (this.isNativeSqlite && this.db) {
+      try {
+        const stmt = this.db.prepare(`
+          INSERT INTO door_api_logs (
+            id, timestamp, action, url, method, requestHeaders, requestBody,
+            statusCode, statusText, responseBody, success, error, durationMs, triggeredBy
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          ON CONFLICT(id) DO NOTHING
+        `);
+        stmt.run(
+          log.id,
+          log.timestamp,
+          log.action,
+          log.url,
+          log.method,
+          log.requestHeaders ? JSON.stringify(log.requestHeaders) : null,
+          log.requestBody || null,
+          log.statusCode || null,
+          log.statusText || null,
+          log.responseBody || null,
+          log.success ? 1 : 0,
+          log.error || null,
+          log.durationMs || 0,
+          log.triggeredBy || "System"
+        );
+        return;
+      } catch (err) {
+        console.error("[SQLite] Lỗi saveDoorApiLog:", err);
+      }
+    }
+    if (!this.fallbackData.door_api_logs) this.fallbackData.door_api_logs = [];
+    this.fallbackData.door_api_logs.unshift(log);
+    if (this.fallbackData.door_api_logs.length > 60) {
+      this.fallbackData.door_api_logs = this.fallbackData.door_api_logs.slice(0, 60);
+    }
+    this.saveFallback();
+  }
+
+  clearDoorApiLogs(): void {
+    if (this.isNativeSqlite && this.db) {
+      try {
+        this.db.prepare("DELETE FROM door_api_logs").run();
+      } catch (err) {
+        console.error("[SQLite] Lỗi clearDoorApiLogs:", err);
+      }
+    }
+    this.fallbackData.door_api_logs = [];
+    this.saveFallback();
+  }
+
+  // ================= CAMERA STREAMS CONFIG =================
+  getCameraStreamsConfig(defaultConfig: CameraStreamsConfigRecord): CameraStreamsConfigRecord {
+    if (this.isNativeSqlite && this.db) {
+      try {
+        const row = this.db.prepare("SELECT config_json FROM camera_streams_config WHERE id = 'default'").get();
+        if (row && row.config_json) {
+          return JSON.parse(row.config_json);
+        }
+      } catch (err) {
+        console.error("[SQLite] Lỗi getCameraStreamsConfig:", err);
+      }
+    }
+    return this.fallbackData.camera_streams_config || defaultConfig;
+  }
+
+  saveCameraStreamsConfig(config: CameraStreamsConfigRecord): void {
+    if (this.isNativeSqlite && this.db) {
+      try {
+        const stmt = this.db.prepare(`
+          INSERT INTO camera_streams_config (id, config_json)
+          VALUES ('default', ?)
+          ON CONFLICT(id) DO UPDATE SET config_json = excluded.config_json
+        `);
+        stmt.run(JSON.stringify(config));
+        return;
+      } catch (err) {
+        console.error("[SQLite] Lỗi saveCameraStreamsConfig:", err);
+      }
+    }
+    this.fallbackData.camera_streams_config = config;
     this.saveFallback();
   }
 

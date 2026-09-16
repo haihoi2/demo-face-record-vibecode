@@ -484,7 +484,7 @@ pm2 start smartface-gateway # hoặc: docker compose start smartface-app
 ## 🔗 Tích Hợp Webhook Eton Chat Room
 
 Hệ thống hỗ trợ gửi thông báo điểm danh tự động vào kênh Chat Room của Eton:
-* **Địa chỉ mặc định**: `https://chat-room.eton.vn/hooks/...`
+* **Địa chỉ mặc định**: `https://chat-room.eton.vn/hooks/6aa4dfb6928518a18ba27a13/mguNArZoWHY7AegnWFw7d7TwyfnoT4JZWpmwvxtLmfi7iGuY`
 * **Định dạng Payload chuẩn Eton**:
 ```json
 {
