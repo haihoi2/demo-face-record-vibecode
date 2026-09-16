@@ -96,6 +96,7 @@ export const CameraStreamConfigPage: React.FC = () => {
 
   // Live Stream Preview State
   const [isPreviewActive, setIsPreviewActive] = useState<boolean>(false);
+  const [isStartingCamera, setIsStartingCamera] = useState<boolean>(false);
   const [previewError, setPreviewError] = useState<string | null>(null);
   const [previewFps, setPreviewFps] = useState<number>(24);
   const [testStatusMessage, setTestStatusMessage] = useState<string | null>(null);
@@ -156,14 +157,26 @@ export const CameraStreamConfigPage: React.FC = () => {
   const detectClientCameras = async () => {
     try {
       if (!navigator.mediaDevices || !navigator.mediaDevices.enumerateDevices) return;
-      const devices = await navigator.mediaDevices.enumerateDevices();
-      const videoDevs = devices
-        .filter((d) => d.kind === "videoinput")
-        .map((d, index) => ({
-          deviceId: d.deviceId,
-          label: d.label || `Camera UVC thiết bị #${index + 1}`,
-        }));
-      setAvailableCameras(videoDevs);
+      let devices = await navigator.mediaDevices.enumerateDevices();
+      let videoDevs = devices.filter((d) => d.kind === "videoinput");
+
+      // In modern browsers, device labels are empty until permission is granted at least once
+      if (videoDevs.length > 0 && !videoDevs[0].label) {
+        try {
+          const tempStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
+          devices = await navigator.mediaDevices.enumerateDevices();
+          videoDevs = devices.filter((d) => d.kind === "videoinput");
+          tempStream.getTracks().forEach((t) => t.stop());
+        } catch {
+          // Ignore if prompt dismissed
+        }
+      }
+
+      const mapped = videoDevs.map((d, index) => ({
+        deviceId: d.deviceId,
+        label: d.label || `Camera UVC thiết bị #${index + 1}`,
+      }));
+      setAvailableCameras(mapped);
     } catch (err) {
       console.warn("Không thể quét thiết bị camera UVC client:", err);
     }
@@ -321,31 +334,96 @@ export const CameraStreamConfigPage: React.FC = () => {
     setTimeout(() => setCopiedKey(null), 2500);
   };
 
+  // Video element callback ref to ensure mediaStream is mounted immediately when element appears in DOM
+  const attachVideoRef = (el: HTMLVideoElement | null) => {
+    videoPreviewRef.current = el;
+    if (el && mediaStreamRef.current) {
+      if (el.srcObject !== mediaStreamRef.current) {
+        el.srcObject = mediaStreamRef.current;
+      }
+      el.play().catch((err) => {
+        console.warn("Autoplay video client preview:", err);
+      });
+    }
+  };
+
   // Start / Stop Live Preview for the currently selected Gate
-  const startPreview = async () => {
+  const startPreview = async (overrideGate?: GateStreamConfig) => {
     setPreviewError(null);
     setPreviewTimestamp(Date.now());
-    const currentGate = activeGateTab === "EXIT" ? config.exitGate : config.entryGate;
+    const currentGate = overrideGate || (activeGateTab === "EXIT" ? config.exitGate : config.entryGate);
 
     if (currentGate.sourceType === "CLIENT_UVC") {
+      setIsStartingCamera(true);
       try {
-        const constraints: MediaStreamConstraints = {
-          video:
-            currentGate.uvcDeviceId && currentGate.uvcDeviceId !== "default"
-              ? { deviceId: { exact: currentGate.uvcDeviceId } }
-              : true,
-          audio: false,
-        };
+        if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+          throw new Error(
+            "Trình duyệt không hỗ trợ WebRTC getUserMedia hoặc trang đang mở qua HTTP không bảo mật."
+          );
+        }
 
-        const stream = await navigator.mediaDevices.getUserMedia(constraints);
+        // Clean up previous stream tracks to free hardware camera lock
+        if (mediaStreamRef.current) {
+          mediaStreamRef.current.getTracks().forEach((track) => track.stop());
+          mediaStreamRef.current = null;
+        }
+
+        let videoConstraints: MediaTrackConstraints = {};
+        if (currentGate.uvcDeviceId && currentGate.uvcDeviceId !== "default") {
+          videoConstraints.deviceId = { ideal: currentGate.uvcDeviceId };
+        }
+
+        if (currentGate.resolution && currentGate.resolution !== "AUTO") {
+          const [wStr, hStr] = currentGate.resolution.split("x");
+          const width = parseInt(wStr, 10);
+          const height = parseInt(hStr, 10);
+          if (!isNaN(width) && !isNaN(height)) {
+            videoConstraints.width = { ideal: width };
+            videoConstraints.height = { ideal: height };
+          }
+        }
+
+        let stream: MediaStream | null = null;
+        try {
+          stream = await navigator.mediaDevices.getUserMedia({
+            video: Object.keys(videoConstraints).length > 0 ? videoConstraints : true,
+            audio: false,
+          });
+        } catch (firstErr: any) {
+          console.warn("getUserMedia với thông số ideal thất bại, thử lại với video mặc định:", firstErr);
+          stream = await navigator.mediaDevices.getUserMedia({
+            video: true,
+            audio: false,
+          });
+        }
+
         mediaStreamRef.current = stream;
+        setIsPreviewActive(true);
+
+        // Attach stream directly if video DOM element is already mounted
         if (videoPreviewRef.current) {
           videoPreviewRef.current.srcObject = stream;
-          await videoPreviewRef.current.play();
+          await videoPreviewRef.current.play().catch((err) => {
+            console.warn("Video play error:", err);
+          });
         }
-        setIsPreviewActive(true);
+
+        // Re-detect cameras to populate readable labels if they were withheld before permission
+        detectClientCameras();
       } catch (err: any) {
-        setPreviewError("Không thể mở Webcam UVC client: " + (err?.message || err));
+        console.error("Lỗi mở Webcam UVC client:", err);
+        let msg = "Không thể mở Webcam UVC client: " + (err?.message || err);
+        if (err?.name === "NotAllowedError" || err?.name === "PermissionDeniedError") {
+          msg = "Quyền truy cập Camera bị từ chối trên trình duyệt. Vui lòng bấm vào biểu tượng ổ khóa/camera trên thanh địa chỉ và chọn 'Cho phép' (Allow) truy cập Camera.";
+        } else if (err?.name === "NotFoundError" || err?.name === "DevicesNotFoundError") {
+          msg = "Không tìm thấy thiết bị webcam nào được kết nối với máy tính của bạn.";
+        } else if (err?.name === "NotReadableError" || err?.name === "TrackStartError") {
+          msg = "Camera đang bị ứng dụng khác (Zoom, Teams, Zalo, hoặc tab trình duyệt khác) chiếm quyền sử dụng.";
+        }
+        setPreviewError(msg);
+        setIsPreviewActive(false);
+      } finally {
+        setIsStartingCamera(false);
       }
     } else {
       // RTSP or HTTP: show live canvas or stream
@@ -363,6 +441,24 @@ export const CameraStreamConfigPage: React.FC = () => {
     }
     setIsPreviewActive(false);
   };
+
+  // Keep video element srcObject synchronized when active state or source type changes
+  useEffect(() => {
+    const currentGate = activeGateTab === "EXIT" ? config.exitGate : config.entryGate;
+    if (
+      isPreviewActive &&
+      currentGate.sourceType === "CLIENT_UVC" &&
+      videoPreviewRef.current &&
+      mediaStreamRef.current
+    ) {
+      if (videoPreviewRef.current.srcObject !== mediaStreamRef.current) {
+        videoPreviewRef.current.srcObject = mediaStreamRef.current;
+      }
+      videoPreviewRef.current.play().catch((err) => {
+        console.warn("Sync video play error:", err);
+      });
+    }
+  }, [isPreviewActive, activeGateTab, config.entryGate.sourceType, config.exitGate.sourceType]);
 
   const currentGateConfig = activeGateTab === "EXIT" ? config.exitGate : config.entryGate;
 
@@ -1121,12 +1217,21 @@ export const CameraStreamConfigPage: React.FC = () => {
                     <select
                       value={currentGateConfig.uvcDeviceId || "default"}
                       onChange={(e) => {
-                        const dev = availableCameras.find((c) => c.deviceId === e.target.value);
+                        const newDeviceId = e.target.value;
+                        const dev = availableCameras.find((c) => c.deviceId === newDeviceId);
+                        const updated = {
+                          ...currentGateConfig,
+                          uvcDeviceId: newDeviceId,
+                          uvcDeviceLabel: dev ? dev.label : "Mặc định",
+                        };
                         updateCurrentGate((prev) => ({
                           ...prev,
-                          uvcDeviceId: e.target.value,
+                          uvcDeviceId: newDeviceId,
                           uvcDeviceLabel: dev ? dev.label : "Mặc định",
                         }));
+                        if (isPreviewActive && currentGateConfig.sourceType === "CLIENT_UVC") {
+                          startPreview(updated);
+                        }
                       }}
                       className="w-full px-3 py-2.5 rounded-lg border border-slate-300 text-sm bg-white outline-none font-medium"
                     >
@@ -1145,12 +1250,20 @@ export const CameraStreamConfigPage: React.FC = () => {
                     </label>
                     <select
                       value={currentGateConfig.resolution || "1280x720"}
-                      onChange={(e) =>
+                      onChange={(e) => {
+                        const newRes = e.target.value as any;
+                        const updated = {
+                          ...currentGateConfig,
+                          resolution: newRes,
+                        };
                         updateCurrentGate((prev) => ({
                           ...prev,
-                          resolution: e.target.value as any,
-                        }))
-                      }
+                          resolution: newRes,
+                        }));
+                        if (isPreviewActive && currentGateConfig.sourceType === "CLIENT_UVC") {
+                          startPreview(updated);
+                        }
+                      }}
                       className="w-full px-3 py-2.5 rounded-lg border border-slate-300 text-sm bg-white outline-none font-medium"
                     >
                       <option value="1920x1080">1080p Full HD (1920 x 1080) - Chi tiết cao nhất</option>
@@ -1306,13 +1419,25 @@ export const CameraStreamConfigPage: React.FC = () => {
 
               {/* Player Stage */}
               <div className="relative w-full aspect-video bg-slate-950 rounded-2xl overflow-hidden border border-slate-800 flex items-center justify-center">
+                {isStartingCamera && (
+                  <div className="absolute inset-0 bg-black/60 backdrop-blur-xs flex items-center justify-center text-white text-xs z-20 gap-2">
+                    <RefreshCw className="w-4 h-4 animate-spin text-emerald-400" />
+                    <span>Đang kết nối camera trình duyệt...</span>
+                  </div>
+                )}
+
                 {isPreviewActive ? (
                   currentGateConfig.sourceType === "CLIENT_UVC" ? (
                     <video
-                      ref={videoPreviewRef}
+                      ref={attachVideoRef}
                       autoPlay
                       playsInline
                       muted
+                      onLoadedMetadata={() => {
+                        videoPreviewRef.current?.play().catch((err) => {
+                          console.warn("Lỗi autoplay video onLoadedMetadata:", err);
+                        });
+                      }}
                       className="w-full h-full object-cover"
                     />
                   ) : currentGateConfig.sourceType === "RTSP" ? (
@@ -1375,7 +1500,10 @@ export const CameraStreamConfigPage: React.FC = () => {
                       <span className="w-2.5 h-2.5 rounded-full bg-emerald-500 animate-ping" />
                       <span>{currentGateConfig.name}</span>
                       <span className="text-slate-400">|</span>
-                      <span className="text-emerald-400 font-bold">{currentGateConfig.sourceType} ({rtspViewMode})</span>
+                      <span className="text-emerald-400 font-bold">
+                        {currentGateConfig.sourceType}
+                        {currentGateConfig.sourceType === "RTSP" ? ` (${rtspViewMode})` : ""}
+                      </span>
                     </div>
 
                     <div className="absolute top-3 right-3 bg-black/70 backdrop-blur-xs text-white text-xs px-3 py-1.5 rounded-lg font-mono">
