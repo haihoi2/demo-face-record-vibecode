@@ -1,0 +1,18 @@
+# Build context exclusions for the SmartFace gateway image
+node_modules
+dist
+build
+coverage
+data
+.git
+.gitignore
+.env
+.env.*
+!.env.example
+*.log
+.DS_Store
+README.md
+deploy-local.sh
+docker-compose.yml
+netlify.toml
+render.yaml

@@ -7,8 +7,8 @@ WORKDIR /app
 # Copy package files
 COPY package*.json ./
 
-# Install dependencies
-RUN npm ci
+# Install dependencies (npm ci when a lockfile is committed, npm install otherwise)
+RUN if [ -f package-lock.json ]; then npm ci; else npm install --no-audit --no-fund; fi
 
 # Copy source files
 COPY . .
@@ -34,7 +34,8 @@ RUN apk add --no-cache ffmpeg ca-certificates tzdata
 COPY package*.json ./
 
 # Install only production dependencies
-RUN npm ci --omit=dev && npm cache clean --force
+RUN if [ -f package-lock.json ]; then npm ci --omit=dev; else npm install --omit=dev --no-audit --no-fund; fi \
+    && npm cache clean --force
 
 # Copy compiled frontend and bundled backend from builder
 COPY --from=builder /app/dist ./dist
