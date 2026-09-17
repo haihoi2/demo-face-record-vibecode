@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useCallback } from "react";
-import { Navbar } from "./components/Navbar";
+import { Navbar, NavTabType } from "./components/Navbar";
 import { FaceScanner } from "./components/FaceScanner";
+import { CameraDashboard } from "./components/CameraDashboard";
 import { SmartLockCard } from "./components/SmartLockCard";
 import { EmployeeRegistration } from "./components/EmployeeRegistration";
 import { AccessLogs } from "./components/AccessLogs";
@@ -17,7 +18,7 @@ import {
   MobileNotification,
   FaceRecognitionResult,
 } from "./types";
-import { Bell, CheckCircle2, AlertTriangle, Sparkles, X, Code2, Copy, Check } from "lucide-react";
+import { Bell, CheckCircle2, AlertTriangle, Sparkles, X, Code2, Copy, Check, Camera, ScanFace } from "lucide-react";
 import { soundEffects } from "./utils/audio";
 import { safeJsonFetch, normalizeApiUrl, getApiBaseUrl, getCustomBackendUrl, setCustomBackendUrl } from "./utils/api";
 import {
@@ -35,7 +36,7 @@ import {
 } from "./utils/offlineEngine";
 
 export default function App() {
-  const [activeTab, setActiveTab] = useState<"scanner" | "register" | "logs" | "mobile" | "webhook" | "door" | "cameras" | "config">("scanner");
+  const [activeTab, setActiveTab] = useState<NavTabType>("scanner");
 
   const [employees, setEmployees] = useState<Employee[]>([]);
   const [accessLogs, setAccessLogs] = useState<AccessLog[]>([]);
@@ -410,9 +411,9 @@ export default function App() {
     }
   };
 
-  // Switch to scanner and test an employee
+  // Switch to manual track and test an employee
   const handleTestEmployee = (emp: Employee) => {
-    setActiveTab("scanner");
+    setActiveTab("manual");
   };
 
   const handleEmployeeDeleted = async (id: string) => {
@@ -514,7 +515,54 @@ export default function App() {
 
         {activeTab === "scanner" && (
           <div className="space-y-8">
-            {/* Primary Scanner Station */}
+            {/* Multi-Stream Live Surveillance & Recognition Dashboard */}
+            <CameraDashboard
+              employees={employees}
+              lockState={lockState}
+              accessLogs={accessLogs}
+              onRecognitionComplete={handleRecognitionComplete}
+              onTriggerManualUnlock={handleManualUnlock}
+              onOpenStrangerClusters={(photo) => handleOpenStrangerModal(photo)}
+              onNavigateToCamerasConfig={() => setActiveTab("cameras")}
+              onNavigateToManualTrack={() => setActiveTab("manual")}
+              onNavigateToLogs={() => setActiveTab("logs")}
+            />
+
+            {/* Smart Lock Hardware & API Section */}
+            <SmartLockCard
+              lockState={lockState}
+              onRefresh={fetchData}
+            />
+          </div>
+        )}
+
+        {activeTab === "manual" && (
+          <div className="space-y-8">
+            {/* Manual Track Header Banner */}
+            <div className="bg-white rounded-2xl border border-slate-200/80 shadow-xs p-5 sm:p-6 flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+              <div className="flex items-center gap-3">
+                <div className="w-10 h-10 rounded-xl bg-indigo-50 border border-indigo-100 flex items-center justify-center text-indigo-600 shadow-2xs">
+                  <Camera className="w-5 h-5" />
+                </div>
+                <div>
+                  <h2 className="text-lg font-bold text-slate-900 tracking-tight flex items-center gap-2">
+                    Nhận Diện Thủ Công - Manual Track
+                  </h2>
+                  <p className="text-xs text-slate-500 mt-0.5">
+                    Nhận diện khuôn mặt qua webcam mặc định của thiết bị, kiểm thử kịch bản giả lập hoặc tải ảnh thủ công từ máy tính.
+                  </p>
+                </div>
+              </div>
+              <button
+                onClick={() => setActiveTab("scanner")}
+                className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl bg-indigo-50 hover:bg-indigo-100 text-indigo-700 text-xs font-semibold transition-colors cursor-pointer"
+              >
+                <ScanFace className="w-4 h-4" />
+                <span>Quay Lại Quét Cửa AI (Dashboard)</span>
+              </button>
+            </div>
+
+            {/* Primary Manual Scanner Station (Default Webcam / Test Scenarios) */}
             <FaceScanner
               employees={employees}
               lockState={lockState}

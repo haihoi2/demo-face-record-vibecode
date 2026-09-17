@@ -14,12 +14,24 @@ import {
   UserX,
   KeyRound,
   Video,
+  Camera,
 } from "lucide-react";
 import { SmartLockState } from "../types";
 
+export type NavTabType =
+  | "scanner"
+  | "manual"
+  | "register"
+  | "logs"
+  | "mobile"
+  | "webhook"
+  | "door"
+  | "cameras"
+  | "config";
+
 interface NavbarProps {
-  activeTab: "scanner" | "register" | "logs" | "mobile" | "webhook" | "door" | "cameras" | "config";
-  setActiveTab: (tab: "scanner" | "register" | "logs" | "mobile" | "webhook" | "door" | "cameras" | "config") => void;
+  activeTab: NavTabType;
+  setActiveTab: (tab: NavTabType) => void;
   lockState: SmartLockState;
   unreadCount: number;
   sseConnected: boolean;
@@ -86,12 +98,27 @@ export const Navbar: React.FC<NavbarProps> = ({
               onClick={() => setActiveTab("scanner")}
               className={`flex items-center gap-2 px-3 py-2 rounded-lg text-sm font-medium transition-all ${
                 activeTab === "scanner"
-                  ? "bg-indigo-50 text-indigo-700 shadow-xs border border-indigo-100"
+                  ? "bg-indigo-50 text-indigo-700 shadow-xs border border-indigo-100 font-semibold"
                   : "text-slate-600 hover:text-slate-900 hover:bg-slate-100"
               }`}
+              title="Dashboard giám sát trực tiếp các luồng camera active và nhận diện tự động"
             >
               <ScanFace className="w-4 h-4" />
               <span className="hidden sm:inline">Quét Cửa AI</span>
+            </button>
+
+            <button
+              id="nav-tab-manual"
+              onClick={() => setActiveTab("manual")}
+              className={`flex items-center gap-2 px-3 py-2 rounded-lg text-sm font-medium transition-all ${
+                activeTab === "manual"
+                  ? "bg-indigo-50 text-indigo-700 shadow-xs border border-indigo-100 font-semibold"
+                  : "text-slate-600 hover:text-slate-900 hover:bg-slate-100"
+              }`}
+              title="Nhận diện thủ công qua webcam mặc định hoặc tải ảnh"
+            >
+              <Camera className="w-4 h-4 text-indigo-600" />
+              <span className="hidden sm:inline">Nhận diện thủ công- Manual track</span>
             </button>
 
             <button
