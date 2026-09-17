@@ -192,9 +192,13 @@ export const CameraDashboard: React.FC<CameraDashboardProps> = ({
   // Fetch camera config
   const fetchConfig = useCallback(async () => {
     try {
-      const res = await safeJsonFetch<CameraStreamsConfig>("/api/camera-streams/config");
-      if (res.ok && res.data) {
-        setConfig(res.data);
+      // The endpoint replies with an envelope: { success, config, telemetry }.
+      // Assigning res.data directly leaves config.entryGate undefined.
+      const res = await safeJsonFetch<{ success?: boolean; config?: CameraStreamsConfig }>(
+        "/api/camera-streams/config"
+      );
+      if (res.ok && res.data?.config?.entryGate && res.data.config.exitGate) {
+        setConfig(res.data.config);
       }
     } catch (err) {
       console.warn("[CameraDashboard] Sử dụng cấu hình camera mặc định:", err);
@@ -209,10 +213,10 @@ export const CameraDashboard: React.FC<CameraDashboardProps> = ({
 
   // Determine active gates
   const activeGates: { gate: GateStreamConfig; state: StreamScanState; setState: React.Dispatch<React.SetStateAction<StreamScanState>> }[] = [];
-  if (config.entryGate.enabled) {
+  if (config.entryGate?.enabled) {
     activeGates.push({ gate: config.entryGate, state: entryState, setState: setEntryState });
   }
-  if (config.exitGate.enabled) {
+  if (config.exitGate?.enabled) {
     activeGates.push({ gate: config.exitGate, state: exitState, setState: setExitState });
   }
 
@@ -441,7 +445,7 @@ export const CameraDashboard: React.FC<CameraDashboardProps> = ({
   // Auto-scan cycle timers for each active gate
   useEffect(() => {
     let entryTimer: NodeJS.Timeout | null = null;
-    if (config.entryGate.enabled && entryState.autoScanEnabled) {
+    if (config.entryGate?.enabled && entryState.autoScanEnabled) {
       entryTimer = setInterval(() => {
         if (!entryState.isScanning) {
           performStreamScan("ENTRY");
@@ -451,11 +455,11 @@ export const CameraDashboard: React.FC<CameraDashboardProps> = ({
     return () => {
       if (entryTimer) clearInterval(entryTimer);
     };
-  }, [config.entryGate.enabled, entryState.autoScanEnabled, entryState.scanIntervalSeconds, entryState.isScanning, employees]);
+  }, [config.entryGate?.enabled, entryState.autoScanEnabled, entryState.scanIntervalSeconds, entryState.isScanning, employees]);
 
   useEffect(() => {
     let exitTimer: NodeJS.Timeout | null = null;
-    if (config.exitGate.enabled && exitState.autoScanEnabled) {
+    if (config.exitGate?.enabled && exitState.autoScanEnabled) {
       exitTimer = setInterval(() => {
         if (!exitState.isScanning) {
           performStreamScan("EXIT");
@@ -465,11 +469,11 @@ export const CameraDashboard: React.FC<CameraDashboardProps> = ({
     return () => {
       if (exitTimer) clearInterval(exitTimer);
     };
-  }, [config.exitGate.enabled, exitState.autoScanEnabled, exitState.scanIntervalSeconds, exitState.isScanning, employees]);
+  }, [config.exitGate?.enabled, exitState.autoScanEnabled, exitState.scanIntervalSeconds, exitState.isScanning, employees]);
 
   // Auto start UVC cameras if any active stream uses CLIENT_UVC
   useEffect(() => {
-    if (config.entryGate.enabled && config.entryGate.sourceType === "CLIENT_UVC" && !entryState.clientUvcActive) {
+    if (config.entryGate?.enabled && config.entryGate.sourceType === "CLIENT_UVC" && !entryState.clientUvcActive) {
       startClientUvcCamera("ENTRY");
     }
     return () => {
@@ -477,10 +481,10 @@ export const CameraDashboard: React.FC<CameraDashboardProps> = ({
         stopClientUvcCamera("ENTRY");
       }
     };
-  }, [config.entryGate.enabled, config.entryGate.sourceType]);
+  }, [config.entryGate?.enabled, config.entryGate.sourceType]);
 
   useEffect(() => {
-    if (config.exitGate.enabled && config.exitGate.sourceType === "CLIENT_UVC" && !exitState.clientUvcActive) {
+    if (config.exitGate?.enabled && config.exitGate.sourceType === "CLIENT_UVC" && !exitState.clientUvcActive) {
       startClientUvcCamera("EXIT");
     }
     return () => {
@@ -488,7 +492,7 @@ export const CameraDashboard: React.FC<CameraDashboardProps> = ({
         stopClientUvcCamera("EXIT");
       }
     };
-  }, [config.exitGate.enabled, config.exitGate.sourceType]);
+  }, [config.exitGate?.enabled, config.exitGate.sourceType]);
 
   // Quick unlock for a specific gate
   const handleGateUnlock = async (gateName: string) => {
