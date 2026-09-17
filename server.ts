@@ -25,18 +25,64 @@ const app = express();
 const PORT = 3000;
 
 // =========================================================================
-// 1. BULLETPROOF CORS & PREFLIGHT MIDDLEWARE (MUST BE VERY FIRST)
-// Fully compatible with Netlify, Vercel, Localhost, and any external client.
+// 1. CORS & PREFLIGHT MIDDLEWARE (MUST BE VERY FIRST)
+//
+// Allowed browser origins come from CORS_ALLOWED_ORIGINS (comma separated).
+// When the variable is empty or unset the server stays permissive and
+// reflects any origin, which preserves the previous behaviour for Netlify /
+// Render style deployments - but that combination (reflected origin +
+// credentials) lets any website call this gateway on a visitor's behalf, so
+// configuring the list is strongly recommended.
 // =========================================================================
-app.use((req, res, next) => {
-  const origin = req.headers.origin;
-  if (origin) {
-    res.setHeader("Access-Control-Allow-Origin", origin);
-  } else {
-    res.setHeader("Access-Control-Allow-Origin", "*");
+const CORS_ALLOWED_ORIGINS = String(process.env.CORS_ALLOWED_ORIGINS || "")
+  .split(",")
+  .map((o) => o.trim().replace(/\/+$/, "").toLowerCase())
+  .filter(Boolean);
+
+const CORS_ALLOW_ANY_ORIGIN = CORS_ALLOWED_ORIGINS.length === 0;
+
+function isOriginAllowed(origin?: string): boolean {
+  if (!origin) return false;
+  if (CORS_ALLOW_ANY_ORIGIN) return true;
+  return CORS_ALLOWED_ORIGINS.includes(origin.trim().replace(/\/+$/, "").toLowerCase());
+}
+
+/**
+ * Sets the Access-Control-Allow-Origin / -Credentials pair.
+ * Returns false when a cross-origin request was rejected by the allowlist,
+ * in which case no CORS header is emitted and the browser blocks the read.
+ */
+function applyCorsOrigin(req: Request, res: Response): boolean {
+  const origin = req.headers.origin as string | undefined;
+
+  // Same-origin / non-browser callers send no Origin header.
+  if (!origin) {
+    if (CORS_ALLOW_ANY_ORIGIN) {
+      res.setHeader("Access-Control-Allow-Origin", "*");
+    }
+    return true;
   }
 
+  res.setHeader("Vary", "Origin");
+
+  if (!isOriginAllowed(origin)) {
+    return false;
+  }
+
+  res.setHeader("Access-Control-Allow-Origin", origin);
   res.setHeader("Access-Control-Allow-Credentials", "true");
+  return true;
+}
+
+app.use((req, res, next) => {
+  const allowed = applyCorsOrigin(req, res);
+
+  if (!allowed && req.method === "OPTIONS") {
+    // Reject the preflight outright so the failure is visible in DevTools.
+    res.status(403).end();
+    return;
+  }
+
   res.setHeader(
     "Access-Control-Allow-Methods",
     "GET, POST, PUT, PATCH, DELETE, OPTIONS, HEAD"
@@ -1392,11 +1438,12 @@ app.get("/api/camera-streams/snapshot", async (req, res) => {
   // FFmpeg snapshot command: grab 1 frame with 3.5s timeout
   const args = [
     "-rtsp_transport", transport,
-    "-stimeout", "3500000", // 3.5s timeout in microseconds
+    "-timeout", "3500000", // 3.5s socket timeout in microseconds (FFmpeg >= 8 renamed -stimeout)
     "-i", streamUrl,
     "-vframes", "1",
     "-q:v", "2",
     "-f", "image2",
+    "-update", "1",
     "pipe:1",
   ];
 
@@ -1451,7 +1498,7 @@ app.get("/api/camera-streams/mjpeg", (req, res) => {
 
   const args = [
     "-rtsp_transport", transport,
-    "-stimeout", "4000000",
+    "-timeout", "4000000",
     "-i", streamUrl,
     "-f", "mpjpeg",
     "-boundary_tag", "ffmpeg",
@@ -1494,11 +1541,12 @@ app.post("/api/camera-streams/scan-rtsp", async (req, res) => {
   // Grab single frame using FFmpeg
   const args = [
     "-rtsp_transport", transport,
-    "-stimeout", "3500000",
+    "-timeout", "3500000",
     "-i", streamUrl,
     "-vframes", "1",
     "-q:v", "2",
     "-f", "image2",
+    "-update", "1",
     "pipe:1",
   ];
 
@@ -2816,13 +2864,7 @@ app.use((err: any, req: Request, res: Response, next: any) => {
   if (res.headersSent) {
     return next(err);
   }
-  const origin = req.headers.origin;
-  if (origin) {
-    res.setHeader("Access-Control-Allow-Origin", origin);
-  } else {
-    res.setHeader("Access-Control-Allow-Origin", "*");
-  }
-  res.setHeader("Access-Control-Allow-Credentials", "true");
+  applyCorsOrigin(req, res);
   const statusCode = err?.status || err?.statusCode || 500;
   res.status(statusCode).json({
     error: err?.message || "Lỗi máy chủ nội bộ",
