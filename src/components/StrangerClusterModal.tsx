@@ -20,6 +20,9 @@ import {
   Briefcase,
   KeyRound,
   Check,
+  Search,
+  Link2,
+  UserSearch,
 } from "lucide-react";
 import { StrangerCluster, StrangerPhoto, Employee, AccessLog } from "../types";
 import { safeJsonFetch } from "../utils/api";
@@ -62,6 +65,15 @@ export const StrangerClusterModal: React.FC<StrangerClusterModalProps> = ({
   const [submitting, setSubmitting] = useState<boolean>(false);
   const [successToast, setSuccessToast] = useState<string | null>(null);
   const [previewEnlargedPhoto, setPreviewEnlargedPhoto] = useState<string | null>(null);
+
+  // --- Merge-into-existing-employee mode ---
+  // Used when the recognition engine failed on somebody who is already enrolled.
+  const [formMode, setFormMode] = useState<"CREATE" | "MERGE">("CREATE");
+  const [employeeQuery, setEmployeeQuery] = useState<string>("");
+  const [employeeResults, setEmployeeResults] = useState<Employee[]>([]);
+  const [searchingEmployees, setSearchingEmployees] = useState<boolean>(false);
+  const [mergeTarget, setMergeTarget] = useState<Employee | null>(null);
+  const [adoptPhoto, setAdoptPhoto] = useState<boolean>(false);
 
   // Quick department options
   const DEPARTMENTS = [
@@ -223,6 +235,139 @@ export const StrangerClusterModal: React.FC<StrangerClusterModalProps> = ({
     setName(cluster.suggestedName ? cluster.suggestedName.split("(")[0].trim() : "");
     setPosition("Chuyên viên");
     setAccessLevel("ALL_ACCESS");
+    // Reset the merge panel so a previous cluster's pick never leaks into this one.
+    setFormMode("CREATE");
+    setMergeTarget(null);
+    setEmployeeQuery("");
+    setEmployeeResults([]);
+    setAdoptPhoto(false);
+    setRetroUpdateLogs(true);
+  };
+
+  // Search the roster. Falls back to filtering the offline cache when the API is unreachable.
+  const searchEmployees = async (q: string) => {
+    setSearchingEmployees(true);
+    try {
+      const res = await safeJsonFetch<{ success: boolean; employees: Employee[] }>(
+        `/api/strangers/search-employees?q=${encodeURIComponent(q)}`
+      );
+      if (res.ok && res.data?.employees) {
+        setEmployeeResults(res.data.employees);
+      } else {
+        throw new Error("fallback");
+      }
+    } catch {
+      const term = q.trim().toLowerCase();
+      const local = getStoredEmployees();
+      setEmployeeResults(
+        (term
+          ? local.filter((e) =>
+              [e.name, e.employeeCode, e.department, e.position]
+                .filter(Boolean)
+                .some((f) => String(f).toLowerCase().includes(term))
+            )
+          : local
+        ).slice(0, 20)
+      );
+    } finally {
+      setSearchingEmployees(false);
+    }
+  };
+
+  // Debounce the roster lookup while the operator types.
+  useEffect(() => {
+    if (!isOpen || formMode !== "MERGE") return;
+    const timer = setTimeout(() => searchEmployees(employeeQuery), 250);
+    return () => clearTimeout(timer);
+  }, [employeeQuery, formMode, isOpen]);
+
+  const handleSubmitMerge = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!selectedCluster) return;
+    if (!mergeTarget) {
+      alert("Vui lòng chọn nhân viên cần gộp cụm ảnh này vào");
+      return;
+    }
+
+    setSubmitting(true);
+    try {
+      const clusterLogIds = selectedCluster.photos.map((p) => p.logId);
+      const payload = {
+        employeeId: mergeTarget.id,
+        employeeCode: mergeTarget.employeeCode,
+        clusterLogIds,
+        retroUpdateLogs,
+        adoptPhoto,
+        photoUrl: activePhotoUrl || selectedCluster.primaryPhoto,
+      };
+
+      const res = await safeJsonFetch<{
+        success: boolean;
+        employee: Employee;
+        updatedLogsCount: number;
+      }>("/api/strangers/merge", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+
+      let merged: Employee = mergeTarget;
+      let mergedCount = 0;
+
+      if (res.ok && res.data?.employee) {
+        merged = res.data.employee;
+        mergedCount = res.data.updatedLogsCount || 0;
+      } else {
+        // Offline fallback: reattribute the cached logs locally.
+        merged = adoptPhoto
+          ? { ...mergeTarget, photoUrl: payload.photoUrl }
+          : mergeTarget;
+
+        if (adoptPhoto) {
+          const allEmps = getStoredEmployees();
+          saveStoredEmployees(allEmps.map((e) => (e.id === merged.id ? merged : e)));
+        }
+
+        if (retroUpdateLogs) {
+          const targetIds = new Set(clusterLogIds);
+          const logs = getStoredLogs();
+          const updated = logs.map((l) => {
+            if (!targetIds.has(l.id)) return l;
+            mergedCount++;
+            return {
+              ...l,
+              status: "GRANTED" as const,
+              employeeId: merged.id,
+              employeeName: merged.name,
+              employeeCode: merged.employeeCode,
+              department: merged.department,
+              reason: `Đã gộp thủ công vào nhân viên có sẵn ${merged.name} (${merged.employeeCode})`,
+              lockAction: l.lockAction || "Xác thực thủ công bởi quản trị viên",
+            };
+          });
+          saveStoredLogs(updated);
+        }
+      }
+
+      soundEffects.playSuccess();
+      onEmployeeAdded(merged);
+      if (onLogsUpdated) onLogsUpdated();
+
+      setSuccessToast(
+        `Đã gộp ${mergedCount} ảnh/nhật ký vào nhân viên ${merged.name} (${merged.employeeCode})`
+      );
+      setSelectedCluster(null);
+      setMergeTarget(null);
+      setEmployeeQuery("");
+      setAdoptPhoto(false);
+      setFormMode("CREATE");
+      loadClusters();
+      setTimeout(() => setSuccessToast(null), 4200);
+    } catch (err: any) {
+      alert(`Gộp cụm ảnh thất bại: ${err?.message || "Lỗi không xác định"}`);
+    } finally {
+      setSubmitting(false);
+    }
   };
 
   const handleSubmitQuickRegister = async (e: React.FormEvent) => {
@@ -527,12 +672,226 @@ export const StrangerClusterModal: React.FC<StrangerClusterModalProps> = ({
                       </div>
                     </div>
 
-                    {/* Inline Quick Register Form for this cluster */}
+                    {/* Inline panel: create a new employee, or merge into an existing one */}
                     {isSelected && (
+                      <div className="mt-5 space-y-4 animate-in slide-in-from-top duration-200">
+                        {/* Mode switch */}
+                        <div className="flex items-center gap-2 p-1 bg-slate-100 rounded-xl">
+                          <button
+                            id={`btn-mode-create-${cluster.clusterId}`}
+                            type="button"
+                            onClick={() => setFormMode("CREATE")}
+                            className={`flex-1 inline-flex items-center justify-center gap-2 px-3 py-2 rounded-lg text-xs font-semibold transition-colors ${
+                              formMode === "CREATE"
+                                ? "bg-white text-indigo-700 shadow-2xs"
+                                : "text-slate-600 hover:text-slate-900"
+                            }`}
+                          >
+                            <UserPlus className="w-3.5 h-3.5" />
+                            <span>Tạo nhân viên mới</span>
+                          </button>
+                          <button
+                            id={`btn-mode-merge-${cluster.clusterId}`}
+                            type="button"
+                            onClick={() => setFormMode("MERGE")}
+                            className={`flex-1 inline-flex items-center justify-center gap-2 px-3 py-2 rounded-lg text-xs font-semibold transition-colors ${
+                              formMode === "MERGE"
+                                ? "bg-white text-emerald-700 shadow-2xs"
+                                : "text-slate-600 hover:text-slate-900"
+                            }`}
+                          >
+                            <Link2 className="w-3.5 h-3.5" />
+                            <span>Gộp vào nhân viên đã có</span>
+                          </button>
+                        </div>
+
+                        {formMode === "MERGE" ? (
+                          <form
+                            id={`form-merge-existing-${cluster.clusterId}`}
+                            onSubmit={handleSubmitMerge}
+                            className="p-5 bg-white border border-emerald-200 rounded-2xl shadow-xs space-y-4"
+                          >
+                            <div className="flex items-center gap-2 pb-3 border-b border-slate-100">
+                              <UserSearch className="w-4 h-4 text-emerald-600" />
+                              <h4 className="text-sm font-bold text-slate-900">
+                                Gộp Cụm Ảnh Vào Nhân Viên Đã Có
+                              </h4>
+                            </div>
+
+                            <p className="text-xs text-slate-600 bg-amber-50 border border-amber-200 rounded-xl p-3">
+                              Dùng khi AI <strong>không nhận diện được</strong> một người thực tế đã có trong
+                              danh sách nhân viên. Toàn bộ {cluster.photos.length} ảnh/nhật ký của cụm này sẽ
+                              được gán lại cho nhân viên bạn chọn.
+                            </p>
+
+                            {/* Roster search */}
+                            <div>
+                              <label className="block text-xs font-semibold text-slate-700 mb-1">
+                                Tìm nhân viên <span className="text-rose-500">*</span>
+                              </label>
+                              <div className="relative">
+                                <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-slate-400" />
+                                <input
+                                  id={`input-employee-search-${cluster.clusterId}`}
+                                  type="text"
+                                  placeholder="Nhập tên, mã nhân viên, phòng ban hoặc chức vụ..."
+                                  value={employeeQuery}
+                                  onChange={(e) => setEmployeeQuery(e.target.value)}
+                                  className="w-full pl-9 pr-3 py-2 text-xs rounded-xl border border-slate-200 focus:outline-hidden focus:ring-2 focus:ring-emerald-500"
+                                  autoFocus
+                                />
+                              </div>
+                            </div>
+
+                            {/* Results */}
+                            <div className="max-h-56 overflow-y-auto rounded-xl border border-slate-200 divide-y divide-slate-100">
+                              {searchingEmployees && (
+                                <div className="p-3 text-xs text-slate-500 flex items-center gap-2">
+                                  <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+                                  <span>Đang tìm kiếm nhân viên...</span>
+                                </div>
+                              )}
+
+                              {!searchingEmployees && employeeResults.length === 0 && (
+                                <div className="p-3 text-xs text-slate-500">
+                                  Không tìm thấy nhân viên phù hợp. Hãy thử từ khóa khác, hoặc chuyển sang
+                                  “Tạo nhân viên mới”.
+                                </div>
+                              )}
+
+                              {!searchingEmployees &&
+                                employeeResults.map((emp) => {
+                                  const picked = mergeTarget?.id === emp.id;
+                                  return (
+                                    <button
+                                      key={emp.id}
+                                      type="button"
+                                      onClick={() => setMergeTarget(emp)}
+                                      className={`w-full flex items-center gap-3 p-2.5 text-left transition-colors ${
+                                        picked ? "bg-emerald-50" : "hover:bg-slate-50"
+                                      }`}
+                                    >
+                                      <img
+                                        src={emp.photoUrl}
+                                        alt={emp.name}
+                                        className="w-9 h-9 rounded-lg object-cover bg-slate-200 shrink-0"
+                                      />
+                                      <div className="min-w-0 flex-1">
+                                        <p className="text-xs font-semibold text-slate-900 truncate">
+                                          {emp.name}
+                                          <span className="ml-1.5 font-mono text-[10px] text-slate-500">
+                                            {emp.employeeCode}
+                                          </span>
+                                        </p>
+                                        <p className="text-[10px] text-slate-500 truncate">
+                                          {emp.department} • {emp.position}
+                                        </p>
+                                      </div>
+                                      {picked && (
+                                        <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" />
+                                      )}
+                                    </button>
+                                  );
+                                })}
+                            </div>
+
+                            {/* Selected target summary */}
+                            {mergeTarget && (
+                              <div className="flex items-center gap-3 p-3 rounded-xl bg-emerald-50 border border-emerald-200">
+                                <img
+                                  src={activePhotoUrl || cluster.primaryPhoto}
+                                  alt="Ảnh người lạ"
+                                  className="w-10 h-10 rounded-lg object-cover bg-slate-200"
+                                />
+                                <ArrowRight className="w-4 h-4 text-emerald-600 shrink-0" />
+                                <img
+                                  src={mergeTarget.photoUrl}
+                                  alt={mergeTarget.name}
+                                  className="w-10 h-10 rounded-lg object-cover bg-slate-200"
+                                />
+                                <div className="min-w-0">
+                                  <p className="text-xs font-bold text-emerald-900 truncate">
+                                    {mergeTarget.name} ({mergeTarget.employeeCode})
+                                  </p>
+                                  <p className="text-[10px] text-emerald-700">
+                                    {cluster.photos.length} ảnh sẽ được gán cho nhân viên này
+                                  </p>
+                                </div>
+                              </div>
+                            )}
+
+                            {/* Options */}
+                            <div className="space-y-2 pt-1">
+                              <div className="flex items-center gap-2">
+                                <input
+                                  id={`check-merge-retro-${cluster.clusterId}`}
+                                  type="checkbox"
+                                  checked={retroUpdateLogs}
+                                  onChange={(e) => setRetroUpdateLogs(e.target.checked)}
+                                  className="w-4 h-4 rounded-md text-emerald-600 border-slate-300 focus:ring-emerald-500"
+                                />
+                                <label
+                                  htmlFor={`check-merge-retro-${cluster.clusterId}`}
+                                  className="text-xs text-slate-700 font-medium cursor-pointer"
+                                >
+                                  Cập nhật {cluster.photos.length} nhật ký quét cũ thành “Đã xác thực” cho
+                                  nhân viên này
+                                </label>
+                              </div>
+                              <div className="flex items-start gap-2">
+                                <input
+                                  id={`check-merge-photo-${cluster.clusterId}`}
+                                  type="checkbox"
+                                  checked={adoptPhoto}
+                                  onChange={(e) => setAdoptPhoto(e.target.checked)}
+                                  className="mt-0.5 w-4 h-4 rounded-md text-emerald-600 border-slate-300 focus:ring-emerald-500"
+                                />
+                                <label
+                                  htmlFor={`check-merge-photo-${cluster.clusterId}`}
+                                  className="text-xs text-slate-700 font-medium cursor-pointer"
+                                >
+                                  Dùng ảnh chụp này làm ảnh đại diện của nhân viên
+                                  <span className="block text-[10px] font-normal text-slate-500">
+                                    Chỉ thay ảnh hiển thị/hồ sơ — không tự khiến AI nhận diện được ở lần quét sau.
+                                  </span>
+                                </label>
+                              </div>
+                            </div>
+
+                            {/* Actions */}
+                            <div className="flex items-center justify-end gap-3 pt-3 border-t border-slate-100">
+                              <button
+                                type="button"
+                                onClick={() => setSelectedCluster(null)}
+                                className="px-4 py-2 rounded-xl text-xs font-semibold text-slate-600 hover:bg-slate-100 transition-colors"
+                              >
+                                Hủy bỏ
+                              </button>
+                              <button
+                                id={`btn-submit-merge-${cluster.clusterId}`}
+                                type="submit"
+                                disabled={submitting || !mergeTarget}
+                                className="inline-flex items-center gap-2 px-5 py-2.5 rounded-xl text-xs font-semibold bg-emerald-600 hover:bg-emerald-700 text-white shadow-sm shadow-emerald-200 transition-colors disabled:opacity-50"
+                              >
+                                {submitting ? (
+                                  <>
+                                    <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+                                    <span>Đang gộp cụm ảnh...</span>
+                                  </>
+                                ) : (
+                                  <>
+                                    <Link2 className="w-3.5 h-3.5" />
+                                    <span>Gộp Vào Nhân Viên Này</span>
+                                  </>
+                                )}
+                              </button>
+                            </div>
+                          </form>
+                        ) : (
                       <form
                         id={`form-quick-register-${cluster.clusterId}`}
                         onSubmit={handleSubmitQuickRegister}
-                        className="mt-5 p-5 bg-white border border-indigo-200 rounded-2xl shadow-xs space-y-4 animate-in slide-in-from-top duration-200"
+                        className="p-5 bg-white border border-indigo-200 rounded-2xl shadow-xs space-y-4"
                       >
                         <div className="flex items-center gap-2 pb-3 border-b border-slate-100">
                           <Sparkles className="w-4 h-4 text-indigo-600" />
@@ -677,6 +1036,8 @@ export const StrangerClusterModal: React.FC<StrangerClusterModalProps> = ({
                           </button>
                         </div>
                       </form>
+                        )}
+                      </div>
                     )}
                   </div>
                 );

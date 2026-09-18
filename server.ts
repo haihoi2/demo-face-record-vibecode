@@ -2104,6 +2104,146 @@ app.post(["/api/strangers/quick-register", "/api/strangers/register"], (req, res
   }
 });
 
+// Search the existing roster so an unrecognized stranger cluster can be merged
+// into the employee it actually belongs to, instead of creating a duplicate.
+app.get(["/api/strangers/search-employees", "/api/strangers/employees"], (req, res) => {
+  try {
+    const q = String(req.query.q || "").trim().toLowerCase();
+    const limit = Math.min(50, Math.max(1, parseInt(String(req.query.limit || "20"), 10) || 20));
+
+    const matches = (q
+      ? employees.filter((e) =>
+          [e.name, e.employeeCode, e.department, e.position]
+            .filter(Boolean)
+            .some((field) => String(field).toLowerCase().includes(q))
+        )
+      : employees
+    ).slice(0, limit);
+
+    res.json({
+      success: true,
+      query: q,
+      total: matches.length,
+      employees: matches,
+    });
+  } catch (err: any) {
+    console.error("[Strangers] Lỗi tìm kiếm nhân viên:", err);
+    res.status(500).json({ success: false, error: err?.message || "Lỗi tìm kiếm nhân viên" });
+  }
+});
+
+// Merge a stranger cluster into an EXISTING employee. Used when the recognition
+// engine failed to match a person who is in fact already enrolled: the operator
+// picks the right employee and the cluster's history is reattributed to them.
+app.post(["/api/strangers/merge", "/api/strangers/assign"], (req, res) => {
+  try {
+    const {
+      employeeId,
+      employeeCode,
+      clusterLogIds = [],
+      retroUpdateLogs = true,
+      adoptPhoto = false,
+      photoUrl,
+    } = req.body || {};
+
+    if (!employeeId && !employeeCode) {
+      res.status(400).json({ success: false, error: "Vui lòng chọn nhân viên cần gộp cụm ảnh" });
+      return;
+    }
+
+    const target = employees.find(
+      (e) =>
+        (employeeId && e.id === employeeId) ||
+        (employeeCode && e.employeeCode.toUpperCase() === String(employeeCode).toUpperCase())
+    );
+
+    if (!target) {
+      res.status(404).json({
+        success: false,
+        error: `Không tìm thấy nhân viên tương ứng (${employeeId || employeeCode})`,
+      });
+      return;
+    }
+
+    if (!Array.isArray(clusterLogIds) || clusterLogIds.length === 0) {
+      res.status(400).json({ success: false, error: "Cụm ảnh không có nhật ký nào để gộp" });
+      return;
+    }
+
+    // Adopting the captured frame as the avatar only changes how this person is
+    // displayed and enrolled; it does not by itself make the matcher recognise them.
+    let photoUpdated = false;
+    const newPhoto = String(photoUrl || "").trim();
+    if (adoptPhoto && newPhoto) {
+      target.photoUrl = newPhoto;
+      db.saveEmployee(target);
+      photoUpdated = true;
+    }
+
+    let updatedLogsCount = 0;
+    const skippedLogIds: string[] = [];
+
+    if (retroUpdateLogs) {
+      for (const logId of clusterLogIds) {
+        const log = accessLogs.find((l) => l.id === logId);
+        if (!log) {
+          skippedLogIds.push(logId);
+          continue;
+        }
+        log.status = "GRANTED";
+        log.employeeId = target.id;
+        log.employeeName = target.name;
+        log.employeeCode = target.employeeCode;
+        log.department = target.department;
+        log.reason = `Đã gộp thủ công vào nhân viên có sẵn ${target.name} (${target.employeeCode}) do AI không nhận diện được`;
+        log.lockAction = log.lockAction || "Xác thực thủ công bởi quản trị viên";
+        db.saveAccessLog(log);
+        updatedLogsCount++;
+      }
+    }
+
+    const notif: MobileNotificationRecord = {
+      id: "NOTIF-" + Date.now(),
+      title: "Đã gộp cụm ảnh người lạ",
+      body: `Đã gán ${updatedLogsCount} ảnh/nhật ký người lạ cho nhân viên có sẵn: ${target.name} (${target.employeeCode}).`,
+      timestamp: new Date().toISOString(),
+      type: "SUCCESS",
+      read: false,
+      employeeId: target.id,
+      employeeName: target.name,
+    };
+    mobileNotifications.unshift(notif);
+    db.saveNotification(notif);
+
+    broadcastSSE("notification", notif);
+    broadcastSSE("stranger_merged", {
+      employee: target,
+      updatedLogsCount,
+      clusterLogIds,
+      photoUpdated,
+    });
+    if (photoUpdated) {
+      broadcastSSE("employee_updated", target);
+    }
+
+    console.log(
+      `[Strangers] Đã gộp ${updatedLogsCount}/${clusterLogIds.length} nhật ký người lạ vào nhân viên ${target.name} (${target.employeeCode}).`
+    );
+
+    res.json({
+      success: true,
+      message: `Đã gộp cụm ảnh vào nhân viên ${target.name}`,
+      employee: target,
+      updatedLogsCount,
+      skippedLogIds,
+      photoUpdated,
+    });
+  } catch (err: any) {
+    console.error("[Strangers] Lỗi gộp cụm ảnh vào nhân viên:", err);
+    res.status(500).json({ success: false, error: err?.message || "Lỗi xử lý gộp cụm ảnh" });
+  }
+});
+
 // --- AI Face Recognition Routes (Multi-Face & High-Speed Recognition) ---
 const RECOGNIZE_FACE_ROUTES = [
   "/api/recognize-face",
