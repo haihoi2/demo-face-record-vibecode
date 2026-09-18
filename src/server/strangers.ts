@@ -128,7 +128,14 @@ export function generateFaceSignature(image: string): string {
 /**
  * Clusters stranger access logs (status === 'DENIED' or unauthorized) by face similarity.
  */
-export function clusterStrangerFaces(accessLogs: AccessLogRecord[]): StrangerCluster[] {
+export function clusterStrangerFaces(
+  accessLogs: AccessLogRecord[],
+  resolvedClusterIds: string[] = []
+): StrangerCluster[] {
+  // Clusters already turned into an employee (new or merged) must not come back.
+  // Real clusters disappear on their own once their logs flip to GRANTED; the
+  // seeded demo clusters have no real logs, so they need this explicit list.
+  const resolved = new Set(resolvedClusterIds);
   // 1. Gather all actual stranger logs from the access log history
   const deniedLogs = accessLogs.filter(
     (log) => log.status === "DENIED" || !log.employeeId || log.employeeName === "Không xác định"
@@ -136,8 +143,9 @@ export function clusterStrangerFaces(accessLogs: AccessLogRecord[]): StrangerClu
 
   const clusterMap: Record<string, StrangerPhoto[]> = {};
 
-  // Seed default clusters first
+  // Seed default clusters first, skipping any the operator has already resolved
   for (const seed of SEED_STRANGER_CLUSTERS) {
+    if (resolved.has(seed.clusterId)) continue;
     clusterMap[seed.clusterId] = [...seed.photos];
   }
 
@@ -194,6 +202,7 @@ export function clusterStrangerFaces(accessLogs: AccessLogRecord[]): StrangerClu
 
   for (const [cid, photos] of Object.entries(clusterMap)) {
     if (photos.length === 0) continue;
+    if (resolved.has(cid)) continue;
 
     // Sort photos descending by timestamp
     photos.sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime());

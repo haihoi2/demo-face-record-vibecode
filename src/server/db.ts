@@ -604,7 +604,14 @@ class SQLiteStorage {
           "employeeId" VARCHAR(64),
           "employeeName" VARCHAR(255)
         );
+
+        CREATE TABLE IF NOT EXISTS resolved_stranger_clusters (
+          "clusterId" VARCHAR(128) PRIMARY KEY,
+          "resolvedAt" VARCHAR(64),
+          "resolvedBy" VARCHAR(255)
+        );
       `);
+      await this.loadResolvedStrangerClusters();
       console.log("[PostgreSQL] Các bảng dữ liệu đã sẵn sàng trên PostgreSQL!");
     } catch (err) {
       console.error("[PostgreSQL] Lỗi khởi tạo bảng:", err);
@@ -760,12 +767,14 @@ class SQLiteStorage {
     door_controller_config?: DoorControllerConfigRecord;
     door_api_logs: DoorApiLogRecord[];
     camera_streams_config?: CameraStreamsConfigRecord;
+    resolved_stranger_clusters?: string[];
   } = {
     employees: [],
     access_logs: [],
     webhook_logs: [],
     mobile_notifications: [],
     door_api_logs: [],
+    resolved_stranger_clusters: [],
   };
 
   private fallbackFile = path.join(DATA_DIR, "smartface_data.json");
@@ -1531,6 +1540,118 @@ class SQLiteStorage {
     }
     this.fallbackData.camera_streams_config = config;
     this.saveFallback();
+  }
+
+  // ================= RESOLVED STRANGER CLUSTERS =================
+  // Seeded demo clusters carry synthetic log ids that never exist in
+  // access_logs, so acting on one cannot remove it the way a real cluster is
+  // removed (its logs flipping to GRANTED). Remember the resolved ids instead.
+  //
+  // Read path is synchronous (the clusters endpoint is sync), so the ids are
+  // held in memory and hydrated from PostgreSQL at startup. Writes go to every
+  // store that is active: PostgreSQL, native SQLite, and the JSON fallback.
+  // The JSON fallback alone is not sufficient - when ./data is bind-mounted
+  // from a host user, the container cannot write it and saveFallback() fails
+  // silently in its catch.
+  private resolvedClustersCache: string[] = [];
+
+  private async loadResolvedStrangerClusters() {
+    if (!this.pgPool) return;
+    try {
+      const res = await this.pgPool.query('SELECT "clusterId" FROM resolved_stranger_clusters');
+      this.resolvedClustersCache = res.rows.map((r: any) => r.clusterId);
+      if (this.resolvedClustersCache.length > 0) {
+        console.log(
+          `[PostgreSQL] Đã nạp ${this.resolvedClustersCache.length} cụm người lạ đã xử lý.`
+        );
+      }
+    } catch (err) {
+      console.error("[PostgreSQL] Lỗi nạp danh sách cụm người lạ đã xử lý:", err);
+    }
+  }
+
+  getResolvedStrangerClusters(): string[] {
+    if (this.resolvedClustersCache.length > 0) return this.resolvedClustersCache;
+    // SQLite / JSON-only deployments never hydrate the cache from PostgreSQL.
+    if (this.isNativeSqlite && this.db) {
+      try {
+        const rows = this.db
+          .prepare("SELECT clusterId FROM resolved_stranger_clusters")
+          .all() as any[];
+        if (rows?.length) {
+          this.resolvedClustersCache = rows.map((r) => r.clusterId);
+          return this.resolvedClustersCache;
+        }
+      } catch {}
+    }
+    return this.fallbackData.resolved_stranger_clusters || [];
+  }
+
+  markStrangerClusterResolved(clusterId: string, resolvedBy = "operator"): void {
+    if (!clusterId) return;
+    if (this.resolvedClustersCache.includes(clusterId)) return;
+    this.resolvedClustersCache = [...this.resolvedClustersCache, clusterId];
+
+    const resolvedAt = new Date().toISOString();
+
+    if (this.pgPool && this.isPostgres) {
+      this.pgPool
+        .query(
+          `INSERT INTO resolved_stranger_clusters ("clusterId", "resolvedAt", "resolvedBy")
+           VALUES ($1, $2, $3)
+           ON CONFLICT ("clusterId") DO NOTHING`,
+          [clusterId, resolvedAt, resolvedBy]
+        )
+        .catch((err: any) =>
+          console.error("[PostgreSQL] Lỗi lưu cụm người lạ đã xử lý:", err?.message)
+        );
+    }
+
+    if (this.isNativeSqlite && this.db) {
+      try {
+        this.db.exec(`
+          CREATE TABLE IF NOT EXISTS resolved_stranger_clusters (
+            clusterId TEXT PRIMARY KEY,
+            resolvedAt TEXT,
+            resolvedBy TEXT
+          )
+        `);
+        this.db
+          .prepare(
+            "INSERT OR IGNORE INTO resolved_stranger_clusters (clusterId, resolvedAt, resolvedBy) VALUES (?, ?, ?)"
+          )
+          .run(clusterId, resolvedAt, resolvedBy);
+      } catch (err) {
+        console.error("[SQLite] Lỗi lưu cụm người lạ đã xử lý:", err);
+      }
+    }
+
+    const current = this.fallbackData.resolved_stranger_clusters || [];
+    if (!current.includes(clusterId)) {
+      this.fallbackData.resolved_stranger_clusters = [...current, clusterId];
+      this.saveFallback();
+    }
+  }
+
+  unmarkStrangerClusterResolved(clusterId: string): void {
+    this.resolvedClustersCache = this.resolvedClustersCache.filter((id) => id !== clusterId);
+
+    if (this.pgPool && this.isPostgres) {
+      this.pgPool
+        .query('DELETE FROM resolved_stranger_clusters WHERE "clusterId" = $1', [clusterId])
+        .catch(() => {});
+    }
+    if (this.isNativeSqlite && this.db) {
+      try {
+        this.db.prepare("DELETE FROM resolved_stranger_clusters WHERE clusterId = ?").run(clusterId);
+      } catch {}
+    }
+
+    const current = this.fallbackData.resolved_stranger_clusters || [];
+    if (current.includes(clusterId)) {
+      this.fallbackData.resolved_stranger_clusters = current.filter((id) => id !== clusterId);
+      this.saveFallback();
+    }
   }
 
   // Get info & statistics

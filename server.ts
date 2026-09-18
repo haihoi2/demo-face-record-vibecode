@@ -1998,7 +1998,7 @@ app.post(["/api/notifications/mark-read", "/notifications/mark-read"], (_req, re
 // --- Stranger Face Alerts & Clustered Face Quick Registration ---
 app.get(["/api/strangers/clusters", "/api/strangers", "/api/strangers/"], (_req, res) => {
   try {
-    const clusters = clusterStrangerFaces(accessLogs);
+    const clusters = clusterStrangerFaces(accessLogs, db.getResolvedStrangerClusters());
     const deniedLogsCount = accessLogs.filter(
       (l) => l.status === "DENIED" || !l.employeeId || l.employeeName === "Không xác định"
     ).length;
@@ -2024,6 +2024,7 @@ app.post(["/api/strangers/quick-register", "/api/strangers/register"], (req, res
       position,
       accessLevel = "ALL_ACCESS",
       photoUrl,
+      clusterId,
       clusterLogIds = [],
       retroUpdateLogs = true,
     } = req.body;
@@ -2082,11 +2083,15 @@ app.post(["/api/strangers/quick-register", "/api/strangers/register"], (req, res
     mobileNotifications.unshift(notif);
     db.saveNotification(notif);
 
+    // Retire the cluster so it stops being offered once it has an owner.
+    if (clusterId) db.markStrangerClusterResolved(String(clusterId));
+
     broadcastSSE("employee_added", newEmployee);
     broadcastSSE("notification", notif);
     broadcastSSE("stranger_registered", {
       employee: newEmployee,
       updatedLogsCount,
+      clusterId,
       clusterLogIds,
     });
 
@@ -2097,6 +2102,8 @@ app.post(["/api/strangers/quick-register", "/api/strangers/register"], (req, res
       message: `Đã khai báo thành công nhân viên ${newEmployee.name}`,
       employee: newEmployee,
       updatedLogsCount,
+      clusterId: clusterId || null,
+      clusterResolved: Boolean(clusterId),
     });
   } catch (err: any) {
     console.error("[Strangers] Lỗi khai báo nhanh nhân viên:", err);
@@ -2140,6 +2147,7 @@ app.post(["/api/strangers/merge", "/api/strangers/assign"], (req, res) => {
     const {
       employeeId,
       employeeCode,
+      clusterId,
       clusterLogIds = [],
       retroUpdateLogs = true,
       adoptPhoto = false,
@@ -2215,10 +2223,14 @@ app.post(["/api/strangers/merge", "/api/strangers/assign"], (req, res) => {
     mobileNotifications.unshift(notif);
     db.saveNotification(notif);
 
+    // Retire the cluster so it stops being offered once it has an owner.
+    if (clusterId) db.markStrangerClusterResolved(String(clusterId));
+
     broadcastSSE("notification", notif);
     broadcastSSE("stranger_merged", {
       employee: target,
       updatedLogsCount,
+      clusterId,
       clusterLogIds,
       photoUpdated,
     });
@@ -2237,6 +2249,8 @@ app.post(["/api/strangers/merge", "/api/strangers/assign"], (req, res) => {
       updatedLogsCount,
       skippedLogIds,
       photoUpdated,
+      clusterId: clusterId || null,
+      clusterResolved: Boolean(clusterId),
     });
   } catch (err: any) {
     console.error("[Strangers] Lỗi gộp cụm ảnh vào nhân viên:", err);

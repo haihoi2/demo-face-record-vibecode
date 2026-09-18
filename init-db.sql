@@ -90,6 +90,13 @@ CREATE TABLE IF NOT EXISTS door_controller_config (
   "updatedAt" VARCHAR(64)
 );
 
+
+CREATE TABLE IF NOT EXISTS resolved_stranger_clusters (
+  "clusterId" VARCHAR(128) PRIMARY KEY,
+  "resolvedAt" VARCHAR(64),
+  "resolvedBy" VARCHAR(255)
+);
+
 -- Indices for rapid query performance
 CREATE INDEX IF NOT EXISTS idx_access_logs_timestamp ON access_logs (timestamp DESC);
 CREATE INDEX IF NOT EXISTS idx_notifications_timestamp ON mobile_notifications (timestamp DESC);

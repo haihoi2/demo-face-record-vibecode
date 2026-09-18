@@ -295,6 +295,7 @@ export const StrangerClusterModal: React.FC<StrangerClusterModalProps> = ({
       const payload = {
         employeeId: mergeTarget.id,
         employeeCode: mergeTarget.employeeCode,
+        clusterId: selectedCluster.clusterId,
         clusterLogIds,
         retroUpdateLogs,
         adoptPhoto,
@@ -353,6 +354,10 @@ export const StrangerClusterModal: React.FC<StrangerClusterModalProps> = ({
       onEmployeeAdded(merged);
       if (onLogsUpdated) onLogsUpdated();
 
+      // Drop the card immediately - the cluster now has an owner.
+      const resolvedId = selectedCluster.clusterId;
+      setClusters((prev) => prev.filter((c) => c.clusterId !== resolvedId));
+
       setSuccessToast(
         `Đã gộp ${mergedCount} ảnh/nhật ký vào nhân viên ${merged.name} (${merged.employeeCode})`
       );
@@ -387,6 +392,7 @@ export const StrangerClusterModal: React.FC<StrangerClusterModalProps> = ({
         position: position.trim(),
         accessLevel,
         photoUrl: activePhotoUrl || selectedCluster.primaryPhoto,
+        clusterId: selectedCluster.clusterId,
         clusterLogIds: selectedCluster.photos.map((p) => p.logId),
         retroUpdateLogs,
       };
