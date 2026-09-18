@@ -423,43 +423,34 @@ class FaceWorkerPoolManager {
         workerId: workerItem.id,
       });
     } else {
-      // Fallback async simulator if worker threads cannot be spawned
+      // No worker thread available. This path used to fabricate a match for
+      // employees[0] at 97% confidence, which meant a failure to spawn threads
+      // silently granted access to any face. A recognition engine that cannot
+      // run must deny, never approve.
       setImmediate(() => {
         try {
           const t0 = Date.now();
-          const emp = task.payload.employees[0];
           const result: FaceTaskResult = {
             taskId: task.payload.taskId,
             workerId: workerItem.id,
-            threadLatencyMs: Math.max(12, Date.now() - t0 + 15),
-            detectedFaces: emp
-              ? [
-                  {
-                    id: "worker-face-" + emp.id,
-                    box2d: [180, 270, 720, 720],
-                    employeeId: emp.id,
-                    employeeName: emp.name,
-                    employeeCode: emp.employeeCode,
-                    department: emp.department,
-                    confidence: 97.0,
-                    livenessScore: 98.5,
-                    recognized: true,
-                    message: `Nhận diện qua Multi-Thread Fallback Worker #${workerItem.id}`,
-                  },
-                ]
-              : [],
-            bestMatch: emp,
-            overallConfidence: 97.0,
-            overallLiveness: 98.5,
-            cosineSimilarity: 0.93,
-            modelName: "Multi-Thread Biometric Fallback",
-            recognized: Boolean(emp),
-            engineUsed: `Backend Multi-Thread Worker #${workerItem.id}`,
+            threadLatencyMs: Math.max(1, Date.now() - t0),
+            detectedFaces: [],
+            bestMatch: undefined,
+            overallConfidence: 0,
+            overallLiveness: 0,
+            cosineSimilarity: 0,
+            modelName: "Unavailable (worker thread could not be started)",
+            recognized: false,
+            engineUsed: `Backend Multi-Thread Worker #${workerItem.id} (unavailable)`,
           };
+          console.error(
+            `[WorkerPool] Worker #${workerItem.id} không khả dụng - từ chối nhận diện task ${task.payload.taskId} (fail-closed).`
+          );
           this.handleTaskCompleted(workerItem, result);
           task.resolve(result);
         } catch (err) {
           workerItem.busy = false;
+          this.processNextInQueue();
           task.reject(err);
         }
       });

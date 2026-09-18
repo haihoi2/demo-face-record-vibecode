@@ -42,6 +42,8 @@ services:
       - DATA_DIR=/app/data
 
       # Cơ chế nhận diện khuôn mặt: "local" hoặc "google" (Gemini AI)
+      # Demo-only unlock shortcuts. Never enable where a real lock is attached.
+      - ALLOW_SIMULATED_RECOGNITION=${ALLOW_SIMULATED_RECOGNITION:-false}
       - FACE_RECOGNITION_PROVIDER=${FACE_RECOGNITION_PROVIDER:-local}
       - LOCAL_FACE_RECOGNITION_MODEL=${LOCAL_FACE_RECOGNITION_MODEL:-local-exact-match}
       - GEMINI_API_KEY=${GEMINI_API_KEY:-}

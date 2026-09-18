@@ -2334,8 +2334,26 @@ app.post(RECOGNIZE_FACE_ROUTES, async (req, res) => {
       body.image_base64;
 
     const scanType: "ENTRY" | "EXIT" = body.scanType === "EXIT" ? "EXIT" : "ENTRY";
-    const testEmployeeId: string | undefined =
+    // Simulation shortcuts below fabricate a successful recognition from a
+    // name/code alone, with no image. Reachable from the request body, that is
+    // a remote door-unlock bypass: POST {"employeeCode":"NV-5588"} was enough.
+    // They stay available for demos, but only when explicitly enabled, and
+    // never by default.
+    const simulationAllowed = process.env.ALLOW_SIMULATED_RECOGNITION === "true";
+    const requestedTestId: string | undefined =
       body.testEmployeeId || body.testEmployee || body.employeeId || body.employeeCode;
+
+    if (!simulationAllowed && (body.testEmployeeId || body.testEmployee)) {
+      res.status(403).json({
+        error:
+          "Chế độ nhận diện giả lập đang tắt. Đặt ALLOW_SIMULATED_RECOGNITION=true để bật cho môi trường demo (không dùng khi có khóa cửa thật).",
+        recognized: false,
+        simulationDisabled: true,
+      });
+      return;
+    }
+
+    const testEmployeeId: string | undefined = simulationAllowed ? requestedTestId : undefined;
     const clientEmployees = body.clientEmployees;
 
     // Sync any employees sent from client that server doesn't have yet
@@ -2752,25 +2770,25 @@ Yêu cầu phân tích:
       }
     }
 
-    // High-speed fallback if Gemini is unreachable or experiencing peak demand
+    // No engine produced a match. This previously granted access to
+    // employees[0] at a hard-coded 96.5% whenever detectedFaces was empty -
+    // which is also the state for an empty frame, a wall, or darkness, so any
+    // unrecognised image opened the door. Recognition failure must deny.
     if (detectedFaces.length === 0) {
       if (employees.length > 0) {
-        const emp = employees[0];
         detectedFaces = [
           {
-            id: "face-fb-" + Date.now(),
-            box2d: [180, 280, 720, 720],
-            employeeId: emp.id,
-            employeeName: emp.name,
-            employeeCode: emp.employeeCode,
-            department: emp.department,
-            confidence: 96.5,
-            livenessScore: 98.8,
-            recognized: true,
-            message: `Chào mừng ${emp.name}! Xác thực khuôn mặt qua Engine Biometrics dự phòng.`,
+            id: "face-nomatch-" + Date.now(),
+            box2d: [190, 270, 750, 730],
+            confidence: 0,
+            livenessScore: 0,
+            recognized: false,
+            message:
+              "Không nhận diện được khuôn mặt hợp lệ trong khung hình. Cửa giữ trạng thái khóa.",
           },
         ];
-        overallMessage = `Nhận diện khuôn mặt thành công: ${emp.name} (${emp.employeeCode})`;
+        overallMessage =
+          "Không nhận diện được nhân viên nào trong khung hình. Từ chối mở khóa.";
       } else {
         detectedFaces = [
           {
