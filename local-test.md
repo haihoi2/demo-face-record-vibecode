@@ -29,14 +29,47 @@ down` preserves it, `docker compose down -v` destroys it.
 
 ```bash
 cp .env.example .env          # only if .env does not exist yet
+# match the in-container user to the host owner of ./data (see 2.2)
+sed -i "s/^APP_UID=.*/APP_UID=$(id -u)/; s/^APP_GID=.*/APP_GID=$(id -g)/" .env
 docker compose up -d --build
 ```
 
-`deploy-local.sh` wraps the same flow and additionally detects whether port
+`deploy-local.sh` wraps the same flow (including the `APP_UID`/`APP_GID`
+substitution when it creates `.env`) and additionally detects whether port
 5432 is already taken by a host PostgreSQL, in which case it starts only the
 app container.
 
-### 2.2 Verify
+### 2.2 Base image and file ownership
+
+The image is built on `node:22-bookworm-slim` (Debian 12, glibc 2.36). It
+used to be Alpine; the switch is required because `onnxruntime-node` ships
+glibc-only prebuilt binaries and will not load on musl. Runtime packages are
+`ffmpeg` (Debian 5.1.x, which has the `-timeout` / `-update 1` flags the
+RTSP snapshot and MJPEG handlers use), `ca-certificates` and `tzdata`.
+
+The app runs as the non-root user `node`. `./data` is bind-mounted to
+`/app/data`, so the uid/gid of that user **must match the host owner of
+`./data`**, otherwise SQLite reports `attempt to write a readonly database`
+and the JSON fallback save fails silently. The Dockerfile remaps the `node`
+user via the build args `APP_UID` / `APP_GID`; compose forwards them from
+`.env` (default `1000`, the stock `node` uid). On this host the checkout is
+owned by uid/gid `1001`, so `.env` needs:
+
+```bash
+id -u; id -g                  # -> 1001 1001 here
+APP_UID=1001
+APP_GID=1001
+```
+
+They are build args, not runtime env, so a change needs
+`docker compose up -d --build`. Check the result with:
+
+```bash
+docker exec smartface-local-gateway id            # uid=1001(node) gid=1001(node)
+docker exec smartface-local-gateway sh -c 'touch /app/data/.w && rm /app/data/.w && echo writable'
+```
+
+### 2.3 Verify
 
 ```bash
 docker compose ps                                   # both must read (healthy)
@@ -61,7 +94,7 @@ On a healthy start the app log reports the PostgreSQL handshake:
 [PostgreSQL] Các bảng dữ liệu đã sẵn sàng trên PostgreSQL!
 ```
 
-### 2.3 Storage modes
+### 2.4 Storage modes
 
 The backend picks its store from `DATABASE_URL`:
 
@@ -78,7 +111,7 @@ The backend picks its store from `DATABASE_URL`:
 > exists in neither schema. Harmless while PostgreSQL is the active store, but
 > the SQLite-only mode is degraded.
 
-### 2.4 Common operations
+### 2.5 Common operations
 
 ```bash
 docker compose logs -f smartface-app     # follow app logs
@@ -323,7 +356,10 @@ curl -o live.mjpeg 'http://localhost:8080/api/camera-streams/mjpeg?gate=entry'
 
 | Symptom | Cause / Fix |
 | :--- | :--- |
-| Container stays `unhealthy` but `curl` works | The healthcheck must target `127.0.0.1`, not `localhost`: BusyBox `wget` resolves `localhost` to `::1` while the server binds IPv4 `0.0.0.0`. |
+| Container stays `unhealthy` but `curl` works | The healthcheck is a Node `fetch()` one-liner (Debian slim ships neither `wget` nor `curl`) and must target `127.0.0.1`, not `localhost`, which may resolve to `::1` while the server binds IPv4 `0.0.0.0`. |
+| `attempt to write a readonly database` / employees not persisted in SQLite mode | The in-container uid/gid does not match the host owner of `./data`. Set `APP_UID`/`APP_GID` in `.env` to `id -u` / `id -g` and rebuild: `docker compose up -d --build` — see §2.2. |
+| `Error loading shared library ... onnxruntime` or `Exec format error` | The image was built from an Alpine (musl) base. Rebuild from the current `Dockerfile` (`node:22-bookworm-slim`); check with `docker exec smartface-local-gateway ldd --version`. |
+| Build fails at `apt-get install ffmpeg` | Transient Debian mirror error or no network from the Docker daemon. Re-run `docker compose build --no-cache smartface-app`. |
 | `npm ci` fails during build | No `package-lock.json` is committed (only `bun.lock`). The Dockerfile falls back to `npm install`; commit a lockfile for reproducible builds. |
 | Port 5432 already allocated | A host PostgreSQL is running. Either set `POSTGRES_PORT=5433` in `.env`, or start only the app: `docker compose up -d --build smartface-app`. |
 | Port 8080 already allocated | Set `APP_PORT` to a free port in `.env`, then `docker compose up -d`. |

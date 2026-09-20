@@ -40,9 +40,22 @@ fi
 if [ ! -f ".env" ]; then
   echo -e "${YELLOW}➜ Chưa có file .env, sao chép từ .env.example...${NC}"
   cp .env.example .env
-  echo -e "${GREEN}✓ Đã tạo file .env thành công.${NC}"
+  # The container runs as a non-root user; ./data is bind-mounted, so the
+  # in-container uid/gid must match the host owner of ./data (build args).
+  sed -i "s/^APP_UID=.*/APP_UID=$(id -u)/; s/^APP_GID=.*/APP_GID=$(id -g)/" .env
+  echo -e "${GREEN}✓ Đã tạo file .env thành công (APP_UID=$(id -u), APP_GID=$(id -g) khớp với user hiện tại).${NC}"
 else
   echo -e "${GREEN}✓ Sử dụng cấu hình từ file .env hiện có.${NC}"
+fi
+
+# 4b. Warn when the in-container uid/gid will not match the owner of ./data
+ENV_UID=$(grep -E '^APP_UID=' .env | tail -1 | cut -d= -f2 | tr -d '"' )
+ENV_GID=$(grep -E '^APP_GID=' .env | tail -1 | cut -d= -f2 | tr -d '"' )
+DATA_UID=$(stat -c %u ./data 2>/dev/null || echo "?")
+DATA_GID=$(stat -c %g ./data 2>/dev/null || echo "?")
+if [ "${ENV_UID:-1000}" != "$DATA_UID" ] || [ "${ENV_GID:-1000}" != "$DATA_GID" ]; then
+  echo -e "${YELLOW}[CẢNH BÁO] ./data thuộc uid:gid ${DATA_UID}:${DATA_GID} nhưng .env đặt APP_UID=${ENV_UID:-1000} APP_GID=${ENV_GID:-1000}.${NC}"
+  echo -e "${YELLOW}           SQLite trong container sẽ báo 'attempt to write a readonly database'. Sửa APP_UID/APP_GID trong .env rồi chạy lại.${NC}"
 fi
 
 # 5. Build and launch Docker Compose services
@@ -65,6 +78,9 @@ else
   docker compose up -d --build
 fi
 
+# Published host port (APP_PORT in .env; compose default 8080). The container itself listens on 3000.
+APP_PORT_VALUE=$(grep -E '^APP_PORT=' .env 2>/dev/null | tail -1 | cut -d= -f2 | tr -d '"')
+APP_PORT_VALUE=${APP_PORT_VALUE:-8080}
 # 6. Wait for service to become healthy
 echo -e "\n${YELLOW}➜ Đang kiểm tra trạng thái khởi động của SmartFace Gateway (tối đa 40s)...${NC}"
 ATTEMPTS=0
@@ -75,7 +91,7 @@ while [ $ATTEMPTS -lt $MAX_ATTEMPTS ]; do
   sleep 2
   ATTEMPTS=$((ATTEMPTS+1))
   
-  if curl -s -f http://localhost:3000/api/health > /dev/null 2>&1; then
+  if curl -s -f http://localhost:${APP_PORT_VALUE}/api/health > /dev/null 2>&1; then
     HEALTHY=true
     break
   fi
@@ -88,10 +104,10 @@ if [ "$HEALTHY" = true ]; then
   echo -e "${GREEN}  ✓ TRIỂN KHAI THÀNH CÔNG TRÊN MÁY CỤC BỘ (LOCAL MACHINE)!            ${NC}"
   echo -e "${GREEN}=====================================================================${NC}"
   echo -e "Truy cập ứng dụng tại các địa chỉ sau:"
-  echo -e "  🌐 Giao Diện Điều Khiển (Web App) : ${BLUE}http://localhost:3000${NC}"
-  echo -e "  📹 Cấu Hình Camera Stream RTSP/UVC: ${BLUE}http://localhost:3000/#camera-streams${NC}"
-  echo -e "  🏥 Kiểm Tra API Health           : ${BLUE}http://localhost:3000/api/health${NC}"
-  echo -e "  🗄️ Trạng Thái Cơ Sở Dữ Liệu       : ${BLUE}http://localhost:3000/api/database/status${NC}"
+  echo -e "  🌐 Giao Diện Điều Khiển (Web App) : ${BLUE}http://localhost:${APP_PORT_VALUE}${NC}"
+  echo -e "  📹 Cấu Hình Camera Stream RTSP/UVC: ${BLUE}http://localhost:${APP_PORT_VALUE}/#camera-streams${NC}"
+  echo -e "  🏥 Kiểm Tra API Health           : ${BLUE}http://localhost:${APP_PORT_VALUE}/api/health${NC}"
+  echo -e "  🗄️ Trạng Thái Cơ Sở Dữ Liệu       : ${BLUE}http://localhost:${APP_PORT_VALUE}/api/database/status${NC}"
   echo -e ""
   echo -e "Các lệnh quản lý thường dùng:"
   echo -e "  - Xem log thời gian thực : ${YELLOW}docker compose logs -f smartface-app${NC}"

@@ -17,6 +17,11 @@
 #     - Trong file .env, bỏ trống DATABASE_URL=
 #     - Khởi động:
 #         $ docker compose up -d --build smartface-app
+#
+#   QUYỀN GHI THƯ MỤC ./data (SQLite / JSON fallback):
+#     Container chạy dưới user không phải root. Đặt APP_UID / APP_GID trong .env
+#     bằng `id -u` / `id -g` của user sở hữu ./data trên máy host, rồi
+#     `docker compose up -d --build` (giá trị này là build arg -> cần --build).
 # =============================================================================
 
 services:
@@ -28,6 +33,12 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      args:
+        # uid/gid the app runs as inside the container. Set APP_UID / APP_GID in
+        # .env to the HOST user that owns ./data (`id -u` / `id -g`) so the
+        # bind-mounted SQLite database is writable. Default 1000 = stock `node` user.
+        APP_UID: ${APP_UID:-1000}
+        APP_GID: ${APP_GID:-1000}
     container_name: smartface-local-gateway
     restart: unless-stopped
     ports:
@@ -66,9 +77,8 @@ services:
     volumes:
       # Dữ liệu ảnh nhân viên, SQLite fallback, cấu hình luồng camera
       - ./data:/app/data
-      # Đồng bộ múi giờ với máy tính chủ
+      # Đồng bộ múi giờ với máy tính chủ (TZ ở trên vẫn được ưu tiên; image đã có tzdata)
       - /etc/localtime:/etc/localtime:ro
-      - /etc/timezone:/etc/timezone:ro
 
     # Cho phép container kết nối trực tiếp đến PostgreSQL 18 đang chạy trên máy Host (host.docker.internal)
     # và các Camera IP LAN nội bộ (ví dụ: 192.168.60.2)
@@ -85,7 +95,9 @@ services:
         required: false
 
     healthcheck:
-      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://127.0.0.1:3000/api/health"]
+      # Debian slim ships neither wget nor curl; probe with Node itself.
+      # Must target 127.0.0.1 (server binds IPv4 0.0.0.0; `localhost` may resolve to ::1).
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
       interval: 15s
       timeout: 5s
       retries: 3
