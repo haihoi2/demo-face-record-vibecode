@@ -178,20 +178,28 @@ export function runLocalFaceRecognition({
     };
   }
 
-  // Real or targeted employee comparison
+  // Targeted test hook: an explicit employee id/code is a deliberate demo shortcut,
+  // so it is granted with a fixed simulated similarity.
   let matchedEmp: Employee | undefined;
+  let bestSim = 0;
   if (testEmployeeId) {
     matchedEmp = employees.find(
       (e) =>
         e.id === testEmployeeId ||
         e.employeeCode.toUpperCase() === testEmployeeId.toUpperCase()
     );
+    if (matchedEmp) {
+      bestSim = 0.86;
+    }
   }
 
-  // If no explicit test ID, compare probe embedding against all enrolled employee embeddings
-  let bestSim = 0;
+  // No (or unresolved) test hook: compare the probe embedding against every enrolled
+  // employee and report the REAL best cosine similarity. There is no fallback to the
+  // first employee and no artificial score floor - an unknown face must stay unknown,
+  // otherwise this path becomes a door-unlock bypass whenever the server refuses.
   if (!matchedEmp && employees.length > 0) {
     const probeVector = generateFaceEmbedding(imageBase64.slice(0, 640));
+    bestSim = -1;
     for (const emp of employees) {
       const empVector = generateFaceEmbedding(emp.photoUrl || emp.id);
       const sim = computeCosineSimilarity(probeVector, empVector);
@@ -202,15 +210,9 @@ export function runLocalFaceRecognition({
     }
   }
 
-  // Fallback to top employee if none matched and employees exist
-  if (!matchedEmp && employees.length > 0) {
-    matchedEmp = employees[0];
-    bestSim = 0.86;
-  }
-
-  const cosineSim = Math.max(bestSim, 0.82 + (Math.sin(Date.now()) * 0.08));
-  const isMatch = cosineSim >= similarityThreshold;
-  const confidencePercent = Math.round(cosineSim * 1000) / 10;
+  const cosineSim = bestSim;
+  const isMatch = !!matchedEmp && cosineSim >= similarityThreshold;
+  const confidencePercent = Math.max(0, Math.round(cosineSim * 1000) / 10);
   const elapsed = Math.round(performance.now() - t0 + baseLatency);
 
   const box: [number, number, number, number] = [170, 270, 740, 730];

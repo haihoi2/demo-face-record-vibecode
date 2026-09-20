@@ -60,6 +60,9 @@ export const FaceScanner: React.FC<FaceScannerProps> = ({
   const [isScanning, setIsScanning] = useState<boolean>(false);
   const [scanType, setScanType] = useState<ScanType>("ENTRY");
   const [lastResult, setLastResult] = useState<FaceRecognitionResult | null>(null);
+  // Message returned by the server when it REFUSED a recognition request (e.g. HTTP 400/403).
+  // Shown verbatim to the operator; the client simulation is never used in this case.
+  const [serverNotice, setServerNotice] = useState<string | null>(null);
   const [scanMode, setScanMode] = useState<"OFF" | "FAST" | "TURBO">("OFF");
   const [capturedSnapshot, setCapturedSnapshot] = useState<string | null>(null);
   const [activeFaces, setActiveFaces] = useState<DetectedFace[]>([]);
@@ -145,6 +148,7 @@ export const FaceScanner: React.FC<FaceScannerProps> = ({
   const handleScan = async (overrideBase64?: string, testEmployeeId?: string) => {
     if (isScanning) return;
     setIsScanning(true);
+    setServerNotice(null);
     const clientStartTime = Date.now();
 
     let imageToSend = overrideBase64;
@@ -220,12 +224,51 @@ export const FaceScanner: React.FC<FaceScannerProps> = ({
 
       let data: FaceRecognitionResult;
 
-      if (response.ok && response.data) {
-        data = response.data;
-      } else {
-        // Fallback for Netlify Static Hosting or offline deployments where server returns 404
+      // safeJsonFetch only yields an object in `data` when the server answered with JSON.
+      // A network failure (status 0) or an HTML/empty body (static host 404, proxy error
+      // page) leaves `data` undefined - that is the only case where the server is
+      // genuinely unreachable and the client-side simulation may take over.
+      const serverPayload =
+        response.data && typeof response.data === "object"
+          ? (response.data as FaceRecognitionResult & { error?: string; simulationDisabled?: boolean })
+          : null;
+      const serverAnswered =
+        !!serverPayload && ("recognized" in serverPayload || "error" in serverPayload);
+
+      if (response.ok && serverPayload) {
+        data = serverPayload;
+      } else if (serverAnswered && serverPayload) {
+        // The server deliberately refused (400 no image, 403 simulation disabled, ...).
+        // Fail closed: surface the server's message and never fall back to the simulation.
+        const refusalMessage =
+          serverPayload.error ||
+          response.error ||
+          `Máy chủ từ chối yêu cầu nhận diện (HTTP ${response.status})`;
         console.warn(
-          "[FaceScanner] Máy chủ trả về lỗi hoặc 404 trên Netlify (" +
+          "[FaceScanner] Máy chủ từ chối nhận diện (HTTP " + response.status + "): " + refusalMessage
+        );
+        setServerNotice(refusalMessage);
+        data = {
+          recognized: false,
+          detectedFaces: [],
+          totalFacesDetected: 0,
+          authorizedCount: 0,
+          unauthorizedCount: 0,
+          processingTimeMs: Date.now() - clientStartTime,
+          confidence: 0,
+          livenessScore: 0,
+          message: refusalMessage,
+          lockUnlocked: false,
+          engineUsed: serverPayload.simulationDisabled
+            ? "Máy chủ AI (giả lập bị tắt)"
+            : "Máy chủ AI (từ chối)",
+          modelUsed: `HTTP ${response.status}`,
+        };
+      } else {
+        // Fallback for Netlify Static Hosting or offline deployments where the server is
+        // unreachable or returns an HTML 404 page instead of JSON
+        console.warn(
+          "[FaceScanner] Không kết nối được máy chủ hoặc nhận trang HTML 404 trên Netlify (" +
             (response.error || "404 Not Found") +
             "), tự động kích hoạt bộ nhận diện Client-Side Biometrics..."
         );
@@ -700,8 +743,33 @@ export const FaceScanner: React.FC<FaceScannerProps> = ({
           </div>
         </div>
 
+        {/* Server refusal notice (HTTP 400/403 JSON answer - no client simulation) */}
+        {serverNotice && (
+          <div
+            id="server-refusal-notice"
+            className="p-4 bg-gradient-to-r from-amber-950/95 via-slate-900/95 to-slate-900/95 border-2 border-amber-500/60 rounded-2xl shadow-xl text-white animate-in slide-in-from-top duration-300"
+          >
+            <div className="flex items-start gap-3.5">
+              <div className="w-11 h-11 rounded-2xl bg-amber-600/30 border border-amber-500 text-amber-300 flex items-center justify-center shrink-0 shadow-inner">
+                <AlertTriangle className="w-5 h-5" />
+              </div>
+              <div className="space-y-1 min-w-0">
+                <div className="flex items-center gap-2 flex-wrap">
+                  <span className="px-2.5 py-0.5 rounded-full bg-amber-600 text-white font-mono text-[10px] font-bold uppercase tracking-wider shadow-xs">
+                    Máy chủ từ chối yêu cầu nhận diện
+                  </span>
+                  <span className="text-xs text-amber-200 font-medium">
+                    Khóa cửa giữ an toàn (LOCKED) - không dùng bộ giả lập trình duyệt
+                  </span>
+                </div>
+                <h4 className="text-sm font-bold text-white break-words">{serverNotice}</h4>
+              </div>
+            </div>
+          </div>
+        )}
+
         {/* Stranger Security Alert & Quick Registration Card */}
-        {lastResult && (!lastResult.recognized || (lastResult.unauthorizedCount && lastResult.unauthorizedCount > 0)) && (
+        {lastResult && !serverNotice && (!lastResult.recognized || (lastResult.unauthorizedCount && lastResult.unauthorizedCount > 0)) && (
           <div
             id="stranger-security-alert-card"
             className="p-4.5 bg-gradient-to-r from-rose-950/95 via-amber-950/85 to-slate-900/95 border-2 border-rose-500/60 rounded-2xl shadow-xl text-white animate-in slide-in-from-top duration-300"

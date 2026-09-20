@@ -189,14 +189,78 @@ describe("runLocalFaceRecognition", () => {
     assert.equal(result.bestMatch?.id, "EMP-0003");
   });
 
-  it("matches against enrolled embeddings when no test hook is supplied", () => {
+  it("does NOT recognize an arbitrary image against a non-empty roster when no test hook is supplied", () => {
+    // The hash-based "embeddings" cannot really match a camera frame; a fabricated match
+    // here (the old employees[0] fallback) was a door-unlock bypass.
     const result = runLocalFaceRecognition({ imageBase64: PROBE, employees: EMPLOYEES });
 
-    assert.equal(result.recognized, true);
-    assert.ok(result.bestMatch);
-    assert.ok(EMPLOYEES.some((e) => e.id === result.bestMatch?.id));
-    assert.ok(result.cosineSimilarity >= 0.72);
-    assert.equal(result.overallConfidence, Math.round(result.cosineSimilarity * 1000) / 10);
+    assert.equal(result.recognized, false);
+    assert.equal(result.bestMatch, undefined);
+    assert.equal(result.detectedFaces.length, 1);
+    assert.equal(result.detectedFaces[0].recognized, false);
+    assert.equal(result.detectedFaces[0].employeeId, undefined);
+    assert.ok(result.cosineSimilarity < 0.72, `unexpected high similarity ${result.cosineSimilarity}`);
+  });
+
+  it("reports the real best cosine similarity with no artificial floor", () => {
+    const probeVector = generateFaceEmbedding(PROBE.slice(0, 640));
+    const realBest = Math.max(
+      ...EMPLOYEES.map((emp) =>
+        computeCosineSimilarity(probeVector, generateFaceEmbedding(emp.photoUrl || emp.id))
+      )
+    );
+
+    const result = runLocalFaceRecognition({ imageBase64: PROBE, employees: EMPLOYEES });
+
+    assert.equal(result.cosineSimilarity, realBest);
+    assert.ok(result.cosineSimilarity < 0.74, "the old 0.82 + sin floor (>= 0.74) must be gone");
+    assert.equal(
+      result.overallConfidence,
+      Math.max(0, Math.round(result.cosineSimilarity * 1000) / 10)
+    );
+    // Stable across calls: no Date.now()-dependent jitter in the score.
+    const again = runLocalFaceRecognition({ imageBase64: PROBE, employees: EMPLOYEES });
+    assert.equal(again.cosineSimilarity, result.cosineSimilarity);
+  });
+
+  it("respects similarityThreshold: grants only when the real similarity meets it", () => {
+    const probeVector = generateFaceEmbedding(PROBE.slice(0, 640));
+    const sims = EMPLOYEES.map((emp) =>
+      computeCosineSimilarity(probeVector, generateFaceEmbedding(emp.photoUrl || emp.id))
+    );
+    const realBest = Math.max(...sims);
+    const expectedEmployee = EMPLOYEES[sims.indexOf(realBest)];
+
+    // Threshold just above the real best similarity -> denied.
+    const denied = runLocalFaceRecognition({
+      imageBase64: PROBE,
+      employees: EMPLOYEES,
+      similarityThreshold: realBest + 1e-6,
+    });
+    assert.equal(denied.recognized, false);
+    assert.equal(denied.bestMatch, undefined);
+    assert.equal(denied.cosineSimilarity, realBest);
+
+    // Threshold at (or below) the real best similarity -> the genuine top match is granted.
+    const granted = runLocalFaceRecognition({
+      imageBase64: PROBE,
+      employees: EMPLOYEES,
+      similarityThreshold: realBest,
+    });
+    assert.equal(granted.recognized, true);
+    assert.equal(granted.bestMatch?.id, expectedEmployee.id);
+    assert.equal(granted.cosineSimilarity, realBest);
+  });
+
+  it("does not grant an unresolvable targeted hook via a fallback", () => {
+    const result = runLocalFaceRecognition({
+      imageBase64: PROBE,
+      employees: EMPLOYEES,
+      testEmployeeId: "EMP-DOES-NOT-EXIST",
+    });
+
+    assert.equal(result.recognized, false);
+    assert.equal(result.bestMatch, undefined);
   });
 
   it("does not recognize anyone when the roster is empty", () => {

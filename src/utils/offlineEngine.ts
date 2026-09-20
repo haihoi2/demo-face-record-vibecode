@@ -367,10 +367,12 @@ export function saveStoredAiConfig(config: AiRecognitionConfig): void {
 const STORAGE_KEY_DOOR_CONFIG = "smartlock_door_controller_config_v1";
 const STORAGE_KEY_DOOR_LOGS = "smartlock_door_controller_logs_v1";
 
+// Fail closed: the browser must never drive a physical door controller unless an
+// operator explicitly enables it in the Door Controller settings page.
 export const DEFAULT_OFFLINE_DOOR_CONFIG: DoorControllerConfig = {
-  enabled: true,
+  enabled: false,
   apiUrl: "https://smartlock.eton.vn/api/door/control",
-  apiToken: "eton_door_secret_token_2026_secure_key",
+  apiToken: "" /* set via the Door Controller page; never ship a real token in source */,
   authHeaderType: "BEARER",
   customHeaderName: "X-Door-Token",
   openMethod: "POST",
@@ -378,7 +380,7 @@ export const DEFAULT_OFFLINE_DOOR_CONFIG: DoorControllerConfig = {
   openPayloadTemplate: JSON.stringify({ action: "OPEN", doorId: "CỔNG CHÍNH", pulseDuration: 6 }, null, 2),
   closePayloadTemplate: JSON.stringify({ action: "CLOSE", doorId: "CỔNG CHÍNH" }, null, 2),
   pulseDurationSeconds: 6,
-  triggerOnFaceRecognition: true,
+  triggerOnFaceRecognition: false,
   triggerOnManualUnlock: true,
 };
 
@@ -639,7 +641,21 @@ export const clientEventBus = new ClientEventBus();
 let activeRelockTimer: any = null;
 let currentClientLock: SmartLockState = getStoredLockState();
 
-export function clientDoorUnlock(source: string, employeeName?: string, employeeId?: string): SmartLockState {
+export interface ClientDoorUnlockOptions {
+  /**
+   * True when the unlock was produced by the browser-side recognition SIMULATION
+   * (simulateClientFaceRecognition). Simulated grants only update the local lock
+   * state, logs and UI; they NEVER send an OPEN command to the physical door API.
+   */
+  simulated?: boolean;
+}
+
+export function clientDoorUnlock(
+  source: string,
+  employeeName?: string,
+  employeeId?: string,
+  options: ClientDoorUnlockOptions = {}
+): SmartLockState {
   if (activeRelockTimer) {
     clearInterval(activeRelockTimer);
     activeRelockTimer = null;
@@ -657,15 +673,22 @@ export function clientDoorUnlock(source: string, employeeName?: string, employee
   saveStoredLockState(currentClientLock);
   clientEventBus.emit("lock_state", currentClientLock);
 
-  // Trigger Door Controller API dispatch if enabled
-  const doorConfig = getStoredDoorConfig();
-  if (doorConfig.enabled) {
-    const isFace = source.includes("Nhận diện") || Boolean(employeeName);
-    const shouldTrigger = isFace
-      ? doorConfig.triggerOnFaceRecognition
-      : doorConfig.triggerOnManualUnlock;
-    if (shouldTrigger) {
-      dispatchDirectDoorControllerCommand("OPEN", employeeName || source).catch(() => {});
+  // Trigger Door Controller API dispatch if enabled.
+  // A simulated (client-side demo) recognition is never allowed to reach the door.
+  if (options.simulated) {
+    console.info(
+      `[Client Lock] Mở khóa giả lập (${employeeName || source}) - chỉ cập nhật giao diện, KHÔNG gửi lệnh tới bộ điều khiển cửa.`
+    );
+  } else {
+    const doorConfig = getStoredDoorConfig();
+    if (doorConfig.enabled) {
+      const isFace = source.includes("Nhận diện") || Boolean(employeeName);
+      const shouldTrigger = isFace
+        ? doorConfig.triggerOnFaceRecognition
+        : doorConfig.triggerOnManualUnlock;
+      if (shouldTrigger) {
+        dispatchDirectDoorControllerCommand("OPEN", employeeName || source).catch(() => {});
+      }
     }
   }
 
@@ -785,7 +808,7 @@ export function simulateClientFaceRecognition({
         reason: `Khớp vector Cosine ${(localRes.cosineSimilarity * 100).toFixed(1)}% [${localRes.modelName}]`,
       };
 
-      clientDoorUnlock("Local SOTA Biometrics", emp.name, emp.id);
+      clientDoorUnlock("Local SOTA Biometrics", emp.name, emp.id, { simulated: true });
       saveStoredLogs([log, ...getStoredLogs()]);
 
       const notif: MobileNotification = {
@@ -853,8 +876,8 @@ export function simulateClientFaceRecognition({
     }
   }
 
-  // CASE 1: MULTI-EMPLOYEE TEST
-  if (testEmployeeId === "MULTI_EMPLOYEES") {
+  // CASE 1: MULTI-EMPLOYEE TEST (explicit demo hook only)
+  if (testEmployeeId === "MULTI_EMPLOYEES" || testEmployeeId === "MULTI_MIXED") {
     const matchedEmps = currentEmployees.slice(0, Math.min(3, currentEmployees.length));
     const detectedFaces: DetectedFace[] = matchedEmps.map((emp, index) => {
       const xOffset = 80 + index * 290;
@@ -890,7 +913,7 @@ export function simulateClientFaceRecognition({
     }));
 
     // Unlock door
-    clientDoorUnlock("AI Nhận Diện Đa Người", matchedEmps[0].name, matchedEmps[0].id);
+    clientDoorUnlock("AI Nhận Diện Đa Người", matchedEmps[0].name, matchedEmps[0].id, { simulated: true });
 
     // Save logs
     const existingLogs = getStoredLogs();
@@ -928,8 +951,8 @@ export function simulateClientFaceRecognition({
     };
   }
 
-  // CASE 2: UNKNOWN PERSON
-  if (testEmployeeId === "UNKNOWN") {
+  // CASE 2: UNKNOWN PERSON (explicit demo hook)
+  if (testEmployeeId === "UNKNOWN" || testEmployeeId === "UNKNOWN_VISITOR") {
     const detectedFace: DetectedFace = {
       id: `face-unknown-${Date.now()}`,
       box2d: [180, 260, 760, 740],
@@ -985,7 +1008,11 @@ export function simulateClientFaceRecognition({
     };
   }
 
-  // CASE 3: SPECIFIC EMPLOYEE OR CAMERA RECOGNITION
+  // CASE 3: SPECIFIC EMPLOYEE (explicit demo hook only)
+  // The browser-side simulation cannot actually recognise a face. Without an explicit
+  // test hook that resolves to an enrolled employee it must deny - it used to grant
+  // currentEmployees[0] for ANY camera frame, which turned every server refusal into
+  // an unlock.
   let targetEmployee: Employee | undefined;
   if (testEmployeeId) {
     targetEmployee = currentEmployees.find(
@@ -994,7 +1021,48 @@ export function simulateClientFaceRecognition({
   }
 
   if (!targetEmployee && currentEmployees.length > 0) {
-    targetEmployee = currentEmployees[0];
+    const detectedFace: DetectedFace = {
+      id: `face-unverified-${Date.now()}`,
+      box2d: [180, 270, 750, 730],
+      confidence: 0,
+      livenessScore: 0,
+      recognized: false,
+      message: "Không thể xác thực ngoại tuyến - bộ giả lập trình duyệt không được phép cấp quyền",
+    };
+
+    const log: AccessLog = {
+      id: `LOG-${Date.now()}`,
+      timestamp: new Date().toISOString(),
+      type: scanType,
+      status: "DENIED",
+      photoSnapshot: imageBase64,
+      confidence: 0,
+      livenessScore: 0,
+      lockAction: "Khóa giữ nguyên trạng thái LOCKED",
+      doorName: "Cửa Chính Trụ Sở - Cổng A",
+      reason: testEmployeeId
+        ? `Mã thử nghiệm "${testEmployeeId}" không khớp nhân viên nào trong danh sách`
+        : "Máy chủ AI không khả dụng - chế độ giả lập phía trình duyệt không cấp quyền mở cửa",
+    };
+    saveStoredLogs([log, ...getStoredLogs()]);
+
+    return {
+      recognized: false,
+      detectedFaces: [detectedFace],
+      totalFacesDetected: 1,
+      authorizedCount: 0,
+      unauthorizedCount: 1,
+      processingTimeMs: Date.now() - startTime + 40,
+      confidence: 0,
+      livenessScore: 0,
+      message:
+        "Từ chối truy cập: Không thể xác thực khuôn mặt khi máy chủ AI không khả dụng (bộ giả lập trình duyệt không cấp quyền mở cửa)",
+      lockUnlocked: false,
+      log,
+      logs: [log],
+      engineUsed,
+      modelUsed,
+    };
   }
 
   if (targetEmployee) {
@@ -1032,7 +1100,7 @@ export function simulateClientFaceRecognition({
     };
 
     // Unlock smart lock
-    clientDoorUnlock("AI Nhận Diện Khuôn Mặt", targetEmployee.name, targetEmployee.id);
+    clientDoorUnlock("AI Nhận Diện Khuôn Mặt", targetEmployee.name, targetEmployee.id, { simulated: true });
 
     // Save log & notification
     const existingLogs = getStoredLogs();
