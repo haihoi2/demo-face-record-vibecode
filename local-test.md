@@ -327,6 +327,40 @@ curl -o frame.jpg 'http://localhost:8080/api/camera-streams/snapshot?gate=entry'
 curl -o live.mjpeg 'http://localhost:8080/api/camera-streams/mjpeg?gate=entry'
 ```
 
+### Multiple streams per gate
+
+Each gate (`entryGate`, `exitGate`) carries a `streams[]` list; the lowest-priority
+*enabled* stream is the **primary**, and the legacy single-stream fields on the gate
+are always a mirror of it, so older clients keep working. Configs saved before this
+feature are normalised on load into one derived stream (id like `exit-501`).
+
+| Method / path | Purpose |
+| :--- | :--- |
+| `GET /api/camera-streams/:gate/streams` | List streams (`gate` = `entry` \| `exit`) with `primaryStreamId` |
+| `POST /api/camera-streams/:gate/streams` | Add a stream (`label`, `sourceType`, `rtspUrl`, `rtspTransport`, `enabled`, `priority`); 409 on duplicate id/URL |
+| `PUT /api/camera-streams/:gate/streams/:id` | Partial update (rename, enable/disable, reprioritise, change URL) |
+| `DELETE /api/camera-streams/:gate/streams/:id` | Remove; the last stream of a gate cannot be deleted (400) |
+| `GET /api/camera-streams/snapshot?gate=exit&stream=<id>` | Single frame from one stream (primary when `stream` is omitted) |
+| `GET /api/camera-streams/mjpeg?gate=exit&stream=<id>` | Live MJPEG from one stream |
+| `POST /api/camera-streams/scan-rtsp` `{gate, stream?}` | With `stream`: scan that one. Without: scan **all enabled RTSP streams of the gate concurrently** (max 4) |
+
+A gate-wide scan returns the usual single-scan fields for the aggregate plus
+`streams: [{streamId, streamLabel, success, frameCaptureDurationMs, recognized,
+totalFacesDetected, detectedFaces, error?}]`; every face carries `streamId`/`streamLabel`.
+One failed grab does not fail the request while another stream succeeds; if all fail
+the route answers 502 (still with `streams[]`).
+
+Example — the exit gate watched by two NVR channels:
+
+```bash
+curl -X POST http://localhost:8080/api/camera-streams/exit/streams \
+  -H 'Content-Type: application/json' \
+  -d '{"label":"OB-LoiDiVaoKho","sourceType":"RTSP","rtspUrl":"rtsp://user:pass@192.168.60.1:554/Streaming/Channels/2401","rtspTransport":"TCP","enabled":true,"priority":20}'
+
+curl -X POST http://localhost:8080/api/camera-streams/scan-rtsp \
+  -H 'Content-Type: application/json' -d '{"gate":"exit"}'
+```
+
 > If `snapshot` returns `image/svg+xml` instead of `image/jpeg`, ffmpeg failed
 > and the handler fell back to the diagnostic placeholder. Reproduce the real
 > error with:

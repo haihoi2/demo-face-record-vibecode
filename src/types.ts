@@ -252,10 +252,46 @@ export interface DoorApiLog {
 // ----------------- CAMERA STREAM & GATE IN/OUT CONFIGURATION -----------------
 export type CameraSourceType = "CLIENT_UVC" | "RTSP" | "HTTP_MJPEG" | "BACKEND_UVC";
 
+/**
+ * One video source attached to a gate. A gate may have several (e.g. the exit
+ * gate watched by two NVR channels); `streams[0]` is the PRIMARY stream.
+ */
+export interface GateStreamSource {
+  /** Stable id used in API calls (`?stream=<id>`), e.g. "exit-501". */
+  id: string;
+  /** Human label shown in the UI, e.g. "BVE-CUA-KHO". */
+  label: string;
+  sourceType: CameraSourceType;
+  // RTSP settings
+  rtspUrl?: string;
+  rtspTransport?: "TCP" | "UDP";
+  // HTTP / MJPEG settings
+  httpUrl?: string;
+  // Client UVC (Browser MediaDevices) settings
+  uvcDeviceId?: string;
+  uvcDeviceLabel?: string;
+  // Backend UVC (Server /dev/videoX) settings
+  backendDevicePath?: string;
+  resolution?: "1920x1080" | "1280x720" | "640x480" | "AUTO";
+  fps?: number;
+  /** Disabled streams are kept in config but never captured or scanned. */
+  enabled: boolean;
+  /** Lower runs/shows first. The lowest-priority enabled stream is the primary. */
+  priority: number;
+}
+
 export interface GateStreamConfig {
   gateType: "ENTRY" | "EXIT";
   name: string;
   enabled: boolean;
+  /**
+   * All video sources for this gate. Optional for backward compatibility:
+   * when absent or empty, the server derives a single stream from the legacy
+   * single-stream fields below. The server always keeps the legacy fields
+   * mirrored from the primary stream so older clients keep working.
+   */
+  streams?: GateStreamSource[];
+  // ---- Legacy single-stream fields (mirror of the primary stream) ----
   sourceType: CameraSourceType;
   // RTSP settings
   rtspUrl?: string;
@@ -271,6 +307,18 @@ export interface GateStreamConfig {
   backendDevicePath?: string;
   autoStart: boolean;
   reconnectIntervalSeconds: number;
+}
+
+/** Per-stream outcome inside a multi-stream gate scan (`POST /api/camera-streams/scan-rtsp`). */
+export interface GateStreamScanResult {
+  streamId: string;
+  streamLabel: string;
+  success: boolean;
+  frameCaptureDurationMs?: number;
+  recognized: boolean;
+  totalFacesDetected: number;
+  detectedFaces: DetectedFace[];
+  error?: string;
 }
 
 export interface CameraStreamsConfig {
