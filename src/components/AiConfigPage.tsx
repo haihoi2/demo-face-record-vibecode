@@ -78,6 +78,16 @@ interface FaceEngineStatus {
   ready?: boolean;
   failClosed?: boolean;
   info?: {
+    // The server reports these names; the short aliases are kept so an older
+    // or differently-shaped payload still renders.
+    detectorModel?: string;
+    recognizerModel?: string;
+    embeddingDim?: number;
+    loadTimeMs?: number;
+    modelDir?: string;
+    detectorInputSize?: number;
+    detectThreshold?: number;
+    lastError?: string | null;
     detector?: string;
     recognizer?: string;
     dims?: number;
@@ -334,7 +344,24 @@ export const AiConfigPage: React.FC<AiConfigPageProps> = ({
   };
 
   // ---- Derived engine facts (all tolerant of a missing / partial payload) ----
-  const engineInfo = engineStatus?.info || {};
+  const rawEngineInfo = engineStatus?.info || {};
+  /** The server names these detectorModel/recognizerModel/embeddingDim/loadTimeMs;
+   *  fall back to the shorter aliases so any payload shape still renders. */
+  const engineInfo = {
+    ...rawEngineInfo,
+    detector: rawEngineInfo.detectorModel || rawEngineInfo.detector,
+    recognizer: rawEngineInfo.recognizerModel || rawEngineInfo.recognizer,
+    dims:
+      typeof rawEngineInfo.embeddingDim === "number"
+        ? rawEngineInfo.embeddingDim
+        : rawEngineInfo.dims,
+    loadMs:
+      typeof rawEngineInfo.loadTimeMs === "number"
+        ? rawEngineInfo.loadTimeMs
+        : rawEngineInfo.loadMs,
+    // modelTag lives on templates in the server payload.
+    modelTag: rawEngineInfo.modelTag || engineStatus?.templates?.modelTag,
+  };
   const engineName = String(engineStatus?.engine || "").toLowerCase();
   const engineIsOnnx = engineName === "onnx";
   const engineOperational = engineStatus?.ready === true && engineIsOnnx;
