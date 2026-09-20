@@ -11,6 +11,12 @@
 #                      that owns ./data (`id -u` / `id -g`) so the bind-mounted
 #                      SQLite database and JSON fallback are writable. Compose
 #                      forwards APP_UID / APP_GID from .env automatically.
+# Static ffmpeg 8 (pinned by digest). Debian bookworm only packages ffmpeg 5.1,
+# whose HEVC decoder emits a flat grey frame before the first keyframe and
+# whose dependency tree adds ~475 MB. ffmpeg 8 is what the RTSP paths were
+# validated against (16 Sep 2026); the static build has no runtime deps.
+FROM mwader/static-ffmpeg:8.0.1@sha256:252705ff88532fa338e7065c21792756552f8fe7c212f84bc503d3c340689594 AS ffmpeg
+
 FROM node:22-bookworm-slim AS builder
 
 WORKDIR /app
@@ -52,10 +58,11 @@ ENV PORT=3000
 # - ffmpeg: required for RTSP video stream transcoding, snapshot capture, and frame extraction
 # - ca-certificates: required for secure HTTPS webhooks and external APIs
 # - tzdata: ensures correct timezone timestamps (e.g. Asia/Ho_Chi_Minh)
-# --no-install-recommends keeps the (large) ffmpeg dependency tree to what is needed.
+# ffmpeg is copied from the pinned static image above, not installed from apt.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ffmpeg ca-certificates tzdata \
+    && apt-get install -y --no-install-recommends ca-certificates tzdata \
     && rm -rf /var/lib/apt/lists/*
+COPY --from=ffmpeg /ffmpeg /usr/local/bin/ffmpeg
 
 # Remap the stock `node` user (uid/gid 1000) to APP_UID/APP_GID so files the app
 # writes into the bind-mounted /app/data belong to the host user, and files the

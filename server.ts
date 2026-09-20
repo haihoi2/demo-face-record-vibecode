@@ -1514,6 +1514,10 @@ app.get("/api/camera-streams/snapshot", async (req, res) => {
   const args = [
     "-rtsp_transport", transport,
     "-timeout", "3500000", // 3.5s socket timeout in microseconds (FFmpeg >= 8 renamed -stimeout)
+    // Wait for a keyframe: on ffmpeg 5.x (Debian) the first HEVC frame decoded
+    // before any reference arrives is emitted as a flat grey picture instead of
+    // being discarded, so a single-frame grab returned a blank image.
+    "-skip_frame", "nokey",
     "-i", streamUrl,
     "-vframes", "1",
     "-q:v", "2",
@@ -1534,7 +1538,7 @@ app.get("/api/camera-streams/snapshot", async (req, res) => {
 
     const timeout = setTimeout(() => {
       proc.kill("SIGKILL");
-    }, 4500);
+    }, 9000);
 
     proc.on("close", (code) => {
       clearTimeout(timeout);
@@ -1617,6 +1621,10 @@ app.post("/api/camera-streams/scan-rtsp", async (req, res) => {
   const args = [
     "-rtsp_transport", transport,
     "-timeout", "3500000",
+    // Wait for a keyframe: on ffmpeg 5.x (Debian) the first HEVC frame decoded
+    // before any reference arrives is emitted as a flat grey picture instead of
+    // being discarded, so a single-frame grab returned a blank image.
+    "-skip_frame", "nokey",
     "-i", streamUrl,
     "-vframes", "1",
     "-q:v", "2",
@@ -1635,7 +1643,7 @@ app.post("/api/camera-streams/scan-rtsp", async (req, res) => {
 
   const timeout = setTimeout(() => {
     proc.kill("SIGKILL");
-  }, 4500);
+  }, 9000);
 
   proc.on("close", async (code) => {
     clearTimeout(timeout);
