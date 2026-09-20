@@ -17,6 +17,26 @@
 # validated against (16 Sep 2026); the static build has no runtime deps.
 FROM mwader/static-ffmpeg:8.0.1@sha256:252705ff88532fa338e7065c21792756552f8fe7c212f84bc503d3c340689594 AS ffmpeg
 
+# ----------------- Face Model Stage -----------------
+# InsightFace `buffalo_l` bundle: downloaded ONCE here and cached as its own
+# layer, so editing application source never re-pulls 288 MB. Only the two
+# models src/server/faceEmbedding.ts actually loads are extracted:
+#   det_10g.onnx    17 MB  SCRFD face detector, 640x640 input
+#   w600k_r50.onnx 174 MB  ArcFace r50 recogniser, 112x112 -> 512-D
+# The archive's other three files (1k3d68, 2d106det, genderage) are dense
+# landmark and attribute models this pipeline never loads, so they are left in
+# the build cache rather than shipped.
+FROM node:22-bookworm-slim AS models
+ARG BUFFALO_L_URL=https://github.com/deepinsight/insightface/releases/download/v0.7/buffalo_l.zip
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends curl unzip ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && mkdir -p /models \
+    && curl -fsSL -o /tmp/buffalo_l.zip "$BUFFALO_L_URL" \
+    && unzip -o -j /tmp/buffalo_l.zip '*det_10g.onnx' '*w600k_r50.onnx' -d /models \
+    && rm -f /tmp/buffalo_l.zip \
+    && ls -l /models
+
 FROM node:22-bookworm-slim AS builder
 
 WORKDIR /app
@@ -41,6 +61,12 @@ RUN npm run build
 #   docker build --target tester -t smartface-tests . && docker run --rm smartface-tests
 FROM builder AS tester
 ENV NODE_ENV=test
+# tests/faceEmbedding.test.ts exercises the real ffmpeg decode path (JPEG in ->
+# raw RGB out). Without the binary those cases self-skip, which would silently
+# stop covering decodeToRgb, so the tester gets the same static ffmpeg the
+# runner uses. The ONNX models are deliberately NOT copied here: the unit suite
+# must prove it stays green on a model-less image.
+COPY --from=ffmpeg /ffmpeg /usr/local/bin/ffmpeg
 CMD ["npm", "test"]
 
 # ----------------- Production Stage -----------------
@@ -84,11 +110,39 @@ USER node
 COPY --chown=node:node package*.json ./
 
 # Install only production dependencies
+# onnxruntime-node ships one package for every platform AND every execution
+# provider, which is ~548 MB installed. Two slices of that are dead weight here
+# and are deleted in the SAME layer as the install (a later RUN would only
+# whiteout them and keep the bytes in the image):
+#
+#   1. GPU providers — libonnxruntime_providers_cuda.so (260 MiB) and
+#      _tensorrt.so (1 MiB). This gateway is CPU-only; faceEmbedding.ts asks for
+#      the "cpu" execution provider explicitly.
+#   2. Foreign platform binaries (~242 MB) — darwin/arm64, win32/x64,
+#      win32/arm64 and the non-native linux arch. A container image is built for
+#      exactly one platform, so only the one matching this stage's own Node can
+#      ever load. `node -p process.platform/process.arch` names it in exactly the
+#      layout onnxruntime-node uses (linux/x64, linux/arm64, ...), so this stays
+#      correct on an arm64 build instead of hard-coding x64.
 RUN if [ -f package-lock.json ]; then npm ci --omit=dev; else npm install --omit=dev --no-audit --no-fund; fi \
-    && npm cache clean --force
+    && npm cache clean --force \
+    && if [ -d node_modules/onnxruntime-node ]; then \
+         find node_modules/onnxruntime-node \( -name 'libonnxruntime_providers_cuda*' \
+              -o -name 'libonnxruntime_providers_tensorrt*' \) -type f -print -delete; \
+         KEEP="$(node -p 'process.platform + "/" + process.arch')"; \
+         find node_modules/onnxruntime-node/bin/napi-v6 -mindepth 2 -maxdepth 2 -type d \
+              ! -path "*/$KEEP" -print -exec rm -rf {} +; \
+         test -d "node_modules/onnxruntime-node/bin/napi-v6/$KEEP" || (echo "native ORT binaries for $KEEP missing" && exit 1); \
+       fi
 
 # Copy compiled frontend and bundled backend from builder
 COPY --chown=node:node --from=builder /app/dist ./dist
+
+# ONNX face models (SCRFD detector + ArcFace recogniser). FACE_MODEL_DIR is what
+# src/server/faceEmbedding.ts reads; override it to point at a mounted volume if
+# you would rather not bake ~190 MB of weights into the image.
+COPY --chown=node:node --from=models /models /app/models
+ENV FACE_MODEL_DIR=/app/models
 
 # Expose server port
 EXPOSE 3000
