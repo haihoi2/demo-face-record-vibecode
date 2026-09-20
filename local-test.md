@@ -366,6 +366,45 @@ curl -X POST http://localhost:8080/api/camera-streams/scan-rtsp \
 > error with:
 > `docker exec smartface-local-gateway ffmpeg -rtsp_transport tcp -i "<url>" -vframes 1 -f image2 -update 1 /tmp/x.jpg`
 
+### Stranger alert webhook
+
+When an unrecognised face is captured, the gateway posts a chat webhook whose
+message carries a click-through link straight into the stranger-cluster panel:
+
+```
+<APP_URL>/#strangers/<accessLogId>
+```
+
+The link is built from, in order: `appBaseUrl` in the webhook config, the
+`APP_URL` env var (the literal `MY_APP_URL` counts as unset), then the incoming
+request's own origin (`X-Forwarded-Proto` / `X-Forwarded-Host` first, since the
+app sits behind the nginx edge). If none resolves, the alert is still sent but
+without a link — never a broken relative URL.
+
+`APP_URL` must be set in `.env` **and** forwarded by compose (it is, as
+`APP_URL=${APP_URL:-}`); on this host it is `https://stg-gate-watch.vota.vn`.
+
+Settings live with the rest of the webhook config (`GET`/`POST
+/api/webhook/config`) and on the Webhook page under "Cảnh báo người lạ":
+
+| Field | Default | Meaning |
+| :--- | :--- | :--- |
+| `strangerAlertEnabled` | `true` | Send the alert at all |
+| `strangerTitle` | `[[CẢNH BÁO NGƯỜI LẠ]]` | Attachment title |
+| `strangerLinkLabel` | `Xem cụm ảnh người lạ` | Text of the link in the message |
+| `appBaseUrl` | *(empty)* | Overrides `APP_URL` for the link |
+| `strangerCooldownSeconds` | `60` | Minimum gap between alerts; `0` = every time |
+
+Send a sample without waiting for a real stranger:
+
+```bash
+curl -X POST http://localhost:8080/api/webhook/test-stranger
+```
+
+Opening `<APP_URL>/#strangers` alone opens the panel with no cluster selected.
+If the linked sighting has since been merged or rejected, the panel says so and
+still lists the remaining clusters.
+
 ---
 
 ## 6. Useful Endpoints

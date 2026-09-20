@@ -63,6 +63,9 @@ services:
       # Eton Webhook thông báo kết quả chấm công
       - ETON_WEBHOOK_URL=${ETON_WEBHOOK_URL:-https://chat-room.eton.vn/hooks/YOUR_WEBHOOK_TOKEN}
 
+      # Public URL of this app, used to build click-through links in webhook alerts
+      - APP_URL=${APP_URL:-}
+
       # -----------------------------------------------------------------------
       # Cấu hình chuỗi kết nối PostgreSQL 18:
       # - Mặc định kết nối tới container postgres:18 trong Docker network:

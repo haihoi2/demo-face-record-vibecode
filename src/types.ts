@@ -213,7 +213,31 @@ export interface WebhookConfig {
   gateInTitle: string;
   gateOutTitle: string;
   includeEmployeeCode: boolean;
+
+  // ---- Stranger ("người lạ") alert ----
+  /** Send a webhook when an unrecognised face is captured. Default true. */
+  strangerAlertEnabled?: boolean;
+  /** Attachment title for the alert, e.g. "[[CẢNH BÁO NGƯỜI LẠ]]". */
+  strangerTitle?: string;
+  /** Link text shown in the chat message, e.g. "Xem cụm ảnh người lạ". */
+  strangerLinkLabel?: string;
+  /**
+   * Public base URL of this app, used to build the click-through link.
+   * Falls back to the APP_URL env var, then to the request's own origin.
+   * No trailing slash, e.g. "https://stg-gate-watch.vota.vn".
+   */
+  appBaseUrl?: string;
+  /** Minimum seconds between two stranger alerts, to avoid flooding. Default 60. */
+  strangerCooldownSeconds?: number;
 }
+
+/**
+ * Deep link into the stranger-cluster panel.
+ *   `<base>/#strangers`            → open the panel
+ *   `<base>/#strangers/<logId>`    → open it with the cluster holding that sighting selected
+ * Hash-based so no server route is needed and the SPA redirect rules still apply.
+ */
+export const STRANGER_DEEP_LINK_HASH = "strangers";
 
 export type DoorAuthHeaderType = "BEARER" | "API_KEY" | "CUSTOM_HEADER" | "QUERY_PARAM";
 
