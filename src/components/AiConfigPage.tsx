@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from "react";
+import React, { useState, useEffect, useCallback } from "react";
 import {
   Sparkles,
   Cpu,
@@ -29,6 +29,7 @@ import {
   RecognitionEngineMode,
   BenchmarkResult,
   Employee,
+  FusionThresholds,
 } from "../types";
 import { safeJsonFetch } from "../utils/api";
 import { soundEffects } from "../utils/audio";
@@ -46,11 +47,14 @@ interface AiConfigPageProps {
 
 /**
  * Which "Local Model SOTA" controls the backend actually honours today.
- * Audited against server.ts / src/server/faceWorkerPool.ts:
- *  - modelArchitecture: only swaps a display string; no different computation runs.
- *  - similarityThreshold: REAL - gates `bestSim >= similarityThreshold` and feeds confidence.
+ * Audited against server.ts / src/server/faceFusion.ts / faceWorkerPool.ts:
+ *  - modelArchitecture: only swaps a display string. The real detector/recognizer
+ *    pair is decided by the ONNX models loaded server-side and is reported
+ *    read-only by GET /api/face-engine/status.
+ *  - similarityThreshold: REAL - it is the fusion `acceptSingle` operating point
+ *    (one strong observation is enough to accept at or above this cosine).
  *  - livenessSensitivity: thresholds 92/85/75 are compared against a score hardcoded
- *    to 94-100, so the check can never fail.
+ *    to 94-100, so the check can never fail. Still NOT wired to the ONNX pipeline.
  *  - autoContrast / antiSpoofing: stored in config and never read by any code path.
  * Flip an entry to true only when the matching backend work actually lands.
  */
@@ -66,6 +70,70 @@ const NOT_IMPLEMENTED_BADGE = "Chưa triển khai";
 const NOT_IMPLEMENTED_HINT =
   "Tùy chọn này chưa được triển khai ở backend - thay đổi sẽ được lưu nhưng không ảnh hưởng đến kết quả nhận diện.";
 
+/** Shape of GET /api/face-engine/status. Every field is optional on purpose:
+ *  an older server may answer 404 or omit parts of the payload. */
+interface FaceEngineStatus {
+  engine?: string;
+  requestedEngine?: string;
+  ready?: boolean;
+  failClosed?: boolean;
+  info?: {
+    detector?: string;
+    recognizer?: string;
+    dims?: number;
+    modelTag?: string;
+    loadMs?: number;
+  };
+  templates?: {
+    total?: number;
+    byEmployee?: Record<string, number> | number;
+    modelTag?: string;
+    /** How many of those templates were made by the model currently loaded. */
+    matchingModelTag?: number;
+  };
+  thresholds?: Partial<FusionThresholds>;
+}
+
+const FUSION_THRESHOLD_LABELS: Array<{
+  key: keyof FusionThresholds;
+  label: string;
+  desc: string;
+  integer?: boolean;
+}> = [
+  {
+    key: "acceptSingle",
+    label: "acceptSingle",
+    desc: "Một góc nhìn đạt cosine này là đủ để chấp nhận. Đây chính là thanh trượt bên dưới.",
+  },
+  {
+    key: "minEvidence",
+    label: "minEvidence",
+    desc: "Dưới mức này, quan sát không được tính là bằng chứng cho bất kỳ ai.",
+  },
+  {
+    key: "acceptFused",
+    label: "acceptFused",
+    desc: "Cosine trung bình (có trọng số chất lượng) cần đạt khi chấp nhận nhờ nhiều góc nhìn đồng thuận.",
+  },
+  {
+    key: "minAgreeing",
+    label: "minAgreeing",
+    desc: "Số quan sát tối thiểu phải cùng chỉ về một người khi chấp nhận theo đồng thuận.",
+    integer: true,
+  },
+  {
+    key: "minMargin",
+    label: "minMargin",
+    desc: "Khoảng cách tối thiểu giữa người đứng đầu và người kế tiếp, tránh chấp nhận nhập nhằng.",
+  },
+];
+
+const countEnrolledEmployees = (byEmployee: Record<string, number> | number | undefined): number | null => {
+  if (typeof byEmployee === "number") return Number.isFinite(byEmployee) ? byEmployee : null;
+  if (byEmployee && typeof byEmployee === "object") return Object.keys(byEmployee).length;
+  return null;
+};
+
 export const AiConfigPage: React.FC<AiConfigPageProps> = ({
   employees,
   onNavigateToScanner,
@@ -78,7 +146,35 @@ export const AiConfigPage: React.FC<AiConfigPageProps> = ({
   const [testSubject, setTestSubject] = useState<string>("FIRST_EMPLOYEE");
   const [activeTabSection, setActiveTabSection] = useState<"engine" | "google" | "local" | "benchmark">("engine");
 
+  // Real face engine status (GET /api/face-engine/status). Never assumed present.
+  const [engineStatus, setEngineStatus] = useState<FaceEngineStatus | null>(null);
+  const [engineLoading, setEngineLoading] = useState<boolean>(true);
+  const [engineError, setEngineError] = useState<string | null>(null);
+  const [engineCheckedAt, setEngineCheckedAt] = useState<string | null>(null);
+
   const effectiveEmployees = employees.length > 0 ? employees : getStoredEmployees();
+
+  const fetchEngineStatus = useCallback(async (): Promise<void> => {
+    setEngineLoading(true);
+    const res = await safeJsonFetch<FaceEngineStatus>("/api/face-engine/status");
+    if (res.ok && res.data && typeof res.data === "object") {
+      setEngineStatus(res.data);
+      setEngineError(null);
+    } else {
+      setEngineStatus(null);
+      setEngineError(
+        res.status === 404
+          ? "Máy chủ chưa có endpoint /api/face-engine/status (HTTP 404). Không xác định được động cơ nào đang chạy."
+          : res.error || `Không đọc được trạng thái động cơ (HTTP ${res.status || 0}).`
+      );
+    }
+    setEngineCheckedAt(new Date().toLocaleTimeString("vi-VN"));
+    setEngineLoading(false);
+  }, []);
+
+  useEffect(() => {
+    fetchEngineStatus();
+  }, [fetchEngineStatus]);
 
   // Fetch current server config on mount
   useEffect(() => {
@@ -237,6 +333,250 @@ export const AiConfigPage: React.FC<AiConfigPageProps> = ({
     }
   };
 
+  // ---- Derived engine facts (all tolerant of a missing / partial payload) ----
+  const engineInfo = engineStatus?.info || {};
+  const engineName = String(engineStatus?.engine || "").toLowerCase();
+  const engineIsOnnx = engineName === "onnx";
+  const engineOperational = engineStatus?.ready === true && engineIsOnnx;
+  const templateTotal =
+    typeof engineStatus?.templates?.total === "number" ? engineStatus.templates.total : null;
+  const enrolledEmployeeCount = countEnrolledEmployees(engineStatus?.templates?.byEmployee);
+  const serverThresholds: Partial<FusionThresholds> = engineStatus?.thresholds || {};
+  const serverAcceptSingle =
+    typeof serverThresholds.acceptSingle === "number" ? serverThresholds.acceptSingle : null;
+  const templateTotalForTag = engineStatus?.templates?.matchingModelTag;
+  const staleTemplates =
+    typeof templateTotalForTag === "number" && templateTotal !== null
+      ? templateTotal - templateTotalForTag
+      : 0;
+
+  const threshold = config.localModel.similarityThreshold;
+  /** Honest reading of the slider against this site's measured cosine ranges. */
+  const thresholdVerdict =
+    threshold < 0.32
+      ? {
+          tone: "rose" as const,
+          title: "Nguy hiểm: dải chéo camera vắt ngang ngưỡng này",
+          text: "Dải đo chéo giữa hai camera là 0.139 - 0.304: 4/6 cặp đo được nằm dưới 0.28, nhưng phần trên của dải vượt lên tới 0.304, tức là dải này nằm vắt ngang ngưỡng chứ không nằm trọn dưới. Đáy của dải còn chạm vào vùng đo được giữa hai người khác nhau (≤ 0.145). Đặt ngưỡng ở đây thì một người chưa đăng ký tại chính camera đó vẫn có thể vượt qua.",
+        }
+      : threshold < 0.45
+      ? {
+          tone: "amber" as const,
+          title: "Dễ dãi: biên an toàn mỏng",
+          text: "Toàn bộ dải chéo camera đo được (cao nhất 0.304) nằm dưới ngưỡng này, nhưng khoảng cách chỉ còn 0.02 - 0.15 - rất ít chỗ dự phòng cho những góc chụp chưa từng đo. Ngưỡng này cũng thấp hơn hẳn dải cùng người trên exit-501 (0.50 - 0.62).",
+        }
+      : threshold <= 0.62
+      ? {
+          tone: "emerald" as const,
+          title: "Nằm trong vùng đo được của cùng một người",
+          text: "Cùng một người trên camera exit-501 đo được 0.50 - 0.62. Ngưỡng trong khoảng này chấp nhận người đã đăng ký tại chính camera đó và loại vùng người lạ.",
+        }
+      : {
+          tone: "amber" as const,
+          title: "Khắt khe: nhiều lần quét hợp lệ sẽ bị từ chối",
+          text: "Trên 0.62 là cao hơn mức cao nhất đo được của cùng một người (0.62). Nhân viên hợp lệ sẽ thường xuyên bị từ chối và phải quét lại.",
+        };
+
+  const renderEngineStatusPanel = () => (
+    <div className="bg-white rounded-2xl border border-slate-200 shadow-xs overflow-hidden">
+      <div className="px-5 py-3.5 border-b border-slate-100 flex items-center justify-between gap-3">
+        <div className="flex items-center gap-2 min-w-0">
+          <Server className="w-4.5 h-4.5 text-slate-700 shrink-0" />
+          <h2 className="text-sm font-bold text-slate-900 truncate">
+            Động Cơ Nhận Diện Thật Trên Máy Chủ (Face Engine)
+          </h2>
+          {engineStatus && (
+            <span
+              className={`px-2 py-0.5 text-[10px] font-bold rounded-full border shrink-0 ${
+                engineOperational
+                  ? "bg-emerald-100 text-emerald-800 border-emerald-200"
+                  : "bg-rose-100 text-rose-800 border-rose-200"
+              }`}
+            >
+              {engineOperational ? "ĐANG HOẠT ĐỘNG" : "KHÔNG HOẠT ĐỘNG"}
+            </span>
+          )}
+        </div>
+        <div className="flex items-center gap-2 shrink-0">
+          {engineCheckedAt && (
+            <span className="hidden sm:inline text-[10px] text-slate-400 font-mono">
+              Kiểm tra lúc {engineCheckedAt}
+            </span>
+          )}
+          <button
+            type="button"
+            id="btn-refresh-face-engine"
+            onClick={fetchEngineStatus}
+            disabled={engineLoading}
+            className="inline-flex items-center gap-1.5 px-2.5 py-1.5 text-[11px] font-semibold rounded-lg bg-slate-100 hover:bg-slate-200 text-slate-700 transition-all disabled:opacity-60"
+            title="Đọc lại /api/face-engine/status"
+          >
+            <RefreshCw className={`w-3.5 h-3.5 ${engineLoading ? "animate-spin" : ""}`} />
+            <span>Làm mới</span>
+          </button>
+        </div>
+      </div>
+
+      <div className="p-5 space-y-4">
+        {engineLoading && !engineStatus && !engineError && (
+          <div className="flex items-center gap-2 text-xs text-slate-500">
+            <RefreshCw className="w-4 h-4 animate-spin text-slate-400" />
+            <span>Đang đọc trạng thái động cơ từ máy chủ...</span>
+          </div>
+        )}
+
+        {!engineLoading && engineError && (
+          <div className="p-3.5 rounded-xl bg-amber-50 border border-amber-200 space-y-2">
+            <div className="flex items-start gap-2 text-xs text-amber-900">
+              <AlertTriangle className="w-4 h-4 text-amber-600 mt-0.5 shrink-0" />
+              <div>
+                <strong className="block">Không xác định được trạng thái động cơ.</strong>
+                <span className="font-mono text-[11px] break-words">{engineError}</span>
+                <p className="mt-1 leading-relaxed">
+                  Khi chưa đọc được trạng thái, đừng giả định là hệ thống đang nhận diện được. Hãy
+                  kiểm tra lại máy chủ trước khi cho phép mở cửa bằng khuôn mặt.
+                </p>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {!engineError && !engineLoading && !engineStatus && (
+          <div className="text-xs text-slate-500">Máy chủ không trả về dữ liệu trạng thái nào.</div>
+        )}
+
+        {engineStatus && (
+          <>
+            {/* Honest headline state */}
+            {engineOperational ? (
+              <div className="p-3.5 rounded-xl bg-emerald-50 border border-emerald-200 flex items-start gap-2.5 text-xs text-emerald-900">
+                <ShieldCheck className="w-4 h-4 text-emerald-600 mt-0.5 shrink-0" />
+                <div className="leading-relaxed">
+                  <strong>Động cơ ONNX đã nạp xong và đang nhận diện thật.</strong> Vector đặc trưng
+                  được trích xuất trên máy chủ và so khớp với các mẫu đã đăng ký theo từng camera.
+                </div>
+              </div>
+            ) : (
+              <div className="p-3.5 rounded-xl bg-rose-50 border-2 border-rose-300 flex items-start gap-2.5 text-xs text-rose-900">
+                <AlertTriangle className="w-4.5 h-4.5 text-rose-600 mt-0.5 shrink-0" />
+                <div className="space-y-1 leading-relaxed">
+                  <strong className="block text-sm">
+                    Nhận diện khuôn mặt KHÔNG hoạt động. Mọi yêu cầu mở cửa bằng khuôn mặt sẽ bị từ chối.
+                  </strong>
+                  {engineName === "unavailable" ? (
+                    <p>
+                      Máy chủ được yêu cầu chạy động cơ{" "}
+                      <span className="font-mono">{engineStatus.requestedEngine || "onnx"}</span> nhưng{" "}
+                      <strong>không nạp được mô hình</strong>. Hệ thống đang ở trạng thái an toàn
+                      (fail-closed): không có quyết định mở cửa nào được đưa ra. Kiểm tra tệp mô hình
+                      ONNX và log máy chủ.
+                    </p>
+                  ) : engineName === "hash" ? (
+                    <p>
+                      Máy chủ đang chạy bộ so khớp <span className="font-mono">hash</span> thay cho mô
+                      hình ONNX thật. Cơ chế này chỉ băm ảnh, không đo được độ giống của khuôn mặt,
+                      nên không có kết quả nào từ nó được xem là xác thực.
+                    </p>
+                  ) : engineStatus.ready === false ? (
+                    <p>
+                      Động cơ <span className="font-mono">{engineStatus.engine || "?"}</span> báo{" "}
+                      <span className="font-mono">ready: false</span> - mô hình chưa nạp xong hoặc nạp
+                      thất bại. Kiểm tra log máy chủ và tệp mô hình ONNX.
+                    </p>
+                  ) : (
+                    <p>
+                      Máy chủ báo động cơ{" "}
+                      <span className="font-mono">{engineStatus.engine || "không rõ"}</span>, không phải
+                      ONNX. Đây là trạng thái thật, không phải lỗi hiển thị.
+                    </p>
+                  )}
+                </div>
+              </div>
+            )}
+
+            {/* Engine facts */}
+            <div className="grid grid-cols-2 lg:grid-cols-3 gap-3">
+              {[
+                { label: "Động cơ", value: engineStatus.engine || "—", mono: true },
+                { label: "Bộ phát hiện (detector)", value: engineInfo.detector || "—", mono: true },
+                { label: "Bộ nhận diện (recognizer)", value: engineInfo.recognizer || "—", mono: true },
+                {
+                  label: "Số chiều vector",
+                  value: typeof engineInfo.dims === "number" ? `${engineInfo.dims}-D` : "—",
+                  mono: true,
+                },
+                { label: "Model tag", value: engineInfo.modelTag || "—", mono: true },
+                {
+                  label: "Thời gian nạp mô hình",
+                  value: typeof engineInfo.loadMs === "number" ? `${engineInfo.loadMs} ms` : "—",
+                  mono: true,
+                },
+              ].map((item) => (
+                <div key={item.label} className="p-3 rounded-xl bg-slate-50 border border-slate-200">
+                  <div className="text-[10px] uppercase tracking-wider text-slate-500 font-semibold">
+                    {item.label}
+                  </div>
+                  <div
+                    className={`text-xs text-slate-900 font-semibold mt-0.5 break-words ${
+                      item.mono ? "font-mono" : ""
+                    }`}
+                  >
+                    {item.value}
+                  </div>
+                </div>
+              ))}
+            </div>
+
+            {/* Enrolled templates */}
+            <div className="p-3.5 rounded-xl bg-slate-50 border border-slate-200 flex flex-wrap items-center gap-x-6 gap-y-2">
+              <div className="flex items-center gap-2">
+                <Activity className="w-4 h-4 text-indigo-600 shrink-0" />
+                <span className="text-xs text-slate-700">
+                  <strong className="font-semibold">Mẫu khuôn mặt đã đăng ký: </strong>
+                  <span className="font-mono font-bold text-slate-900">
+                    {templateTotal === null ? "—" : templateTotal}
+                  </span>
+                  {enrolledEmployeeCount !== null && (
+                    <span className="text-slate-500">
+                      {" "}
+                      trên {enrolledEmployeeCount} nhân viên
+                    </span>
+                  )}
+                </span>
+              </div>
+              {engineStatus.templates?.modelTag && (
+                <span className="text-[11px] font-mono text-slate-500">
+                  tag của mẫu: {engineStatus.templates.modelTag}
+                </span>
+              )}
+              {templateTotal === 0 && (
+                <span className="text-[11px] text-amber-800 bg-amber-100 border border-amber-200 rounded-full px-2 py-0.5 font-semibold">
+                  Chưa có mẫu nào - không ai được nhận diện
+                </span>
+              )}
+            </div>
+
+            {staleTemplates > 0 && (
+              <div className="p-3 rounded-xl bg-amber-50 border border-amber-200 flex items-start gap-2 text-[11px] text-amber-900">
+                <AlertTriangle className="w-4 h-4 text-amber-600 mt-0.5 shrink-0" />
+                <span>
+                  {staleTemplates} mẫu được tạo bởi một model khác{" "}
+                  {engineInfo.modelTag ? (
+                    <>
+                      (hiện chạy <span className="font-mono">{engineInfo.modelTag}</span>)
+                    </>
+                  ) : null}
+                  . Vector của hai model không so sánh được nên những mẫu này bị bỏ qua khi nhận diện -
+                  cần chụp lại tại đúng camera.
+                </span>
+              </div>
+            )}
+          </>
+        )}
+      </div>
+    </div>
+  );
+
   return (
     <div className="space-y-6 max-w-6xl mx-auto pb-12">
       {/* Header Banner */}
@@ -255,7 +595,8 @@ export const AiConfigPage: React.FC<AiConfigPageProps> = ({
               </span>
             </div>
             <p className="text-sm text-slate-600">
-              Tùy chọn sử dụng Google Cloud AI Vision (Gemini) hoặc Mô hình Nhận diện Sinh trắc học Cục bộ (Local Edge Biometrics) với ArcFace & BlazeFace V2.
+              Chọn giữa Google Cloud AI Vision (Gemini) và động cơ nhận diện cục bộ chạy trên máy chủ.
+              Tên mô hình thật đang nạp được báo trực tiếp từ máy chủ ở bảng bên dưới - không phải nhãn cố định trong giao diện.
             </p>
           </div>
 
@@ -335,6 +676,9 @@ export const AiConfigPage: React.FC<AiConfigPageProps> = ({
           </div>
         </div>
       </div>
+
+      {/* Real engine status - shown on every tab: it decides whether anything below matters */}
+      {renderEngineStatusPanel()}
 
       {/* Navigation Sub-tabs */}
       <div className="flex items-center gap-2 border-b border-slate-200 pb-2">
@@ -476,7 +820,11 @@ export const AiConfigPage: React.FC<AiConfigPageProps> = ({
                   )}
                 </h3>
                 <p className="text-xs text-slate-500 mt-1">
-                  ArcFace 512-D Deep Metric + BlazeFace V2 Detector
+                  {engineStatus && (engineInfo.detector || engineInfo.recognizer)
+                    ? `${engineInfo.detector || "?"} + ${engineInfo.recognizer || "?"}${
+                        typeof engineInfo.dims === "number" ? ` (${engineInfo.dims}-D)` : ""
+                      }`
+                    : "Mô hình ONNX chạy trên máy chủ (xem bảng trạng thái động cơ)"}
                 </p>
               </div>
 
@@ -746,15 +1094,16 @@ export const AiConfigPage: React.FC<AiConfigPageProps> = ({
             </span>
           </div>
 
-          {/* Honest status of this section: most controls are not wired to any engine yet. */}
+          {/* Honest status of this section: the engine is real, most of these controls still are not. */}
           <div className="flex items-start gap-3 p-3 rounded-xl bg-amber-50 border border-amber-200">
             <AlertTriangle className="w-4 h-4 text-amber-600 mt-0.5 shrink-0" />
             <div className="text-[11px] text-amber-900 leading-relaxed">
-              <strong>Phần lớn tùy chọn dưới đây chưa được triển khai.</strong> Hệ thống hiện chưa có
-              bộ trích xuất đặc trưng khuôn mặt thật (ONNX/ArcFace), nên việc chọn kiến trúc mô hình,
-              độ nhạy chống giả mạo và các tùy chọn tiền xử lý <em>không làm thay đổi</em> kết quả nhận
-              diện. Chúng bị khóa để tránh hiểu nhầm. Chỉ{" "}
-              <strong>Ngưỡng Tương Đồng Cosine</strong> đang thực sự có hiệu lực.
+              <strong>Bộ trích xuất đặc trưng thật đã có (SCRFD + ArcFace, vector 512 chiều)</strong> và{" "}
+              <strong>Ngưỡng Tương Đồng Cosine</strong> bên dưới điều khiển trực tiếp ngưỡng{" "}
+              <span className="font-mono">acceptSingle</span> của bộ quyết định. Nhưng{" "}
+              <strong>chọn kiến trúc mô hình, độ nhạy chống giả mạo, cân bằng tương phản và kiểm tra
+              sống thật vẫn chưa được nối vào luồng ONNX</strong> - chúng bị khóa để tránh hiểu nhầm.
+              Kiến trúc thật đang chạy được máy chủ báo về ở bảng trạng thái phía trên, không chọn được từ đây.
             </div>
           </div>
 
@@ -833,11 +1182,11 @@ export const AiConfigPage: React.FC<AiConfigPageProps> = ({
 
           {/* Local Model Sliders */}
           <div className="grid grid-cols-1 md:grid-cols-2 gap-6 pt-4 border-t border-slate-100">
-            {/* Cosine Similarity Threshold */}
+            {/* Cosine Similarity Threshold -> fusion acceptSingle */}
             <div className="space-y-2">
               <div className="flex items-center justify-between text-xs">
                 <span className="font-semibold text-slate-700 flex items-center gap-2">
-                  Ngưỡng Tương Đồng Cosine (Similarity Threshold):
+                  Ngưỡng Tương Đồng Cosine → <span className="font-mono">acceptSingle</span>
                   {LOCAL_MODEL_SUPPORT.similarityThreshold && (
                     <span className="text-[10px] font-semibold px-2 py-0.5 rounded-full bg-emerald-100 text-emerald-800">
                       Đang hoạt động
@@ -845,15 +1194,15 @@ export const AiConfigPage: React.FC<AiConfigPageProps> = ({
                   )}
                 </span>
                 <span className="font-mono font-bold text-emerald-600">
-                  {config.localModel.similarityThreshold.toFixed(2)}
+                  {threshold.toFixed(2)}
                 </span>
               </div>
               <input
                 type="range"
-                min="0.55"
+                min="0.30"
                 max="0.90"
                 step="0.01"
-                value={config.localModel.similarityThreshold}
+                value={threshold}
                 onChange={(e) =>
                   setConfig({
                     ...config,
@@ -866,10 +1215,37 @@ export const AiConfigPage: React.FC<AiConfigPageProps> = ({
                 className="w-full accent-emerald-600"
               />
               <div className="flex justify-between text-[10px] text-slate-400">
-                <span>Dễ nhận diện (0.55)</span>
-                <span>Khuyến nghị (0.72)</span>
-                <span>Khắt khe (0.90)</span>
+                <span>0.30 (trùng vùng người lạ)</span>
+                <span>0.50 - 0.62 (đo được: cùng người)</span>
+                <span>0.90</span>
               </div>
+
+              <p className="text-[11px] text-slate-600 leading-relaxed">
+                Đây là ngưỡng <span className="font-mono">acceptSingle</span>: chỉ cần{" "}
+                <strong>một</strong> quan sát đạt cosine này (và cách người kế tiếp tối thiểu{" "}
+                <span className="font-mono">minMargin</span>) là cửa được mở. Các quan sát yếu hơn vẫn
+                có thể cộng dồn theo cơ chế đồng thuận nhiều góc nhìn.
+              </p>
+
+              <div
+                className={`p-2.5 rounded-lg border text-[11px] leading-relaxed ${
+                  thresholdVerdict.tone === "emerald"
+                    ? "bg-emerald-50 border-emerald-200 text-emerald-900"
+                    : thresholdVerdict.tone === "amber"
+                    ? "bg-amber-50 border-amber-200 text-amber-900"
+                    : "bg-rose-50 border-rose-200 text-rose-900"
+                }`}
+              >
+                <strong>{thresholdVerdict.title}.</strong> {thresholdVerdict.text}
+              </div>
+
+              {serverAcceptSingle !== null && Math.abs(serverAcceptSingle - threshold) > 0.005 && (
+                <p className="text-[11px] text-slate-500">
+                  Máy chủ đang áp dụng{" "}
+                  <span className="font-mono font-semibold">{serverAcceptSingle.toFixed(2)}</span>. Giá trị
+                  bạn chọn chỉ có hiệu lực sau khi bấm <strong>Lưu Cấu Hình</strong>.
+                </p>
+              )}
             </div>
 
             {/* Liveness Sensitivity */}
@@ -914,6 +1290,118 @@ export const AiConfigPage: React.FC<AiConfigPageProps> = ({
                   nào có thể từ chối được khung hình.
                 </p>
               )}
+            </div>
+          </div>
+
+          {/* Read-only fusion thresholds reported by the engine */}
+          <div className="rounded-xl border border-slate-200 overflow-hidden">
+            <div className="px-4 py-2.5 bg-slate-50 border-b border-slate-200 flex items-center justify-between gap-2">
+              <span className="text-xs font-bold text-slate-800 flex items-center gap-2">
+                <Lock className="w-3.5 h-3.5 text-slate-500" />
+                Các ngưỡng quyết định khác (chỉ đọc từ máy chủ)
+              </span>
+              <span className="text-[10px] font-mono text-slate-500">GET /api/face-engine/status</span>
+            </div>
+
+            {engineLoading && !engineStatus ? (
+              <div className="px-4 py-3 text-[11px] text-slate-500 flex items-center gap-2">
+                <RefreshCw className="w-3.5 h-3.5 animate-spin" /> Đang đọc ngưỡng từ máy chủ...
+              </div>
+            ) : Object.keys(serverThresholds).length === 0 ? (
+              <div className="px-4 py-3 text-[11px] text-amber-800 bg-amber-50 flex items-start gap-2">
+                <AlertTriangle className="w-3.5 h-3.5 text-amber-600 mt-0.5 shrink-0" />
+                <span>
+                  Máy chủ chưa báo về bộ ngưỡng nào{engineError ? ` (${engineError})` : ""}. Không hiển thị
+                  giá trị phỏng đoán ở đây - hãy bấm <strong>Làm mới</strong> ở bảng trạng thái phía trên.
+                </span>
+              </div>
+            ) : (
+              <div className="divide-y divide-slate-100">
+                {FUSION_THRESHOLD_LABELS.map((t) => {
+                  const raw = serverThresholds[t.key];
+                  const has = typeof raw === "number" && Number.isFinite(raw);
+                  return (
+                    <div key={t.key} className="px-4 py-2.5 flex items-start justify-between gap-4">
+                      <div className="min-w-0">
+                        <div className="text-xs font-semibold text-slate-800 font-mono">{t.label}</div>
+                        <p className="text-[11px] text-slate-500 leading-relaxed">{t.desc}</p>
+                      </div>
+                      <span className="font-mono text-xs font-bold text-slate-900 shrink-0 tabular-nums">
+                        {has ? (t.integer ? String(raw) : (raw as number).toFixed(2)) : "—"}
+                      </span>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+
+          {/* Measured calibration note - the numbers behind the threshold advice */}
+          <div className="rounded-xl border border-indigo-200 bg-indigo-50/50 p-4 space-y-3">
+            <div className="flex items-center gap-2">
+              <Info className="w-4 h-4 text-indigo-600 shrink-0" />
+              <h3 className="text-xs font-bold text-indigo-950">
+                Số đo thực tế trên camera của chính site này (dùng để chọn ngưỡng)
+              </h3>
+            </div>
+
+            <div className="overflow-x-auto">
+              <table className="w-full text-[11px] text-left border-collapse">
+                <thead>
+                  <tr className="text-indigo-900/70 uppercase tracking-wide text-[10px]">
+                    <th className="py-1 pr-3 font-semibold">Phép đo</th>
+                    <th className="py-1 pr-3 font-semibold">exit-501 (BVE-CUA-KHO)</th>
+                    <th className="py-1 font-semibold">exit-2401</th>
+                  </tr>
+                </thead>
+                <tbody className="font-mono text-slate-800">
+                  <tr className="border-t border-indigo-100">
+                    <td className="py-1.5 pr-3 font-sans text-slate-600">Cùng một người</td>
+                    <td className="py-1.5 pr-3 text-emerald-700 font-bold">0.50 - 0.62</td>
+                    <td className="py-1.5 text-slate-500">—</td>
+                  </tr>
+                  <tr className="border-t border-indigo-100">
+                    <td className="py-1.5 pr-3 font-sans text-slate-600">Hai người khác nhau</td>
+                    <td className="py-1.5 pr-3 text-rose-700 font-bold">≤ 0.145</td>
+                    <td className="py-1.5 text-slate-500">—</td>
+                  </tr>
+                  <tr className="border-t border-indigo-100">
+                    <td className="py-1.5 pr-3 font-sans text-slate-600">Kích thước khuôn mặt</td>
+                    <td className="py-1.5 pr-3">49 - 62 px</td>
+                    <td className="py-1.5">40 - 44 px</td>
+                  </tr>
+                  <tr className="border-t border-indigo-100">
+                    <td className="py-1.5 pr-3 font-sans text-slate-600">Điểm chất lượng</td>
+                    <td className="py-1.5 pr-3">0.34 - 0.43</td>
+                    <td className="py-1.5">0.20 - 0.24</td>
+                  </tr>
+                  <tr className="border-t border-indigo-100">
+                    <td className="py-1.5 pr-3 font-sans text-slate-600">Chéo camera (2401 ↔ 501)</td>
+                    <td className="py-1.5 pr-3 text-rose-700 font-bold" colSpan={2}>
+                      0.139 - 0.304 (vắt ngang ngưỡng; 4/6 cặp &lt; 0.28)
+                    </td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            <div className="text-[11px] text-indigo-950 leading-relaxed space-y-1.5">
+              <p>
+                <strong>0.50 nghĩa là gì:</strong> chấp nhận gần như toàn bộ dải đo được của cùng một
+                người trên exit-501, trong khi hai người khác nhau chỉ đạt tối đa 0.145 - khoảng cách
+                an toàn còn rất rộng. <strong>0.30 nghĩa là gì:</strong> ngưỡng nằm lọt giữa dải chéo
+                camera 0.139 - 0.304: 4/6 cặp đo được rơi xuống dưới 0.28 nhưng phần trên của dải
+                vượt qua 0.30, nên kết quả trở thành may rủi - một người chưa đăng ký tại camera đó
+                vẫn có thể vượt ngưỡng ở một số khung hình.
+              </p>
+              <p>
+                Ảnh chụp ở exit-2401 nhỏ hơn và điểm chất lượng chỉ bằng khoảng một nửa exit-501, nên
+                cosine đo trên 2401 thấp hơn hệ thống; đáy của dải chéo camera vì thế chạm vào vùng
+                của hai người khác nhau, dù hai dải không trùng nhau. <strong>Vì vậy mỗi nhân viên phải được đăng ký
+                riêng tại từng camera nơi họ cần được nhận diện</strong> - mẫu lấy từ camera này không
+                dùng lại được cho camera kia. Thao tác đăng ký theo camera nằm ở trang{" "}
+                <strong>Đăng Ký Nhân Viên</strong>.
+              </p>
             </div>
           </div>
 

@@ -34,6 +34,8 @@ import {
   SmartLockState,
   AccessLog,
   DetectedFace,
+  FusionDecision,
+  FusionThresholds,
 } from "../types";
 import { soundEffects } from "../utils/audio";
 import { safeJsonFetch, normalizeApiUrl, getApiBaseUrl } from "../utils/api";
@@ -136,7 +138,9 @@ const maskRtspCredentials = (url?: string): string => {
 /** Faces returned by a multi-stream scan also carry the stream they were seen on. */
 type StreamFace = DetectedFace & { streamId?: string; streamLabel?: string };
 
-/** Aggregate scan-rtsp response (single stream or whole gate). */
+/** Aggregate scan-rtsp response (single stream or whole gate).
+ *  `fusion` only exists on a server that runs the ONNX + fusion pipeline;
+ *  an older server omits it and the panel falls back to the plain view. */
 type GateScanResponse = FaceRecognitionResult & {
   success?: boolean;
   error?: string;
@@ -146,7 +150,60 @@ type GateScanResponse = FaceRecognitionResult & {
   streamId?: string;
   streamLabel?: string;
   detectedFaces: StreamFace[];
+  fusion?: FusionSummary;
 };
+
+/** The decision plus the context the server adds around it. Extra fields are
+ *  optional: a server that only sends a bare FusionDecision still renders. */
+type FusionSummary = FusionDecision & {
+  engine?: string;
+  observations?: number;
+  observationCap?: number;
+  framesPerStream?: number;
+  frameIntervalMs?: number;
+  streamsPooled?: number;
+  galleryTemplates?: number;
+  modelTag?: string;
+};
+
+/** Roughly how long one extra frame per stream costs (grab + detect + embed). */
+const FRAME_LATENCY_COST_MS = 1000;
+
+/** Readable chip for a fusion decision basis. */
+const describeBasis = (
+  fusion: FusionDecision
+): { text: string; tone: "emerald" | "sky" | "amber" | "rose" } => {
+  switch (fusion.basis) {
+    case "single-strong":
+      return { text: "1 góc nhìn rõ", tone: "emerald" };
+    case "multi-agree":
+      return {
+        text:
+          fusion.agreeingStreams > 1
+            ? `${fusion.agreeingStreams} luồng đồng thuận`
+            : `${fusion.agreeingObservations} quan sát đồng thuận`,
+        tone: "sky",
+      };
+    case "rejected-weak":
+      return { text: "Từ chối: bằng chứng yếu", tone: "amber" };
+    case "rejected-ambiguous":
+      return { text: "Từ chối: không rõ danh tính", tone: "rose" };
+    case "rejected-no-face":
+      return { text: "Từ chối: không thấy khuôn mặt", tone: "rose" };
+    default:
+      return { text: fusion.basis ? `Cơ sở: ${fusion.basis}` : "Cơ sở không rõ", tone: "amber" };
+  }
+};
+
+const BASIS_TONE_CLASS: Record<"emerald" | "sky" | "amber" | "rose", string> = {
+  emerald: "bg-emerald-950/80 text-emerald-300 border-emerald-700/70",
+  sky: "bg-sky-950/80 text-sky-300 border-sky-700/70",
+  amber: "bg-amber-950/70 text-amber-300 border-amber-700/70",
+  rose: "bg-rose-950/70 text-rose-300 border-rose-700/70",
+};
+
+const pct = (v: number) => `${Math.min(100, Math.max(0, v * 100)).toFixed(1)}%`;
+const cos = (v: unknown) => (typeof v === "number" && Number.isFinite(v) ? v.toFixed(3) : "—");
 
 interface CameraDashboardProps {
   employees: Employee[];
@@ -186,6 +243,8 @@ interface StreamScanState {
   clientUvcActive: boolean;
   perStream: Record<string, PerStreamState>;
   showScanPanel: boolean;
+  /** Frames grabbed per stream per scan; more frames = more fusion evidence, more latency. */
+  scanFrames: number;
 }
 
 const createInitialScanState = (): StreamScanState => ({
@@ -203,6 +262,7 @@ const createInitialScanState = (): StreamScanState => ({
   clientUvcActive: false,
   perStream: {},
   showScanPanel: true,
+  scanFrames: 1,
 });
 
 const emptyPerStream = (): PerStreamState => ({
@@ -380,23 +440,35 @@ export const CameraDashboard: React.FC<CameraDashboardProps> = ({
     }));
   };
 
-  // Recognise a frame captured from the browser webcam (primary CLIENT_UVC stream)
+  /**
+   * Recognise a frame captured from the browser webcam (primary CLIENT_UVC stream).
+   *
+   * SECURITY: when a backend exists, its answer is the ONLY answer. A server
+   * error NEVER falls back to the client-side simulator - that would open a
+   * door on a made-up result. The on-device simulator is reached only when no
+   * backend is configured at all (static demo build) and is labelled as such.
+   */
   const recognizeClientUvcFrame = async (
     gateType: "ENTRY" | "EXIT",
     videoEl: HTMLVideoElement,
     gateName: string
-  ): Promise<GateScanResponse | null> => {
-    if (videoEl.videoWidth <= 0) return null;
+  ): Promise<{ result: GateScanResponse | null; error: string | null; retryNotice: string | null }> => {
+    const fail = (error: string | null, retryNotice: string | null = null) => ({
+      result: null,
+      error,
+      retryNotice,
+    });
+    if (videoEl.videoWidth <= 0) return fail("Webcam trình duyệt chưa có khung hình nào.");
     const canvas = document.createElement("canvas");
     canvas.width = videoEl.videoWidth;
     canvas.height = videoEl.videoHeight;
     const ctx = canvas.getContext("2d");
-    if (!ctx) return null;
+    if (!ctx) return fail("Trình duyệt không tạo được canvas để lấy khung hình.");
     ctx.drawImage(videoEl, 0, 0);
     const imageBase64 = canvas.toDataURL("image/jpeg", 0.85);
 
-    let result: GateScanResponse | null = null;
-    if (!isNetlifyOrStaticHost() || getApiBaseUrl()) {
+    const hasBackend = !isNetlifyOrStaticHost() || Boolean(getApiBaseUrl());
+    if (hasBackend) {
       const res = await safeJsonFetch<GateScanResponse>("/api/recognize-face", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -407,15 +479,27 @@ export const CameraDashboard: React.FC<CameraDashboardProps> = ({
           config: getStoredAiConfig(),
         }),
       });
-      if (res.ok && res.data) {
-        result = res.data;
+
+      if (res.status === 503) {
+        return fail(
+          null,
+          `Cụm xử lý đang quá tải, sẽ thử lại sau ${res.data?.retryAfterSeconds || 1} giây.`
+        );
       }
+      if (res.ok && res.data && res.data.success !== false) {
+        return { result: res.data, error: null, retryNotice: null };
+      }
+      // Show the server's own refusal verbatim; do not invent a local verdict.
+      return fail(
+        res.data?.error || res.error || `Máy chủ không nhận diện được (HTTP ${res.status || 0}).`
+      );
     }
 
-    // Fallback to local biometrics
-    if (!result) {
+    // No backend at all (static demo build): explicitly simulated, never dressed
+    // up as a real recognition result.
+    {
       const localMatch = runLocalFaceRecognition({ imageBase64, employees });
-      result = {
+      const result: GateScanResponse = {
         recognized: localMatch.recognized,
         employee: localMatch.bestMatch,
         detectedFaces: localMatch.detectedFaces,
@@ -426,14 +510,14 @@ export const CameraDashboard: React.FC<CameraDashboardProps> = ({
         confidence: localMatch.overallConfidence,
         livenessScore: localMatch.overallLiveness,
         message: localMatch.recognized
-          ? `Xác thực thành công tại ${gateName}: ${localMatch.bestMatch?.name}`
-          : `Phát hiện khuôn mặt tại ${gateName}, không khớp hồ sơ nhân viên`,
+          ? `Mô phỏng cục bộ tại ${gateName}: ${localMatch.bestMatch?.name} (không phải nhận diện thật)`
+          : `Mô phỏng cục bộ tại ${gateName}: không khớp hồ sơ nhân viên`,
         lockUnlocked: localMatch.recognized,
-        engineUsed: "ArcFace SOTA On-Device Edge Biometrics",
+        engineUsed: "Mô phỏng cục bộ trong trình duyệt (không có máy chủ nhận diện)",
         modelUsed: localMatch.modelName,
       };
+      return { result, error: null, retryNotice: null };
     }
-    return result;
   };
 
   /**
@@ -474,7 +558,12 @@ export const CameraDashboard: React.FC<CameraDashboardProps> = ({
 
       if (useClientUvc) {
         if (videoRef.current) {
-          result = await recognizeClientUvcFrame(gateType, videoRef.current, gateConfig.name);
+          const outcome = await recognizeClientUvcFrame(gateType, videoRef.current, gateConfig.name);
+          result = outcome.result;
+          scanError = outcome.error;
+          retryNotice = outcome.retryNotice;
+        } else {
+          scanError = "Chưa mở được webcam trình duyệt cho cổng này.";
         }
         if (result && primary) {
           result = {
@@ -486,6 +575,11 @@ export const CameraDashboard: React.FC<CameraDashboardProps> = ({
         }
       } else {
         // RTSP / HTTP / backend UVC: the server grabs the frame(s) and runs recognition.
+        // Frames per stream: an older server simply ignores the extra field.
+        const framesPerStream = Math.min(
+          5,
+          Math.max(1, (gateType === "ENTRY" ? entryState : exitState).scanFrames || 1)
+        );
         const scanRes = await safeJsonFetch<GateScanResponse>("/api/camera-streams/scan-rtsp", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -493,12 +587,15 @@ export const CameraDashboard: React.FC<CameraDashboardProps> = ({
             gate: key,
             ...(targetStream ? { stream: targetStream.id } : {}),
             scanType: gateType,
+            frames: framesPerStream,
           }),
         });
 
-        if (scanRes.status === 503) {
-          const retry = scanRes.data?.retryAfterSeconds || 1;
-          retryNotice = `Cụm xử lý đang quá tải, sẽ thử lại sau ${retry} giây.`;
+        if (scanRes.status === 503 && typeof scanRes.data?.retryAfterSeconds === "number") {
+          retryNotice = `Cụm xử lý đang quá tải, sẽ thử lại sau ${scanRes.data.retryAfterSeconds} giây.`;
+        } else if (scanRes.status === 503) {
+          // A 503 without a retry hint is a refusal, not congestion: show it as-is.
+          scanError = scanRes.data?.error || scanRes.error || "Máy chủ từ chối quét lúc này (HTTP 503).";
         } else if (scanRes.ok && scanRes.data && scanRes.data.success !== false) {
           result = scanRes.data;
           if (targetStream) {
@@ -910,7 +1007,214 @@ export const CameraDashboard: React.FC<CameraDashboardProps> = ({
     );
   };
 
-  // Scan results panel: per-stream outcomes + aggregate
+  /** Name for an employee id coming back from the fusion decision. */
+  const employeeLabel = (employeeId?: string): string => {
+    if (!employeeId) return "Không xác định";
+    const match = employees.find((e) => e.id === employeeId);
+    return match ? `${match.name} (${match.employeeCode})` : employeeId;
+  };
+
+  /**
+   * Evidence behind one decision: basis, fused vs best cosine against the active
+   * threshold, agreement, candidates and the raw per-observation matches.
+   * Every field is defensive - a partial `fusion` object must not crash the tile.
+   */
+  const renderFusionBlock = (fusion: FusionSummary, streams: GateStreamSource[]) => {
+    const basis = describeBasis(fusion);
+    const th: Partial<FusionThresholds> = fusion.thresholds || {};
+    const acceptSingle = typeof th.acceptSingle === "number" ? th.acceptSingle : null;
+    const minEvidence = typeof th.minEvidence === "number" ? th.minEvidence : null;
+    const acceptFused = typeof th.acceptFused === "number" ? th.acceptFused : null;
+    const fused = typeof fusion.fusedCosine === "number" ? fusion.fusedCosine : 0;
+    const best = typeof fusion.bestCosine === "number" ? fusion.bestCosine : 0;
+    const candidates = Array.isArray(fusion.candidates) ? fusion.candidates : [];
+    const observations = Array.isArray(fusion.perObservation) ? fusion.perObservation : [];
+    const streamLabelOf = (streamId: string) =>
+      streams.find((st) => st.id === streamId)?.label || streamId;
+
+    return (
+      <div className="rounded-lg border border-slate-800 bg-slate-900/60 overflow-hidden">
+        {/* Decision header */}
+        <div className="px-3 py-2 flex flex-wrap items-center gap-2 border-b border-slate-800">
+          <span className="text-[10px] uppercase tracking-wider text-slate-500 font-semibold">
+            Cơ sở quyết định
+          </span>
+          <span
+            className={`px-2 py-0.5 rounded-md text-[11px] font-bold border ${BASIS_TONE_CLASS[basis.tone]}`}
+          >
+            {basis.text}
+          </span>
+          <span className={`text-[11px] font-semibold ${fusion.recognized ? "text-emerald-300" : "text-slate-400"}`}>
+            {fusion.recognized ? employeeLabel(fusion.employeeId) : "Không mở cửa"}
+          </span>
+          {fusion.engine && fusion.engine !== "onnx" && (
+            <span className="px-2 py-0.5 rounded-md text-[10px] font-bold border bg-rose-950/70 text-rose-300 border-rose-700/70">
+              engine: {fusion.engine} - không phải nhận diện thật
+            </span>
+          )}
+          {typeof fusion.confidence === "number" && (
+            <span className="ml-auto font-mono text-[11px] text-slate-400">
+              tin cậy {pct(fusion.confidence)}
+            </span>
+          )}
+        </div>
+
+        {/* Cosine vs threshold */}
+        <div className="px-3 py-2.5 space-y-1.5">
+          <div className="relative h-2.5 rounded-full bg-slate-800 overflow-hidden">
+            <div
+              className={`absolute inset-y-0 left-0 ${fusion.recognized ? "bg-emerald-500/80" : "bg-slate-500/70"}`}
+              style={{ width: pct(fused) }}
+            />
+            {minEvidence !== null && (
+              <div
+                className="absolute inset-y-0 w-px bg-slate-400/60"
+                style={{ left: pct(minEvidence) }}
+                title={`minEvidence ${minEvidence.toFixed(3)}`}
+              />
+            )}
+            {acceptSingle !== null && (
+              <div
+                className="absolute inset-y-0 w-0.5 bg-amber-300"
+                style={{ left: pct(acceptSingle) }}
+                title={`acceptSingle ${acceptSingle.toFixed(3)}`}
+              />
+            )}
+            <div
+              className="absolute inset-y-0 w-0.5 bg-white"
+              style={{ left: pct(best) }}
+              title={`best ${best.toFixed(3)}`}
+            />
+          </div>
+
+          <div className="flex flex-wrap items-center gap-x-3 gap-y-1 font-mono text-[10px]">
+            <span className="text-slate-300">
+              fused <span className="font-bold text-white">{cos(fused)}</span>
+            </span>
+            <span className="text-slate-300">
+              best <span className="font-bold text-white">{cos(best)}</span>
+            </span>
+            <span className="text-amber-300">
+              acceptSingle {acceptSingle === null ? "—" : acceptSingle.toFixed(3)}
+            </span>
+            <span className="text-slate-500">
+              acceptFused {acceptFused === null ? "—" : acceptFused.toFixed(3)}
+            </span>
+            <span className="text-slate-500">
+              minEvidence {minEvidence === null ? "—" : minEvidence.toFixed(3)}
+            </span>
+            <span className="ml-auto text-slate-400">
+              {fusion.agreeingObservations ?? 0} quan sát / {fusion.agreeingStreams ?? 0} luồng đồng thuận
+            </span>
+          </div>
+        </div>
+
+        {/* Candidates */}
+        <div className="px-3 pb-2.5">
+          <div className="text-[10px] uppercase tracking-wider text-slate-500 font-semibold mb-1">
+            Ứng viên
+          </div>
+          {candidates.length === 0 ? (
+            <div className="text-[11px] text-slate-500">
+              Không có ứng viên nào vượt ngưỡng bằng chứng tối thiểu.
+            </div>
+          ) : (
+            <div className="space-y-1">
+              {candidates.map((cand, i) => (
+                <div
+                  key={cand.employeeId || i}
+                  className={`flex flex-wrap items-center gap-x-3 gap-y-0.5 px-2 py-1 rounded-md border text-[11px] ${
+                    i === 0 && fusion.recognized
+                      ? "bg-emerald-950/50 border-emerald-800/70 text-emerald-100"
+                      : "bg-slate-900 border-slate-800 text-slate-300"
+                  }`}
+                >
+                  <span className="font-semibold truncate max-w-[200px]">
+                    {employeeLabel(cand.employeeId)}
+                  </span>
+                  <span className="font-mono text-slate-400">fused {cos(cand.fusedCosine)}</span>
+                  <span className="font-mono text-slate-400">best {cos(cand.bestCosine)}</span>
+                  <span className="font-mono text-slate-500">
+                    {cand.observations ?? 0} quan sát • {cand.streams ?? 0} luồng
+                  </span>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+
+        {/* Context of this decision */}
+        <div className="px-3 pb-2.5 flex flex-wrap gap-x-3 gap-y-1 font-mono text-[10px] text-slate-500">
+          {typeof fusion.framesPerStream === "number" && (
+            <span>{fusion.framesPerStream} khung/luồng</span>
+          )}
+          {typeof fusion.streamsPooled === "number" && <span>{fusion.streamsPooled} luồng gộp</span>}
+          {typeof fusion.observations === "number" && (
+            <span>
+              {fusion.observations} quan sát
+              {typeof fusion.observationCap === "number" ? ` / tối đa ${fusion.observationCap}` : ""}
+            </span>
+          )}
+          {typeof fusion.galleryTemplates === "number" && (
+            <span className={fusion.galleryTemplates === 0 ? "text-amber-400" : undefined}>
+              thư viện {fusion.galleryTemplates} mẫu
+            </span>
+          )}
+          {fusion.modelTag && <span className="truncate">{fusion.modelTag}</span>}
+        </div>
+
+        {/* Per-observation table */}
+        <div className="px-3 pb-3">
+          <div className="text-[10px] uppercase tracking-wider text-slate-500 font-semibold mb-1">
+            Từng quan sát
+          </div>
+          {observations.length === 0 ? (
+            <div className="text-[11px] text-slate-500">
+              Không có khuôn mặt nào được trích xuất trong lần quét này.
+            </div>
+          ) : (
+            <div className="overflow-x-auto">
+              <table className="w-full text-[11px] border-collapse">
+                <thead>
+                  <tr className="text-slate-500 text-[10px] uppercase tracking-wide">
+                    <th className="text-left font-semibold py-1 pr-3">Luồng</th>
+                    <th className="text-left font-semibold py-1 pr-3">Khung</th>
+                    <th className="text-left font-semibold py-1 pr-3">Khớp với</th>
+                    <th className="text-right font-semibold py-1 pr-3">Cosine</th>
+                    <th className="text-right font-semibold py-1 pr-3">Kế tiếp</th>
+                    <th className="text-right font-semibold py-1">Chất lượng</th>
+                  </tr>
+                </thead>
+                <tbody className="font-mono text-slate-300">
+                  {observations.map((obs, i) => {
+                    const passes = acceptSingle !== null && typeof obs.cosine === "number" && obs.cosine >= acceptSingle;
+                    return (
+                      <tr key={`${obs.streamId}-${obs.frameIndex ?? i}-${i}`} className="border-t border-slate-800">
+                        <td className="py-1 pr-3 truncate max-w-[140px]" title={obs.streamId}>
+                          {streamLabelOf(obs.streamId)}
+                        </td>
+                        <td className="py-1 pr-3">{obs.frameIndex ?? 0}</td>
+                        <td className="py-1 pr-3 font-sans truncate max-w-[160px]">
+                          {obs.employeeId ? employeeLabel(obs.employeeId) : "—"}
+                        </td>
+                        <td className={`py-1 pr-3 text-right font-bold ${passes ? "text-emerald-400" : "text-slate-300"}`}>
+                          {cos(obs.cosine)}
+                        </td>
+                        <td className="py-1 pr-3 text-right text-slate-500">{cos(obs.secondCosine)}</td>
+                        <td className="py-1 text-right text-slate-400">{cos(obs.quality)}</td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </div>
+      </div>
+    );
+  };
+
+  // Scan results panel: fusion evidence + per-stream outcomes + aggregate
   const renderScanPanel = (
     gateConfig: GateStreamConfig,
     streams: GateStreamSource[],
@@ -962,6 +1266,9 @@ export const CameraDashboard: React.FC<CameraDashboardProps> = ({
             </div>
           </div>
         </div>
+
+        {/* Fusion evidence (only present on a server running the ONNX pipeline) */}
+        {result.fusion && renderFusionBlock(result.fusion, streams)}
 
         {/* Per-stream rows */}
         <div className="rounded-lg border border-slate-800 divide-y divide-slate-800 overflow-hidden">
@@ -1261,6 +1568,29 @@ export const CameraDashboard: React.FC<CameraDashboardProps> = ({
                 <option value={5}>5.0 giây (Tiết kiệm)</option>
               </select>
             )}
+
+            {/* Frames per stream per scan -> more fusion evidence, more latency */}
+            <label className="inline-flex items-center gap-1.5 text-slate-400">
+              <span className="hidden sm:inline">Số khung hình</span>
+              <select
+                id={`select-frames-${gateConfig.gateType.toLowerCase()}`}
+                value={scanState.scanFrames}
+                onChange={(e) =>
+                  setScanState((prev) => ({
+                    ...prev,
+                    scanFrames: Math.min(5, Math.max(1, Number(e.target.value) || 1)),
+                  }))
+                }
+                className="bg-slate-900 text-slate-300 border border-slate-700 rounded-lg px-2 py-1.5 text-xs font-mono focus:outline-hidden focus:border-indigo-500"
+                title="Số khung hình chụp trên mỗi luồng cho mỗi lần quét"
+              >
+                {[1, 2, 3, 4, 5].map((n) => (
+                  <option key={n} value={n}>
+                    {n} khung
+                  </option>
+                ))}
+              </select>
+            </label>
           </div>
 
           <div className="flex items-center gap-2">
@@ -1288,6 +1618,32 @@ export const CameraDashboard: React.FC<CameraDashboardProps> = ({
               <KeyRound className="w-3.5 h-3.5 text-emerald-400" />
               <span>Mở Cổng Này</span>
             </button>
+          </div>
+
+          {/* Honest cost of the frame count */}
+          <div className="w-full text-[10px] text-slate-500 leading-relaxed">
+            {scanState.scanFrames === 1 ? (
+              <>
+                1 khung/luồng: nhanh nhất, nhưng chỉ chấp nhận được khi có một góc nhìn thật rõ.
+                Chọn từ 2 khung trở lên để bộ quyết định có thể dựa vào nhiều quan sát đồng thuận.
+              </>
+            ) : (
+              <>
+                {scanState.scanFrames} khung/luồng trên {enabledStreams.length} luồng: mỗi khung thêm
+                tốn khoảng {FRAME_LATENCY_COST_MS / 1000} giây cho mỗi luồng, tức chậm hơn khoảng{" "}
+                {((scanState.scanFrames - 1) * FRAME_LATENCY_COST_MS) / 1000} giây so với 1 khung.
+                Đổi lại có thêm bằng chứng cho quyết định đồng thuận.
+              </>
+            )}
+            {scanState.autoScanEnabled &&
+              scanState.scanIntervalSeconds <
+                ((scanState.scanFrames - 1) * FRAME_LATENCY_COST_MS) / 1000 + 1 && (
+                <span className="text-amber-400">
+                  {" "}
+                  Chu kỳ tự động {scanState.scanIntervalSeconds} giây ngắn hơn thời gian một lần quét -
+                  các lượt trùng nhau sẽ bị bỏ qua.
+                </span>
+              )}
           </div>
         </div>
 
