@@ -1518,6 +1518,11 @@ app.get("/api/camera-streams/snapshot", async (req, res) => {
     // before any reference arrives is emitted as a flat grey picture instead of
     // being discarded, so a single-frame grab returned a blank image.
     "-skip_frame", "nokey",
+    // Bound stream probing: with -skip_frame nokey, ffmpeg's default probe kept
+    // reading an H.264 feed for ~13 s before emitting a frame (measured on the
+    // NVR channel 2401); a small probe brings that to ~2 s. HEVC was unaffected.
+    "-probesize", "65536",
+    "-analyzeduration", "500000",
     "-i", streamUrl,
     "-vframes", "1",
     "-q:v", "2",
@@ -1625,6 +1630,11 @@ app.post("/api/camera-streams/scan-rtsp", async (req, res) => {
     // before any reference arrives is emitted as a flat grey picture instead of
     // being discarded, so a single-frame grab returned a blank image.
     "-skip_frame", "nokey",
+    // Bound stream probing: with -skip_frame nokey, ffmpeg's default probe kept
+    // reading an H.264 feed for ~13 s before emitting a frame (measured on the
+    // NVR channel 2401); a small probe brings that to ~2 s. HEVC was unaffected.
+    "-probesize", "65536",
+    "-analyzeduration", "500000",
     "-i", streamUrl,
     "-vframes", "1",
     "-q:v", "2",
