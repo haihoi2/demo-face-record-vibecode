@@ -18,7 +18,9 @@ import {
   GateStreamSourceRecord,
   AiRecognitionConfigRecord,
   AI_ENGINE_MODES,
+  DEFAULT_STRANGER_WEBHOOK_CONFIG,
 } from "./src/server/db";
+import { STRANGER_DEEP_LINK_HASH } from "./src/types";
 import { runLocalFaceRecognition } from "./src/utils/localBiometrics";
 import { clusterStrangerFaces } from "./src/server/strangers";
 import { faceWorkerPool } from "./src/server/faceWorkerPool";
@@ -369,6 +371,12 @@ const DEFAULT_WEBHOOK_CONFIG = {
   gateInTitle: "[[CỔNG VÀO]]",
   gateOutTitle: "[[CỔNG RA]]",
   includeEmployeeCode: true,
+  // ---- Cảnh báo người lạ (stranger alert) ----
+  strangerAlertEnabled: DEFAULT_STRANGER_WEBHOOK_CONFIG.strangerAlertEnabled,
+  strangerTitle: DEFAULT_STRANGER_WEBHOOK_CONFIG.strangerTitle,
+  strangerLinkLabel: DEFAULT_STRANGER_WEBHOOK_CONFIG.strangerLinkLabel,
+  appBaseUrl: DEFAULT_STRANGER_WEBHOOK_CONFIG.appBaseUrl,
+  strangerCooldownSeconds: DEFAULT_STRANGER_WEBHOOK_CONFIG.strangerCooldownSeconds,
 };
 
 // Persistent instances loaded from database (PostgreSQL / SQLite)
@@ -760,6 +768,230 @@ async function sendEtonWebhook({
   return logEntry;
 }
 
+// =========================================================================
+// STRANGER ("NGƯỜI LẠ") ALERT WEBHOOK
+//
+// When an unrecognised face is captured we post a chat message carrying a
+// clickable deep link into the stranger-cluster panel. Nothing here ever
+// unlocks a door or fabricates a recognition, and the annotated snapshot is
+// NOT attached - chat webhooks reject large bodies, so we link instead.
+// =========================================================================
+
+/** Placeholder shipped in .env.example; treated as "not configured". */
+const APP_URL_PLACEHOLDER = "MY_APP_URL";
+
+/**
+ * Normalise a candidate base URL: trim, drop surrounding quotes, strip every
+ * trailing slash, and reject anything that is not an absolute http(s) URL with
+ * a host. Returns "" when the candidate is unusable, so callers can fall
+ * through to the next source instead of emitting a broken/relative link.
+ */
+function normalizeAppBaseUrl(raw?: string | null): string {
+  if (!raw || typeof raw !== "string") return "";
+  let value = raw.trim().replace(/^['"]+|['"]+$/g, "").trim();
+  if (!value || value === APP_URL_PLACEHOLDER) return "";
+  value = value.replace(/\/+$/, "");
+  if (!/^https?:\/\//i.test(value)) return "";
+  try {
+    const parsed = new URL(value);
+    if (!parsed.hostname) return "";
+  } catch {
+    return "";
+  }
+  return value;
+}
+
+function firstHeaderValue(req: Request, name: string): string {
+  const raw = req.headers[name];
+  const value = Array.isArray(raw) ? raw[0] : raw;
+  if (typeof value !== "string") return "";
+  return value.split(",")[0].trim();
+}
+
+/**
+ * Public base URL of this app, used to build the stranger deep link.
+ * Resolution order:
+ *   1. webhookConfig.appBaseUrl (operator setting)
+ *   2. process.env.APP_URL (ignoring the "MY_APP_URL" placeholder)
+ *   3. the request itself - X-Forwarded-Proto / X-Forwarded-Host first, since
+ *      the app sits behind an nginx / Cloudflare edge, then plain Host
+ *   4. "" - the caller must then send the message WITHOUT a link
+ */
+function resolveAppBaseUrl(req?: Request): string {
+  const fromConfig = normalizeAppBaseUrl(webhookConfig?.appBaseUrl);
+  if (fromConfig) return fromConfig;
+
+  const fromEnv = normalizeAppBaseUrl(process.env.APP_URL);
+  if (fromEnv) return fromEnv;
+
+  if (req) {
+    const forwardedProto = firstHeaderValue(req, "x-forwarded-proto");
+    const forwardedHost = firstHeaderValue(req, "x-forwarded-host");
+    const host = forwardedHost || firstHeaderValue(req, "host");
+    if (host) {
+      const scheme = forwardedProto || (req.protocol === "https" ? "https" : "http");
+      const fromRequest = normalizeAppBaseUrl(`${scheme}://${host}`);
+      if (fromRequest) return fromRequest;
+    }
+  }
+
+  return "";
+}
+
+/** `<base>/#strangers` or `<base>/#strangers/<logId>`; "" when there is no base. */
+function buildStrangerDeepLink(baseUrl: string, logId?: string): string {
+  const base = normalizeAppBaseUrl(baseUrl);
+  if (!base) return "";
+  const hash = `${base}/#${STRANGER_DEEP_LINK_HASH}`;
+  return logId ? `${hash}/${encodeURIComponent(logId)}` : hash;
+}
+
+/** Timestamp (ms) of the last stranger alert actually dispatched. */
+let lastStrangerWebhookAt = 0;
+
+async function sendStrangerWebhook({
+  log,
+  doorName,
+  faceCount,
+  baseUrl,
+  timestamp,
+  bypassCooldown,
+}: {
+  log: { id: string; type: "ENTRY" | "EXIT"; reason?: string };
+  doorName?: string;
+  faceCount?: number;
+  baseUrl?: string;
+  timestamp?: string;
+  /** Used by POST /api/webhook/test-stranger so an operator test is never swallowed. */
+  bypassCooldown?: boolean;
+}): Promise<WebhookLogRecord | null> {
+  // Always load latest config and auto-heal corrupted or truncated URL
+  webhookConfig = db.getWebhookConfig(DEFAULT_WEBHOOK_CONFIG);
+  if (!webhookConfig.url || webhookConfig.url.includes("...") || webhookConfig.url.endsWith("/hooks/") || webhookConfig.url.endsWith("/hooks")) {
+    webhookConfig.url = DEFAULT_WEBHOOK_CONFIG.url;
+    db.saveWebhookConfig(webhookConfig);
+  }
+
+  if (!webhookConfig.enabled) return null;
+  // Opt-out is explicit `false`; an old config without the field stays enabled.
+  if (webhookConfig.strangerAlertEnabled === false) return null;
+
+  const cooldownSeconds =
+    typeof webhookConfig.strangerCooldownSeconds === "number" && webhookConfig.strangerCooldownSeconds >= 0
+      ? webhookConfig.strangerCooldownSeconds
+      : DEFAULT_WEBHOOK_CONFIG.strangerCooldownSeconds;
+
+  if (!bypassCooldown && cooldownSeconds > 0) {
+    const elapsedMs = Date.now() - lastStrangerWebhookAt;
+    if (lastStrangerWebhookAt > 0 && elapsedMs < cooldownSeconds * 1000) {
+      console.log(
+        `[Webhook] Bỏ qua cảnh báo người lạ (đang trong thời gian chờ ${cooldownSeconds}s, còn ${Math.ceil(
+          (cooldownSeconds * 1000 - elapsedMs) / 1000
+        )}s).`
+      );
+      return null;
+    }
+  }
+  if (!bypassCooldown) {
+    lastStrangerWebhookAt = Date.now();
+  }
+
+  const now = new Date();
+  const formattedTime =
+    timestamp ||
+    now.toLocaleString("vi-VN", {
+      timeZone: "Asia/Ho_Chi_Minh",
+      hour12: false,
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit",
+    });
+
+  const door = doorName || smartLockState.doorName || "cổng";
+  const link = buildStrangerDeepLink(baseUrl || resolveAppBaseUrl(), log.id);
+  const linkLabel =
+    webhookConfig.strangerLinkLabel || DEFAULT_WEBHOOK_CONFIG.strangerLinkLabel;
+  const strangerTitle =
+    webhookConfig.strangerTitle || DEFAULT_WEBHOOK_CONFIG.strangerTitle;
+
+  // Mattermost / Eton compatible body. The markdown link in `text` and the
+  // attachment `title_link` point at the same URL so either renderer gives the
+  // operator a click target. Both are omitted when no base URL is known.
+  const textLines = [`🚨 Phát hiện người lạ tại ${door} - ${formattedTime}`];
+  if (link) textLines.push(`[${linkLabel}](${link})`);
+
+  const detailLines: string[] = [];
+  if (typeof faceCount === "number" && faceCount > 0) {
+    detailLines.push(`Số khuôn mặt không xác định: ${faceCount}`);
+  }
+  detailLines.push(`Mã nhật ký: ${log.id}`);
+  if (log.reason) detailLines.push(log.reason);
+  detailLines.push("Cửa giữ trạng thái KHÓA. Không có quyền ra vào nào được cấp.");
+
+  const attachment: { title: string; title_link?: string; text?: string } = {
+    title: strangerTitle,
+  };
+  if (link) attachment.title_link = link;
+  attachment.text = detailLines.join("\n");
+
+  const payload = {
+    text: textLines.join("\n"),
+    attachments: [attachment],
+  };
+
+  const logEntry: WebhookLogRecord = {
+    id: "WH-" + Date.now() + "-" + Math.floor(Math.random() * 1000),
+    timestamp: new Date().toISOString(),
+    url: webhookConfig.url,
+    method: "POST",
+    payload,
+    success: false,
+    scanType: log.type === "EXIT" ? "EXIT" : "ENTRY",
+    userName: "Người lạ",
+  };
+
+  try {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 7000);
+
+    const response = await fetch(webhookConfig.url, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) EtonWebhookBot/1.0",
+      },
+      body: JSON.stringify(payload),
+      signal: controller.signal,
+    });
+    clearTimeout(timeoutId);
+
+    logEntry.statusCode = response.status;
+    logEntry.statusText = response.statusText;
+    const resText = await response.text();
+    logEntry.responseBody = resText.substring(0, 500);
+    logEntry.success = response.ok;
+
+    console.log(
+      `[Webhook] Dispatched stranger alert (${logEntry.scanType}): status=${response.status} link="${link || "(không có)"}"`
+    );
+  } catch (err: any) {
+    logEntry.error = err?.message || String(err);
+    console.error("[Webhook] Failed to dispatch stranger alert:", err?.message);
+  }
+
+  webhookLogs.unshift(logEntry);
+  if (webhookLogs.length > 60) {
+    webhookLogs = webhookLogs.slice(0, 60);
+  }
+  db.saveWebhookLog(logEntry);
+
+  broadcastSSE("webhook_log", logEntry);
+  return logEntry;
+}
+
 let autoRelockTimer: NodeJS.Timeout | null = null;
 let countdownInterval: NodeJS.Timeout | null = null;
 
@@ -1098,6 +1330,13 @@ const WEBHOOK_TEST_ROUTES = [
   "/webhook/test/",
 ];
 
+const WEBHOOK_TEST_STRANGER_ROUTES = [
+  "/api/webhook/test-stranger",
+  "/api/webhook/test-stranger/",
+  "/webhook/test-stranger",
+  "/webhook/test-stranger/",
+];
+
 const WEBHOOK_CLIENT_LOG_ROUTES = [
   "/api/webhook/client-log",
   "/api/webhook/client-log/",
@@ -1128,6 +1367,25 @@ app.post(WEBHOOK_CONFIG_ROUTES, (req, res) => {
   if (gateInTitle && typeof gateInTitle === "string") webhookConfig.gateInTitle = gateInTitle.trim();
   if (gateOutTitle && typeof gateOutTitle === "string") webhookConfig.gateOutTitle = gateOutTitle.trim();
   if (typeof includeEmployeeCode === "boolean") webhookConfig.includeEmployeeCode = includeEmployeeCode;
+
+  // ---- Cảnh báo người lạ. Partial updates must never drop the other fields. ----
+  const {
+    strangerAlertEnabled,
+    strangerTitle,
+    strangerLinkLabel,
+    appBaseUrl,
+    strangerCooldownSeconds,
+  } = body;
+  if (typeof strangerAlertEnabled === "boolean") webhookConfig.strangerAlertEnabled = strangerAlertEnabled;
+  if (strangerTitle && typeof strangerTitle === "string") webhookConfig.strangerTitle = strangerTitle.trim();
+  if (strangerLinkLabel && typeof strangerLinkLabel === "string") webhookConfig.strangerLinkLabel = strangerLinkLabel.trim();
+  if (typeof appBaseUrl === "string") {
+    // "" clears the override and falls back to APP_URL / the request origin.
+    webhookConfig.appBaseUrl = appBaseUrl.trim().replace(/\/+$/, "");
+  }
+  if (typeof strangerCooldownSeconds === "number" && Number.isFinite(strangerCooldownSeconds) && strangerCooldownSeconds >= 0) {
+    webhookConfig.strangerCooldownSeconds = Math.floor(strangerCooldownSeconds);
+  }
 
   db.saveWebhookConfig(webhookConfig);
   res.json({ success: true, config: webhookConfig });
@@ -1292,6 +1550,92 @@ app.post(WEBHOOK_TEST_ROUTES, async (req, res) => {
     success: result ? result.success : true,
     log: result,
     notification: mobileNotif,
+    config: webhookConfig,
+  });
+});
+
+/**
+ * POST /api/webhook/test-stranger
+ *
+ * Sends a sample "người lạ" alert with the CURRENT config and a synthetic log
+ * id, so the UI can offer "Gửi thử cảnh báo người lạ". The cooldown is bypassed
+ * by default (an operator test must never be silently swallowed) and a test
+ * send does not start the cooldown for real alerts; pass
+ * `{ respectCooldown: true }` to exercise the real throttling path.
+ *
+ * Body (all optional): { scanType: "ENTRY" | "EXIT", doorName, faceCount,
+ *                        logId, respectCooldown }
+ * 200 -> { success, log: WebhookLogRecord | null, baseUrl, link, config }
+ *        or { success: false, error } when the alert was not sent.
+ */
+app.post(WEBHOOK_TEST_STRANGER_ROUTES, async (req, res) => {
+  let body = req.body || {};
+  if (typeof body === "string") {
+    try {
+      body = JSON.parse(body);
+    } catch {}
+  }
+
+  const scanType: "ENTRY" | "EXIT" = body.scanType === "EXIT" ? "EXIT" : "ENTRY";
+  const syntheticLogId =
+    typeof body.logId === "string" && body.logId.trim()
+      ? body.logId.trim()
+      : "LOG-TEST-" + Date.now();
+  const doorName =
+    typeof body.doorName === "string" && body.doorName.trim()
+      ? body.doorName.trim()
+      : smartLockState.doorName;
+  const faceCount =
+    typeof body.faceCount === "number" && body.faceCount > 0 ? Math.floor(body.faceCount) : 1;
+
+  const baseUrl = resolveAppBaseUrl(req);
+  const link = buildStrangerDeepLink(baseUrl, syntheticLogId);
+
+  let result: WebhookLogRecord | null = null;
+  try {
+    result = await sendStrangerWebhook({
+      log: {
+        id: syntheticLogId,
+        type: scanType,
+        reason: "Gửi thử cảnh báo người lạ từ bảng điều khiển (không phải sự kiện thật)",
+      },
+      doorName,
+      faceCount,
+      baseUrl,
+      bypassCooldown: body.respectCooldown !== true,
+    });
+  } catch (err: any) {
+    res.json({
+      success: false,
+      error: err?.message || String(err),
+      baseUrl,
+      link,
+      config: webhookConfig,
+    });
+    return;
+  }
+
+  if (!result) {
+    res.json({
+      success: false,
+      error: !webhookConfig.enabled
+        ? "Webhook đang tắt. Bật webhook trước khi gửi thử."
+        : webhookConfig.strangerAlertEnabled === false
+          ? "Cảnh báo người lạ đang tắt (strangerAlertEnabled = false)."
+          : "Cảnh báo người lạ bị bỏ qua do đang trong thời gian chờ (cooldown).",
+      log: null,
+      baseUrl,
+      link,
+      config: webhookConfig,
+    });
+    return;
+  }
+
+  res.json({
+    success: result.success,
+    log: result,
+    baseUrl,
+    link,
     config: webhookConfig,
   });
 });
@@ -3905,6 +4249,16 @@ app.post(RECOGNIZE_FACE_ROUTES, async (req, res) => {
         timestamp: accessLog.timestamp,
       });
       broadcastSSE("notification", mobileNotif);
+
+      // Cảnh báo người lạ qua webhook, kèm liên kết mở thẳng cụm ảnh người lạ.
+      // Fire-and-forget: một webhook chậm/chết không được làm trễ phản hồi HTTP,
+      // và lỗi gửi tin không bao giờ ảnh hưởng tới nhật ký ra vào ở trên.
+      sendStrangerWebhook({
+        log: { id: accessLog.id, type: accessLog.type, reason: accessLog.reason },
+        doorName: smartLockState.doorName,
+        faceCount: detectedFaces.length,
+        baseUrl: resolveAppBaseUrl(req),
+      }).catch(() => {});
 
       res.json({
         recognized: false,

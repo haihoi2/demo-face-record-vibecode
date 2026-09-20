@@ -76,6 +76,90 @@ export interface WebhookConfigRecord {
   gateInTitle: string;
   gateOutTitle: string;
   includeEmployeeCode: boolean;
+
+  // ---- Stranger ("người lạ") alert. All optional: configs persisted before
+  // these existed must keep loading, falling back to DEFAULT_STRANGER_WEBHOOK_CONFIG.
+  strangerAlertEnabled?: boolean;
+  strangerTitle?: string;
+  strangerLinkLabel?: string;
+  /** Public base URL used to build the click-through deep link. No trailing slash. */
+  appBaseUrl?: string;
+  strangerCooldownSeconds?: number;
+}
+
+/** Defaults for the optional stranger-alert half of the webhook config. */
+export const DEFAULT_STRANGER_WEBHOOK_CONFIG = {
+  strangerAlertEnabled: true,
+  strangerTitle: "[[CẢNH BÁO NGƯỜI LẠ]]",
+  strangerLinkLabel: "Xem cụm ảnh người lạ",
+  appBaseUrl: "",
+  strangerCooldownSeconds: 60,
+};
+
+/** The stranger-alert keys, persisted together as one JSON blob column. */
+const STRANGER_WEBHOOK_KEYS = [
+  "strangerAlertEnabled",
+  "strangerTitle",
+  "strangerLinkLabel",
+  "appBaseUrl",
+  "strangerCooldownSeconds",
+] as const;
+
+/**
+ * Fill in any missing stranger-alert field from the defaults, so an OLD
+ * persisted config (written before these fields existed, or a row whose blob
+ * column is still NULL) still loads with sane values. Never touches
+ * url / titles / enabled - those keep whatever was persisted.
+ */
+export function withStrangerWebhookDefaults(
+  config: WebhookConfigRecord,
+  defaultConfig?: Partial<WebhookConfigRecord>
+): WebhookConfigRecord {
+  const d = { ...DEFAULT_STRANGER_WEBHOOK_CONFIG, ...(defaultConfig || {}) };
+  const cooldown = config.strangerCooldownSeconds;
+  const fallbackCooldown =
+    typeof d.strangerCooldownSeconds === "number" && Number.isFinite(d.strangerCooldownSeconds)
+      ? d.strangerCooldownSeconds
+      : DEFAULT_STRANGER_WEBHOOK_CONFIG.strangerCooldownSeconds;
+  return {
+    ...config,
+    strangerAlertEnabled:
+      typeof config.strangerAlertEnabled === "boolean"
+        ? config.strangerAlertEnabled
+        : typeof d.strangerAlertEnabled === "boolean"
+          ? d.strangerAlertEnabled
+          : DEFAULT_STRANGER_WEBHOOK_CONFIG.strangerAlertEnabled,
+    strangerTitle: config.strangerTitle || d.strangerTitle || DEFAULT_STRANGER_WEBHOOK_CONFIG.strangerTitle,
+    strangerLinkLabel:
+      config.strangerLinkLabel || d.strangerLinkLabel || DEFAULT_STRANGER_WEBHOOK_CONFIG.strangerLinkLabel,
+    appBaseUrl: typeof config.appBaseUrl === "string" ? config.appBaseUrl : (d.appBaseUrl || ""),
+    strangerCooldownSeconds:
+      typeof cooldown === "number" && Number.isFinite(cooldown) && cooldown >= 0 ? cooldown : fallbackCooldown,
+  };
+}
+
+/** Serialise the stranger-alert fields for the `strangerConfig` blob column. */
+function serializeStrangerWebhookConfig(config: WebhookConfigRecord): string {
+  const blob: Record<string, unknown> = {};
+  for (const key of STRANGER_WEBHOOK_KEYS) {
+    if (config[key] !== undefined) blob[key] = config[key];
+  }
+  return JSON.stringify(blob);
+}
+
+/** Read the `strangerConfig` blob column back; tolerates NULL / corrupt JSON. */
+function parseStrangerWebhookConfig(raw: unknown): Partial<WebhookConfigRecord> {
+  if (!raw) return {};
+  if (typeof raw === "object") return raw as Partial<WebhookConfigRecord>;
+  if (typeof raw === "string") {
+    try {
+      const parsed = JSON.parse(raw);
+      return parsed && typeof parsed === "object" ? (parsed as Partial<WebhookConfigRecord>) : {};
+    } catch {
+      return {};
+    }
+  }
+  return {};
 }
 
 export interface WebhookLogRecord {
@@ -568,28 +652,37 @@ class SQLiteStorage {
           gateInTitle: "[[CỔNG VÀO]]",
           gateOutTitle: "[[CỔNG RA]]",
           includeEmployeeCode: true,
+          ...DEFAULT_STRANGER_WEBHOOK_CONFIG,
         });
         await this.pgPool.query(`
-          INSERT INTO webhook_config (id, enabled, url, "gateInTitle", "gateOutTitle", "includeEmployeeCode")
-          VALUES ('default', $1, $2, $3, $4, $5)
+          INSERT INTO webhook_config (id, enabled, url, "gateInTitle", "gateOutTitle", "includeEmployeeCode", "strangerConfig")
+          VALUES ('default', $1, $2, $3, $4, $5, $6)
           ON CONFLICT (id) DO NOTHING
-        `, [currentHook.enabled, currentHook.url, currentHook.gateInTitle, currentHook.gateOutTitle, currentHook.includeEmployeeCode]);
+        `, [currentHook.enabled, currentHook.url, currentHook.gateInTitle, currentHook.gateOutTitle, currentHook.includeEmployeeCode, serializeStrangerWebhookConfig(currentHook)]);
       } else {
         const pgHook = await this.pgPool.query('SELECT * FROM webhook_config WHERE id = $1', ['default']);
         if (pgHook.rows[0] && this.isNativeSqlite && this.db) {
           const row = pgHook.rows[0];
           try {
             const stmt = this.db.prepare(`
-              INSERT INTO webhook_config (id, enabled, url, gateInTitle, gateOutTitle, includeEmployeeCode)
-              VALUES ('default', ?, ?, ?, ?, ?)
+              INSERT INTO webhook_config (id, enabled, url, gateInTitle, gateOutTitle, includeEmployeeCode, strangerConfig)
+              VALUES ('default', ?, ?, ?, ?, ?, ?)
               ON CONFLICT(id) DO UPDATE SET
                 enabled = excluded.enabled,
                 url = excluded.url,
                 gateInTitle = excluded.gateInTitle,
                 gateOutTitle = excluded.gateOutTitle,
-                includeEmployeeCode = excluded.includeEmployeeCode
+                includeEmployeeCode = excluded.includeEmployeeCode,
+                strangerConfig = excluded.strangerConfig
             `);
-            stmt.run(row.enabled ? 1 : 0, row.url, row.gateInTitle, row.gateOutTitle, row.includeEmployeeCode ? 1 : 0);
+            stmt.run(
+              row.enabled ? 1 : 0,
+              row.url,
+              row.gateInTitle,
+              row.gateOutTitle,
+              row.includeEmployeeCode ? 1 : 0,
+              typeof row.strangerConfig === "string" ? row.strangerConfig : JSON.stringify(parseStrangerWebhookConfig(row.strangerConfig))
+            );
           } catch {}
         }
       }
@@ -691,7 +784,8 @@ class SQLiteStorage {
           url TEXT,
           "gateInTitle" VARCHAR(255),
           "gateOutTitle" VARCHAR(255),
-          "includeEmployeeCode" BOOLEAN
+          "includeEmployeeCode" BOOLEAN,
+          "strangerConfig" TEXT
         );
 
         CREATE TABLE IF NOT EXISTS webhook_logs (
@@ -731,6 +825,9 @@ class SQLiteStorage {
           config_json JSONB NOT NULL,
           "updatedAt" VARCHAR(64)
         );
+
+        -- Migration: stranger-alert settings for databases created before they existed
+        ALTER TABLE webhook_config ADD COLUMN IF NOT EXISTS "strangerConfig" TEXT;
       `);
       await this.loadResolvedStrangerClusters();
       await this.loadAiRecognitionConfig();
@@ -809,7 +906,8 @@ class SQLiteStorage {
         url TEXT,
         gateInTitle TEXT,
         gateOutTitle TEXT,
-        includeEmployeeCode INTEGER
+        includeEmployeeCode INTEGER,
+        strangerConfig TEXT
       );
 
       CREATE TABLE IF NOT EXISTS webhook_logs (
@@ -882,6 +980,15 @@ class SQLiteStorage {
         updatedAt TEXT
       );
     `);
+
+    // Migration: databases created before the stranger alert existed have no
+    // `strangerConfig` column. SQLite has no ADD COLUMN IF NOT EXISTS, so the
+    // "duplicate column name" error simply means the migration already ran.
+    try {
+      this.db.exec(`ALTER TABLE webhook_config ADD COLUMN strangerConfig TEXT`);
+    } catch {
+      // column already present
+    }
   }
 
   // --- Fallback JSON storage in case node:sqlite is not present ---
@@ -1266,34 +1373,40 @@ class SQLiteStorage {
         const row = this.db.prepare("SELECT * FROM webhook_config WHERE id = 'default'").get();
         if (row) {
           let url = row.url;
-          // Auto-heal truncated URL with ellipsis or incomplete hook path
-          if (!url || typeof url !== "string" || url.includes("...") || url.endsWith("/hooks/") || url.endsWith("/hooks")) {
-            url = defaultConfig.url;
-            this.saveWebhookConfig({
+          // Optional stranger-alert fields live in one JSON blob column; a row
+          // written before they existed has NULL there and falls back to defaults.
+          const stranger = parseStrangerWebhookConfig(row.strangerConfig);
+          const merged = withStrangerWebhookDefaults(
+            {
               enabled: Boolean(row.enabled),
-              url: defaultConfig.url,
+              url: url,
               gateInTitle: row.gateInTitle || defaultConfig.gateInTitle,
               gateOutTitle: row.gateOutTitle || defaultConfig.gateOutTitle,
               includeEmployeeCode: Boolean(row.includeEmployeeCode),
-            });
+              ...stranger,
+            },
+            defaultConfig
+          );
+          // Auto-heal truncated URL with ellipsis or incomplete hook path
+          if (!url || typeof url !== "string" || url.includes("...") || url.endsWith("/hooks/") || url.endsWith("/hooks")) {
+            url = defaultConfig.url;
+            merged.url = defaultConfig.url;
+            this.saveWebhookConfig(merged);
           }
-          return {
-            enabled: Boolean(row.enabled),
-            url: url,
-            gateInTitle: row.gateInTitle || defaultConfig.gateInTitle,
-            gateOutTitle: row.gateOutTitle || defaultConfig.gateOutTitle,
-            includeEmployeeCode: Boolean(row.includeEmployeeCode),
-          };
+          return merged;
         }
-        this.saveWebhookConfig(defaultConfig);
-        return defaultConfig;
+        this.saveWebhookConfig(withStrangerWebhookDefaults(defaultConfig, defaultConfig));
+        return withStrangerWebhookDefaults(defaultConfig, defaultConfig);
       } catch (err) {
         console.error("[SQLite] Lỗi getWebhookConfig:", err);
       }
     }
-    const current = this.fallbackData.webhook_config || defaultConfig;
+    const stored = this.fallbackData.webhook_config;
+    const current = withStrangerWebhookDefaults(stored || defaultConfig, defaultConfig);
     if (!current.url || current.url.includes("...") || current.url.endsWith("/hooks/") || current.url.endsWith("/hooks")) {
       current.url = defaultConfig.url;
+    }
+    if (!stored || JSON.stringify(stored) !== JSON.stringify(current)) {
       this.fallbackData.webhook_config = current;
       this.saveFallback();
     }
@@ -1303,36 +1416,39 @@ class SQLiteStorage {
   saveWebhookConfig(config: WebhookConfigRecord) {
     if (this.pgPool && this.isPostgres) {
       this.pgPool.query(`
-        INSERT INTO webhook_config (id, enabled, url, "gateInTitle", "gateOutTitle", "includeEmployeeCode")
-        VALUES ('default', $1, $2, $3, $4, $5)
+        INSERT INTO webhook_config (id, enabled, url, "gateInTitle", "gateOutTitle", "includeEmployeeCode", "strangerConfig")
+        VALUES ('default', $1, $2, $3, $4, $5, $6)
         ON CONFLICT (id) DO UPDATE SET
           enabled = EXCLUDED.enabled,
           url = EXCLUDED.url,
           "gateInTitle" = EXCLUDED."gateInTitle",
           "gateOutTitle" = EXCLUDED."gateOutTitle",
-          "includeEmployeeCode" = EXCLUDED."includeEmployeeCode"
-      `, [config.enabled, config.url, config.gateInTitle, config.gateOutTitle, config.includeEmployeeCode])
+          "includeEmployeeCode" = EXCLUDED."includeEmployeeCode",
+          "strangerConfig" = EXCLUDED."strangerConfig"
+      `, [config.enabled, config.url, config.gateInTitle, config.gateOutTitle, config.includeEmployeeCode, serializeStrangerWebhookConfig(config)])
       .catch((e) => console.error("[PostgreSQL] Lỗi saveWebhookConfig:", e.message));
     }
 
     if (this.isNativeSqlite && this.db) {
       try {
         const stmt = this.db.prepare(`
-          INSERT INTO webhook_config (id, enabled, url, gateInTitle, gateOutTitle, includeEmployeeCode)
-          VALUES ('default', ?, ?, ?, ?, ?)
+          INSERT INTO webhook_config (id, enabled, url, gateInTitle, gateOutTitle, includeEmployeeCode, strangerConfig)
+          VALUES ('default', ?, ?, ?, ?, ?, ?)
           ON CONFLICT(id) DO UPDATE SET
             enabled = excluded.enabled,
             url = excluded.url,
             gateInTitle = excluded.gateInTitle,
             gateOutTitle = excluded.gateOutTitle,
-            includeEmployeeCode = excluded.includeEmployeeCode
+            includeEmployeeCode = excluded.includeEmployeeCode,
+            strangerConfig = excluded.strangerConfig
         `);
         stmt.run(
           config.enabled ? 1 : 0,
           config.url,
           config.gateInTitle,
           config.gateOutTitle,
-          config.includeEmployeeCode ? 1 : 0
+          config.includeEmployeeCode ? 1 : 0,
+          serializeStrangerWebhookConfig(config)
         );
         return;
       } catch (err) {
