@@ -153,11 +153,41 @@ export const DEFAULT_DOOR_CONTROLLER_CONFIG: DoorControllerConfigRecord = {
   triggerOnManualUnlock: true,
 };
 
+export type CameraSourceTypeRecord = "CLIENT_UVC" | "RTSP" | "HTTP_MJPEG" | "BACKEND_UVC";
+
+/**
+ * One video source attached to a gate (mirror of `GateStreamSource` in
+ * src/types.ts). A gate may carry several; the enabled stream with the lowest
+ * `priority` is the PRIMARY one and is mirrored onto the gate's legacy fields.
+ */
+export interface GateStreamSourceRecord {
+  id: string;
+  label: string;
+  sourceType: CameraSourceTypeRecord;
+  rtspUrl?: string;
+  rtspTransport?: "TCP" | "UDP";
+  httpUrl?: string;
+  uvcDeviceId?: string;
+  uvcDeviceLabel?: string;
+  backendDevicePath?: string;
+  resolution?: "1920x1080" | "1280x720" | "640x480" | "AUTO";
+  fps?: number;
+  enabled: boolean;
+  priority: number;
+}
+
 export interface GateStreamConfigRecord {
   gateType: "ENTRY" | "EXIT";
   name: string;
   enabled: boolean;
-  sourceType: "CLIENT_UVC" | "RTSP" | "HTTP_MJPEG" | "BACKEND_UVC";
+  /**
+   * All video sources of the gate. Optional in persisted blobs written before
+   * multi-stream support: the server derives one stream from the legacy fields
+   * below and always keeps those fields mirrored from the primary stream.
+   */
+  streams?: GateStreamSourceRecord[];
+  // ---- Legacy single-stream fields (mirror of the primary stream) ----
+  sourceType: CameraSourceTypeRecord;
   rtspUrl?: string;
   rtspTransport?: "TCP" | "UDP";
   httpUrl?: string;
@@ -185,6 +215,23 @@ export const DEFAULT_CAMERA_STREAMS_CONFIG: CameraStreamsConfigRecord = {
     gateType: "ENTRY",
     name: "Camera Cổng Vào (Main Entry Gate)",
     enabled: true,
+    streams: [
+      {
+        id: "entry-101",
+        label: "Camera Cổng Vào (Main Entry Gate)",
+        sourceType: "RTSP",
+        rtspUrl: "rtsp://viewCam:1234abcd@192.168.60.2:554/Streaming/Channels/101",
+        rtspTransport: "TCP",
+        httpUrl: "http://192.168.60.2/stream",
+        uvcDeviceId: "default",
+        uvcDeviceLabel: "Camera UVC Mặc Định Trình Duyệt",
+        backendDevicePath: "/dev/video0",
+        resolution: "1920x1080",
+        fps: 25,
+        enabled: true,
+        priority: 1,
+      },
+    ],
     sourceType: "RTSP",
     rtspUrl: "rtsp://viewCam:1234abcd@192.168.60.2:554/Streaming/Channels/101",
     rtspTransport: "TCP",
@@ -201,6 +248,23 @@ export const DEFAULT_CAMERA_STREAMS_CONFIG: CameraStreamsConfigRecord = {
     gateType: "EXIT",
     name: "Camera Cổng Ra (Exit Gate B2)",
     enabled: true,
+    streams: [
+      {
+        id: "exit-102",
+        label: "Camera Cổng Ra (Exit Gate B2)",
+        sourceType: "RTSP",
+        rtspUrl: "rtsp://viewCam:1234abcd@192.168.60.2:554/Streaming/Channels/102",
+        rtspTransport: "TCP",
+        httpUrl: "http://192.168.60.2/substream",
+        uvcDeviceId: "default",
+        uvcDeviceLabel: "Camera UVC Mặc Định Trình Duyệt",
+        backendDevicePath: "/dev/video1",
+        resolution: "1280x720",
+        fps: 25,
+        enabled: true,
+        priority: 1,
+      },
+    ],
     sourceType: "RTSP",
     rtspUrl: "rtsp://viewCam:1234abcd@192.168.60.2:554/Streaming/Channels/102",
     rtspTransport: "TCP",

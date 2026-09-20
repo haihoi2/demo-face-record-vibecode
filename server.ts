@@ -14,6 +14,8 @@ import {
   DoorControllerConfigRecord,
   DoorApiLogRecord,
   CameraStreamsConfigRecord,
+  GateStreamConfigRecord,
+  GateStreamSourceRecord,
   AiRecognitionConfigRecord,
   AI_ENGINE_MODES,
 } from "./src/server/db";
@@ -378,7 +380,228 @@ let webhookConfig = db.getWebhookConfig(DEFAULT_WEBHOOK_CONFIG);
 let webhookLogs: WebhookLogRecord[] = db.getWebhookLogs();
 let doorControllerConfig = db.getDoorControllerConfig(DEFAULT_DOOR_CONTROLLER_CONFIG);
 let doorApiLogs: DoorApiLogRecord[] = db.getDoorApiLogs();
-let cameraStreamsConfig: CameraStreamsConfigRecord = db.getCameraStreamsConfig(DEFAULT_CAMERA_STREAMS_CONFIG);
+// =========================================================================
+// MULTI-STREAM GATE CONFIG NORMALISATION
+//
+// A gate may carry several video sources (`streams`). The enabled stream with
+// the lowest `priority` is the PRIMARY one; its fields are mirrored onto the
+// gate's legacy single-stream fields so clients written before multi-stream
+// support (and the persisted JSON blobs they produced) keep working unchanged.
+// Every load and every save goes through `normalizeCameraStreamsConfig`.
+// =========================================================================
+const GATE_LEGACY_STREAM_FIELDS = [
+  "sourceType",
+  "rtspUrl",
+  "rtspTransport",
+  "httpUrl",
+  "uvcDeviceId",
+  "uvcDeviceLabel",
+  "resolution",
+  "fps",
+  "backendDevicePath",
+] as const;
+type GateLegacyStreamField = (typeof GATE_LEGACY_STREAM_FIELDS)[number];
+type GateLegacyStreamFields = Pick<GateStreamConfigRecord, GateLegacyStreamField>;
+
+const CAMERA_SOURCE_TYPES: ReadonlyArray<GateStreamSourceRecord["sourceType"]> = [
+  "CLIENT_UVC",
+  "RTSP",
+  "HTTP_MJPEG",
+  "BACKEND_UVC",
+];
+const CAMERA_RESOLUTIONS: ReadonlyArray<NonNullable<GateStreamSourceRecord["resolution"]>> = [
+  "1920x1080",
+  "1280x720",
+  "640x480",
+  "AUTO",
+];
+const STREAM_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
+const MAX_STREAMS_PER_GATE = 16;
+
+function normalizeGateKey(value: unknown): "entry" | "exit" {
+  return String(value || "entry").toLowerCase() === "exit" ? "exit" : "entry";
+}
+
+function isRtspUrl(value: unknown): boolean {
+  return typeof value === "string" && value.trim().toLowerCase().startsWith("rtsp://");
+}
+
+/** Last path segment of an RTSP URL (`.../Streaming/Channels/501` -> `501`), if it is id-safe. */
+function rtspChannelSegment(url: unknown): string | null {
+  if (typeof url !== "string" || !url.trim()) return null;
+  const segments = url.trim().replace(/[?#].*$/, "").split("/").filter(Boolean);
+  const last = segments.length > 2 ? segments[segments.length - 1] : null;
+  return last && /^[A-Za-z0-9._-]{1,40}$/.test(last) ? last : null;
+}
+
+function deriveStreamId(gateKey: "entry" | "exit", rtspUrl: unknown, fallbackSuffix: string): string {
+  const channel = rtspChannelSegment(rtspUrl);
+  return `${gateKey}-${channel || fallbackSuffix}`;
+}
+
+function optionalTrimmedString(value: unknown): string | undefined {
+  if (value === undefined || value === null) return undefined;
+  const str = String(value).trim();
+  return str ? str : undefined;
+}
+
+/** Whitelists and coerces the per-stream media fields shared by streams and the legacy gate fields. */
+function sanitizeStreamMediaFields(raw: any): GateLegacyStreamFields {
+  const sourceType = CAMERA_SOURCE_TYPES.includes(raw?.sourceType) ? raw.sourceType : "RTSP";
+  const transport = String(raw?.rtspTransport || "").toUpperCase();
+  const fpsNum = Number(raw?.fps);
+  return {
+    sourceType,
+    rtspUrl: optionalTrimmedString(raw?.rtspUrl),
+    rtspTransport: transport === "UDP" ? "UDP" : transport === "TCP" ? "TCP" : undefined,
+    httpUrl: optionalTrimmedString(raw?.httpUrl),
+    uvcDeviceId: optionalTrimmedString(raw?.uvcDeviceId),
+    uvcDeviceLabel: optionalTrimmedString(raw?.uvcDeviceLabel),
+    resolution: CAMERA_RESOLUTIONS.includes(raw?.resolution) ? raw.resolution : undefined,
+    fps: Number.isFinite(fpsNum) && fpsNum > 0 ? Math.round(fpsNum) : undefined,
+    backendDevicePath: optionalTrimmedString(raw?.backendDevicePath),
+  };
+}
+
+/** Validates one stream entry: stable id, label, enabled flag, numeric priority, whitelisted media fields. */
+function sanitizeStreamSource(
+  raw: any,
+  index: number,
+  gateKey: "entry" | "exit",
+  fallbackLabel: string
+): GateStreamSourceRecord {
+  const media = sanitizeStreamMediaFields(raw);
+  const rawId = optionalTrimmedString(raw?.id);
+  const id = rawId && STREAM_ID_RE.test(rawId) ? rawId : deriveStreamId(gateKey, media.rtspUrl, `stream-${index + 1}`);
+  const priorityNum = Number(raw?.priority);
+  return {
+    id,
+    label: optionalTrimmedString(raw?.label) || fallbackLabel || id,
+    ...media,
+    enabled: raw?.enabled !== false && raw?.enabled !== "false" && raw?.enabled !== 0,
+    priority: Number.isFinite(priorityNum) ? priorityNum : (index + 1) * 10,
+  };
+}
+
+/** Builds the single stream an old (streams-less) gate config implies. */
+function streamFromLegacyGateFields(gate: GateStreamConfigRecord, gateKey: "entry" | "exit"): GateStreamSourceRecord {
+  const media = sanitizeStreamMediaFields(gate);
+  return {
+    id: deriveStreamId(gateKey, media.rtspUrl, "primary"),
+    label: String(gate.name || "").trim() || `${gateKey}-primary`,
+    ...media,
+    enabled: true,
+    priority: 1,
+  };
+}
+
+/** The lowest-priority enabled stream; when every stream is disabled, the first one. */
+function pickPrimaryStream(streams: GateStreamSourceRecord[]): GateStreamSourceRecord {
+  return streams.find((s) => s.enabled) || streams[0];
+}
+
+function legacyFieldsFromStream(stream: GateStreamSourceRecord): GateLegacyStreamFields {
+  return {
+    sourceType: stream.sourceType,
+    rtspUrl: stream.rtspUrl,
+    rtspTransport: stream.rtspTransport,
+    httpUrl: stream.httpUrl,
+    uvcDeviceId: stream.uvcDeviceId,
+    uvcDeviceLabel: stream.uvcDeviceLabel,
+    resolution: stream.resolution,
+    fps: stream.fps,
+    backendDevicePath: stream.backendDevicePath,
+  };
+}
+
+/**
+ * Pure normalisation of one gate:
+ *   1. missing/empty `streams` -> one stream derived from the legacy fields
+ *      (id `${gate}-${rtsp channel}` e.g. `exit-501`, else `${gate}-primary`);
+ *   2. every stream gets id / label / enabled / priority and whitelisted fields;
+ *   3. duplicates by id are dropped (first wins), list capped, sorted by priority;
+ *   4. the primary stream is mirrored back onto the legacy fields.
+ */
+function normalizeGateConfig(gate: GateStreamConfigRecord): GateStreamConfigRecord {
+  const gateType: "ENTRY" | "EXIT" = gate.gateType === "EXIT" ? "EXIT" : "ENTRY";
+  const gateKey = gateType.toLowerCase() as "entry" | "exit";
+  const fallbackLabel = String(gate.name || "").trim();
+
+  const rawStreams = Array.isArray(gate.streams) ? gate.streams.filter((s) => s && typeof s === "object") : [];
+  let streams = rawStreams.map((s, i) => sanitizeStreamSource(s, i, gateKey, fallbackLabel));
+  if (streams.length === 0) {
+    streams = [streamFromLegacyGateFields(gate, gateKey)];
+  }
+
+  const seen = new Set<string>();
+  streams = streams.filter((s) => (seen.has(s.id) ? false : (seen.add(s.id), true)));
+  streams = streams.slice(0, MAX_STREAMS_PER_GATE);
+  streams.sort((a, b) => a.priority - b.priority); // Array.prototype.sort is stable
+
+  const primary = pickPrimaryStream(streams);
+  return {
+    ...gate,
+    gateType,
+    streams,
+    ...legacyFieldsFromStream(primary),
+  };
+}
+
+/** Normalises both gates of a (possibly older / partial) persisted config. */
+function normalizeCameraStreamsConfig(config: CameraStreamsConfigRecord): CameraStreamsConfigRecord {
+  const source = config && typeof config === "object" ? config : DEFAULT_CAMERA_STREAMS_CONFIG;
+  return {
+    ...source,
+    entryGate: normalizeGateConfig({ ...(source.entryGate || DEFAULT_CAMERA_STREAMS_CONFIG.entryGate), gateType: "ENTRY" }),
+    exitGate: normalizeGateConfig({ ...(source.exitGate || DEFAULT_CAMERA_STREAMS_CONFIG.exitGate), gateType: "EXIT" }),
+  };
+}
+
+function loadCameraStreamsConfig(): CameraStreamsConfigRecord {
+  return normalizeCameraStreamsConfig(db.getCameraStreamsConfig(DEFAULT_CAMERA_STREAMS_CONFIG));
+}
+
+/**
+ * Applies a gate patch coming from POST /api/camera-streams/config:
+ *   - a non-empty `streams` array REPLACES the gate's list (normalised);
+ *   - legacy single-stream fields update the PRIMARY stream, preserving the
+ *     other streams. When the body carries both (an older dashboard echoing
+ *     the `streams` it received while editing the legacy form), only legacy
+ *     values that actually differ from the current primary are applied, so a
+ *     stale echo never overrides an edited `streams` list.
+ */
+function applyGateConfigPatch(current: GateStreamConfigRecord, patch: any): GateStreamConfigRecord {
+  const base = normalizeGateConfig(current);
+  if (!patch || typeof patch !== "object") return base;
+
+  const { streams: patchStreams, gateType: _ignoredGateType, ...rest } = patch;
+  const currentPrimary = pickPrimaryStream(base.streams!);
+  const legacyChanges: Partial<GateLegacyStreamFields> = {};
+  for (const field of GATE_LEGACY_STREAM_FIELDS) {
+    if (field in rest && rest[field] !== undefined && rest[field] !== currentPrimary[field]) {
+      (legacyChanges as any)[field] = rest[field];
+    }
+  }
+  const hasLegacyChanges = Object.keys(legacyChanges).length > 0;
+
+  const replaced = Array.isArray(patchStreams) && patchStreams.length > 0;
+  const working = normalizeGateConfig({
+    ...base,
+    ...rest,
+    gateType: base.gateType,
+    streams: replaced ? patchStreams : base.streams,
+  });
+
+  if (!hasLegacyChanges) return working;
+
+  const primary = pickPrimaryStream(working.streams!);
+  const streams = working.streams!.map((s) =>
+    s.id === primary.id ? { ...s, ...sanitizeStreamMediaFields({ ...s, ...legacyChanges }) } : s
+  );
+  return normalizeGateConfig({ ...working, streams });
+}
+
+let cameraStreamsConfig: CameraStreamsConfigRecord = loadCameraStreamsConfig();
 
 // --- AI recognition engine configuration (persisted, see db.getAiRecognitionConfig) ---
 type ServerAiConfig = AiRecognitionConfigRecord;
@@ -429,7 +652,7 @@ db.onSync(() => {
   webhookLogs = db.getWebhookLogs();
   doorControllerConfig = db.getDoorControllerConfig(DEFAULT_DOOR_CONTROLLER_CONFIG);
   doorApiLogs = db.getDoorApiLogs();
-  cameraStreamsConfig = db.getCameraStreamsConfig(DEFAULT_CAMERA_STREAMS_CONFIG);
+  cameraStreamsConfig = loadCameraStreamsConfig();
   console.log(`[Server] Bộ nhớ In-Memory đã tự động đồng bộ từ PostgreSQL: ${employees.length} NV, ${accessLogs.length} logs, ${mobileNotifications.length} thông báo.`);
 });
 
@@ -1256,7 +1479,7 @@ const CAMERA_THREADS_ROUTES = [
 ];
 
 app.get(CAMERA_CONFIG_ROUTES, (_req, res) => {
-  cameraStreamsConfig = db.getCameraStreamsConfig(DEFAULT_CAMERA_STREAMS_CONFIG);
+  cameraStreamsConfig = loadCameraStreamsConfig();
   res.json({
     success: true,
     config: cameraStreamsConfig,
@@ -1271,13 +1494,14 @@ app.post(CAMERA_CONFIG_ROUTES, (req, res) => {
       body = JSON.parse(body);
     } catch {}
   }
-  const current = db.getCameraStreamsConfig(DEFAULT_CAMERA_STREAMS_CONFIG);
-  const updated: CameraStreamsConfigRecord = {
+  const current = loadCameraStreamsConfig();
+  const { entryGate: entryPatch, exitGate: exitPatch, ...rootPatch } = body || {};
+  const updated: CameraStreamsConfigRecord = normalizeCameraStreamsConfig({
     ...current,
-    ...body,
-    entryGate: { ...current.entryGate, ...(body.entryGate || {}) },
-    exitGate: { ...current.exitGate, ...(body.exitGate || {}) },
-  };
+    ...rootPatch,
+    entryGate: applyGateConfigPatch(current.entryGate, entryPatch),
+    exitGate: applyGateConfigPatch(current.exitGate, exitPatch),
+  });
 
   if (typeof body.workerThreadsCount === "number" && body.workerThreadsCount !== current.workerThreadsCount) {
     faceWorkerPool.scaleWorkerPool(body.workerThreadsCount);
@@ -1293,6 +1517,269 @@ app.post(CAMERA_CONFIG_ROUTES, (req, res) => {
     telemetry: faceWorkerPool.getPoolTelemetry(),
   });
 });
+
+// ---- Per-stream convenience endpoints: /api/camera-streams/:gate/streams[/:streamId] ----
+type GateConfigKey = "entryGate" | "exitGate";
+
+function gateConfigKeyFromParam(param: unknown): GateConfigKey | null {
+  const key = String(param || "").toLowerCase();
+  if (key === "entry") return "entryGate";
+  if (key === "exit") return "exitGate";
+  return null;
+}
+
+/** Persists a gate whose stream list was edited, broadcasts, and returns the normalised gate. */
+function commitGateStreams(gateKey: GateConfigKey, streams: GateStreamSourceRecord[]): GateStreamConfigRecord {
+  const current = loadCameraStreamsConfig();
+  const updated = normalizeCameraStreamsConfig({
+    ...current,
+    [gateKey]: normalizeGateConfig({ ...current[gateKey], streams }),
+  });
+  cameraStreamsConfig = updated;
+  db.saveCameraStreamsConfig(updated);
+  broadcastSSE("camera_config_updated", updated);
+  return updated[gateKey];
+}
+
+function findDuplicateStream(
+  streams: GateStreamSourceRecord[],
+  candidate: { id: string; rtspUrl?: string },
+  ignoreId?: string
+): { field: "id" | "rtspUrl"; stream: GateStreamSourceRecord } | null {
+  for (const s of streams) {
+    if (ignoreId && s.id === ignoreId) continue;
+    if (s.id === candidate.id) return { field: "id", stream: s };
+    if (candidate.rtspUrl && s.rtspUrl && s.rtspUrl.toLowerCase() === candidate.rtspUrl.toLowerCase()) {
+      return { field: "rtspUrl", stream: s };
+    }
+  }
+  return null;
+}
+
+const STREAM_ROUTE = ["/api/camera-streams/:gate/streams", "/api/camera-streams/:gate/streams/"];
+const STREAM_ITEM_ROUTE = ["/api/camera-streams/:gate/streams/:streamId", "/api/camera-streams/:gate/streams/:streamId/"];
+
+app.get(STREAM_ROUTE, (req, res) => {
+  const gateKey = gateConfigKeyFromParam(req.params.gate);
+  if (!gateKey) return res.status(400).json({ success: false, error: "Cổng không hợp lệ: chỉ chấp nhận entry hoặc exit" });
+  const gate = loadCameraStreamsConfig()[gateKey];
+  res.json({ success: true, gate, streams: gate.streams, primaryStreamId: pickPrimaryStream(gate.streams!).id });
+});
+
+app.post(STREAM_ROUTE, (req, res) => {
+  const gateKey = gateConfigKeyFromParam(req.params.gate);
+  if (!gateKey) return res.status(400).json({ success: false, error: "Cổng không hợp lệ: chỉ chấp nhận entry hoặc exit" });
+  const body = req.body && typeof req.body === "object" ? req.body : {};
+  const gate = loadCameraStreamsConfig()[gateKey];
+  const existing = gate.streams!;
+  if (existing.length >= MAX_STREAMS_PER_GATE) {
+    return res.status(400).json({ success: false, error: `Mỗi cổng chỉ hỗ trợ tối đa ${MAX_STREAMS_PER_GATE} luồng video` });
+  }
+
+  const gateParam = gateKey === "exitGate" ? "exit" : "entry";
+  const hasPriority = Number.isFinite(Number(body.priority));
+  const nextPriority = existing.reduce((max, s) => Math.max(max, s.priority), 0) + 10;
+  const rawId = optionalTrimmedString(body.id);
+  if (rawId && !STREAM_ID_RE.test(rawId)) {
+    return res.status(400).json({ success: false, error: "Mã luồng (id) chỉ gồm chữ, số, dấu chấm, gạch ngang/gạch dưới (tối đa 64 ký tự)" });
+  }
+  const candidate = sanitizeStreamSource(
+    {
+      ...body,
+      id: rawId || deriveStreamId(gateParam, body.rtspUrl, Date.now().toString(36)),
+      priority: hasPriority ? Number(body.priority) : nextPriority,
+    },
+    existing.length,
+    gateParam,
+    gate.name
+  );
+  if (!candidate.label || candidate.label === candidate.id) {
+    candidate.label = optionalTrimmedString(body.label) || `${gate.name} #${existing.length + 1}`;
+  }
+
+  const duplicate = findDuplicateStream(existing, candidate);
+  if (duplicate) {
+    return res.status(409).json({
+      success: false,
+      error:
+        duplicate.field === "id"
+          ? `Luồng "${candidate.id}" đã tồn tại ở cổng này`
+          : `URL RTSP này đã được dùng bởi luồng "${duplicate.stream.label}" (${duplicate.stream.id})`,
+      conflictField: duplicate.field,
+      conflictStreamId: duplicate.stream.id,
+    });
+  }
+
+  const updatedGate = commitGateStreams(gateKey, [...existing, candidate]);
+  res.status(201).json({
+    success: true,
+    gate: updatedGate,
+    stream: updatedGate.streams!.find((s) => s.id === candidate.id) || candidate,
+    primaryStreamId: pickPrimaryStream(updatedGate.streams!).id,
+  });
+});
+
+app.put(STREAM_ITEM_ROUTE, (req, res) => {
+  const gateKey = gateConfigKeyFromParam(req.params.gate);
+  if (!gateKey) return res.status(400).json({ success: false, error: "Cổng không hợp lệ: chỉ chấp nhận entry hoặc exit" });
+  const streamId = String(req.params.streamId || "");
+  const gate = loadCameraStreamsConfig()[gateKey];
+  const existing = gate.streams!;
+  const index = existing.findIndex((s) => s.id === streamId);
+  if (index === -1) {
+    return res.status(404).json({ success: false, error: `Không tìm thấy luồng "${streamId}" ở cổng này` });
+  }
+
+  const body = req.body && typeof req.body === "object" ? req.body : {};
+  const { id: _ignoredId, ...patch } = body; // ids are immutable (used in URLs / SSE clients)
+  const gateParam = gateKey === "exitGate" ? "exit" : "entry";
+  const updatedStream = sanitizeStreamSource({ ...existing[index], ...patch, id: streamId }, index, gateParam, gate.name);
+
+  const duplicate = findDuplicateStream(existing, updatedStream, streamId);
+  if (duplicate) {
+    return res.status(409).json({
+      success: false,
+      error: `URL RTSP này đã được dùng bởi luồng "${duplicate.stream.label}" (${duplicate.stream.id})`,
+      conflictField: duplicate.field,
+      conflictStreamId: duplicate.stream.id,
+    });
+  }
+
+  const streams = existing.map((s, i) => (i === index ? updatedStream : s));
+  const updatedGate = commitGateStreams(gateKey, streams);
+  res.json({
+    success: true,
+    gate: updatedGate,
+    stream: updatedGate.streams!.find((s) => s.id === streamId) || updatedStream,
+    primaryStreamId: pickPrimaryStream(updatedGate.streams!).id,
+  });
+});
+
+app.delete(STREAM_ITEM_ROUTE, (req, res) => {
+  const gateKey = gateConfigKeyFromParam(req.params.gate);
+  if (!gateKey) return res.status(400).json({ success: false, error: "Cổng không hợp lệ: chỉ chấp nhận entry hoặc exit" });
+  const streamId = String(req.params.streamId || "");
+  const gate = loadCameraStreamsConfig()[gateKey];
+  const existing = gate.streams!;
+  if (!existing.some((s) => s.id === streamId)) {
+    return res.status(404).json({ success: false, error: `Không tìm thấy luồng "${streamId}" ở cổng này` });
+  }
+  if (existing.length <= 1) {
+    return res.status(400).json({
+      success: false,
+      error: "Không thể xoá luồng video cuối cùng của cổng. Hãy thêm luồng khác trước hoặc tắt (enabled=false) luồng này.",
+    });
+  }
+  const updatedGate = commitGateStreams(gateKey, existing.filter((s) => s.id !== streamId));
+  res.json({
+    success: true,
+    gate: updatedGate,
+    removedStreamId: streamId,
+    primaryStreamId: pickPrimaryStream(updatedGate.streams!).id,
+  });
+});
+
+/**
+ * Picks the stream a media route (snapshot / mjpeg / scan-rtsp) should use:
+ * `?stream=<id>` when given (error when the id is unknown for that gate),
+ * otherwise the gate's primary stream.
+ */
+function resolveGateStream(
+  gateParam: unknown,
+  streamParam?: unknown
+): { gateKey: "entry" | "exit"; gate: GateStreamConfigRecord; stream: GateStreamSourceRecord; error?: string } {
+  const gateKey = normalizeGateKey(gateParam);
+  const gate = normalizeGateConfig(gateKey === "exit" ? cameraStreamsConfig.exitGate : cameraStreamsConfig.entryGate);
+  const streams = gate.streams!;
+  const primary = pickPrimaryStream(streams);
+  const wanted = optionalTrimmedString(streamParam);
+  if (!wanted) return { gateKey, gate, stream: primary };
+  const found = streams.find((s) => s.id === wanted);
+  if (!found) {
+    return {
+      gateKey,
+      gate,
+      stream: primary,
+      error: `Luồng "${wanted}" không tồn tại ở cổng ${gateKey === "exit" ? "ra" : "vào"}. Các luồng hiện có: ${streams.map((s) => s.id).join(", ")}`,
+    };
+  }
+  return { gateKey, gate, stream: found };
+}
+
+/**
+ * ffmpeg argument set for a single-frame RTSP grab (snapshot + scan-rtsp).
+ * Tuned on the site NVR - keep in sync between the two routes by changing it here only.
+ */
+function buildRtspSingleFrameArgs(streamUrl: string, transport: "tcp" | "udp"): string[] {
+  return [
+    "-rtsp_transport", transport,
+    "-timeout", "3500000", // 3.5s socket timeout in microseconds (FFmpeg >= 8 renamed -stimeout)
+    // Wait for a keyframe: on ffmpeg 5.x (Debian) the first HEVC frame decoded
+    // before any reference arrives is emitted as a flat grey picture instead of
+    // being discarded, so a single-frame grab returned a blank image.
+    "-skip_frame", "nokey",
+    // Bound stream probing: with -skip_frame nokey, ffmpeg's default probe kept
+    // reading an H.264 feed for ~13 s before emitting a frame (measured on the
+    // NVR channel 2401); a small probe brings that to ~2 s. HEVC was unaffected.
+    "-probesize", "65536",
+    "-analyzeduration", "500000",
+    "-i", streamUrl,
+    "-vframes", "1",
+    "-q:v", "2",
+    "-f", "image2",
+    "-update", "1",
+    "pipe:1",
+  ];
+}
+
+interface RtspFrameGrab {
+  ok: boolean;
+  jpeg?: Buffer;
+  durationMs: number;
+  exitCode: number | null;
+  errorLog: string;
+}
+
+/** Grabs one JPEG from an RTSP stream (ffmpeg, hard-killed after 9 s). Never rejects. */
+function grabRtspFrame(streamUrl: string, transport: "tcp" | "udp"): Promise<RtspFrameGrab> {
+  return new Promise((resolve) => {
+    const tStart = Date.now();
+    const chunks: Buffer[] = [];
+    let errorLog = "";
+    let settled = false;
+    const finish = (ok: boolean, exitCode: number | null, extraErr = "") => {
+      if (settled) return;
+      settled = true;
+      resolve({
+        ok,
+        jpeg: ok ? Buffer.concat(chunks) : undefined,
+        durationMs: Date.now() - tStart,
+        exitCode,
+        errorLog: (errorLog + extraErr).slice(-400),
+      });
+    };
+    let proc: ReturnType<typeof spawn>;
+    try {
+      proc = spawn("ffmpeg", buildRtspSingleFrameArgs(streamUrl, transport));
+    } catch (err: any) {
+      finish(false, null, String(err?.message || err));
+      return;
+    }
+    proc.stdout?.on("data", (chunk: Buffer) => chunks.push(chunk));
+    proc.stderr?.on("data", (chunk: Buffer) => { errorLog += chunk.toString(); });
+    const timeout = setTimeout(() => {
+      try { proc.kill("SIGKILL"); } catch {}
+    }, 9000);
+    proc.on("error", (err) => {
+      clearTimeout(timeout);
+      finish(false, null, String(err?.message || err));
+    });
+    proc.on("close", (code) => {
+      clearTimeout(timeout);
+      finish(code === 0 && chunks.length > 0, code);
+    });
+  });
+}
 
 app.get(CAMERA_THREADS_ROUTES, (_req, res) => {
   res.json({
@@ -1501,62 +1988,31 @@ app.post("/api/camera-streams/test-stream", (req, res) => {
 
 // Capture single JPEG snapshot frame from RTSP/HTTP stream via FFmpeg
 app.get("/api/camera-streams/snapshot", async (req, res) => {
-  const gateParam = String(req.query.gate || "entry").toLowerCase();
-  const targetGate = gateParam === "exit" ? cameraStreamsConfig.exitGate : cameraStreamsConfig.entryGate;
-  const streamUrl = String(req.query.url || targetGate.rtspUrl || "").trim();
-  const transport = targetGate.rtspTransport === "UDP" ? "udp" : "tcp";
+  const resolved = resolveGateStream(req.query.gate, req.query.stream);
+  if (resolved.error) {
+    return res.status(400).json({ success: false, error: resolved.error });
+  }
+  const gateParam = resolved.gateKey;
+  const stream = resolved.stream;
+  const streamUrl = String(req.query.url || stream.rtspUrl || "").trim();
+  const transport = stream.rtspTransport === "UDP" ? "udp" : "tcp";
 
   if (!streamUrl || !streamUrl.toLowerCase().startsWith("rtsp://")) {
     return res.redirect(`/api/camera-streams/test-frame?gate=${gateParam}`);
   }
 
-  // FFmpeg snapshot command: grab 1 frame with 3.5s timeout
-  const args = [
-    "-rtsp_transport", transport,
-    "-timeout", "3500000", // 3.5s socket timeout in microseconds (FFmpeg >= 8 renamed -stimeout)
-    // Wait for a keyframe: on ffmpeg 5.x (Debian) the first HEVC frame decoded
-    // before any reference arrives is emitted as a flat grey picture instead of
-    // being discarded, so a single-frame grab returned a blank image.
-    "-skip_frame", "nokey",
-    // Bound stream probing: with -skip_frame nokey, ffmpeg's default probe kept
-    // reading an H.264 feed for ~13 s before emitting a frame (measured on the
-    // NVR channel 2401); a small probe brings that to ~2 s. HEVC was unaffected.
-    "-probesize", "65536",
-    "-analyzeduration", "500000",
-    "-i", streamUrl,
-    "-vframes", "1",
-    "-q:v", "2",
-    "-f", "image2",
-    "-update", "1",
-    "pipe:1",
-  ];
-
+  // FFmpeg snapshot command: grab 1 frame with 3.5s timeout (args in buildRtspSingleFrameArgs)
   try {
-    const proc = spawn("ffmpeg", args);
-    const chunks: Buffer[] = [];
-    let errorOutput = "";
+    const grab = await grabRtspFrame(streamUrl, transport);
+    if (grab.ok && grab.jpeg) {
+      res.setHeader("Content-Type", "image/jpeg");
+      res.setHeader("Cache-Control", "no-cache, no-store, must-revalidate");
+      res.setHeader("X-Stream-Id", stream.id);
+      return res.send(grab.jpeg);
+    }
 
-    proc.stdout.on("data", (chunk: Buffer) => chunks.push(chunk));
-    proc.stderr.on("data", (chunk: Buffer) => {
-      errorOutput += chunk.toString();
-    });
-
-    const timeout = setTimeout(() => {
-      proc.kill("SIGKILL");
-    }, 9000);
-
-    proc.on("close", (code) => {
-      clearTimeout(timeout);
-      if (code === 0 && chunks.length > 0) {
-        const fullBuf = Buffer.concat(chunks);
-        res.setHeader("Content-Type", "image/jpeg");
-        res.setHeader("Cache-Control", "no-cache, no-store, must-revalidate");
-        return res.send(fullBuf);
-      }
-
-      // If FFmpeg fails or cannot reach camera, return clean fallback SVG with diagnostic message
-      return res.redirect(`/api/camera-streams/test-frame?gate=${gateParam}&source=RTSP%20Offline`);
-    });
+    // If FFmpeg fails or cannot reach camera, return clean fallback SVG with diagnostic message
+    return res.redirect(`/api/camera-streams/test-frame?gate=${gateParam}&source=RTSP%20Offline`);
   } catch (err: any) {
     return res.redirect(`/api/camera-streams/test-frame?gate=${gateParam}&source=RTSP%20Error`);
   }
@@ -1564,10 +2020,13 @@ app.get("/api/camera-streams/snapshot", async (req, res) => {
 
 // Real-time Live MJPEG Video Stream Proxy for Browsers
 app.get("/api/camera-streams/mjpeg", (req, res) => {
-  const gateParam = String(req.query.gate || "entry").toLowerCase();
-  const targetGate = gateParam === "exit" ? cameraStreamsConfig.exitGate : cameraStreamsConfig.entryGate;
-  const streamUrl = String(req.query.url || targetGate.rtspUrl || "").trim();
-  const transport = targetGate.rtspTransport === "UDP" ? "udp" : "tcp";
+  const resolved = resolveGateStream(req.query.gate, req.query.stream);
+  if (resolved.error) {
+    return res.status(400).send(resolved.error);
+  }
+  const stream = resolved.stream;
+  const streamUrl = String(req.query.url || stream.rtspUrl || "").trim();
+  const transport = stream.rtspTransport === "UDP" ? "udp" : "tcp";
 
   if (!streamUrl || !streamUrl.toLowerCase().startsWith("rtsp://")) {
     return res.status(400).send("URL luồng RTSP không hợp lệ");
@@ -1610,139 +2069,202 @@ app.get("/api/camera-streams/mjpeg", (req, res) => {
   }
 });
 
-// Scan and recognize face directly from an RTSP camera stream
-app.post("/api/camera-streams/scan-rtsp", async (req, res) => {
-  const { gate, url, scanType } = req.body || {};
-  const gateParam = String(gate || "entry").toLowerCase();
-  const targetGate = gateParam === "exit" ? cameraStreamsConfig.exitGate : cameraStreamsConfig.entryGate;
-  const streamUrl = String(url || targetGate.rtspUrl || "").trim();
-  const transport = targetGate.rtspTransport === "UDP" ? "udp" : "tcp";
+// Scan and recognize face directly from one or all RTSP streams of a gate.
+//   body { gate, stream?, url?, scanType? }
+//   - `stream` (id) or `url` -> scan that single stream (legacy behaviour);
+//   - neither -> scan every enabled RTSP stream of the gate concurrently (max 4)
+//     and aggregate; per-stream outcomes are returned in `streams[]`.
+const SCAN_RTSP_MAX_CONCURRENT_STREAMS = 4;
 
-  if (!streamUrl || !streamUrl.toLowerCase().startsWith("rtsp://")) {
-    return res.status(400).json({ success: false, error: "Vui lòng chỉ định URL luồng RTSP hợp lệ" });
+interface ScanStreamOutcome {
+  stream: GateStreamSourceRecord;
+  url: string;
+  grab: RtspFrameGrab;
+  recognition?: RecognizeFrameResult;
+  faces: Array<DetectedFaceItem & { streamId: string; streamLabel: string }>;
+  error?: string;
+  poolUnavailableError?: unknown;
+  recognitionError?: unknown;
+}
+
+app.post("/api/camera-streams/scan-rtsp", async (req, res) => {
+  const { gate, stream, url, scanType } = req.body || {};
+  const resolved = resolveGateStream(gate, stream);
+  if (resolved.error) {
+    return res.status(400).json({ success: false, error: resolved.error });
+  }
+  const gateParam = resolved.gateKey;
+  const targetGate = resolved.gate;
+  const singleStreamMode = Boolean(optionalTrimmedString(url) || optionalTrimmedString(stream));
+
+  const targets: Array<{ stream: GateStreamSourceRecord; url: string }> = [];
+  if (singleStreamMode) {
+    const streamUrl = String(url || resolved.stream.rtspUrl || "").trim();
+    if (!isRtspUrl(streamUrl)) {
+      return res.status(400).json({ success: false, error: "Vui lòng chỉ định URL luồng RTSP hợp lệ" });
+    }
+    targets.push({ stream: resolved.stream, url: streamUrl });
+  } else {
+    const rtspStreams = targetGate.streams!.filter(
+      (s) => s.enabled && (s.sourceType === "RTSP" || !s.sourceType) && isRtspUrl(s.rtspUrl)
+    );
+    if (rtspStreams.length === 0) {
+      return res.status(400).json({
+        success: false,
+        error: "Cổng này chưa có luồng RTSP nào đang bật. Vui lòng chỉ định URL luồng RTSP hợp lệ",
+      });
+    }
+    for (const s of rtspStreams.slice(0, SCAN_RTSP_MAX_CONCURRENT_STREAMS)) {
+      targets.push({ stream: s, url: String(s.rtspUrl).trim() });
+    }
   }
 
-  // Grab single frame using FFmpeg
-  const args = [
-    "-rtsp_transport", transport,
-    "-timeout", "3500000",
-    // Wait for a keyframe: on ffmpeg 5.x (Debian) the first HEVC frame decoded
-    // before any reference arrives is emitted as a flat grey picture instead of
-    // being discarded, so a single-frame grab returned a blank image.
-    "-skip_frame", "nokey",
-    // Bound stream probing: with -skip_frame nokey, ffmpeg's default probe kept
-    // reading an H.264 feed for ~13 s before emitting a frame (measured on the
-    // NVR channel 2401); a small probe brings that to ~2 s. HEVC was unaffected.
-    "-probesize", "65536",
-    "-analyzeduration", "500000",
-    "-i", streamUrl,
-    "-vframes", "1",
-    "-q:v", "2",
-    "-f", "image2",
-    "-update", "1",
-    "pipe:1",
-  ];
+  const resolvedScanType: "ENTRY" | "EXIT" =
+    String(scanType || "").toUpperCase() === "EXIT" || (!scanType && gateParam === "exit") ? "EXIT" : "ENTRY";
+  const tWall = Date.now();
 
-  const tStart = Date.now();
-  const proc = spawn("ffmpeg", args);
-  const chunks: Buffer[] = [];
-  let errorLog = "";
-
-  proc.stdout.on("data", (chunk: Buffer) => chunks.push(chunk));
-  proc.stderr.on("data", (chunk: Buffer) => { errorLog += chunk.toString(); });
-
-  const timeout = setTimeout(() => {
-    proc.kill("SIGKILL");
-  }, 9000);
-
-  proc.on("close", async (code) => {
-    clearTimeout(timeout);
-    if (code !== 0 || chunks.length === 0) {
-      return res.status(502).json({
-        success: false,
-        error: "Không thể lấy khung hình từ luồng RTSP. Hãy kiểm tra địa chỉ IP, tài khoản/mật khẩu hoặc kết nối mạng LAN.",
-        details: errorLog.slice(-400),
-      });
-    }
-
-    const jpegBuffer = Buffer.concat(chunks);
-    const base64Data = jpegBuffer.toString("base64");
-    const base64Image = `data:image/jpeg;base64,${base64Data}`;
-    const frameCaptureDurationMs = Date.now() - tStart;
-    const resolvedScanType: "ENTRY" | "EXIT" =
-      String(scanType || "").toUpperCase() === "EXIT" || (!scanType && gateParam === "exit") ? "EXIT" : "ENTRY";
-
-    try {
-      // Same engine selection as /api/recognize-face: LOCAL_BIOMETRIC -> worker pool,
-      // GOOGLE_GEMINI -> Gemini Vision, HYBRID_AUTO -> local pre-filter then cloud.
-      const tRecognize = Date.now();
-      const recognition = await recognizeFrame({
-        base64Data,
-        rawImage: base64Image,
-        mimeType: "image/jpeg",
-        employees,
-        scanType: resolvedScanType,
-      });
-      const processingTimeMs = Date.now() - tRecognize;
-
-      const { detectedFaces } = recognition;
-      const authorizedFaces = detectedFaces.filter((f) => f.recognized && f.employeeId);
-      const recognized = authorizedFaces.length > 0;
-      const recognizedEmployees = authorizedFaces
-        .map((f) => employees.find((e) => e.id === f.employeeId))
-        .filter((e, i, arr): e is EmployeeRecord => Boolean(e) && arr.indexOf(e) === i);
-      const bestMatch = recognizedEmployees[0];
-      const primaryFace = authorizedFaces[0] || detectedFaces[0];
-      const overallConfidence = Number(primaryFace?.confidence ?? 0);
-      const overallLiveness = Number(primaryFace?.livenessScore ?? 0);
-
-      res.json({
-        success: true,
-        frameCaptureDurationMs,
-        taskId: `rtsp-${Date.now()}`,
-        gate: gateParam,
-        scanType: resolvedScanType,
-        // Recognition outcome (fail-closed: recognized only when an engine matched a registered employee)
-        recognized,
-        detectedFaces,
-        totalFacesDetected: detectedFaces.length,
-        authorizedCount: authorizedFaces.length,
-        unauthorizedCount: detectedFaces.length - authorizedFaces.length,
-        bestMatch,
-        employee: bestMatch,
-        matchedEmployee: bestMatch,
-        recognizedEmployees,
-        overallConfidence,
-        overallLiveness,
-        confidence: overallConfidence,
-        livenessScore: overallLiveness,
-        similarityScore: Math.round(overallConfidence * 10) / 1000,
-        message: recognition.overallMessage,
-        // Engine telemetry
-        engineMode: recognition.engineMode,
-        engineUsed: recognition.engineUsed,
-        modelUsed: recognition.modelUsed,
-        modelName: recognition.modelUsed,
-        multiThreadUsed: Boolean(recognition.multiThreadInfo.workerId),
-        workerId: recognition.multiThreadInfo.workerId,
-        threadLatencyMs: recognition.multiThreadInfo.threadLatencyMs ?? processingTimeMs,
-        processingTimeMs,
-        processDurationMs: processingTimeMs,
-      });
-    } catch (err: any) {
-      if (isWorkerPoolUnavailableError(err)) {
-        console.warn("[RTSP Scan] Cụm luồng từ chối tạm thời (503):", err?.message);
-        respondWorkerPoolUnavailable(res, err, { frameCaptureDurationMs });
-        return;
+  // Grab + recognise every target concurrently. Each stream owns its own ffmpeg
+  // process (same tuned args, same 9 s kill); a failure on one never aborts another.
+  const outcomes: ScanStreamOutcome[] = await Promise.all(
+    targets.map(async ({ stream: target, url: streamUrl }): Promise<ScanStreamOutcome> => {
+      const transport = target.rtspTransport === "UDP" ? "udp" : "tcp";
+      const grab = await grabRtspFrame(streamUrl, transport);
+      const outcome: ScanStreamOutcome = { stream: target, url: streamUrl, grab, faces: [] };
+      if (!grab.ok || !grab.jpeg) {
+        outcome.error =
+          "Không thể lấy khung hình từ luồng RTSP. Hãy kiểm tra địa chỉ IP, tài khoản/mật khẩu hoặc kết nối mạng LAN.";
+        return outcome;
       }
-      console.error("[RTSP Scan] Lỗi nhận diện khung hình:", err?.message || err);
-      res.status(500).json({
+      const base64Data = grab.jpeg.toString("base64");
+      try {
+        // Same engine selection as /api/recognize-face: LOCAL_BIOMETRIC -> worker pool,
+        // GOOGLE_GEMINI -> Gemini Vision, HYBRID_AUTO -> local pre-filter then cloud.
+        const recognition = await recognizeFrame({
+          base64Data,
+          rawImage: `data:image/jpeg;base64,${base64Data}`,
+          mimeType: "image/jpeg",
+          employees,
+          scanType: resolvedScanType,
+        });
+        outcome.recognition = recognition;
+        outcome.faces = recognition.detectedFaces.map((f) => ({ ...f, streamId: target.id, streamLabel: target.label }));
+      } catch (err: any) {
+        if (isWorkerPoolUnavailableError(err)) {
+          outcome.poolUnavailableError = err;
+        } else {
+          outcome.recognitionError = err;
+        }
+        outcome.error = err?.message || "Lỗi xử lý nhận diện khung hình RTSP";
+      }
+      return outcome;
+    })
+  );
+
+  const processingTimeMs = Date.now() - tWall;
+  const frameCaptureDurationMs = outcomes.reduce((max, o) => Math.max(max, o.grab.durationMs), 0);
+  const streamResults = outcomes.map((o) => ({
+    streamId: o.stream.id,
+    streamLabel: o.stream.label,
+    success: Boolean(o.recognition),
+    frameCaptureDurationMs: o.grab.durationMs,
+    recognized: o.faces.some((f) => f.recognized && f.employeeId),
+    totalFacesDetected: o.faces.length,
+    detectedFaces: o.faces,
+    error: o.error,
+  }));
+  const successful = outcomes.filter((o) => o.recognition);
+
+  if (successful.length === 0) {
+    // Nothing usable came back from any stream: keep today's status codes.
+    const poolRejected = outcomes.find((o) => o.poolUnavailableError);
+    if (poolRejected) {
+      console.warn("[RTSP Scan] Cụm luồng từ chối tạm thời (503):", (poolRejected.poolUnavailableError as any)?.message);
+      respondWorkerPoolUnavailable(res, poolRejected.poolUnavailableError, {
+        gate: gateParam,
+        frameCaptureDurationMs,
+        streams: streamResults,
+      });
+      return;
+    }
+    const recognitionFailed = outcomes.find((o) => o.recognitionError);
+    if (recognitionFailed) {
+      console.error("[RTSP Scan] Lỗi nhận diện khung hình:", (recognitionFailed.recognitionError as any)?.message || recognitionFailed.recognitionError);
+      return res.status(500).json({
         success: false,
         recognized: false,
-        error: err?.message || "Lỗi xử lý nhận diện khung hình RTSP",
+        gate: gateParam,
+        error: recognitionFailed.error || "Lỗi xử lý nhận diện khung hình RTSP",
         frameCaptureDurationMs,
+        streams: streamResults,
       });
     }
+    return res.status(502).json({
+      success: false,
+      recognized: false,
+      gate: gateParam,
+      error: "Không thể lấy khung hình từ luồng RTSP. Hãy kiểm tra địa chỉ IP, tài khoản/mật khẩu hoặc kết nối mạng LAN.",
+      details: outcomes[0]?.grab.errorLog || "",
+      frameCaptureDurationMs,
+      streams: streamResults,
+    });
+  }
+
+  // Aggregate across streams (fail-closed: recognized only when an engine matched a registered employee).
+  const detectedFaces = successful.flatMap((o) => o.faces);
+  const authorizedFaces = detectedFaces.filter((f) => f.recognized && f.employeeId);
+  const recognized = authorizedFaces.length > 0;
+  const recognizedEmployees = authorizedFaces
+    .map((f) => employees.find((e) => e.id === f.employeeId))
+    .filter((e, i, arr): e is EmployeeRecord => Boolean(e) && arr.indexOf(e) === i);
+  const bestMatch = recognizedEmployees[0];
+  const primaryFace = authorizedFaces[0] || detectedFaces[0];
+  const overallConfidence = Number(primaryFace?.confidence ?? 0);
+  const overallLiveness = Number(primaryFace?.livenessScore ?? 0);
+  const first = successful[0].recognition!;
+  const workerInfo = successful.find((o) => o.recognition?.multiThreadInfo.workerId)?.recognition?.multiThreadInfo;
+  const message =
+    successful.length === 1
+      ? first.overallMessage
+      : successful.map((o) => `[${o.stream.label}] ${o.recognition!.overallMessage}`).join(" | ");
+
+  res.json({
+    success: true,
+    frameCaptureDurationMs,
+    taskId: `rtsp-${Date.now()}`,
+    gate: gateParam,
+    scanType: resolvedScanType,
+    // Stream telemetry
+    streamId: singleStreamMode ? targets[0].stream.id : pickPrimaryStream(targetGate.streams!).id,
+    streamLabel: singleStreamMode ? targets[0].stream.label : pickPrimaryStream(targetGate.streams!).label,
+    streamsScanned: outcomes.length,
+    streamsSucceeded: successful.length,
+    streams: streamResults,
+    // Recognition outcome (fail-closed: recognized only when an engine matched a registered employee)
+    recognized,
+    detectedFaces,
+    totalFacesDetected: detectedFaces.length,
+    authorizedCount: authorizedFaces.length,
+    unauthorizedCount: detectedFaces.length - authorizedFaces.length,
+    bestMatch,
+    employee: bestMatch,
+    matchedEmployee: bestMatch,
+    recognizedEmployees,
+    overallConfidence,
+    overallLiveness,
+    confidence: overallConfidence,
+    livenessScore: overallLiveness,
+    similarityScore: Math.round(overallConfidence * 10) / 1000,
+    message,
+    // Engine telemetry (from the first successful stream)
+    engineMode: first.engineMode,
+    engineUsed: first.engineUsed,
+    modelUsed: first.modelUsed,
+    modelName: first.modelUsed,
+    multiThreadUsed: Boolean(workerInfo?.workerId),
+    workerId: workerInfo?.workerId,
+    threadLatencyMs: workerInfo?.threadLatencyMs ?? processingTimeMs,
+    processingTimeMs,
+    processDurationMs: processingTimeMs,
   });
 });
 
