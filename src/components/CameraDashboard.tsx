@@ -6,49 +6,38 @@ import {
   CheckCircle2,
   XCircle,
   AlertTriangle,
-  Play,
-  Square,
   Zap,
-  Sliders,
-  Radio,
   Camera,
   Layers,
   Activity,
   HardDrive,
   Clock,
-  ArrowRightLeft,
   ArrowDownRight,
   ArrowUpRight,
   Settings,
-  Server,
   Eye,
-  Lock,
-  Unlock,
   KeyRound,
   UserX,
-  Users,
-  Sparkles,
-  RefreshCw,
-  ExternalLink,
   ChevronRight,
-  Check,
+  ChevronDown,
+  ChevronUp,
+  Star,
+  RefreshCw,
 } from "lucide-react";
 import {
   CameraStreamsConfig,
   GateStreamConfig,
+  GateStreamSource,
+  GateStreamScanResult,
   Employee,
   FaceRecognitionResult,
   SmartLockState,
   AccessLog,
-  ScanType,
   DetectedFace,
 } from "../types";
 import { soundEffects } from "../utils/audio";
 import { safeJsonFetch, normalizeApiUrl, getApiBaseUrl } from "../utils/api";
-import {
-  runLocalFaceRecognition,
-  generateFaceEmbedding,
-} from "../utils/localBiometrics";
+import { runLocalFaceRecognition } from "../utils/localBiometrics";
 import {
   isNetlifyOrStaticHost,
   clientDoorUnlock,
@@ -95,6 +84,70 @@ const DEFAULT_STREAMS_CONFIG: CameraStreamsConfig = {
   backendCaptureFps: 15,
 };
 
+// ----------------- MULTI-STREAM HELPERS -----------------
+type GateKey = "entry" | "exit";
+const gateKeyOf = (gateType: "ENTRY" | "EXIT"): GateKey => (gateType === "EXIT" ? "exit" : "entry");
+
+/**
+ * Streams of a gate sorted by priority. When the payload has no `streams`
+ * (legacy server / legacy config) derive one stream from the legacy fields.
+ */
+const deriveGateStreams = (gate: GateStreamConfig | undefined, key: GateKey): GateStreamSource[] => {
+  if (!gate) return [];
+  const list = Array.isArray(gate.streams) ? gate.streams.filter(Boolean) : [];
+  if (list.length > 0) {
+    return list
+      .map((s, index) => ({
+        ...s,
+        enabled: s.enabled !== false,
+        priority: typeof s.priority === "number" ? s.priority : index,
+      }))
+      .sort((a, b) => a.priority - b.priority);
+  }
+  return [
+    {
+      id: `${key}-primary`,
+      label: gate.name || (key === "exit" ? "Cổng Ra" : "Cổng Vào"),
+      sourceType: gate.sourceType || "RTSP",
+      rtspUrl: gate.rtspUrl,
+      rtspTransport: gate.rtspTransport || "TCP",
+      httpUrl: gate.httpUrl,
+      uvcDeviceId: gate.uvcDeviceId,
+      uvcDeviceLabel: gate.uvcDeviceLabel,
+      backendDevicePath: gate.backendDevicePath,
+      resolution: gate.resolution,
+      fps: gate.fps,
+      enabled: true,
+      priority: 0,
+    },
+  ];
+};
+
+/** Lowest-priority ENABLED stream is the primary (falls back to the first one). */
+const getPrimaryStream = (streams: GateStreamSource[]): GateStreamSource | null =>
+  streams.find((s) => s.enabled) || streams[0] || null;
+
+/** rtsp://user:secret@host/... -> rtsp://user:•••@host/... */
+const maskRtspCredentials = (url?: string): string => {
+  if (!url) return "";
+  return url.replace(/^([a-z]+:\/\/)([^:@/]+)(?::[^@/]*)?@/i, (_m, proto, user) => `${proto}${user}:•••@`);
+};
+
+/** Faces returned by a multi-stream scan also carry the stream they were seen on. */
+type StreamFace = DetectedFace & { streamId?: string; streamLabel?: string };
+
+/** Aggregate scan-rtsp response (single stream or whole gate). */
+type GateScanResponse = FaceRecognitionResult & {
+  success?: boolean;
+  error?: string;
+  retryAfterSeconds?: number;
+  frameCaptureDurationMs?: number;
+  streams?: GateStreamScanResult[];
+  streamId?: string;
+  streamLabel?: string;
+  detectedFaces: StreamFace[];
+};
+
 interface CameraDashboardProps {
   employees: Employee[];
   lockState: SmartLockState;
@@ -107,19 +160,59 @@ interface CameraDashboardProps {
   onNavigateToLogs: () => void;
 }
 
+interface PerStreamState {
+  isScanning: boolean;
+  lastResult: GateStreamScanResult | null;
+  lastScanTime: string | null;
+  error: string | null;
+  /** MJPEG proxy failed for this tile -> show a periodic snapshot instead. */
+  mjpegFailed: boolean;
+  snapshotTs: number;
+}
+
 interface StreamScanState {
   isScanning: boolean;
-  lastResult: FaceRecognitionResult | null;
+  lastResult: GateScanResponse | null;
   lastScanTime: string | null;
-  activeFaces: DetectedFace[];
+  activeFaces: StreamFace[];
   autoScanEnabled: boolean;
   scanIntervalSeconds: number;
   viewMode: "MJPEG" | "SNAPSHOT" | "SIMULATION";
-  snapshotUrl: string;
+  snapshotTs: number;
   hasError: boolean;
   errorMessage: string | null;
+  /** Short notice when the worker pool answered 503 (Retry-After). */
+  retryNotice: string | null;
   clientUvcActive: boolean;
+  perStream: Record<string, PerStreamState>;
+  showScanPanel: boolean;
 }
+
+const createInitialScanState = (): StreamScanState => ({
+  isScanning: false,
+  lastResult: null,
+  lastScanTime: null,
+  activeFaces: [],
+  autoScanEnabled: true,
+  scanIntervalSeconds: 3,
+  viewMode: "MJPEG",
+  snapshotTs: Date.now(),
+  hasError: false,
+  errorMessage: null,
+  retryNotice: null,
+  clientUvcActive: false,
+  perStream: {},
+  showScanPanel: true,
+});
+
+const emptyPerStream = (): PerStreamState => ({
+  isScanning: false,
+  lastResult: null,
+  lastScanTime: null,
+  error: null,
+  mjpegFailed: false,
+  snapshotTs: Date.now(),
+});
 
 export const CameraDashboard: React.FC<CameraDashboardProps> = ({
   employees,
@@ -137,33 +230,8 @@ export const CameraDashboard: React.FC<CameraDashboardProps> = ({
   const [currentTime, setCurrentTime] = useState<string>("");
 
   // Per-gate scan and view states
-  const [entryState, setEntryState] = useState<StreamScanState>({
-    isScanning: false,
-    lastResult: null,
-    lastScanTime: null,
-    activeFaces: [],
-    autoScanEnabled: true,
-    scanIntervalSeconds: 3,
-    viewMode: "MJPEG",
-    snapshotUrl: `/api/camera-streams/snapshot?gate=entry&t=${Date.now()}`,
-    hasError: false,
-    errorMessage: null,
-    clientUvcActive: false,
-  });
-
-  const [exitState, setExitState] = useState<StreamScanState>({
-    isScanning: false,
-    lastResult: null,
-    lastScanTime: null,
-    activeFaces: [],
-    autoScanEnabled: true,
-    scanIntervalSeconds: 3,
-    viewMode: "MJPEG",
-    snapshotUrl: `/api/camera-streams/snapshot?gate=exit&t=${Date.now()}`,
-    hasError: false,
-    errorMessage: null,
-    clientUvcActive: false,
-  });
+  const [entryState, setEntryState] = useState<StreamScanState>(createInitialScanState);
+  const [exitState, setExitState] = useState<StreamScanState>(createInitialScanState);
 
   // Client UVC video references
   const entryVideoRef = useRef<HTMLVideoElement | null>(null);
@@ -211,27 +279,55 @@ export const CameraDashboard: React.FC<CameraDashboardProps> = ({
     fetchConfig();
   }, [fetchConfig]);
 
+  // Derived stream lists (sorted, legacy-tolerant)
+  const entryStreams = deriveGateStreams(config.entryGate, "entry");
+  const exitStreams = deriveGateStreams(config.exitGate, "exit");
+  const entryPrimary = getPrimaryStream(entryStreams);
+  const exitPrimary = getPrimaryStream(exitStreams);
+  const entryPrimarySourceType = entryPrimary?.sourceType || config.entryGate?.sourceType;
+  const exitPrimarySourceType = exitPrimary?.sourceType || config.exitGate?.sourceType;
+
   // Determine active gates
-  const activeGates: { gate: GateStreamConfig; state: StreamScanState; setState: React.Dispatch<React.SetStateAction<StreamScanState>> }[] = [];
+  const activeGates: {
+    gate: GateStreamConfig;
+    streams: GateStreamSource[];
+    state: StreamScanState;
+    setState: React.Dispatch<React.SetStateAction<StreamScanState>>;
+  }[] = [];
   if (config.entryGate?.enabled) {
-    activeGates.push({ gate: config.entryGate, state: entryState, setState: setEntryState });
+    activeGates.push({ gate: config.entryGate, streams: entryStreams, state: entryState, setState: setEntryState });
   }
   if (config.exitGate?.enabled) {
-    activeGates.push({ gate: config.exitGate, state: exitState, setState: setExitState });
+    activeGates.push({ gate: config.exitGate, streams: exitStreams, state: exitState, setState: setExitState });
   }
+  const totalEnabledStreams = activeGates.reduce(
+    (sum, g) => sum + g.streams.filter((s) => s.enabled).length,
+    0
+  );
 
-  // Handle Client UVC Camera Start for a gate
-  const startClientUvcCamera = async (gateType: "ENTRY" | "EXIT") => {
+  const gateHelpers = (gateType: "ENTRY" | "EXIT") => {
     const isEntry = gateType === "ENTRY";
-    const gateConfig = isEntry ? config.entryGate : config.exitGate;
-    const setState = isEntry ? setEntryState : setExitState;
-    const videoRef = isEntry ? entryVideoRef : exitVideoRef;
-    const streamRef = isEntry ? entryMediaStreamRef : exitMediaStreamRef;
+    return {
+      isEntry,
+      key: gateKeyOf(gateType),
+      gateConfig: isEntry ? config.entryGate : config.exitGate,
+      streams: isEntry ? entryStreams : exitStreams,
+      primary: isEntry ? entryPrimary : exitPrimary,
+      setState: isEntry ? setEntryState : setExitState,
+      videoRef: isEntry ? entryVideoRef : exitVideoRef,
+      streamRef: isEntry ? entryMediaStreamRef : exitMediaStreamRef,
+    };
+  };
+
+  // Handle Client UVC Camera Start for a gate (only the PRIMARY stream may be a browser webcam)
+  const startClientUvcCamera = async (gateType: "ENTRY" | "EXIT") => {
+    const { gateConfig, primary, setState, videoRef, streamRef } = gateHelpers(gateType);
+    const uvcDeviceId = primary?.uvcDeviceId || gateConfig?.uvcDeviceId;
 
     try {
       const constraints: MediaStreamConstraints = {
-        video: gateConfig.uvcDeviceId && gateConfig.uvcDeviceId !== "default"
-          ? { deviceId: { exact: gateConfig.uvcDeviceId } }
+        video: uvcDeviceId && uvcDeviceId !== "default"
+          ? { deviceId: { exact: uvcDeviceId } }
           : { facingMode: "user", width: { ideal: 1280 }, height: { ideal: 720 } },
         audio: false,
       };
@@ -258,10 +354,7 @@ export const CameraDashboard: React.FC<CameraDashboardProps> = ({
 
   // Stop Client UVC
   const stopClientUvcCamera = (gateType: "ENTRY" | "EXIT") => {
-    const isEntry = gateType === "ENTRY";
-    const setState = isEntry ? setEntryState : setExitState;
-    const videoRef = isEntry ? entryVideoRef : exitVideoRef;
-    const streamRef = isEntry ? entryMediaStreamRef : exitMediaStreamRef;
+    const { setState, videoRef, streamRef } = gateHelpers(gateType);
 
     if (streamRef.current) {
       streamRef.current.getTracks().forEach((track) => track.stop());
@@ -273,145 +366,230 @@ export const CameraDashboard: React.FC<CameraDashboardProps> = ({
     setState((prev) => ({ ...prev, clientUvcActive: false }));
   };
 
-  // Perform Face Recognition on a specific camera stream
-  const performStreamScan = async (gateType: "ENTRY" | "EXIT") => {
-    const isEntry = gateType === "ENTRY";
-    const gateConfig = isEntry ? config.entryGate : config.exitGate;
-    const setState = isEntry ? setEntryState : setExitState;
-    const videoRef = isEntry ? entryVideoRef : exitVideoRef;
+  const updatePerStream = (
+    setState: React.Dispatch<React.SetStateAction<StreamScanState>>,
+    streamId: string,
+    patch: Partial<PerStreamState>
+  ) => {
+    setState((prev) => ({
+      ...prev,
+      perStream: {
+        ...prev.perStream,
+        [streamId]: { ...(prev.perStream[streamId] || emptyPerStream()), ...patch },
+      },
+    }));
+  };
 
-    setState((prev) => ({ ...prev, isScanning: true, hasError: false }));
+  // Recognise a frame captured from the browser webcam (primary CLIENT_UVC stream)
+  const recognizeClientUvcFrame = async (
+    gateType: "ENTRY" | "EXIT",
+    videoEl: HTMLVideoElement,
+    gateName: string
+  ): Promise<GateScanResponse | null> => {
+    if (videoEl.videoWidth <= 0) return null;
+    const canvas = document.createElement("canvas");
+    canvas.width = videoEl.videoWidth;
+    canvas.height = videoEl.videoHeight;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return null;
+    ctx.drawImage(videoEl, 0, 0);
+    const imageBase64 = canvas.toDataURL("image/jpeg", 0.85);
+
+    let result: GateScanResponse | null = null;
+    if (!isNetlifyOrStaticHost() || getApiBaseUrl()) {
+      const res = await safeJsonFetch<GateScanResponse>("/api/recognize-face", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          imageBase64,
+          scanType: gateType,
+          clientEmployees: employees,
+          config: getStoredAiConfig(),
+        }),
+      });
+      if (res.ok && res.data) {
+        result = res.data;
+      }
+    }
+
+    // Fallback to local biometrics
+    if (!result) {
+      const localMatch = runLocalFaceRecognition({ imageBase64, employees });
+      result = {
+        recognized: localMatch.recognized,
+        employee: localMatch.bestMatch,
+        detectedFaces: localMatch.detectedFaces,
+        totalFacesDetected: localMatch.detectedFaces.length,
+        authorizedCount: localMatch.recognized ? 1 : 0,
+        unauthorizedCount: localMatch.recognized ? 0 : localMatch.detectedFaces.length,
+        processingTimeMs: localMatch.processingTimeMs,
+        confidence: localMatch.overallConfidence,
+        livenessScore: localMatch.overallLiveness,
+        message: localMatch.recognized
+          ? `Xác thực thành công tại ${gateName}: ${localMatch.bestMatch?.name}`
+          : `Phát hiện khuôn mặt tại ${gateName}, không khớp hồ sơ nhân viên`,
+        lockUnlocked: localMatch.recognized,
+        engineUsed: "ArcFace SOTA On-Device Edge Biometrics",
+        modelUsed: localMatch.modelName,
+      };
+    }
+    return result;
+  };
+
+  /**
+   * Perform Face Recognition on a gate.
+   * - `streamId` given  -> scan that single stream (`POST scan-rtsp { gate, stream }`).
+   * - `streamId` absent -> scan ALL enabled streams of the gate concurrently on the
+   *   server (`POST scan-rtsp { gate }`), which also returns per-stream `streams[]`.
+   * A gate whose PRIMARY stream is a browser webcam keeps the CLIENT_UVC path.
+   */
+  const performStreamScan = async (gateType: "ENTRY" | "EXIT", streamId?: string) => {
+    const { key, gateConfig, streams, primary, setState, videoRef } = gateHelpers(gateType);
+    if (!gateConfig) return;
+    const enabledStreams = streams.filter((s) => s.enabled);
+    const targetStream = streamId ? streams.find((s) => s.id === streamId) || null : null;
+
+    if (streamId && !targetStream) return;
+    if (!streamId && enabledStreams.length === 0) {
+      setState((prev) => ({ ...prev, hasError: true, errorMessage: "Cổng này chưa có luồng camera nào được bật." }));
+      return;
+    }
+
+    const useClientUvc =
+      (targetStream ? targetStream.sourceType : primary?.sourceType) === "CLIENT_UVC";
+    if (targetStream && useClientUvc && primary?.id !== targetStream.id) {
+      updatePerStream(setState, targetStream.id, {
+        error: "Webcam trình duyệt chỉ hỗ trợ khi là luồng chính của cổng.",
+      });
+      return;
+    }
+
+    setState((prev) => ({ ...prev, isScanning: true, hasError: false, retryNotice: null }));
+    if (targetStream) updatePerStream(setState, targetStream.id, { isScanning: true, error: null });
 
     try {
-      let result: FaceRecognitionResult | null = null;
+      let result: GateScanResponse | null = null;
+      let scanError: string | null = null;
+      let retryNotice: string | null = null;
 
-      if (gateConfig.sourceType === "CLIENT_UVC") {
-        // Capture frame from local <video> element
-        if (videoRef.current && videoRef.current.videoWidth > 0) {
-          const canvas = document.createElement("canvas");
-          canvas.width = videoRef.current.videoWidth;
-          canvas.height = videoRef.current.videoHeight;
-          const ctx = canvas.getContext("2d");
-          if (ctx) {
-            ctx.drawImage(videoRef.current, 0, 0);
-            const imageBase64 = canvas.toDataURL("image/jpeg", 0.85);
-
-            // Run recognition
-            if (!isNetlifyOrStaticHost() || getApiBaseUrl()) {
-              const res = await safeJsonFetch<FaceRecognitionResult>("/api/recognize-face", {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({
-                  imageBase64,
-                  scanType: gateType,
-                  clientEmployees: employees,
-                  config: getStoredAiConfig(),
-                }),
-              });
-              if (res.ok && res.data) {
-                result = res.data;
-              }
-            }
-
-            // Fallback to local biometrics
-            if (!result) {
-              const localMatch = runLocalFaceRecognition({
-                imageBase64,
-                employees,
-              });
-
-              result = {
-                recognized: localMatch.recognized,
-                employee: localMatch.bestMatch,
-                detectedFaces: localMatch.detectedFaces,
-                totalFacesDetected: localMatch.detectedFaces.length,
-                authorizedCount: localMatch.recognized ? 1 : 0,
-                unauthorizedCount: localMatch.recognized ? 0 : localMatch.detectedFaces.length,
-                processingTimeMs: localMatch.processingTimeMs,
-                confidence: localMatch.overallConfidence,
-                livenessScore: localMatch.overallLiveness,
-                message: localMatch.recognized
-                  ? `Xác thực thành công tại ${gateConfig.name}: ${localMatch.bestMatch?.name}`
-                  : `Phát hiện khuôn mặt tại ${gateConfig.name}, không khớp hồ sơ nhân viên`,
-                lockUnlocked: localMatch.recognized,
-                engineUsed: "ArcFace SOTA On-Device Edge Biometrics",
-                modelUsed: localMatch.modelName,
-              };
-            }
-          }
+      if (useClientUvc) {
+        if (videoRef.current) {
+          result = await recognizeClientUvcFrame(gateType, videoRef.current, gateConfig.name);
+        }
+        if (result && primary) {
+          result = {
+            ...result,
+            streamId: primary.id,
+            streamLabel: primary.label,
+            detectedFaces: (result.detectedFaces || []).map((f) => ({ ...f, streamId: primary.id, streamLabel: primary.label })),
+          };
         }
       } else {
-        // RTSP or HTTP: Call backend /api/camera-streams/scan-rtsp
-        const scanRes = await safeJsonFetch<any>("/api/camera-streams/scan-rtsp", {
+        // RTSP / HTTP / backend UVC: the server grabs the frame(s) and runs recognition.
+        const scanRes = await safeJsonFetch<GateScanResponse>("/api/camera-streams/scan-rtsp", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
-            gate: gateType.toLowerCase(),
-            url: gateConfig.rtspUrl,
+            gate: key,
+            ...(targetStream ? { stream: targetStream.id } : {}),
             scanType: gateType,
           }),
         });
 
-        if (scanRes.ok && scanRes.data && scanRes.data.success) {
+        if (scanRes.status === 503) {
+          const retry = scanRes.data?.retryAfterSeconds || 1;
+          retryNotice = `Cụm xử lý đang quá tải, sẽ thử lại sau ${retry} giây.`;
+        } else if (scanRes.ok && scanRes.data && scanRes.data.success !== false) {
           result = scanRes.data;
+          if (targetStream) {
+            result = {
+              ...result,
+              streamId: result.streamId || targetStream.id,
+              streamLabel: result.streamLabel || targetStream.label,
+              detectedFaces: ((result.detectedFaces || []) as StreamFace[]).map((f: StreamFace) => ({
+                ...f,
+                streamId: f.streamId || targetStream.id,
+                streamLabel: f.streamLabel || targetStream.label,
+              })),
+            };
+          }
         } else {
-          // If server RTSP scan cannot reach real camera IP or running offline:
-          // Simulate smart scan from test frame
-          const testFrameUrl = `/api/camera-streams/test-frame?gate=${gateType.toLowerCase()}`;
-          // Generate realistic biometric detection result using enrolled employees
-          const matchedEmployee = employees.length > 0 ? employees[0] : undefined;
-          const box: [number, number, number, number] = [230, 70, 410, 290];
-
-          result = {
-            recognized: !!matchedEmployee,
-            employee: matchedEmployee,
-            detectedFaces: [
-              {
-                id: `rtsp-face-${Date.now()}`,
-                box2d: box,
-                confidence: 97.8,
-                livenessScore: 98.4,
-                recognized: !!matchedEmployee,
-                employeeId: matchedEmployee?.id,
-                employeeName: matchedEmployee?.name,
-                employeeCode: matchedEmployee?.employeeCode,
-                department: matchedEmployee?.department,
-                message: matchedEmployee
-                  ? `Khớp nhận diện nhân viên ${matchedEmployee.name} (${matchedEmployee.employeeCode})`
-                  : "Phát hiện khuôn mặt tại luồng camera",
-              },
-            ],
-            totalFacesDetected: 1,
-            authorizedCount: matchedEmployee ? 1 : 0,
-            unauthorizedCount: matchedEmployee ? 0 : 1,
-            processingTimeMs: 114,
-            confidence: 97.8,
-            livenessScore: 98.4,
-            message: matchedEmployee
-              ? `[${gateConfig.name}] Xác thực khuôn mặt thành công: ${matchedEmployee.name} (${matchedEmployee.employeeCode})`
-              : `[${gateConfig.name}] Phát hiện người lạ - Không khớp hồ sơ`,
-            lockUnlocked: !!matchedEmployee,
-            engineUsed: "Multi-Thread ArcFace Edge Worker Pool",
-            modelUsed: "BlazeFace V2 + ArcFace 512-D",
-            multiThreadUsed: true,
-            workerId: gateType === "ENTRY" ? 1 : 2,
-            threadLatencyMs: 82,
-          };
+          scanError =
+            scanRes.data?.error ||
+            scanRes.error ||
+            (scanRes.status === 502
+              ? "Không thể lấy khung hình từ luồng camera nào."
+              : `Lỗi quét luồng (HTTP ${scanRes.status || 0})`);
         }
       }
 
+      if (retryNotice) {
+        setState((prev) => ({ ...prev, retryNotice }));
+        if (targetStream) updatePerStream(setState, targetStream.id, { error: retryNotice });
+        return;
+      }
+
+      if (scanError) {
+        if (targetStream) {
+          updatePerStream(setState, targetStream.id, { error: scanError });
+        } else {
+          setState((prev) => ({ ...prev, hasError: true, errorMessage: scanError }));
+        }
+        return;
+      }
+
       if (result) {
-        setState((prev) => ({
-          ...prev,
-          lastResult: result,
-          lastScanTime: new Date().toLocaleTimeString("vi-VN"),
-          activeFaces: result?.detectedFaces || [],
-          snapshotUrl: `/api/camera-streams/snapshot?gate=${gateType.toLowerCase()}&t=${Date.now()}`,
-        }));
+        const finalResult = result;
+        const now = new Date().toLocaleTimeString("vi-VN");
+        const faces: StreamFace[] = finalResult.detectedFaces || [];
 
-        onRecognitionComplete(result);
+        setState((prev) => {
+          const perStream = { ...prev.perStream };
+          if (Array.isArray(finalResult.streams) && finalResult.streams.length > 0) {
+            for (const r of finalResult.streams) {
+              perStream[r.streamId] = {
+                ...(perStream[r.streamId] || emptyPerStream()),
+                isScanning: false,
+                lastResult: r,
+                lastScanTime: now,
+                error: r.success ? null : r.error || "Không lấy được khung hình",
+                snapshotTs: Date.now(),
+              };
+            }
+          } else {
+            const id = finalResult.streamId || targetStream?.id || primary?.id;
+            if (id) {
+              perStream[id] = {
+                ...(perStream[id] || emptyPerStream()),
+                isScanning: false,
+                lastResult: {
+                  streamId: id,
+                  streamLabel: finalResult.streamLabel || targetStream?.label || primary?.label || id,
+                  success: true,
+                  frameCaptureDurationMs: finalResult.frameCaptureDurationMs,
+                  recognized: !!finalResult.recognized,
+                  totalFacesDetected: finalResult.totalFacesDetected ?? faces.length,
+                  detectedFaces: faces,
+                },
+                lastScanTime: now,
+                error: null,
+                snapshotTs: Date.now(),
+              };
+            }
+          }
+          return {
+            ...prev,
+            lastResult: finalResult,
+            lastScanTime: now,
+            activeFaces: faces,
+            snapshotTs: Date.now(),
+            perStream,
+          };
+        });
 
-        if (result.recognized) {
+        onRecognitionComplete(finalResult);
+
+        if (finalResult.recognized) {
           soundEffects.playSuccess();
           // Trigger smart lock unlock
           try {
@@ -420,13 +598,13 @@ export const CameraDashboard: React.FC<CameraDashboardProps> = ({
               headers: { "Content-Type": "application/json" },
               body: JSON.stringify({
                 source: `${gateConfig.name} (Quét Cửa Tự Động)`,
-                reason: `Nhận diện khuôn mặt hợp lệ: ${result.employee?.name || "Nhân viên"}`,
+                reason: `Nhận diện khuôn mặt hợp lệ: ${finalResult.employee?.name || "Nhân viên"}`,
               }),
             });
           } catch {
             clientDoorUnlock(`${gateConfig.name} (Client Fallback)`);
           }
-        } else {
+        } else if ((finalResult.totalFacesDetected ?? faces.length) > 0) {
           soundEffects.playStrangerAlert();
         }
       }
@@ -439,10 +617,11 @@ export const CameraDashboard: React.FC<CameraDashboardProps> = ({
       }));
     } finally {
       setState((prev) => ({ ...prev, isScanning: false }));
+      if (targetStream) updatePerStream(setState, targetStream.id, { isScanning: false });
     }
   };
 
-  // Auto-scan cycle timers for each active gate
+  // Auto-scan cycle timers for each active gate (scan the whole gate = all enabled streams)
   useEffect(() => {
     let entryTimer: NodeJS.Timeout | null = null;
     if (config.entryGate?.enabled && entryState.autoScanEnabled) {
@@ -471,9 +650,9 @@ export const CameraDashboard: React.FC<CameraDashboardProps> = ({
     };
   }, [config.exitGate?.enabled, exitState.autoScanEnabled, exitState.scanIntervalSeconds, exitState.isScanning, employees]);
 
-  // Auto start UVC cameras if any active stream uses CLIENT_UVC
+  // Auto start UVC cameras if a gate's PRIMARY stream uses CLIENT_UVC
   useEffect(() => {
-    if (config.entryGate?.enabled && config.entryGate.sourceType === "CLIENT_UVC" && !entryState.clientUvcActive) {
+    if (config.entryGate?.enabled && entryPrimarySourceType === "CLIENT_UVC" && !entryState.clientUvcActive) {
       startClientUvcCamera("ENTRY");
     }
     return () => {
@@ -481,10 +660,10 @@ export const CameraDashboard: React.FC<CameraDashboardProps> = ({
         stopClientUvcCamera("ENTRY");
       }
     };
-  }, [config.entryGate?.enabled, config.entryGate.sourceType]);
+  }, [config.entryGate?.enabled, entryPrimarySourceType, entryPrimary?.uvcDeviceId]);
 
   useEffect(() => {
-    if (config.exitGate?.enabled && config.exitGate.sourceType === "CLIENT_UVC" && !exitState.clientUvcActive) {
+    if (config.exitGate?.enabled && exitPrimarySourceType === "CLIENT_UVC" && !exitState.clientUvcActive) {
       startClientUvcCamera("EXIT");
     }
     return () => {
@@ -492,7 +671,7 @@ export const CameraDashboard: React.FC<CameraDashboardProps> = ({
         stopClientUvcCamera("EXIT");
       }
     };
-  }, [config.exitGate?.enabled, config.exitGate.sourceType]);
+  }, [config.exitGate?.enabled, exitPrimarySourceType, exitPrimary?.uvcDeviceId]);
 
   // Quick unlock for a specific gate
   const handleGateUnlock = async (gateName: string) => {
@@ -513,31 +692,354 @@ export const CameraDashboard: React.FC<CameraDashboardProps> = ({
     }
   };
 
-  // Render a Single Active Camera Stream Card
+  // Face HUD tag used on tiles
+  const renderFaceBox = (face: StreamFace, index: number, lastResult: GateScanResponse | null) => {
+    const [top, left, bottom, right] = face.box2d;
+    const width = right - left;
+    const height = bottom - top;
+    const isRecognized = face.recognized;
+    const employeeName = face.employeeName || (isRecognized ? lastResult?.employee?.name : undefined);
+
+    return (
+      <div
+        key={face.id || index}
+        style={{
+          top: `${top / 10}%`,
+          left: `${left / 10}%`,
+          width: `${width / 10}%`,
+          height: `${height / 10}%`,
+        }}
+        className={`absolute border-2 transition-all duration-300 pointer-events-none ${
+          isRecognized
+            ? "border-emerald-400 shadow-[0_0_16px_rgba(52,211,153,0.5)]"
+            : "border-rose-500 shadow-[0_0_16px_rgba(244,63,94,0.5)]"
+        }`}
+      >
+        {/* Corner Accents */}
+        <div className="absolute -top-1 -left-1 w-2.5 h-2.5 border-t-2 border-l-2 border-white" />
+        <div className="absolute -top-1 -right-1 w-2.5 h-2.5 border-t-2 border-r-2 border-white" />
+        <div className="absolute -bottom-1 -left-1 w-2.5 h-2.5 border-b-2 border-l-2 border-white" />
+        <div className="absolute -bottom-1 -right-1 w-2.5 h-2.5 border-b-2 border-r-2 border-white" />
+
+        {/* Floating HUD Tag */}
+        <div
+          className={`absolute -top-10 left-0 px-2.5 py-1 rounded-md text-[11px] font-mono whitespace-nowrap shadow-lg backdrop-blur-md flex items-center gap-1.5 pointer-events-auto ${
+            isRecognized
+              ? "bg-emerald-950/90 text-emerald-300 border border-emerald-500/80"
+              : "bg-rose-950/90 text-rose-300 border border-rose-500/80"
+          }`}
+        >
+          {isRecognized ? (
+            <>
+              <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
+              <span className="font-bold">{employeeName || "Nhân viên"}</span>
+              <span className="text-emerald-400/80 text-[10px]">
+                ({face.confidence ? `${face.confidence.toFixed(1)}%` : "98.5%"})
+              </span>
+            </>
+          ) : (
+            <>
+              <AlertTriangle className="w-3.5 h-3.5 text-rose-400 shrink-0" />
+              <span className="font-bold">NGƯỜI LẠ / CHƯA ĐĂNG KÝ</span>
+              {onOpenStrangerClusters && (
+                <button
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    onOpenStrangerClusters(lastResult?.detectedFeatures);
+                  }}
+                  className="ml-1 px-1.5 py-0.5 rounded bg-rose-600 hover:bg-rose-700 text-white text-[9px] font-bold cursor-pointer"
+                >
+                  Khai báo
+                </button>
+              )}
+            </>
+          )}
+          {face.streamLabel && (
+            <span className="ml-1 px-1.5 py-0.5 rounded bg-slate-800/90 text-slate-200 text-[9px] font-semibold border border-slate-600">
+              {face.streamLabel}
+            </span>
+          )}
+        </div>
+      </div>
+    );
+  };
+
+  // One live tile per enabled stream
+  const renderStreamTile = (
+    gateConfig: GateStreamConfig,
+    stream: GateStreamSource,
+    isPrimary: boolean,
+    scanState: StreamScanState,
+    setScanState: React.Dispatch<React.SetStateAction<StreamScanState>>,
+    videoRef: React.RefObject<HTMLVideoElement | null>
+  ) => {
+    const key = gateKeyOf(gateConfig.gateType);
+    const isEntry = gateConfig.gateType === "ENTRY";
+    const per = scanState.perStream[stream.id] || emptyPerStream();
+    const lastResult = scanState.lastResult;
+    const tileFaces = scanState.activeFaces.filter(
+      (f) => f.streamId === stream.id || (!f.streamId && isPrimary)
+    );
+    const isClientUvc = stream.sourceType === "CLIENT_UVC";
+    const isScanning = scanState.isScanning && (per.isScanning || !Object.values(scanState.perStream).some((p) => p.isScanning));
+
+    // Media URL for this tile
+    const snapshotUrl = `/api/camera-streams/snapshot?gate=${key}&stream=${encodeURIComponent(stream.id)}&t=${per.snapshotTs || scanState.snapshotTs}`;
+    const mjpegUrl = `/api/camera-streams/mjpeg?gate=${key}&stream=${encodeURIComponent(stream.id)}`;
+    const testFrameUrl = `/api/camera-streams/test-frame?gate=${key}&source=${encodeURIComponent(stream.sourceType)}`;
+    let mediaUrl = testFrameUrl;
+    if (stream.sourceType === "RTSP" || stream.sourceType === "BACKEND_UVC") {
+      if (scanState.viewMode === "SIMULATION") mediaUrl = testFrameUrl;
+      else if (scanState.viewMode === "SNAPSHOT" || per.mjpegFailed) mediaUrl = snapshotUrl;
+      else mediaUrl = mjpegUrl;
+    } else if (stream.sourceType === "HTTP_MJPEG") {
+      mediaUrl = per.mjpegFailed ? snapshotUrl : stream.httpUrl || mjpegUrl;
+    }
+
+    const perResult = per.lastResult;
+
+    return (
+      <div
+        key={stream.id}
+        id={`tile-stream-${stream.id}`}
+        className="relative aspect-video bg-black flex items-center justify-center overflow-hidden rounded-lg border border-slate-800 group"
+      >
+        {isClientUvc ? (
+          isPrimary ? (
+            <video ref={videoRef} autoPlay playsInline muted className="w-full h-full object-cover" />
+          ) : (
+            <div className="text-center px-4 text-xs text-slate-400 space-y-1">
+              <Camera className="w-6 h-6 mx-auto text-slate-600" />
+              <p>Webcam trình duyệt chỉ hiển thị khi là luồng chính</p>
+            </div>
+          )
+        ) : (
+          <img
+            key={`${stream.id}-${scanState.viewMode}-${per.mjpegFailed ? "snap" : "live"}`}
+            src={mediaUrl}
+            alt={stream.label}
+            onError={(e) => {
+              const img = e.target as HTMLImageElement;
+              if (!per.mjpegFailed && scanState.viewMode === "MJPEG") {
+                // MJPEG proxy failed (ffmpeg timeout / offline RTSP): fall back to snapshot
+                updatePerStream(setScanState, stream.id, { mjpegFailed: true, snapshotTs: Date.now() });
+              } else if (!img.src.includes("/test-frame")) {
+                // Snapshot failed too: show the offline placeholder
+                img.src = `${testFrameUrl}%20Offline`;
+              }
+            }}
+            className="w-full h-full object-cover select-none"
+          />
+        )}
+
+        {/* Radar Scanning Line Animation when active */}
+        {isScanning && (
+          <div className="absolute inset-0 pointer-events-none overflow-hidden">
+            <div className="w-full h-1 bg-gradient-to-r from-transparent via-cyan-400 to-transparent shadow-[0_0_15px_rgba(34,211,238,0.8)] animate-[bounce_2s_infinite]" />
+          </div>
+        )}
+
+        {/* AI Face Bounding Box HUD Overlay (faces seen on this stream) */}
+        {tileFaces.map((face, index) => renderFaceBox(face, index, lastResult))}
+
+        {/* Tile label */}
+        <div className="absolute top-2 left-2 flex flex-col gap-1 pointer-events-none max-w-[85%]">
+          <div className="px-2 py-1 rounded-md bg-black/60 backdrop-blur-sm border border-slate-700/60 text-white text-[11px] font-mono flex items-center gap-1.5">
+            <span className={`w-2 h-2 rounded-full shrink-0 ${isEntry ? "bg-emerald-400" : "bg-blue-400"}`} />
+            <span className="font-bold truncate">{stream.label}</span>
+            {isPrimary && (
+              <span className="inline-flex items-center gap-0.5 px-1.5 py-0.5 rounded bg-indigo-600 text-white text-[9px] font-bold shrink-0">
+                <Star className="w-2.5 h-2.5" />
+                Chính
+              </span>
+            )}
+            <span className="px-1 py-0.5 rounded bg-slate-800 text-slate-300 text-[9px] shrink-0">{stream.sourceType}</span>
+          </div>
+          {stream.rtspUrl && stream.sourceType === "RTSP" && (
+            <div className="px-2 py-0.5 rounded bg-black/50 text-[10px] font-mono text-slate-400 truncate">
+              {maskRtspCredentials(stream.rtspUrl)}
+            </div>
+          )}
+        </div>
+
+        {/* Per-tile last outcome */}
+        <div className="absolute bottom-2 left-2 right-2 flex items-end justify-between gap-2">
+          <div className="min-w-0">
+            {per.error ? (
+              <div className="px-2 py-1 rounded-md bg-rose-950/85 border border-rose-700/70 text-rose-200 text-[10px] font-medium truncate max-w-[260px]" title={per.error}>
+                <XCircle className="w-3 h-3 inline mr-1 -mt-0.5" />
+                {per.error}
+              </div>
+            ) : perResult ? (
+              <div
+                className={`px-2 py-1 rounded-md backdrop-blur-sm border text-[10px] font-mono flex items-center gap-2 ${
+                  perResult.recognized
+                    ? "bg-emerald-950/85 border-emerald-600/70 text-emerald-200"
+                    : perResult.totalFacesDetected > 0
+                    ? "bg-amber-950/85 border-amber-600/70 text-amber-200"
+                    : "bg-black/60 border-slate-700/60 text-slate-300"
+                }`}
+              >
+                <span>{perResult.totalFacesDetected} mặt</span>
+                <span>•</span>
+                <span>{perResult.recognized ? "Đã nhận diện" : "Chưa khớp"}</span>
+                {typeof perResult.frameCaptureDurationMs === "number" && (
+                  <>
+                    <span>•</span>
+                    <span>{perResult.frameCaptureDurationMs}ms</span>
+                  </>
+                )}
+                {per.lastScanTime && <span className="text-slate-400">{per.lastScanTime}</span>}
+              </div>
+            ) : null}
+          </div>
+
+          {/* Per-tile scan button */}
+          <button
+            id={`btn-scan-stream-${stream.id}`}
+            onClick={() => performStreamScan(gateConfig.gateType, stream.id)}
+            disabled={scanState.isScanning || (isClientUvc && !isPrimary)}
+            className="inline-flex items-center gap-1 px-2 py-1 rounded-md bg-indigo-600/90 hover:bg-indigo-500 text-white text-[10px] font-semibold shadow-xs transition-all cursor-pointer disabled:opacity-50 shrink-0"
+            title={`Quét nhận diện riêng luồng ${stream.label}`}
+          >
+            <ScanFace className={`w-3 h-3 ${per.isScanning ? "animate-spin" : ""}`} />
+            {per.isScanning ? "Đang quét..." : "Quét"}
+          </button>
+        </div>
+      </div>
+    );
+  };
+
+  // Scan results panel: per-stream outcomes + aggregate
+  const renderScanPanel = (
+    gateConfig: GateStreamConfig,
+    streams: GateStreamSource[],
+    scanState: StreamScanState
+  ) => {
+    const result = scanState.lastResult;
+    if (!result) return null;
+    const perStreamRows: GateStreamScanResult[] =
+      Array.isArray(result.streams) && result.streams.length > 0
+        ? result.streams
+        : [
+            {
+              streamId: result.streamId || getPrimaryStream(streams)?.id || "primary",
+              streamLabel: result.streamLabel || getPrimaryStream(streams)?.label || gateConfig.name,
+              success: true,
+              frameCaptureDurationMs: result.frameCaptureDurationMs,
+              recognized: !!result.recognized,
+              totalFacesDetected: result.totalFacesDetected ?? (result.detectedFaces || []).length,
+              detectedFaces: result.detectedFaces || [],
+            },
+          ];
+    const faces: StreamFace[] = result.detectedFaces || [];
+
+    return (
+      <div className="px-3.5 pb-3.5 bg-slate-950 space-y-2 text-xs animate-in fade-in">
+        {/* Aggregate */}
+        <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+          <div className="p-2 rounded-lg bg-slate-900 border border-slate-800">
+            <div className="text-[10px] text-slate-500">Luồng đã quét</div>
+            <div className="font-mono font-bold text-white">
+              {perStreamRows.filter((r) => r.success).length}/{perStreamRows.length}
+            </div>
+          </div>
+          <div className="p-2 rounded-lg bg-slate-900 border border-slate-800">
+            <div className="text-[10px] text-slate-500">Khuôn mặt</div>
+            <div className="font-mono font-bold text-white">{result.totalFacesDetected ?? faces.length}</div>
+          </div>
+          <div className="p-2 rounded-lg bg-slate-900 border border-slate-800">
+            <div className="text-[10px] text-slate-500">Nhận diện</div>
+            <div className={`font-mono font-bold ${result.recognized ? "text-emerald-400" : "text-slate-300"}`}>
+              {result.recognized ? result.employee?.name || "Hợp lệ" : "Chưa khớp hồ sơ"}
+            </div>
+          </div>
+          <div className="p-2 rounded-lg bg-slate-900 border border-slate-800">
+            <div className="text-[10px] text-slate-500">Xử lý</div>
+            <div className="font-mono font-bold text-white">
+              {result.processingTimeMs ?? 0}ms
+              <span className="text-slate-500 font-normal"> • {result.engineUsed || "AI"}</span>
+            </div>
+          </div>
+        </div>
+
+        {/* Per-stream rows */}
+        <div className="rounded-lg border border-slate-800 divide-y divide-slate-800 overflow-hidden">
+          {perStreamRows.map((r) => (
+            <div key={r.streamId} className="flex flex-wrap items-center gap-x-3 gap-y-1 px-3 py-2 bg-slate-900/60">
+              {r.success ? (
+                <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
+              ) : (
+                <XCircle className="w-3.5 h-3.5 text-rose-400 shrink-0" />
+              )}
+              <span className="font-semibold text-white truncate max-w-[180px]" title={r.streamLabel}>
+                {r.streamLabel}
+              </span>
+              {r.success ? (
+                <>
+                  <span className="font-mono text-slate-300">{r.totalFacesDetected} mặt</span>
+                  <span className={`font-mono ${r.recognized ? "text-emerald-400" : "text-slate-400"}`}>
+                    {r.recognized ? "Đã nhận diện" : "Chưa khớp"}
+                  </span>
+                  {typeof r.frameCaptureDurationMs === "number" && (
+                    <span className="font-mono text-slate-400 inline-flex items-center gap-1">
+                      <Clock className="w-3 h-3" />
+                      {r.frameCaptureDurationMs}ms
+                    </span>
+                  )}
+                </>
+              ) : (
+                <span className="text-rose-300 truncate" title={r.error}>
+                  {r.error || "Không lấy được khung hình"}
+                </span>
+              )}
+            </div>
+          ))}
+        </div>
+
+        {/* Face cards with stream chip */}
+        {faces.length > 0 && (
+          <div className="flex flex-wrap gap-1.5">
+            {faces.map((f, i) => (
+              <div
+                key={f.id || i}
+                className={`inline-flex items-center gap-1.5 px-2 py-1 rounded-md border text-[11px] ${
+                  f.recognized
+                    ? "bg-emerald-950/70 border-emerald-700/70 text-emerald-200"
+                    : "bg-rose-950/60 border-rose-800/70 text-rose-200"
+                }`}
+              >
+                {f.recognized ? <ShieldCheck className="w-3 h-3" /> : <UserX className="w-3 h-3" />}
+                <span className="font-semibold">{f.recognized ? f.employeeName || "Nhân viên" : "Người lạ"}</span>
+                {typeof f.confidence === "number" && <span className="font-mono opacity-80">{f.confidence.toFixed(0)}%</span>}
+                {f.streamLabel && (
+                  <span className="px-1.5 py-0.5 rounded bg-slate-800 text-slate-300 text-[9px] font-semibold border border-slate-700">
+                    {f.streamLabel}
+                  </span>
+                )}
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+    );
+  };
+
+  // Render a Single Active Gate Card (with one tile per enabled stream)
   const renderCameraStreamCard = (
     gateConfig: GateStreamConfig,
+    streams: GateStreamSource[],
     scanState: StreamScanState,
     setScanState: React.Dispatch<React.SetStateAction<StreamScanState>>,
     videoRef: React.RefObject<HTMLVideoElement | null>
   ) => {
     const isEntry = gateConfig.gateType === "ENTRY";
     const gateLabel = isEntry ? "CỔNG VÀO (ENTRY)" : "CỔNG RA (EXIT)";
-    const gateColor = isEntry ? "emerald" : "blue";
     const lastResult = scanState.lastResult;
-
-    // Determine current stream URL to display
-    let streamMediaUrl = "";
-    if (gateConfig.sourceType === "RTSP") {
-      if (scanState.viewMode === "MJPEG") {
-        streamMediaUrl = `/api/camera-streams/mjpeg?gate=${gateConfig.gateType.toLowerCase()}`;
-      } else if (scanState.viewMode === "SNAPSHOT") {
-        streamMediaUrl = scanState.snapshotUrl;
-      } else {
-        streamMediaUrl = `/api/camera-streams/test-frame?gate=${gateConfig.gateType.toLowerCase()}`;
-      }
-    } else if (gateConfig.sourceType === "HTTP_MJPEG") {
-      streamMediaUrl = gateConfig.httpUrl || `/api/camera-streams/mjpeg?gate=${gateConfig.gateType.toLowerCase()}`;
-    }
+    const enabledStreams = streams.filter((s) => s.enabled);
+    const primary = getPrimaryStream(streams);
+    const hasRtspLike = enabledStreams.some((s) => s.sourceType === "RTSP" || s.sourceType === "BACKEND_UVC");
+    const multi = enabledStreams.length > 1;
 
     return (
       <div
@@ -547,9 +1049,9 @@ export const CameraDashboard: React.FC<CameraDashboardProps> = ({
       >
         {/* Stream Top Header */}
         <div className="p-3.5 bg-slate-950/90 border-b border-slate-800 flex items-center justify-between gap-3 text-xs">
-          <div className="flex items-center gap-2.5">
+          <div className="flex items-center gap-2.5 min-w-0">
             <span
-              className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md text-[11px] font-bold tracking-wide ${
+              className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md text-[11px] font-bold tracking-wide shrink-0 ${
                 isEntry
                   ? "bg-emerald-950/80 text-emerald-400 border border-emerald-800/80"
                   : "bg-blue-950/80 text-blue-400 border border-blue-800/80"
@@ -567,20 +1069,20 @@ export const CameraDashboard: React.FC<CameraDashboardProps> = ({
               {gateConfig.name}
             </span>
 
-            <span className="hidden sm:inline-block px-2 py-0.5 rounded text-[10px] font-mono bg-slate-800 text-slate-300 border border-slate-700">
-              {gateConfig.sourceType}
+            <span className="hidden sm:inline-block px-2 py-0.5 rounded text-[10px] font-mono bg-slate-800 text-slate-300 border border-slate-700 shrink-0">
+              {enabledStreams.length} luồng
             </span>
           </div>
 
-          <div className="flex items-center gap-2">
+          <div className="flex items-center gap-2 shrink-0">
             {/* Live Indicator */}
             <div className="flex items-center gap-1.5 px-2 py-1 rounded-md bg-slate-900 border border-slate-700/80 text-emerald-400 font-mono text-[11px]">
               <span className="w-2 h-2 rounded-full bg-emerald-500 animate-ping inline-block" />
-              <span className="font-bold">LIVE {gateConfig.fps || 25} FPS</span>
+              <span className="font-bold">LIVE {primary?.fps || gateConfig.fps || 25} FPS</span>
             </div>
 
-            {/* RTSP Mode Selector */}
-            {gateConfig.sourceType === "RTSP" && (
+            {/* RTSP Mode Selector (applies to all tiles) */}
+            {hasRtspLike && (
               <div className="hidden md:flex items-center bg-slate-900 border border-slate-700 rounded-lg p-0.5 text-[11px]">
                 <button
                   onClick={() => setScanState((prev) => ({ ...prev, viewMode: "MJPEG" }))}
@@ -592,7 +1094,7 @@ export const CameraDashboard: React.FC<CameraDashboardProps> = ({
                   MJPEG
                 </button>
                 <button
-                  onClick={() => setScanState((prev) => ({ ...prev, viewMode: "SNAPSHOT" }))}
+                  onClick={() => setScanState((prev) => ({ ...prev, viewMode: "SNAPSHOT", snapshotTs: Date.now() }))}
                   className={`px-2 py-0.5 rounded font-medium transition-colors ${
                     scanState.viewMode === "SNAPSHOT" ? "bg-indigo-600 text-white" : "text-slate-400 hover:text-white"
                   }`}
@@ -611,177 +1113,115 @@ export const CameraDashboard: React.FC<CameraDashboardProps> = ({
                 </button>
               </div>
             )}
-          </div>
-        </div>
 
-        {/* Stream Video & AI HUD Viewport */}
-        <div className="relative aspect-video bg-black flex items-center justify-center overflow-hidden group">
-          {gateConfig.sourceType === "CLIENT_UVC" ? (
-            <video
-              ref={videoRef}
-              autoPlay
-              playsInline
-              muted
-              className="w-full h-full object-cover"
-            />
-          ) : (
-            <img
-              src={streamMediaUrl}
-              alt={gateConfig.name}
-              onError={(e) => {
-                // If MJPEG stream failed (e.g., ffmpeg timeout or offline RTSP), gracefully fallback to test-frame SVG
-                (e.target as HTMLImageElement).src = `/api/camera-streams/test-frame?gate=${gateConfig.gateType.toLowerCase()}&source=RTSP%20Offline`;
-              }}
-              className="w-full h-full object-cover select-none"
-            />
-          )}
-
-          {/* Radar Scanning Line Animation when active */}
-          {scanState.isScanning && (
-            <div className="absolute inset-0 pointer-events-none overflow-hidden">
-              <div className="w-full h-1 bg-gradient-to-r from-transparent via-cyan-400 to-transparent shadow-[0_0_15px_rgba(34,211,238,0.8)] animate-[bounce_2s_infinite]" />
-            </div>
-          )}
-
-          {/* AI Face Bounding Box HUD Overlay */}
-          {scanState.activeFaces.map((face, index) => {
-            const [top, left, bottom, right] = face.box2d;
-            const width = right - left;
-            const height = bottom - top;
-            const isRecognized = face.recognized;
-            const employeeName = face.employeeName || (isRecognized ? lastResult?.employee?.name : undefined);
-
-            return (
-              <div
-                key={face.id || index}
-                style={{
-                  top: `${top / 10}%`,
-                  left: `${left / 10}%`,
-                  width: `${width / 10}%`,
-                  height: `${height / 10}%`,
-                }}
-                className={`absolute border-2 transition-all duration-300 pointer-events-none ${
-                  isRecognized
-                    ? "border-emerald-400 shadow-[0_0_16px_rgba(52,211,153,0.5)]"
-                    : "border-rose-500 shadow-[0_0_16px_rgba(244,63,94,0.5)]"
-                }`}
-              >
-                {/* Corner Accents */}
-                <div className="absolute -top-1 -left-1 w-2.5 h-2.5 border-t-2 border-l-2 border-white" />
-                <div className="absolute -top-1 -right-1 w-2.5 h-2.5 border-t-2 border-r-2 border-white" />
-                <div className="absolute -bottom-1 -left-1 w-2.5 h-2.5 border-b-2 border-l-2 border-white" />
-                <div className="absolute -bottom-1 -right-1 w-2.5 h-2.5 border-b-2 border-r-2 border-white" />
-
-                {/* Floating HUD Tag */}
-                <div
-                  className={`absolute -top-10 left-0 px-2.5 py-1 rounded-md text-[11px] font-mono whitespace-nowrap shadow-lg backdrop-blur-md flex items-center gap-1.5 pointer-events-auto ${
-                    isRecognized
-                      ? "bg-emerald-950/90 text-emerald-300 border border-emerald-500/80"
-                      : "bg-rose-950/90 text-rose-300 border border-rose-500/80"
-                  }`}
-                >
-                  {isRecognized ? (
-                    <>
-                      <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
-                      <span className="font-bold">{employeeName || "Nhân viên"}</span>
-                      <span className="text-emerald-400/80 text-[10px]">
-                        ({face.confidence ? `${face.confidence.toFixed(1)}%` : "98.5%"})
-                      </span>
-                    </>
-                  ) : (
-                    <>
-                      <AlertTriangle className="w-3.5 h-3.5 text-rose-400 shrink-0" />
-                      <span className="font-bold">NGƯỜI LẠ / CHƯA ĐĂNG KÝ</span>
-                      {onOpenStrangerClusters && (
-                        <button
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            onOpenStrangerClusters(lastResult?.detectedFeatures);
-                          }}
-                          className="ml-1 px-1.5 py-0.5 rounded bg-rose-600 hover:bg-rose-700 text-white text-[9px] font-bold cursor-pointer"
-                        >
-                          Khai báo
-                        </button>
-                      )}
-                    </>
-                  )}
-                </div>
-              </div>
-            );
-          })}
-
-          {/* On-Screen HUD Overlay: Gate direction & Timecode */}
-          <div className="absolute top-3 left-3 flex flex-col gap-1 pointer-events-none">
-            <div className="px-2.5 py-1 rounded-md bg-black/60 backdrop-blur-sm border border-slate-700/60 text-white text-[11px] font-mono flex items-center gap-2">
-              <span className={`w-2 h-2 rounded-full ${isEntry ? "bg-emerald-400" : "bg-blue-400"}`} />
-              <span className="font-bold">{gateConfig.name}</span>
-            </div>
-            {gateConfig.rtspUrl && (
-              <div className="px-2 py-0.5 rounded bg-black/50 text-[10px] font-mono text-slate-400 max-w-[280px] truncate">
-                {gateConfig.rtspUrl}
-              </div>
-            )}
-          </div>
-
-          <div className="absolute top-3 right-3 pointer-events-none">
-            <div className="px-2.5 py-1 rounded-md bg-black/60 backdrop-blur-sm border border-slate-700/60 text-sky-400 font-mono text-xs">
+            <div className="hidden lg:block px-2 py-1 rounded-md bg-black/60 border border-slate-700/60 text-sky-400 font-mono text-[11px]">
               {currentTime}
             </div>
           </div>
+        </div>
 
-          {/* Bottom Live Result Banner inside viewport if matched */}
-          {lastResult && (
-            <div
-              className={`absolute bottom-3 inset-x-3 p-2.5 rounded-xl backdrop-blur-md border text-xs flex items-center justify-between gap-2 shadow-lg transition-all animate-in fade-in slide-in-from-bottom-2 ${
-                lastResult.recognized
-                  ? "bg-emerald-950/85 text-emerald-100 border-emerald-500/60"
-                  : "bg-slate-900/85 text-slate-200 border-slate-700/80"
-              }`}
+        {/* Stream tiles: one per enabled stream */}
+        {enabledStreams.length === 0 ? (
+          <div className="aspect-video bg-black flex flex-col items-center justify-center text-center text-xs text-slate-400 gap-2 p-6">
+            <Video className="w-8 h-8 text-slate-700" />
+            <p>Cổng này chưa có luồng camera nào được bật.</p>
+            <button
+              onClick={onNavigateToCamerasConfig}
+              className="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 font-semibold border border-slate-700 cursor-pointer"
             >
-              <div className="flex items-center gap-2.5 min-w-0">
-                {lastResult.recognized && lastResult.employee?.photoUrl ? (
-                  <img
-                    src={lastResult.employee.photoUrl}
-                    alt={lastResult.employee.name}
-                    className="w-8 h-8 rounded-lg object-cover border border-emerald-400/80 shrink-0"
-                  />
-                ) : (
-                  <div
-                    className={`w-8 h-8 rounded-lg flex items-center justify-center shrink-0 ${
-                      lastResult.recognized ? "bg-emerald-800 text-white" : "bg-slate-800 text-slate-400"
-                    }`}
-                  >
-                    {lastResult.recognized ? <ShieldCheck className="w-5 h-5" /> : <Eye className="w-5 h-5" />}
-                  </div>
-                )}
-                <div className="min-w-0">
-                  <div className="font-semibold text-white truncate text-[13px]">
-                    {lastResult.recognized
-                      ? `${lastResult.employee?.name} (${lastResult.employee?.employeeCode})`
-                      : "Chưa phát hiện nhân viên hợp lệ"}
-                  </div>
-                  <div className="text-[11px] text-slate-300 truncate">
-                    {lastResult.recognized
-                      ? `Bộ phận: ${lastResult.employee?.department || "Nhân sự"} • Cửa đã mở tự động`
-                      : lastResult.message || "Luồng camera đang giám sát..."}
-                  </div>
-                </div>
-              </div>
+              Thêm luồng trong Cấu Hình
+            </button>
+          </div>
+        ) : (
+          <div className={`grid gap-2 p-2 bg-black ${multi ? "grid-cols-1 md:grid-cols-2" : "grid-cols-1"}`}>
+            {enabledStreams.map((s) =>
+              renderStreamTile(gateConfig, s, primary?.id === s.id, scanState, setScanState, videoRef)
+            )}
+          </div>
+        )}
 
-              <div className="flex items-center gap-2 shrink-0 text-right">
-                <div className="hidden sm:block">
-                  <span className="block font-mono text-[11px] text-emerald-400 font-bold">
-                    {lastResult.confidence ? `${lastResult.confidence.toFixed(1)}%` : "98.5%"}
-                  </span>
-                  <span className="block text-[10px] text-slate-400">Độ tin cậy</span>
+        {/* Notices */}
+        {scanState.retryNotice && (
+          <div className="mx-3.5 mt-3 p-2.5 rounded-lg bg-amber-950/60 border border-amber-700/60 text-amber-200 text-xs flex items-center gap-2">
+            <RefreshCw className="w-3.5 h-3.5 animate-spin shrink-0" />
+            <span>{scanState.retryNotice}</span>
+          </div>
+        )}
+        {scanState.hasError && scanState.errorMessage && (
+          <div className="mx-3.5 mt-3 p-2.5 rounded-lg bg-rose-950/60 border border-rose-700/60 text-rose-200 text-xs flex items-center gap-2">
+            <AlertTriangle className="w-3.5 h-3.5 shrink-0" />
+            <span className="flex-1">{scanState.errorMessage}</span>
+            <button
+              onClick={() => setScanState((prev) => ({ ...prev, hasError: false, errorMessage: null }))}
+              className="text-rose-300 hover:text-white cursor-pointer"
+              title="Đóng"
+            >
+              <XCircle className="w-3.5 h-3.5" />
+            </button>
+          </div>
+        )}
+
+        {/* Gate-level last result banner */}
+        {lastResult && (
+          <div
+            className={`mx-3.5 mt-3 p-2.5 rounded-xl border text-xs flex items-center justify-between gap-2 shadow-lg transition-all animate-in fade-in ${
+              lastResult.recognized
+                ? "bg-emerald-950/85 text-emerald-100 border-emerald-500/60"
+                : "bg-slate-900/85 text-slate-200 border-slate-700/80"
+            }`}
+          >
+            <div className="flex items-center gap-2.5 min-w-0">
+              {lastResult.recognized && lastResult.employee?.photoUrl ? (
+                <img
+                  src={lastResult.employee.photoUrl}
+                  alt={lastResult.employee.name}
+                  className="w-8 h-8 rounded-lg object-cover border border-emerald-400/80 shrink-0"
+                />
+              ) : (
+                <div
+                  className={`w-8 h-8 rounded-lg flex items-center justify-center shrink-0 ${
+                    lastResult.recognized ? "bg-emerald-800 text-white" : "bg-slate-800 text-slate-400"
+                  }`}
+                >
+                  {lastResult.recognized ? <ShieldCheck className="w-5 h-5" /> : <Eye className="w-5 h-5" />}
+                </div>
+              )}
+              <div className="min-w-0">
+                <div className="font-semibold text-white truncate text-[13px]">
+                  {lastResult.recognized
+                    ? `${lastResult.employee?.name} (${lastResult.employee?.employeeCode})`
+                    : "Chưa phát hiện nhân viên hợp lệ"}
+                </div>
+                <div className="text-[11px] text-slate-300 truncate">
+                  {lastResult.recognized
+                    ? `Bộ phận: ${lastResult.employee?.department || "Nhân sự"} • Cửa đã mở tự động`
+                    : lastResult.message || "Luồng camera đang giám sát..."}
+                  {scanState.lastScanTime ? ` • ${scanState.lastScanTime}` : ""}
                 </div>
               </div>
             </div>
-          )}
-        </div>
 
-        {/* Controls Bar for this Stream */}
-        <div className="p-3.5 bg-slate-950 border-t border-slate-800/80 flex flex-wrap items-center justify-between gap-3 text-xs">
+            <div className="flex items-center gap-2 shrink-0 text-right">
+              <div className="hidden sm:block">
+                <span className="block font-mono text-[11px] text-emerald-400 font-bold">
+                  {lastResult.confidence ? `${Number(lastResult.confidence).toFixed(1)}%` : `${lastResult.totalFacesDetected ?? 0} mặt`}
+                </span>
+                <span className="block text-[10px] text-slate-400">{lastResult.confidence ? "Độ tin cậy" : "Phát hiện"}</span>
+              </div>
+              <button
+                onClick={() => setScanState((prev) => ({ ...prev, showScanPanel: !prev.showScanPanel }))}
+                className="inline-flex items-center gap-1 px-2 py-1 rounded-md bg-slate-800 hover:bg-slate-700 text-slate-200 text-[11px] font-semibold border border-slate-700 cursor-pointer"
+                title="Chi tiết kết quả theo từng luồng"
+              >
+                {scanState.showScanPanel ? <ChevronUp className="w-3.5 h-3.5" /> : <ChevronDown className="w-3.5 h-3.5" />}
+                Chi tiết
+              </button>
+            </div>
+          </div>
+        )}
+
+        {/* Controls Bar for this Gate */}
+        <div className="p-3.5 bg-slate-950 flex flex-wrap items-center justify-between gap-3 text-xs">
           <div className="flex items-center gap-2">
             {/* Auto-Scan Toggle Switch */}
             <button
@@ -797,7 +1237,7 @@ export const CameraDashboard: React.FC<CameraDashboardProps> = ({
                   ? "bg-emerald-600 hover:bg-emerald-500 text-white shadow-xs"
                   : "bg-slate-800 hover:bg-slate-700 text-slate-400 border border-slate-700"
               }`}
-              title="Bật/Tắt chế độ tự động nhận diện AI định kỳ từ luồng camera"
+              title="Bật/Tắt chế độ tự động nhận diện AI định kỳ trên toàn bộ luồng của cổng"
             >
               <Zap className={`w-3.5 h-3.5 ${scanState.autoScanEnabled ? "text-white" : "text-slate-500"}`} />
               <span>{scanState.autoScanEnabled ? "Tự Động Quét AI: BẬT" : "Tự Động Quét: TẮT"}</span>
@@ -824,16 +1264,18 @@ export const CameraDashboard: React.FC<CameraDashboardProps> = ({
           </div>
 
           <div className="flex items-center gap-2">
-            {/* Scan Now Manual Trigger */}
+            {/* Scan all streams of this gate */}
             <button
               id={`btn-scannow-${gateConfig.gateType.toLowerCase()}`}
-              disabled={scanState.isScanning}
+              disabled={scanState.isScanning || enabledStreams.length === 0}
               onClick={() => performStreamScan(gateConfig.gateType)}
               className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-indigo-600 hover:bg-indigo-500 active:scale-98 text-white font-semibold transition-all shadow-xs cursor-pointer disabled:opacity-50"
-              title="Chụp khung hình và nhận diện ngay lập tức"
+              title="Chụp khung hình từ tất cả luồng đang bật của cổng và nhận diện đồng thời"
             >
-              <Camera className={`w-3.5 h-3.5 ${scanState.isScanning ? "animate-spin" : ""}`} />
-              <span>{scanState.isScanning ? "Đang Quét..." : "Quét Ngay"}</span>
+              <Layers className={`w-3.5 h-3.5 ${scanState.isScanning ? "animate-spin" : ""}`} />
+              <span>
+                {scanState.isScanning ? "Đang Quét..." : multi ? "Quét tất cả luồng" : "Quét Ngay"}
+              </span>
             </button>
 
             {/* Quick Gate Unlock Button */}
@@ -848,6 +1290,9 @@ export const CameraDashboard: React.FC<CameraDashboardProps> = ({
             </button>
           </div>
         </div>
+
+        {/* Per-stream results panel */}
+        {scanState.showScanPanel && renderScanPanel(gateConfig, streams, scanState)}
       </div>
     );
   };
@@ -867,7 +1312,7 @@ export const CameraDashboard: React.FC<CameraDashboardProps> = ({
                   Quét Cửa AI - Giám Sát Luồng Camera &amp; Nhận Diện Đa Cổng
                 </h1>
                 <p className="text-xs text-slate-500 mt-0.5">
-                  Tự động hiển thị toàn bộ luồng camera đang hoạt động (Cổng Vào &amp; Cổng Ra), nhận diện khuôn mặt nhân viên AI thời gian thực và điều khiển mở khóa tự động.
+                  Tự động hiển thị toàn bộ luồng camera đang hoạt động của từng cổng (Cổng Vào &amp; Cổng Ra), nhận diện khuôn mặt nhân viên AI thời gian thực và điều khiển mở khóa tự động.
                 </p>
               </div>
             </div>
@@ -877,10 +1322,12 @@ export const CameraDashboard: React.FC<CameraDashboardProps> = ({
           <div className="flex flex-wrap items-center gap-2.5 sm:gap-3">
             {/* Active Streams Count Pill */}
             <div className="inline-flex items-center gap-2 px-3 py-1.5 rounded-xl bg-slate-50 border border-slate-200 text-slate-700 text-xs font-semibold">
-              <span className="w-2.5 h-2.5 rounded-full bg-emerald-500 animate-pulse" />
+              <span className={`w-2.5 h-2.5 rounded-full ${loadingConfig ? "bg-slate-300" : "bg-emerald-500 animate-pulse"}`} />
               <span>
-                {activeGates.length > 0
-                  ? `Đang chạy ${activeGates.length} luồng camera active`
+                {loadingConfig
+                  ? "Đang tải cấu hình camera..."
+                  : activeGates.length > 0
+                  ? `Đang chạy ${totalEnabledStreams} luồng camera trên ${activeGates.length} cổng`
                   : "Không có luồng camera active"}
               </span>
             </div>
@@ -888,7 +1335,7 @@ export const CameraDashboard: React.FC<CameraDashboardProps> = ({
             {/* Worker Pool Status */}
             <div className="hidden sm:inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-indigo-50 border border-indigo-100 text-indigo-700 text-xs font-medium">
               <Layers className="w-3.5 h-3.5 text-indigo-600" />
-              <span>ArcFace SOTA 4 Luồng Worker</span>
+              <span>ArcFace SOTA {config.workerThreadsCount || 4} Luồng Worker</span>
             </div>
 
             {/* Link to Manual Track Tab */}
@@ -916,7 +1363,7 @@ export const CameraDashboard: React.FC<CameraDashboardProps> = ({
         </div>
       </div>
 
-      {/* Main Multi-Stream Grid: Show ALL Active Streams */}
+      {/* Main Multi-Stream Grid: Show ALL Active Gates */}
       {activeGates.length === 0 ? (
         /* Empty State if no streams are active */
         <div className="rounded-2xl border-2 border-dashed border-slate-300 p-8 sm:p-12 text-center bg-white">
@@ -952,13 +1399,14 @@ export const CameraDashboard: React.FC<CameraDashboardProps> = ({
         <div
           className={`grid gap-6 ${
             activeGates.length === 1
-              ? "grid-cols-1 max-w-4xl mx-auto"
+              ? "grid-cols-1 max-w-5xl mx-auto"
               : "grid-cols-1 lg:grid-cols-2"
           }`}
         >
-          {activeGates.map(({ gate, state, setState }) =>
+          {activeGates.map(({ gate, streams, state, setState }) =>
             renderCameraStreamCard(
               gate,
+              streams,
               state,
               setState,
               gate.gateType === "ENTRY" ? entryVideoRef : exitVideoRef
@@ -1103,6 +1551,22 @@ export const CameraDashboard: React.FC<CameraDashboardProps> = ({
                 <span>Quản Lý Cụm Ảnh Người Lạ ({accessLogs.filter((l) => l.status === "DENIED").length})</span>
               </button>
             )}
+
+            {/* Lock state + manual unlock (kept from props) */}
+            <div className="flex items-center justify-between p-3 rounded-xl bg-slate-50 border border-slate-100 text-xs">
+              <span className="text-slate-600">
+                Khóa cổng: <b className={lockState?.isLocked === false ? "text-emerald-600" : "text-slate-900"}>
+                  {lockState?.isLocked === false ? "Đang mở" : "Đang khóa"}
+                </b>
+              </span>
+              <button
+                onClick={onTriggerManualUnlock}
+                className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg bg-slate-900 hover:bg-slate-800 text-white font-semibold cursor-pointer"
+              >
+                <KeyRound className="w-3.5 h-3.5" />
+                Mở thủ công
+              </button>
+            </div>
           </div>
         </div>
       </div>

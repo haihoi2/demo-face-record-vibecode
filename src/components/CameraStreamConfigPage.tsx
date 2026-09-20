@@ -17,13 +17,10 @@ import {
   Activity,
   HardDrive,
   Flame,
-  Clock,
-  ArrowRightLeft,
   Settings,
   Server,
   Eye,
   Copy,
-  ExternalLink,
   HelpCircle,
   Info,
   Terminal,
@@ -31,10 +28,20 @@ import {
   ChevronDown,
   ChevronUp,
   ScanFace,
+  Plus,
+  Pencil,
+  Trash2,
+  ArrowUp,
+  ArrowDown,
+  Image as ImageIcon,
+  Star,
+  X,
+  Save,
 } from "lucide-react";
 import {
   CameraStreamsConfig,
   GateStreamConfig,
+  GateStreamSource,
   CameraSourceType,
   ThreadPoolTelemetry,
 } from "../types";
@@ -84,6 +91,183 @@ interface AvailableMediaDevice {
   label: string;
 }
 
+// ----------------- MULTI-STREAM HELPERS -----------------
+type GateKey = "entry" | "exit";
+type GateField = "entryGate" | "exitGate";
+type StreamResolution = NonNullable<GateStreamSource["resolution"]>;
+
+const gateKeyOf = (gateType: "ENTRY" | "EXIT"): GateKey => (gateType === "EXIT" ? "exit" : "entry");
+const gateFieldOf = (key: GateKey): GateField => (key === "exit" ? "exitGate" : "entryGate");
+
+/**
+ * Returns the gate's streams sorted by priority. When the payload carries no
+ * `streams` (legacy server / legacy config), derive a single stream from the
+ * legacy single-stream fields so the UI never breaks.
+ */
+const deriveGateStreams = (gate: GateStreamConfig | undefined, key: GateKey): GateStreamSource[] => {
+  if (!gate) return [];
+  const list = Array.isArray(gate.streams) ? gate.streams.filter(Boolean) : [];
+  if (list.length > 0) {
+    return list
+      .map((s, index) => ({
+        ...s,
+        enabled: s.enabled !== false,
+        priority: typeof s.priority === "number" ? s.priority : index,
+      }))
+      .sort((a, b) => a.priority - b.priority);
+  }
+  return [
+    {
+      id: `${key}-primary`,
+      label: gate.name || (key === "exit" ? "Cổng Ra" : "Cổng Vào"),
+      sourceType: gate.sourceType || "RTSP",
+      rtspUrl: gate.rtspUrl,
+      rtspTransport: gate.rtspTransport || "TCP",
+      httpUrl: gate.httpUrl,
+      uvcDeviceId: gate.uvcDeviceId,
+      uvcDeviceLabel: gate.uvcDeviceLabel,
+      backendDevicePath: gate.backendDevicePath,
+      resolution: gate.resolution,
+      fps: gate.fps,
+      enabled: true,
+      priority: 0,
+    },
+  ];
+};
+
+/** The lowest-priority ENABLED stream is the primary (falls back to the first one). */
+const getPrimaryStream = (streams: GateStreamSource[]): GateStreamSource | null =>
+  streams.find((s) => s.enabled) || streams[0] || null;
+
+/** rtsp://user:secret@host/... -> rtsp://user:•••@host/... */
+const maskRtspCredentials = (url?: string): string => {
+  if (!url) return "";
+  return url.replace(/^([a-z]+:\/\/)([^:@/]+)(?::[^@/]*)?@/i, (_m, proto, user) => `${proto}${user}:•••@`);
+};
+
+/** Replace a gate's stream list and mirror the primary into the legacy fields. */
+const withStreams = (gate: GateStreamConfig, streams: GateStreamSource[]): GateStreamConfig => {
+  const sorted = [...streams].sort((a, b) => a.priority - b.priority);
+  const primary = getPrimaryStream(sorted);
+  return {
+    ...gate,
+    streams: sorted,
+    ...(primary
+      ? {
+          sourceType: primary.sourceType,
+          rtspUrl: primary.rtspUrl,
+          rtspTransport: primary.rtspTransport,
+          httpUrl: primary.httpUrl,
+          uvcDeviceId: primary.uvcDeviceId,
+          uvcDeviceLabel: primary.uvcDeviceLabel,
+          backendDevicePath: primary.backendDevicePath,
+          resolution: primary.resolution,
+          fps: primary.fps,
+        }
+      : {}),
+  };
+};
+
+const streamUrlOf = (s: GateStreamSource): string => {
+  if (s.sourceType === "RTSP") return s.rtspUrl || "";
+  if (s.sourceType === "HTTP_MJPEG") return s.httpUrl || "";
+  if (s.sourceType === "BACKEND_UVC") return s.backendDevicePath || "";
+  return s.uvcDeviceLabel || s.uvcDeviceId || "Webcam trình duyệt";
+};
+
+const SOURCE_TYPE_LABEL: Record<CameraSourceType, string> = {
+  RTSP: "RTSP",
+  HTTP_MJPEG: "HTTP/MJPEG",
+  CLIENT_UVC: "UVC Client",
+  BACKEND_UVC: "UVC Server",
+};
+
+interface StreamFormValues {
+  label: string;
+  sourceType: CameraSourceType;
+  rtspUrl: string;
+  rtspTransport: "TCP" | "UDP";
+  httpUrl: string;
+  uvcDeviceId: string;
+  uvcDeviceLabel: string;
+  backendDevicePath: string;
+  resolution: StreamResolution;
+  fps: number;
+  enabled: boolean;
+}
+
+const EMPTY_STREAM_FORM: StreamFormValues = {
+  label: "",
+  sourceType: "RTSP",
+  rtspUrl: "",
+  rtspTransport: "TCP",
+  httpUrl: "",
+  uvcDeviceId: "default",
+  uvcDeviceLabel: "Camera Mặc Định Trình Duyệt",
+  backendDevicePath: "/dev/video0",
+  resolution: "1280x720",
+  fps: 25,
+  enabled: true,
+};
+
+const streamToForm = (s: GateStreamSource): StreamFormValues => ({
+  label: s.label || "",
+  sourceType: s.sourceType || "RTSP",
+  rtspUrl: s.rtspUrl || "",
+  rtspTransport: s.rtspTransport === "UDP" ? "UDP" : "TCP",
+  httpUrl: s.httpUrl || "",
+  uvcDeviceId: s.uvcDeviceId || "default",
+  uvcDeviceLabel: s.uvcDeviceLabel || "Camera Mặc Định Trình Duyệt",
+  backendDevicePath: s.backendDevicePath || "/dev/video0",
+  resolution: s.resolution || "1280x720",
+  fps: typeof s.fps === "number" && s.fps > 0 ? s.fps : 25,
+  enabled: s.enabled !== false,
+});
+
+const formToStreamPatch = (f: StreamFormValues): Omit<GateStreamSource, "id" | "priority"> => ({
+  label: f.label.trim(),
+  sourceType: f.sourceType,
+  rtspUrl: f.rtspUrl.trim() || undefined,
+  rtspTransport: f.rtspTransport,
+  httpUrl: f.httpUrl.trim() || undefined,
+  uvcDeviceId: f.uvcDeviceId || undefined,
+  uvcDeviceLabel: f.uvcDeviceLabel || undefined,
+  backendDevicePath: f.backendDevicePath.trim() || undefined,
+  resolution: f.resolution,
+  fps: Number(f.fps) || 25,
+  enabled: f.enabled,
+});
+
+const validateStreamForm = (f: StreamFormValues): string | null => {
+  if (!f.label.trim()) return "Vui lòng nhập tên (nhãn) cho luồng camera.";
+  if (f.sourceType === "RTSP") {
+    if (!f.rtspUrl.trim().toLowerCase().startsWith("rtsp://")) {
+      return "URL luồng RTSP phải bắt đầu bằng rtsp://";
+    }
+  } else if (f.sourceType === "HTTP_MJPEG") {
+    const u = f.httpUrl.trim().toLowerCase();
+    if (!u.startsWith("http://") && !u.startsWith("https://")) {
+      return "URL luồng HTTP/MJPEG phải bắt đầu bằng http:// hoặc https://";
+    }
+  } else if (f.sourceType === "BACKEND_UVC") {
+    if (!f.backendDevicePath.trim()) return "Vui lòng nhập đường dẫn thiết bị (VD: /dev/video0).";
+  }
+  return null;
+};
+
+interface RowTestState {
+  loading: boolean;
+  data: any | null;
+  message: string | null;
+}
+
+/** Local preview source: either a stream or (legacy) a gate. */
+interface PreviewSource {
+  sourceType: CameraSourceType;
+  uvcDeviceId?: string;
+  resolution?: string;
+}
+
 export const CameraStreamConfigPage: React.FC = () => {
   const [config, setConfig] = useState<CameraStreamsConfig>(DEFAULT_STREAMS_CONFIG);
   const [telemetry, setTelemetry] = useState<ThreadPoolTelemetry | null>(null);
@@ -94,20 +278,33 @@ export const CameraStreamConfigPage: React.FC = () => {
   const [saveSuccess, setSaveSuccess] = useState<boolean>(false);
   const [saveError, setSaveError] = useState<string | null>(null);
 
+  // Multi-stream list state (per active gate tab)
+  const [addFormOpen, setAddFormOpen] = useState<boolean>(false);
+  const [addForm, setAddForm] = useState<StreamFormValues>(EMPTY_STREAM_FORM);
+  const [addFormError, setAddFormError] = useState<string | null>(null);
+  const [editingStreamId, setEditingStreamId] = useState<string | null>(null);
+  const [editForm, setEditForm] = useState<StreamFormValues>(EMPTY_STREAM_FORM);
+  const [editFormError, setEditFormError] = useState<string | null>(null);
+  const [streamSubmitting, setStreamSubmitting] = useState<boolean>(false);
+  const [busyStreamId, setBusyStreamId] = useState<string | null>(null);
+  const [streamActionError, setStreamActionError] = useState<string | null>(null);
+  const [streamActionNotice, setStreamActionNotice] = useState<string | null>(null);
+  const [rowTests, setRowTests] = useState<Record<string, RowTestState>>({});
+  const [snapshotStreamId, setSnapshotStreamId] = useState<string | null>(null);
+  const [snapshotTimestamp, setSnapshotTimestamp] = useState<number>(Date.now());
+  const [previewStreamId, setPreviewStreamId] = useState<string | null>(null);
+
   // Live Stream Preview State
   const [isPreviewActive, setIsPreviewActive] = useState<boolean>(false);
   const [isStartingCamera, setIsStartingCamera] = useState<boolean>(false);
   const [previewError, setPreviewError] = useState<string | null>(null);
-  const [previewFps, setPreviewFps] = useState<number>(24);
-  const [testStatusMessage, setTestStatusMessage] = useState<string | null>(null);
-  const [testResultData, setTestResultData] = useState<any | null>(null);
-  const [testingConnection, setTestingConnection] = useState<boolean>(false);
+  const [previewFps] = useState<number>(24);
 
   // RTSP Custom Options & AI Scan
   const [rtspViewMode, setRtspViewMode] = useState<"MJPEG" | "SNAPSHOT" | "SIMULATION">("MJPEG");
   const [isScanningRtsp, setIsScanningRtsp] = useState<boolean>(false);
   const [rtspScanResult, setRtspScanResult] = useState<any | null>(null);
-  const [showHikvisionGuide, setShowHikvisionGuide] = useState<boolean>(true);
+  const [showHikvisionGuide, setShowHikvisionGuide] = useState<boolean>(false);
   const [copiedKey, setCopiedKey] = useState<string | null>(null);
   const [previewTimestamp, setPreviewTimestamp] = useState<number>(Date.now());
 
@@ -192,17 +389,24 @@ export const CameraStreamConfigPage: React.FC = () => {
     };
   }, []);
 
-  // Save Configuration
+  // Save Configuration (global settings + gate name/enabled + full stream lists)
   const handleSaveConfig = async () => {
     try {
       setSaving(true);
       setSaveError(null);
       setSaveSuccess(false);
 
+      // Always send an explicit stream list per gate so the server replaces it consistently.
+      const payload: CameraStreamsConfig = {
+        ...config,
+        entryGate: withStreams(config.entryGate, deriveGateStreams(config.entryGate, "entry")),
+        exitGate: withStreams(config.exitGate, deriveGateStreams(config.exitGate, "exit")),
+      };
+
       const res = await fetch("/api/camera-streams/config", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(config),
+        body: JSON.stringify(payload),
       });
 
       if (!res.ok) {
@@ -218,7 +422,7 @@ export const CameraStreamConfigPage: React.FC = () => {
       }
 
       // Also save to localStorage for client-side persistence
-      localStorage.setItem("smartface_camera_streams_config", JSON.stringify(config));
+      localStorage.setItem("smartface_camera_streams_config", JSON.stringify(data.config || payload));
 
       setSaveSuccess(true);
       setTimeout(() => setSaveSuccess(false), 4000);
@@ -270,39 +474,275 @@ export const CameraStreamConfigPage: React.FC = () => {
     }
   };
 
-  // Test RTSP or HTTP Stream URL Connection
-  const handleTestConnection = async (targetGate: GateStreamConfig) => {
+  // ----------------- STREAM LIST: DERIVED VALUES -----------------
+  const currentGateKey: GateKey = activeGateTab === "EXIT" ? "exit" : "entry";
+  const currentGateField: GateField = gateFieldOf(currentGateKey);
+  const currentGateConfig: GateStreamConfig = config[currentGateField];
+  const currentStreams = deriveGateStreams(currentGateConfig, currentGateKey);
+  const currentPrimary = getPrimaryStream(currentStreams);
+  const previewStream: GateStreamSource | null =
+    currentStreams.find((s) => s.id === previewStreamId) || currentPrimary;
+
+  const updateCurrentGate = (updater: (prev: GateStreamConfig) => GateStreamConfig) => {
+    setConfig((prev) => ({ ...prev, [currentGateField]: updater(prev[currentGateField]) }));
+  };
+
+  /** Apply a stream list to a gate locally (keeps locally edited name/enabled/autoStart). */
+  const applyStreamsLocally = (key: GateKey, streams: GateStreamSource[]) => {
+    const field = gateFieldOf(key);
+    setConfig((prev) => ({ ...prev, [field]: withStreams(prev[field], streams) }));
+  };
+
+  /** Extract the stream list from any shape the thin endpoints / config endpoint may return. */
+  const parseStreamsFromResponse = (data: any, key: GateKey): GateStreamSource[] | null => {
+    const field = gateFieldOf(key);
+    const gate =
+      data?.config?.[field] ||
+      data?.gate ||
+      data?.[field] ||
+      (data && data.gateType && Array.isArray(data.streams) ? data : null);
+    if (gate && Array.isArray(gate.streams) && gate.streams.length > 0) {
+      return deriveGateStreams(gate as GateStreamConfig, key);
+    }
+    return null;
+  };
+
+  /** Fallback for servers without the thin stream endpoints: POST the whole gate with its stream list. */
+  const replaceGateStreamsViaConfig = async (key: GateKey, streams: GateStreamSource[]): Promise<GateStreamSource[]> => {
+    const field = gateFieldOf(key);
+    const gatePayload = withStreams(config[field], streams);
+    const res = await fetch("/api/camera-streams/config", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ [field]: gatePayload }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok || data?.success === false) {
+      throw new Error(data?.error || data?.message || `Lưu danh sách luồng thất bại (HTTP ${res.status})`);
+    }
+    setStreamActionNotice("Máy chủ chưa hỗ trợ API luồng riêng lẻ - đã lưu toàn bộ danh sách luồng của cổng.");
+    return parseStreamsFromResponse(data, key) || streams;
+  };
+
+  /**
+   * Call a thin stream endpoint. On 404 (endpoint not deployed yet) fall back to
+   * replacing the gate's whole stream list through /api/camera-streams/config.
+   */
+  const streamRequest = async (
+    key: GateKey,
+    method: "POST" | "PUT" | "DELETE",
+    path: string,
+    body: any | undefined,
+    fallbackStreams: () => GateStreamSource[]
+  ): Promise<{ streams: GateStreamSource[]; usedFallback: boolean }> => {
+    const res = await fetch(path, {
+      method,
+      headers: body !== undefined ? { "Content-Type": "application/json" } : undefined,
+      body: body !== undefined ? JSON.stringify(body) : undefined,
+    });
+    if (res.status === 404) {
+      return { streams: await replaceGateStreamsViaConfig(key, fallbackStreams()), usedFallback: true };
+    }
+    const data = await res.json().catch(() => ({}));
+    if (res.status === 503) {
+      const retry = data?.retryAfterSeconds || res.headers.get("Retry-After") || 1;
+      throw new Error(`Máy chủ đang quá tải, vui lòng thử lại sau ${retry} giây.`);
+    }
+    if (!res.ok || data?.success === false) {
+      throw new Error(data?.error || data?.message || `Thao tác luồng thất bại (HTTP ${res.status})`);
+    }
+    return { streams: parseStreamsFromResponse(data, key) || fallbackStreams(), usedFallback: false };
+  };
+
+  const resetStreamMessages = () => {
+    setStreamActionError(null);
+    setStreamActionNotice(null);
+  };
+
+  // ----------------- STREAM LIST: ACTIONS -----------------
+  const handleAddStream = async () => {
+    const validation = validateStreamForm(addForm);
+    if (validation) {
+      setAddFormError(validation);
+      return;
+    }
+    const key = currentGateKey;
+    const streams = currentStreams;
+    const nextPriority = streams.length > 0 ? Math.max(...streams.map((s) => s.priority)) + 1 : 0;
+    const payload = { ...formToStreamPatch(addForm), priority: nextPriority };
+    const fallback = () => [...streams, { ...payload, id: `${key}-${Date.now().toString(36)}` }];
+
     try {
-      setTestingConnection(true);
-      setTestStatusMessage(null);
-      setTestResultData(null);
-      const targetUrl = targetGate.sourceType === "RTSP" ? targetGate.rtspUrl : targetGate.httpUrl;
+      setStreamSubmitting(true);
+      setAddFormError(null);
+      resetStreamMessages();
+      const { streams: updated } = await streamRequest(key, "POST", `/api/camera-streams/${key}/streams`, payload, fallback);
+      applyStreamsLocally(key, updated);
+      setAddFormOpen(false);
+      setAddForm(EMPTY_STREAM_FORM);
+    } catch (err: any) {
+      setAddFormError(err?.message || "Không thể thêm luồng camera");
+    } finally {
+      setStreamSubmitting(false);
+    }
+  };
+
+  const openEditStream = (s: GateStreamSource) => {
+    setEditingStreamId(s.id);
+    setEditForm(streamToForm(s));
+    setEditFormError(null);
+    setAddFormOpen(false);
+  };
+
+  const handleSaveEditStream = async () => {
+    if (!editingStreamId) return;
+    const validation = validateStreamForm(editForm);
+    if (validation) {
+      setEditFormError(validation);
+      return;
+    }
+    const key = currentGateKey;
+    const streams = currentStreams;
+    const id = editingStreamId;
+    const patch = formToStreamPatch(editForm);
+    const fallback = () => streams.map((s) => (s.id === id ? { ...s, ...patch } : s));
+
+    try {
+      setStreamSubmitting(true);
+      setEditFormError(null);
+      resetStreamMessages();
+      const { streams: updated } = await streamRequest(key, "PUT", `/api/camera-streams/${key}/streams/${encodeURIComponent(id)}`, patch, fallback);
+      applyStreamsLocally(key, updated);
+      setEditingStreamId(null);
+    } catch (err: any) {
+      setEditFormError(err?.message || "Không thể cập nhật luồng camera");
+    } finally {
+      setStreamSubmitting(false);
+    }
+  };
+
+  const handleToggleStreamEnabled = async (s: GateStreamSource) => {
+    const key = currentGateKey;
+    const streams = currentStreams;
+    const patch = { enabled: !s.enabled };
+    const fallback = () => streams.map((x) => (x.id === s.id ? { ...x, ...patch } : x));
+    try {
+      setBusyStreamId(s.id);
+      resetStreamMessages();
+      const { streams: updated } = await streamRequest(key, "PUT", `/api/camera-streams/${key}/streams/${encodeURIComponent(s.id)}`, patch, fallback);
+      applyStreamsLocally(key, updated);
+    } catch (err: any) {
+      setStreamActionError(err?.message || "Không thể đổi trạng thái luồng");
+    } finally {
+      setBusyStreamId(null);
+    }
+  };
+
+  const handleDeleteStream = async (s: GateStreamSource) => {
+    if (currentStreams.length <= 1) return;
+    if (!window.confirm(`Xóa luồng "${s.label}" khỏi ${currentGateConfig.name}?`)) return;
+    const key = currentGateKey;
+    const streams = currentStreams;
+    const fallback = () => streams.filter((x) => x.id !== s.id);
+    try {
+      setBusyStreamId(s.id);
+      resetStreamMessages();
+      const { streams: updated } = await streamRequest(key, "DELETE", `/api/camera-streams/${key}/streams/${encodeURIComponent(s.id)}`, undefined, fallback);
+      applyStreamsLocally(key, updated);
+      if (editingStreamId === s.id) setEditingStreamId(null);
+      if (snapshotStreamId === s.id) setSnapshotStreamId(null);
+      if (previewStreamId === s.id) setPreviewStreamId(null);
+    } catch (err: any) {
+      setStreamActionError(err?.message || "Không thể xóa luồng camera");
+    } finally {
+      setBusyStreamId(null);
+    }
+  };
+
+  const handleMoveStream = async (s: GateStreamSource, direction: -1 | 1) => {
+    const key = currentGateKey;
+    const streams = currentStreams;
+    const index = streams.findIndex((x) => x.id === s.id);
+    const target = index + direction;
+    if (index < 0 || target < 0 || target >= streams.length) return;
+
+    // Normalise priorities to their index, then swap the two neighbours.
+    const reordered = streams.map((x, i) => ({ ...x, priority: i }));
+    const tmp = reordered[index].priority;
+    reordered[index] = { ...reordered[index], priority: reordered[target].priority };
+    reordered[target] = { ...reordered[target], priority: tmp };
+    const finalList = [...reordered].sort((a, b) => a.priority - b.priority);
+    const changed = finalList.filter((x) => {
+      const before = streams.find((o) => o.id === x.id);
+      return !before || before.priority !== x.priority;
+    });
+
+    try {
+      setBusyStreamId(s.id);
+      resetStreamMessages();
+      let latest: GateStreamSource[] = finalList;
+      for (const item of changed) {
+        const { streams: updated, usedFallback } = await streamRequest(
+          key,
+          "PUT",
+          `/api/camera-streams/${key}/streams/${encodeURIComponent(item.id)}`,
+          { priority: item.priority },
+          () => finalList
+        );
+        latest = updated;
+        if (usedFallback) break; // the fallback already wrote the whole list
+      }
+      applyStreamsLocally(key, latest);
+    } catch (err: any) {
+      setStreamActionError(err?.message || "Không thể sắp xếp lại thứ tự luồng");
+    } finally {
+      setBusyStreamId(null);
+    }
+  };
+
+  // Test RTSP or HTTP Stream URL Connection for one stream row
+  const handleTestStream = async (s: GateStreamSource) => {
+    const targetUrl = s.sourceType === "RTSP" ? s.rtspUrl : s.httpUrl;
+    if (!targetUrl) return;
+    setRowTests((prev) => ({ ...prev, [s.id]: { loading: true, data: null, message: null } }));
+    try {
       const res = await fetch("/api/camera-streams/test-stream", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           url: targetUrl,
-          sourceType: targetGate.sourceType,
-          transport: targetGate.rtspTransport,
+          sourceType: s.sourceType,
+          transport: s.rtspTransport,
         }),
       });
-
-      const data = await res.json();
-      setTestResultData(data);
-      if (res.ok && data.success) {
-        setTestStatusMessage(data.message);
-      } else {
-        setTestStatusMessage(data.message || data.error || "Không thể kết nối đến URL luồng camera");
-      }
+      const data = await res.json().catch(() => ({}));
+      setRowTests((prev) => ({
+        ...prev,
+        [s.id]: {
+          loading: false,
+          data,
+          message:
+            res.ok && data.success
+              ? data.message
+              : data.message || data.error || "Không thể kết nối đến URL luồng camera",
+        },
+      }));
     } catch (err: any) {
-      setTestStatusMessage("Lỗi kết nối kiểm tra: " + err?.message);
-    } finally {
-      setTestingConnection(false);
+      setRowTests((prev) => ({
+        ...prev,
+        [s.id]: { loading: false, data: { success: false }, message: "Lỗi kết nối kiểm tra: " + err?.message },
+      }));
     }
   };
 
-  // Trigger real-time Face Recognition test directly on the RTSP stream
+  const handleToggleSnapshot = (s: GateStreamSource) => {
+    setSnapshotTimestamp(Date.now());
+    setSnapshotStreamId((prev) => (prev === s.id ? null : s.id));
+  };
+
+  // Trigger real-time Face Recognition test directly on the previewed stream
   const handleScanRtsp = async () => {
+    if (!previewStream) return;
     try {
       setIsScanningRtsp(true);
       setRtspScanResult(null);
@@ -310,13 +750,22 @@ export const CameraStreamConfigPage: React.FC = () => {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          gate: activeGateTab.toLowerCase(),
-          url: currentGateConfig.rtspUrl,
+          gate: currentGateKey,
+          stream: previewStream.id,
           scanType: activeGateTab === "EXIT" ? "EXIT" : "ENTRY",
         }),
       });
-      const data = await res.json();
-      setRtspScanResult(data);
+      const data = await res.json().catch(() => ({}));
+      if (res.status === 503) {
+        const retry = data?.retryAfterSeconds || res.headers.get("Retry-After") || 1;
+        setRtspScanResult({
+          success: false,
+          overloaded: true,
+          error: `Cụm xử lý đang quá tải, vui lòng quét lại sau ${retry} giây.`,
+        });
+        return;
+      }
+      setRtspScanResult({ ...data, streamLabel: previewStream.label });
     } catch (err: any) {
       setRtspScanResult({
         success: false,
@@ -347,13 +796,17 @@ export const CameraStreamConfigPage: React.FC = () => {
     }
   };
 
-  // Start / Stop Live Preview for the currently selected Gate
-  const startPreview = async (overrideGate?: GateStreamConfig) => {
+  // Start / Stop Live Preview for the currently previewed stream
+  const startPreview = async (overrideSource?: PreviewSource) => {
     setPreviewError(null);
     setPreviewTimestamp(Date.now());
-    const currentGate = overrideGate || (activeGateTab === "EXIT" ? config.exitGate : config.entryGate);
+    const source: PreviewSource | null = overrideSource || previewStream;
+    if (!source) {
+      setPreviewError("Cổng này chưa có luồng camera nào để xem thử.");
+      return;
+    }
 
-    if (currentGate.sourceType === "CLIENT_UVC") {
+    if (source.sourceType === "CLIENT_UVC") {
       setIsStartingCamera(true);
       try {
         if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
@@ -368,13 +821,13 @@ export const CameraStreamConfigPage: React.FC = () => {
           mediaStreamRef.current = null;
         }
 
-        let videoConstraints: MediaTrackConstraints = {};
-        if (currentGate.uvcDeviceId && currentGate.uvcDeviceId !== "default") {
-          videoConstraints.deviceId = { ideal: currentGate.uvcDeviceId };
+        const videoConstraints: MediaTrackConstraints = {};
+        if (source.uvcDeviceId && source.uvcDeviceId !== "default") {
+          videoConstraints.deviceId = { ideal: source.uvcDeviceId };
         }
 
-        if (currentGate.resolution && currentGate.resolution !== "AUTO") {
-          const [wStr, hStr] = currentGate.resolution.split("x");
+        if (source.resolution && source.resolution !== "AUTO") {
+          const [wStr, hStr] = source.resolution.split("x");
           const width = parseInt(wStr, 10);
           const height = parseInt(hStr, 10);
           if (!isNaN(width) && !isNaN(height)) {
@@ -442,12 +895,12 @@ export const CameraStreamConfigPage: React.FC = () => {
     setIsPreviewActive(false);
   };
 
-  // Keep video element srcObject synchronized when active state or source type changes
+  // Keep video element srcObject synchronized when active state or previewed source changes
+  const previewSourceType = previewStream?.sourceType;
   useEffect(() => {
-    const currentGate = activeGateTab === "EXIT" ? config.exitGate : config.entryGate;
     if (
       isPreviewActive &&
-      currentGate.sourceType === "CLIENT_UVC" &&
+      previewSourceType === "CLIENT_UVC" &&
       videoPreviewRef.current &&
       mediaStreamRef.current
     ) {
@@ -458,20 +911,31 @@ export const CameraStreamConfigPage: React.FC = () => {
         console.warn("Sync video play error:", err);
       });
     }
-  }, [isPreviewActive, activeGateTab, config.entryGate.sourceType, config.exitGate.sourceType]);
+  }, [isPreviewActive, activeGateTab, previewSourceType]);
 
-  const currentGateConfig = activeGateTab === "EXIT" ? config.exitGate : config.entryGate;
-
-  const updateCurrentGate = (updater: (prev: GateStreamConfig) => GateStreamConfig) => {
-    if (activeGateTab === "EXIT") {
-      setConfig((prev) => ({ ...prev, exitGate: updater(prev.exitGate) }));
-    } else {
-      setConfig((prev) => ({ ...prev, entryGate: updater(prev.entryGate) }));
-    }
+  const switchGateTab = (tab: "ENTRY" | "EXIT" | "DUAL_MONITOR") => {
+    setActiveGateTab(tab);
+    stopPreview();
+    setPreviewStreamId(null);
+    setEditingStreamId(null);
+    setAddFormOpen(false);
+    setSnapshotStreamId(null);
+    setRtspScanResult(null);
+    resetStreamMessages();
   };
 
-  // RTSP Presets
-  const applyPreset = (type: "HIKVISION_LOCAL_101" | "HIKVISION_LOCAL_102" | "HIKVISION" | "DAHUA" | "EZVIZ" | "GENERIC") => {
+  const selectPreviewStream = (id: string) => {
+    if (isPreviewActive) stopPreview();
+    setPreviewStreamId(id);
+    setRtspScanResult(null);
+    setPreviewTimestamp(Date.now());
+  };
+
+  // RTSP Presets (apply to whichever stream form is open)
+  const applyPreset = (
+    setForm: React.Dispatch<React.SetStateAction<StreamFormValues>>,
+    type: "HIKVISION_LOCAL_101" | "HIKVISION_LOCAL_102" | "HIKVISION" | "DAHUA" | "EZVIZ" | "GENERIC"
+  ) => {
     let presetUrl = "";
     if (type === "HIKVISION_LOCAL_101") {
       presetUrl = "rtsp://viewCam:1234abcd@192.168.60.2:554/Streaming/Channels/101";
@@ -486,7 +950,674 @@ export const CameraStreamConfigPage: React.FC = () => {
     } else {
       presetUrl = "rtsp://192.168.1.100:554/live/ch0";
     }
-    updateCurrentGate((prev) => ({ ...prev, rtspUrl: presetUrl, sourceType: "RTSP", rtspTransport: "TCP" }));
+    setForm((prev) => ({ ...prev, rtspUrl: presetUrl, sourceType: "RTSP", rtspTransport: "TCP" }));
+  };
+
+  // ----------------- STREAM FORM (shared by "Thêm luồng" and "Sửa") -----------------
+  const renderStreamForm = (
+    mode: "ADD" | "EDIT",
+    values: StreamFormValues,
+    setValues: React.Dispatch<React.SetStateAction<StreamFormValues>>,
+    error: string | null,
+    onSubmit: () => void,
+    onCancel: () => void
+  ) => {
+    const set = <K extends keyof StreamFormValues>(field: K, value: StreamFormValues[K]) =>
+      setValues((prev) => ({ ...prev, [field]: value }));
+
+    const sourceOptions: { type: CameraSourceType; title: string; desc: string; icon: React.ReactNode; active: string }[] = [
+      { type: "RTSP", title: "Luồng URL RTSP", desc: "Đầu ghi NVR / Camera IP (Hikvision, Dahua, EZVIZ).", icon: <Video className="w-4 h-4 text-indigo-600" />, active: "border-indigo-600 bg-indigo-50/50" },
+      { type: "HTTP_MJPEG", title: "HTTP / MJPEG", desc: "ESP32-CAM, mjpg-streamer, webcam server IP.", icon: <Radio className="w-4 h-4 text-purple-600" />, active: "border-purple-600 bg-purple-50/50" },
+      { type: "CLIENT_UVC", title: "UVC Camera Client", desc: "Webcam trình duyệt qua MediaDevices API.", icon: <Camera className="w-4 h-4 text-blue-600" />, active: "border-blue-600 bg-blue-50/50" },
+      { type: "BACKEND_UVC", title: "UVC Backend Server", desc: "Webcam cắm vào máy chủ Linux (/dev/videoX).", icon: <Server className="w-4 h-4 text-emerald-600" />, active: "border-emerald-600 bg-emerald-50/50" },
+    ];
+
+    return (
+      <div className="p-5 rounded-xl bg-white border border-indigo-200 shadow-xs space-y-4 animate-in fade-in">
+        <div className="flex items-center justify-between">
+          <span className="text-sm font-bold text-slate-900 flex items-center gap-2">
+            {mode === "ADD" ? <Plus className="w-4 h-4 text-indigo-600" /> : <Pencil className="w-4 h-4 text-indigo-600" />}
+            {mode === "ADD" ? "Thêm Luồng Camera Mới" : `Sửa Luồng: ${values.label || "(chưa đặt tên)"}`}
+          </span>
+          <button
+            type="button"
+            onClick={onCancel}
+            className="p-1.5 rounded-md text-slate-500 hover:text-slate-800 hover:bg-slate-100"
+            title="Đóng"
+          >
+            <X className="w-4 h-4" />
+          </button>
+        </div>
+
+        {/* Label + Enabled */}
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+          <div className="md:col-span-2">
+            <label className="block text-xs font-semibold text-slate-700 uppercase tracking-wider mb-1">
+              Tên Luồng (Nhãn hiển thị) <span className="text-rose-600">*</span>
+            </label>
+            <input
+              type="text"
+              value={values.label}
+              onChange={(e) => set("label", e.target.value)}
+              className="w-full px-3.5 py-2.5 rounded-lg border border-slate-300 text-sm font-medium focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 outline-none"
+              placeholder="VD: BVE-CUA-KHO, Kênh 501 NVR..."
+            />
+          </div>
+          <div className="flex items-end">
+            <label className="w-full flex items-center justify-between p-3 rounded-lg border border-slate-200 hover:bg-slate-50 cursor-pointer">
+              <span className="text-xs font-semibold text-slate-800">Kích hoạt luồng</span>
+              <input
+                type="checkbox"
+                checked={values.enabled}
+                onChange={(e) => set("enabled", e.target.checked)}
+                className="w-4 h-4 text-indigo-600 rounded border-slate-300 focus:ring-indigo-500"
+              />
+            </label>
+          </div>
+        </div>
+
+        {/* Source type */}
+        <div className="space-y-2">
+          <label className="block text-xs font-semibold text-slate-700 uppercase tracking-wider">
+            Loại Nguồn Luồng Camera
+          </label>
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
+            {sourceOptions.map((opt) => (
+              <div
+                key={opt.type}
+                onClick={() => set("sourceType", opt.type)}
+                className={`p-3 rounded-xl border-2 cursor-pointer transition-all ${
+                  values.sourceType === opt.type ? `${opt.active} shadow-xs` : "border-slate-200 hover:border-slate-300 bg-white"
+                }`}
+              >
+                <div className="flex items-center gap-2 mb-1">
+                  {opt.icon}
+                  <span className="font-semibold text-xs text-slate-900">{opt.title}</span>
+                </div>
+                <p className="text-[11px] text-slate-600">{opt.desc}</p>
+              </div>
+            ))}
+          </div>
+        </div>
+
+        {/* Type-specific fields */}
+        {values.sourceType === "RTSP" && (
+          <div className="p-4 rounded-xl bg-slate-50 border border-slate-200 space-y-3">
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+              <span className="text-xs font-semibold text-slate-800 flex items-center gap-2">
+                <Video className="w-4 h-4 text-indigo-600" />
+                Cấu Hình Luồng RTSP (IP Camera)
+              </span>
+              <div className="flex flex-wrap items-center gap-1.5">
+                <span className="text-xs text-slate-700">Mẫu nhanh:</span>
+                <button
+                  type="button"
+                  onClick={() => applyPreset(setValues, "HIKVISION_LOCAL_101")}
+                  className="px-2.5 py-1 rounded-md text-xs bg-indigo-600 text-white hover:bg-indigo-700 font-semibold shadow-xs flex items-center gap-1"
+                  title="rtsp://viewCam:1234abcd@192.168.60.2:554/Streaming/Channels/101"
+                >
+                  <Zap className="w-3 h-3" />
+                  192.168.60.2 (Kênh 101 Main)
+                </button>
+                <button
+                  type="button"
+                  onClick={() => applyPreset(setValues, "HIKVISION_LOCAL_102")}
+                  className="px-2.5 py-1 rounded-md text-xs bg-indigo-100 text-indigo-800 hover:bg-indigo-200 font-semibold border border-indigo-200"
+                  title="rtsp://viewCam:1234abcd@192.168.60.2:554/Streaming/Channels/102"
+                >
+                  192.168.60.2 (Kênh 102 Sub)
+                </button>
+                <button type="button" onClick={() => applyPreset(setValues, "HIKVISION")} className="px-2 py-0.5 rounded text-xs bg-white border border-slate-300 hover:bg-slate-100 font-medium">
+                  Hikvision Khác
+                </button>
+                <button type="button" onClick={() => applyPreset(setValues, "DAHUA")} className="px-2 py-0.5 rounded text-xs bg-white border border-slate-300 hover:bg-slate-100 font-medium">
+                  Dahua
+                </button>
+                <button type="button" onClick={() => applyPreset(setValues, "EZVIZ")} className="px-2 py-0.5 rounded text-xs bg-white border border-slate-300 hover:bg-slate-100 font-medium">
+                  EZVIZ
+                </button>
+              </div>
+            </div>
+
+            <div>
+              <label className="block text-xs font-semibold text-slate-700 uppercase tracking-wider mb-1">
+                URL Luồng RTSP (Bao gồm User/Password nếu có) <span className="text-rose-600">*</span>
+              </label>
+              <input
+                type="text"
+                value={values.rtspUrl}
+                onChange={(e) => set("rtspUrl", e.target.value)}
+                className="w-full px-3.5 py-2.5 rounded-lg border border-slate-300 text-sm font-mono text-slate-800 bg-white focus:ring-2 focus:ring-indigo-500 outline-none"
+                placeholder="rtsp://viewCam:1234abcd@192.168.60.2:554/Streaming/Channels/101"
+              />
+              <div className="flex flex-wrap items-center justify-between text-xs text-slate-700 mt-1.5 gap-2">
+                <span>
+                  Cú pháp chuẩn: <code className="text-indigo-600 font-mono">rtsp://[user]:[password]@[ip]:[port]/[path]</code>
+                </span>
+                <button
+                  type="button"
+                  onClick={() => setShowHikvisionGuide((prev) => !prev)}
+                  className="text-indigo-600 hover:text-indigo-800 font-medium inline-flex items-center gap-1"
+                >
+                  <HelpCircle className="w-3.5 h-3.5" />
+                  {showHikvisionGuide ? "Ẩn hướng dẫn camera 192.168.60.2" : "Xem hướng dẫn cấu hình luồng 192.168.60.2"}
+                  {showHikvisionGuide ? <ChevronUp className="w-3 h-3" /> : <ChevronDown className="w-3 h-3" />}
+                </button>
+              </div>
+            </div>
+
+            {showHikvisionGuide && renderHikvisionGuide()}
+
+            <div>
+              <label className="block text-xs font-semibold text-slate-700 mb-1">
+                Giao Thức Truyền Tải (RTSP Transport Protocol)
+              </label>
+              <select
+                value={values.rtspTransport}
+                onChange={(e) => set("rtspTransport", e.target.value as "TCP" | "UDP")}
+                className="w-full px-3 py-2 rounded-lg border border-slate-300 text-sm bg-white outline-none"
+              >
+                <option value="TCP">TCP (Khuyến nghị: Chống mất gói hình ảnh, ổn định cao)</option>
+                <option value="UDP">UDP (Độ trễ siêu thấp, phù hợp mạng LAN nội bộ chuẩn Gigabit)</option>
+              </select>
+            </div>
+          </div>
+        )}
+
+        {values.sourceType === "HTTP_MJPEG" && (
+          <div className="p-4 rounded-xl bg-slate-50 border border-slate-200 space-y-3">
+            <span className="text-xs font-semibold text-slate-800 flex items-center gap-2">
+              <Radio className="w-4 h-4 text-purple-600" />
+              Cấu Hình Luồng HTTP / MJPEG
+            </span>
+            <div>
+              <label className="block text-xs font-semibold text-slate-700 uppercase tracking-wider mb-1">
+                URL Luồng Stream HTTP <span className="text-rose-600">*</span>
+              </label>
+              <input
+                type="text"
+                value={values.httpUrl}
+                onChange={(e) => set("httpUrl", e.target.value)}
+                className="w-full px-3.5 py-2.5 rounded-lg border border-slate-300 text-sm font-mono text-slate-800 bg-white focus:ring-2 focus:ring-purple-500 outline-none"
+                placeholder="http://192.168.1.75:81/stream"
+              />
+              <p className="text-xs text-slate-700 mt-1">Phù hợp cho ESP32-CAM, mjpg-streamer, hoặc các module camera nhúng.</p>
+            </div>
+          </div>
+        )}
+
+        {values.sourceType === "CLIENT_UVC" && (
+          <div className="p-4 rounded-xl bg-slate-50 border border-slate-200 space-y-3">
+            <div className="flex items-center justify-between">
+              <span className="text-xs font-semibold text-slate-800 flex items-center gap-2">
+                <Camera className="w-4 h-4 text-blue-600" />
+                Thiết Bị UVC Trình Duyệt (Client MediaDevices)
+              </span>
+              <button
+                type="button"
+                onClick={detectClientCameras}
+                className="flex items-center gap-1.5 px-2.5 py-1 rounded-md text-xs font-semibold bg-white border border-slate-300 text-slate-700 hover:bg-slate-100"
+              >
+                <RefreshCw className="w-3.5 h-3.5 text-blue-600" />
+                Quét Lại Camera
+              </button>
+            </div>
+            <div>
+              <label className="block text-xs font-semibold text-slate-700 uppercase tracking-wider mb-1">
+                Chọn Thiết Bị Webcam
+              </label>
+              <select
+                value={values.uvcDeviceId}
+                onChange={(e) => {
+                  const dev = availableCameras.find((c) => c.deviceId === e.target.value);
+                  setValues((prev) => ({
+                    ...prev,
+                    uvcDeviceId: e.target.value,
+                    uvcDeviceLabel: dev ? dev.label : "Camera Mặc Định Trình Duyệt",
+                  }));
+                }}
+                className="w-full px-3 py-2.5 rounded-lg border border-slate-300 text-sm bg-white outline-none font-medium"
+              >
+                <option value="default">Camera Mặc Định Trình Duyệt</option>
+                {availableCameras.map((cam) => (
+                  <option key={cam.deviceId} value={cam.deviceId}>
+                    {cam.label}
+                  </option>
+                ))}
+              </select>
+              <p className="text-[11px] text-slate-600 mt-1">
+                Webcam trình duyệt chỉ được hiển thị/quét khi là luồng chính của cổng.
+              </p>
+            </div>
+          </div>
+        )}
+
+        {values.sourceType === "BACKEND_UVC" && (
+          <div className="p-4 rounded-xl bg-slate-50 border border-slate-200 space-y-3">
+            <span className="text-xs font-semibold text-slate-800 flex items-center gap-2">
+              <Server className="w-4 h-4 text-emerald-600" />
+              Thiết Bị V4L2 Máy Chủ
+            </span>
+            <div>
+              <label className="block text-xs font-semibold text-slate-700 uppercase tracking-wider mb-1">
+                Đường Dẫn Thiết Bị Linux (Device Path) <span className="text-rose-600">*</span>
+              </label>
+              <input
+                type="text"
+                value={values.backendDevicePath}
+                onChange={(e) => set("backendDevicePath", e.target.value)}
+                className="w-full px-3.5 py-2.5 rounded-lg border border-slate-300 text-sm font-mono text-slate-800 bg-white focus:ring-2 focus:ring-emerald-500 outline-none"
+                placeholder="/dev/video0"
+              />
+              <p className="text-xs text-slate-700 mt-1">
+                Cần phân quyền truy cập thiết bị (vd: video group) trong môi trường triển khai docker/container.
+              </p>
+            </div>
+          </div>
+        )}
+
+        {/* Resolution + FPS */}
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+          <div>
+            <label className="block text-xs font-semibold text-slate-700 uppercase tracking-wider mb-1">
+              Độ Phân Giải Mục Tiêu (Resolution)
+            </label>
+            <select
+              value={values.resolution}
+              onChange={(e) => set("resolution", e.target.value as StreamResolution)}
+              className="w-full px-3 py-2.5 rounded-lg border border-slate-300 text-sm bg-white outline-none font-medium"
+            >
+              <option value="1920x1080">1080p Full HD (1920 x 1080) - Chi tiết cao nhất</option>
+              <option value="1280x720">720p HD (1280 x 720) - Chuẩn tối ưu AI</option>
+              <option value="640x480">480p SD (640 x 480) - Tiết kiệm băng thông</option>
+              <option value="AUTO">Tự Động (Theo khả năng thiết bị)</option>
+            </select>
+          </div>
+          <div>
+            <label className="block text-xs font-semibold text-slate-700 uppercase tracking-wider mb-1">
+              Tốc Độ Khung Hình (FPS)
+            </label>
+            <input
+              type="number"
+              min={1}
+              max={60}
+              value={values.fps}
+              onChange={(e) => set("fps", Number(e.target.value))}
+              className="w-full px-3.5 py-2.5 rounded-lg border border-slate-300 text-sm font-mono bg-white focus:ring-2 focus:ring-indigo-500 outline-none"
+            />
+          </div>
+        </div>
+
+        {error && (
+          <div className="p-3 rounded-lg bg-rose-50 border border-rose-200 text-xs text-rose-800 flex items-center gap-2">
+            <AlertTriangle className="w-4 h-4 text-rose-600 shrink-0" />
+            <span>{error}</span>
+          </div>
+        )}
+
+        <div className="flex items-center justify-end gap-2 pt-1">
+          <button
+            type="button"
+            onClick={onCancel}
+            disabled={streamSubmitting}
+            className="px-3.5 py-2 rounded-lg border border-slate-300 text-slate-700 hover:bg-slate-50 text-xs font-semibold transition-colors disabled:opacity-50"
+          >
+            Hủy
+          </button>
+          <button
+            type="button"
+            onClick={onSubmit}
+            disabled={streamSubmitting}
+            className="flex items-center gap-1.5 px-4 py-2 rounded-lg bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-semibold shadow-xs transition-colors disabled:opacity-50"
+          >
+            {streamSubmitting ? <RefreshCw className="w-3.5 h-3.5 animate-spin" /> : <Save className="w-3.5 h-3.5" />}
+            {mode === "ADD" ? "Thêm Luồng" : "Lưu Luồng"}
+          </button>
+        </div>
+      </div>
+    );
+  };
+
+  // EXPANDABLE COMPREHENSIVE GUIDE FOR LOCAL RTSP
+  const renderHikvisionGuide = () => (
+    <div className="rounded-xl border border-indigo-200 bg-indigo-50/50 p-4 space-y-3.5 text-xs text-slate-800 animate-in fade-in">
+      <div className="flex items-center justify-between border-b border-indigo-100 pb-2">
+        <div className="flex items-center gap-2 font-bold text-indigo-950 text-sm">
+          <Info className="w-4 h-4 text-indigo-600" />
+          Hướng Dẫn Cấu Hình Luồng RTSP Cục Bộ: <code className="font-mono text-indigo-700 bg-white px-1.5 py-0.5 rounded border border-indigo-200">rtsp://viewCam:1234abcd@192.168.60.2:554/Streaming/Channels/101</code>
+        </div>
+      </div>
+
+      <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-2.5">
+        <div className="bg-white p-2.5 rounded-lg border border-indigo-100">
+          <div className="text-slate-500 font-semibold text-[11px]">ĐỊA CHỈ IP & PORT MẠNG LAN</div>
+          <div className="font-mono font-bold text-slate-900 mt-0.5">192.168.60.2 : 554</div>
+          <div className="text-[11px] text-slate-500 mt-0.5">IP tĩnh của camera trong mạng nội bộ</div>
+        </div>
+        <div className="bg-white p-2.5 rounded-lg border border-indigo-100">
+          <div className="text-slate-500 font-semibold text-[11px]">TÀI KHOẢN & MẬT KHẨU</div>
+          <div className="font-mono font-bold text-slate-900 mt-0.5">viewCam / 1234abcd</div>
+          <div className="text-[11px] text-slate-500 mt-0.5">Xác thực Digest/Basic quyền xem luồng</div>
+        </div>
+        <div className="bg-white p-2.5 rounded-lg border border-indigo-100">
+          <div className="text-slate-500 font-semibold text-[11px]">KÊNH 101 VS KÊNH 102</div>
+          <div className="font-mono font-bold text-slate-900 mt-0.5">Channels/101 hoặc 102</div>
+          <div className="text-[11px] text-slate-500 mt-0.5">101: Main (FullHD/4K) | 102: Sub (AI siêu mượt)</div>
+        </div>
+      </div>
+
+      <div className="space-y-2.5 bg-white p-3 rounded-lg border border-indigo-100">
+        <div className="font-bold text-slate-900 flex items-center gap-1.5">
+          <Terminal className="w-3.5 h-3.5 text-indigo-600" />
+          3 Bước Xác Thực & Triển Khai Thực Tế:
+        </div>
+
+        <div className="space-y-2 text-slate-700">
+          <div className="flex items-start gap-2">
+            <span className="w-4 h-4 rounded-full bg-indigo-600 text-white flex items-center justify-center font-bold text-[10px] shrink-0 mt-0.5">1</span>
+            <div>
+              <span className="font-semibold text-slate-900">Kiểm tra luồng qua phần mềm VLC Media Player:</span>
+              <p className="text-[11px] text-slate-600 mt-0.5">
+                Mở VLC trên máy tính cùng mạng WiFi/LAN văn phòng &rarr; Nhấn <kbd className="px-1 py-0.5 bg-slate-100 border rounded font-mono text-[10px]">Ctrl + N</kbd> (Open Network Stream) &rarr; Dán URL trên &rarr; Nhấn Play. Nếu phát được hình, camera đang hoạt động hoàn hảo!
+              </p>
+            </div>
+          </div>
+
+          <div className="flex items-start gap-2">
+            <span className="w-4 h-4 rounded-full bg-indigo-600 text-white flex items-center justify-center font-bold text-[10px] shrink-0 mt-0.5">2</span>
+            <div>
+              <span className="font-semibold text-slate-900">Cấu hình trên giao diện Web camera Hikvision (http://192.168.60.2):</span>
+              <ul className="list-disc pl-4 text-[11px] text-slate-600 space-y-0.5 mt-0.5">
+                <li>Vào <b>Configuration &rarr; Network &rarr; Advanced Settings &rarr; Integration Protocol</b> &rarr; Bật <b>Enable Open Network Video Interface (ONVIF)</b> và thêm user <code className="text-indigo-700 font-bold">viewCam</code>.</li>
+                <li>Vào <b>Configuration &rarr; System &rarr; Security &rarr; Authentication</b> &rarr; Mục <i>RTSP Authentication</i> chọn <b>digest/basic</b>.</li>
+              </ul>
+            </div>
+          </div>
+
+          <div className="flex items-start gap-2">
+            <span className="w-4 h-4 rounded-full bg-indigo-600 text-white flex items-center justify-center font-bold text-[10px] shrink-0 mt-0.5">3</span>
+            <div>
+              <span className="font-semibold text-slate-900">Lưu ý quan trọng về môi trường máy chủ (Cloud vs On-Premise):</span>
+              <p className="text-[11px] text-slate-600 mt-0.5">
+                <code className="text-amber-700 bg-amber-50 px-1 py-0.5 rounded font-mono">192.168.60.2</code> là dải IP riêng tư (Private LAN). Nếu bạn đang mở web từ Cloud (Render/Cloud Run), máy chủ Cloud không thể tự vào mạng LAN văn phòng của bạn. Để chạy luồng này, bạn có 2 giải pháp:
+              </p>
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 mt-2">
+                <div className="p-2.5 rounded border border-emerald-200 bg-emerald-50/70 text-[11px]">
+                  <div className="font-bold text-emerald-900 flex items-center gap-1">
+                    <Check className="w-3.5 h-3.5 text-emerald-600" />
+                    Cách 1 (Khuyên dùng): Chạy Backend Cục Bộ
+                  </div>
+                  <div className="text-emerald-800 mt-1">
+                    Chạy server trực tiếp trên PC/Laptop hoặc mini server cắm cùng mạng LAN văn phòng (192.168.60.x). Backend sẽ nhận diện khuôn mặt trực tiếp không có độ trễ:
+                  </div>
+                  <div className="mt-1.5 flex items-center justify-between bg-white px-2 py-1 rounded border border-emerald-300 font-mono text-[10px]">
+                    <span>npm install && npm run dev</span>
+                    <button
+                      type="button"
+                      onClick={() => copyToClipboard("npm install && npm run dev", "npm-dev")}
+                      className="text-emerald-700 hover:text-emerald-900 font-bold flex items-center gap-1"
+                    >
+                      {copiedKey === "npm-dev" ? <Check className="w-3 h-3" /> : <Copy className="w-3 h-3" />}
+                      {copiedKey === "npm-dev" ? "Đã chép" : "Copy"}
+                    </button>
+                  </div>
+                </div>
+
+                <div className="p-2.5 rounded border border-blue-200 bg-blue-50/70 text-[11px]">
+                  <div className="font-bold text-blue-900 flex items-center gap-1">
+                    <ShieldCheck className="w-3.5 h-3.5 text-blue-600" />
+                    Cách 2: Cầu nối Tailscale / VPN / RTSP Bridge
+                  </div>
+                  <div className="text-blue-800 mt-1">
+                    Cài đặt VPN Tailscale hoặc MediaMTX trên một máy trong mạng LAN để tạo đường hầm an toàn đưa luồng camera lên máy chủ Cloud:
+                  </div>
+                  <div className="mt-1.5 flex items-center justify-between bg-white px-2 py-1 rounded border border-blue-300 font-mono text-[10px]">
+                    <span>docker run -d --net=host bluenviron/mediamtx</span>
+                    <button
+                      type="button"
+                      onClick={() => copyToClipboard("docker run -d --net=host bluenviron/mediamtx", "docker-mtx")}
+                      className="text-blue-700 hover:text-blue-900 font-bold flex items-center gap-1"
+                    >
+                      {copiedKey === "docker-mtx" ? <Check className="w-3 h-3" /> : <Copy className="w-3 h-3" />}
+                      {copiedKey === "docker-mtx" ? "Đã chép" : "Copy"}
+                    </button>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+
+  // ----------------- STREAM LIST ROW -----------------
+  const renderStreamRow = (s: GateStreamSource, index: number) => {
+    const isPrimary = currentPrimary?.id === s.id;
+    const isLast = currentStreams.length <= 1;
+    const isBusy = busyStreamId === s.id;
+    const test = rowTests[s.id];
+    const canTest = (s.sourceType === "RTSP" && !!s.rtspUrl) || (s.sourceType === "HTTP_MJPEG" && !!s.httpUrl);
+    const canSnapshot = s.sourceType === "RTSP" || s.sourceType === "HTTP_MJPEG" || s.sourceType === "BACKEND_UVC";
+    const displayUrl = s.sourceType === "RTSP" ? maskRtspCredentials(s.rtspUrl) : streamUrlOf(s);
+    const isEditing = editingStreamId === s.id;
+
+    return (
+      <div
+        key={s.id}
+        className={`rounded-xl border transition-colors ${
+          isEditing ? "border-indigo-300 bg-indigo-50/30" : s.enabled ? "border-slate-200 bg-white hover:border-slate-300" : "border-slate-200 bg-slate-50/70"
+        }`}
+      >
+        <div className="p-3 flex flex-col lg:flex-row lg:items-center gap-3">
+          {/* Priority handle */}
+          <div className="flex items-center gap-2 shrink-0">
+            <div className="flex flex-col">
+              <button
+                type="button"
+                onClick={() => handleMoveStream(s, -1)}
+                disabled={index === 0 || isBusy}
+                className="p-0.5 rounded text-slate-500 hover:text-indigo-700 hover:bg-indigo-50 disabled:opacity-30 disabled:hover:bg-transparent"
+                title="Tăng ưu tiên (lên)"
+              >
+                <ArrowUp className="w-3.5 h-3.5" />
+              </button>
+              <button
+                type="button"
+                onClick={() => handleMoveStream(s, 1)}
+                disabled={index === currentStreams.length - 1 || isBusy}
+                className="p-0.5 rounded text-slate-500 hover:text-indigo-700 hover:bg-indigo-50 disabled:opacity-30 disabled:hover:bg-transparent"
+                title="Giảm ưu tiên (xuống)"
+              >
+                <ArrowDown className="w-3.5 h-3.5" />
+              </button>
+            </div>
+            <span
+              className={`w-7 h-7 rounded-lg flex items-center justify-center font-mono text-xs font-bold border ${
+                isPrimary ? "bg-indigo-600 text-white border-indigo-600" : "bg-slate-100 text-slate-700 border-slate-200"
+              }`}
+              title={`Ưu tiên ${s.priority}`}
+            >
+              {index + 1}
+            </span>
+          </div>
+
+          {/* Label + meta */}
+          <div className="flex-1 min-w-0 space-y-1">
+            <div className="flex flex-wrap items-center gap-2">
+              <span className={`text-sm font-semibold truncate ${s.enabled ? "text-slate-900" : "text-slate-500"}`} title={s.label}>
+                {s.label}
+              </span>
+              {isPrimary && (
+                <span className="inline-flex items-center gap-1 text-[10px] px-2 py-0.5 rounded-full font-bold bg-indigo-100 text-indigo-800 border border-indigo-200">
+                  <Star className="w-3 h-3" />
+                  Chính
+                </span>
+              )}
+              {!s.enabled && (
+                <span className="text-[10px] px-2 py-0.5 rounded-full font-semibold bg-slate-200 text-slate-700">
+                  Đã tắt
+                </span>
+              )}
+              <span className="text-[10px] px-2 py-0.5 rounded-md font-mono font-semibold bg-slate-100 text-slate-700 border border-slate-200">
+                {SOURCE_TYPE_LABEL[s.sourceType] || s.sourceType}
+              </span>
+              {s.sourceType === "RTSP" && (
+                <span className="text-[10px] px-2 py-0.5 rounded-md font-mono bg-white text-slate-600 border border-slate-200">
+                  {s.rtspTransport || "TCP"}
+                </span>
+              )}
+              {(s.resolution || s.fps) && (
+                <span className="hidden sm:inline text-[10px] font-mono text-slate-500">
+                  {s.resolution || "AUTO"} • {s.fps || 25} FPS
+                </span>
+              )}
+            </div>
+            <div className="text-xs font-mono text-slate-600 truncate" title={displayUrl}>
+              {displayUrl || <span className="italic text-slate-400">Chưa có URL</span>}
+            </div>
+          </div>
+
+          {/* Enabled toggle */}
+          <div className="flex items-center gap-2 shrink-0" title={s.enabled ? "Tắt luồng này" : "Bật luồng này"}>
+            <button
+              type="button"
+              onClick={() => handleToggleStreamEnabled(s)}
+              disabled={isBusy}
+              className={`w-10 h-5 rounded-full transition-colors relative p-0.5 focus:outline-none disabled:opacity-50 ${
+                s.enabled ? "bg-emerald-600" : "bg-slate-300"
+              }`}
+            >
+              <div className={`w-4 h-4 rounded-full bg-white shadow-xs transition-transform ${s.enabled ? "translate-x-5" : "translate-x-0"}`} />
+            </button>
+          </div>
+
+          {/* Row actions */}
+          <div className="flex flex-wrap items-center gap-1.5 shrink-0">
+            <button
+              type="button"
+              onClick={() => handleTestStream(s)}
+              disabled={!canTest || test?.loading}
+              className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg border border-indigo-200 bg-indigo-50 text-indigo-700 hover:bg-indigo-100 text-xs font-semibold transition-colors disabled:opacity-40"
+              title={canTest ? "Kiểm tra kết nối TCP tới camera" : "Chỉ kiểm tra được luồng RTSP/HTTP"}
+            >
+              <Radio className={`w-3.5 h-3.5 ${test?.loading ? "animate-pulse" : ""}`} />
+              {test?.loading ? "Đang kiểm tra..." : "Kiểm tra"}
+            </button>
+            <button
+              type="button"
+              onClick={() => handleToggleSnapshot(s)}
+              disabled={!canSnapshot}
+              className={`inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg border text-xs font-semibold transition-colors disabled:opacity-40 ${
+                snapshotStreamId === s.id
+                  ? "border-slate-800 bg-slate-800 text-white"
+                  : "border-slate-300 bg-white text-slate-700 hover:bg-slate-50"
+              }`}
+              title="Chụp 1 khung hình snapshot từ luồng này"
+            >
+              <ImageIcon className="w-3.5 h-3.5" />
+              Xem ảnh
+            </button>
+            <button
+              type="button"
+              onClick={() => (isEditing ? setEditingStreamId(null) : openEditStream(s))}
+              className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg border border-slate-300 bg-white text-slate-700 hover:bg-slate-50 text-xs font-semibold transition-colors"
+              title="Sửa cấu hình luồng"
+            >
+              <Pencil className="w-3.5 h-3.5" />
+              Sửa
+            </button>
+            <button
+              type="button"
+              onClick={() => handleDeleteStream(s)}
+              disabled={isLast || isBusy}
+              className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg border border-rose-200 bg-rose-50 text-rose-700 hover:bg-rose-100 text-xs font-semibold transition-colors disabled:opacity-40"
+              title={isLast ? "Không thể xóa luồng cuối cùng của cổng" : "Xóa luồng này"}
+            >
+              {isBusy ? <RefreshCw className="w-3.5 h-3.5 animate-spin" /> : <Trash2 className="w-3.5 h-3.5" />}
+              Xóa
+            </button>
+          </div>
+        </div>
+
+        {/* Inline test result */}
+        {test && !test.loading && test.data && (
+          <div
+            className={`mx-3 mb-3 p-3 rounded-lg border text-xs space-y-1 animate-in fade-in ${
+              test.data.tcpConnected
+                ? "bg-emerald-50 border-emerald-200 text-emerald-900"
+                : test.data.isPrivateLan
+                ? "bg-amber-50 border-amber-200 text-amber-950"
+                : "bg-rose-50 border-rose-200 text-rose-900"
+            }`}
+          >
+            <div className="flex items-center justify-between gap-2 font-bold">
+              <span className="flex items-center gap-1.5">
+                {test.data.tcpConnected ? (
+                  <>
+                    <CheckCircle2 className="w-4 h-4 text-emerald-600" />
+                    KẾT NỐI THÀNH CÔNG
+                  </>
+                ) : test.data.isPrivateLan ? (
+                  <>
+                    <AlertTriangle className="w-4 h-4 text-amber-600" />
+                    ĐỊA CHỈ MẠNG LAN NỘI BỘ (PRIVATE IP)
+                  </>
+                ) : (
+                  <>
+                    <XCircle className="w-4 h-4 text-rose-600" />
+                    KHÔNG THỂ KẾT NỐI TỚI CAMERA
+                  </>
+                )}
+              </span>
+              {test.data.details?.latencyMs !== undefined && (
+                <span className="font-mono">
+                  {test.data.details.latencyMs}ms • {test.data.details.transport || s.rtspTransport || "TCP"}
+                </span>
+              )}
+            </div>
+            <p className="font-normal">{test.message}</p>
+            {test.data.details?.host && (
+              <div className="font-mono text-[11px] opacity-80">
+                Host: {test.data.details.host}:{test.data.details.port} | Trạng thái: {test.data.details.status}
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* Inline snapshot */}
+        {snapshotStreamId === s.id && (
+          <div className="mx-3 mb-3 space-y-1.5 animate-in fade-in">
+            <div className="flex items-center justify-between text-xs text-slate-600">
+              <span className="font-semibold">Snapshot luồng "{s.label}"</span>
+              <button
+                type="button"
+                onClick={() => setSnapshotTimestamp(Date.now())}
+                className="inline-flex items-center gap-1 text-indigo-600 hover:text-indigo-800 font-semibold"
+              >
+                <RefreshCw className="w-3 h-3" />
+                Chụp lại
+              </button>
+            </div>
+            <div className="relative aspect-video max-h-72 w-full bg-slate-950 rounded-lg overflow-hidden border border-slate-800 flex items-center justify-center">
+              <img
+                key={`row-snap-${s.id}-${snapshotTimestamp}`}
+                src={`/api/camera-streams/snapshot?gate=${currentGateKey}&stream=${encodeURIComponent(s.id)}&t=${snapshotTimestamp}`}
+                alt={`Snapshot ${s.label}`}
+                className="w-full h-full object-contain"
+              />
+            </div>
+          </div>
+        )}
+
+        {/* Inline edit form */}
+        {isEditing && (
+          <div className="px-3 pb-3">
+            {renderStreamForm("EDIT", editForm, setEditForm, editFormError, handleSaveEditStream, () => setEditingStreamId(null))}
+          </div>
+        )}
+      </div>
+    );
   };
 
   return (
@@ -506,7 +1637,7 @@ export const CameraStreamConfigPage: React.FC = () => {
                 </span>
               </h1>
               <p className="text-sm text-slate-700 mt-0.5">
-                Khai báo nguồn camera Cổng Vào/Ra (RTSP, UVC Client Browser, HTTP Stream) và tách nhận diện khuôn mặt chạy đa luồng tại máy chủ.
+                Khai báo nhiều nguồn camera cho mỗi Cổng Vào/Ra (RTSP, UVC Client Browser, HTTP Stream) và tách nhận diện khuôn mặt chạy đa luồng tại máy chủ.
               </p>
             </div>
           </div>
@@ -697,7 +1828,7 @@ export const CameraStreamConfigPage: React.FC = () => {
               Điều Chỉnh Quy Mô Cụm Luồng Worker (1 - 8 Threads)
             </label>
             <p className="text-xs text-slate-400">
-              Khuyến nghị 4 luồng trên máy chủ tiêu chuẩn hoặc 8 luồng khi đồng thời kết nối 2 luồng RTSP Cổng Vào và Cổng Ra.
+              Khuyến nghị 4 luồng trên máy chủ tiêu chuẩn hoặc 8 luồng khi đồng thời kết nối nhiều luồng RTSP cho Cổng Vào và Cổng Ra.
             </p>
           </div>
 
@@ -744,10 +1875,7 @@ export const CameraStreamConfigPage: React.FC = () => {
         {/* Gate Tabs */}
         <div className="flex border-b border-slate-200 bg-slate-50/70 p-2 gap-2">
           <button
-            onClick={() => {
-              setActiveGateTab("ENTRY");
-              stopPreview();
-            }}
+            onClick={() => switchGateTab("ENTRY")}
             className={`flex-1 flex items-center justify-center gap-2 py-2.5 px-4 rounded-xl text-sm font-semibold transition-all ${
               activeGateTab === "ENTRY"
                 ? "bg-white text-indigo-700 shadow-xs border border-slate-200 font-bold"
@@ -756,18 +1884,18 @@ export const CameraStreamConfigPage: React.FC = () => {
           >
             <Radio className="w-4 h-4 text-emerald-600" />
             Cổng Vào (Main Entry Gate)
+            <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-slate-100 text-slate-600 border border-slate-200 font-mono">
+              {deriveGateStreams(config.entryGate, "entry").filter((s) => s.enabled).length} luồng
+            </span>
             <span
               className={`w-2 h-2 rounded-full ${
-                config.entryGate.enabled ? "bg-emerald-500" : "bg-slate-300"
+                config.entryGate?.enabled ? "bg-emerald-500" : "bg-slate-300"
               }`}
             />
           </button>
 
           <button
-            onClick={() => {
-              setActiveGateTab("EXIT");
-              stopPreview();
-            }}
+            onClick={() => switchGateTab("EXIT")}
             className={`flex-1 flex items-center justify-center gap-2 py-2.5 px-4 rounded-xl text-sm font-semibold transition-all ${
               activeGateTab === "EXIT"
                 ? "bg-white text-indigo-700 shadow-xs border border-slate-200 font-bold"
@@ -776,18 +1904,18 @@ export const CameraStreamConfigPage: React.FC = () => {
           >
             <Radio className="w-4 h-4 text-blue-600" />
             Cổng Ra (Exit Gate B2)
+            <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-slate-100 text-slate-600 border border-slate-200 font-mono">
+              {deriveGateStreams(config.exitGate, "exit").filter((s) => s.enabled).length} luồng
+            </span>
             <span
               className={`w-2 h-2 rounded-full ${
-                config.exitGate.enabled ? "bg-emerald-500" : "bg-slate-300"
+                config.exitGate?.enabled ? "bg-emerald-500" : "bg-slate-300"
               }`}
             />
           </button>
 
           <button
-            onClick={() => {
-              setActiveGateTab("DUAL_MONITOR");
-              stopPreview();
-            }}
+            onClick={() => switchGateTab("DUAL_MONITOR")}
             className={`flex-1 flex items-center justify-center gap-2 py-2.5 px-4 rounded-xl text-sm font-semibold transition-all ${
               activeGateTab === "DUAL_MONITOR"
                 ? "bg-white text-indigo-700 shadow-xs border border-slate-200 font-bold"
@@ -816,517 +1944,113 @@ export const CameraStreamConfigPage: React.FC = () => {
                 />
               </div>
 
-              <div className="flex items-center justify-between sm:justify-end gap-4 pt-4 sm:pt-0">
-                <div className="text-right">
-                  <div className="text-sm font-semibold text-slate-800">Trạng Thái Kích Hoạt Luồng</div>
-                  <div className="text-xs text-slate-700">
-                    {currentGateConfig.enabled ? "Đang bật nhận diện cho cổng này" : "Tạm dừng luồng camera"}
+              <div className="flex flex-wrap items-center justify-between sm:justify-end gap-4 pt-4 sm:pt-0">
+                <label className="flex items-center gap-2 text-xs font-semibold text-slate-800 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={currentGateConfig.autoStart !== false}
+                    onChange={(e) => updateCurrentGate((prev) => ({ ...prev, autoStart: e.target.checked }))}
+                    className="w-4 h-4 text-blue-600 rounded border-slate-300 focus:ring-blue-500"
+                  />
+                  Tự động khởi chạy (Auto Start)
+                </label>
+                <div className="flex items-center gap-4">
+                  <div className="text-right">
+                    <div className="text-sm font-semibold text-slate-800">Trạng Thái Kích Hoạt Cổng</div>
+                    <div className="text-xs text-slate-700">
+                      {currentGateConfig.enabled ? "Đang bật nhận diện cho cổng này" : "Tạm dừng toàn bộ luồng camera"}
+                    </div>
                   </div>
+                  <button
+                    type="button"
+                    onClick={() =>
+                      updateCurrentGate((prev) => ({ ...prev, enabled: !prev.enabled }))
+                    }
+                    className={`w-12 h-6 rounded-full transition-colors relative p-0.5 focus:outline-none ${
+                      currentGateConfig.enabled ? "bg-emerald-600" : "bg-slate-300"
+                    }`}
+                  >
+                    <div
+                      className={`w-5 h-5 rounded-full bg-white shadow-xs transition-transform ${
+                        currentGateConfig.enabled ? "translate-x-6" : "translate-x-0"
+                      }`}
+                    />
+                  </button>
+                </div>
+              </div>
+            </div>
+
+            {/* ---------------- STREAM LIST ---------------- */}
+            <div className="space-y-4">
+              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                <div>
+                  <label className="block text-sm font-semibold text-slate-900 flex items-center gap-2">
+                    <Layers className="w-4 h-4 text-indigo-600" />
+                    Danh Sách Luồng Camera Của Cổng ({currentStreams.length})
+                  </label>
+                  <p className="text-xs text-slate-600 mt-0.5">
+                    Mỗi cổng có thể gắn nhiều nguồn video (VD: 2 kênh NVR). Luồng bật có ưu tiên thấp nhất là luồng <b>Chính</b>; dùng mũi tên để đổi thứ tự.
+                  </p>
                 </div>
                 <button
                   type="button"
-                  onClick={() =>
-                    updateCurrentGate((prev) => ({ ...prev, enabled: !prev.enabled }))
-                  }
-                  className={`w-12 h-6 rounded-full transition-colors relative p-0.5 focus:outline-none ${
-                    currentGateConfig.enabled ? "bg-emerald-600" : "bg-slate-300"
+                  onClick={() => {
+                    setAddFormOpen((prev) => !prev);
+                    setAddForm(EMPTY_STREAM_FORM);
+                    setAddFormError(null);
+                    setEditingStreamId(null);
+                  }}
+                  className={`inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg text-xs font-semibold shadow-xs transition-colors ${
+                    addFormOpen
+                      ? "bg-slate-100 text-slate-700 border border-slate-300 hover:bg-slate-200"
+                      : "bg-indigo-600 text-white hover:bg-indigo-700"
                   }`}
                 >
-                  <div
-                    className={`w-5 h-5 rounded-full bg-white shadow-xs transition-transform ${
-                      currentGateConfig.enabled ? "translate-x-6" : "translate-x-0"
-                    }`}
-                  />
+                  {addFormOpen ? <X className="w-3.5 h-3.5" /> : <Plus className="w-3.5 h-3.5" />}
+                  {addFormOpen ? "Đóng biểu mẫu" : "Thêm luồng"}
                 </button>
               </div>
-            </div>
 
-            {/* Source Type Selector Grid */}
-            <div className="space-y-3">
-              <label className="block text-sm font-semibold text-slate-900">
-                Lựa Chọn Loại Nguồn Luồng Camera (Camera Stream Source)
-              </label>
-              <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
-                {/* 1. Client UVC */}
-                <div
-                  onClick={() => updateCurrentGate((prev) => ({ ...prev, sourceType: "CLIENT_UVC" }))}
-                  className={`p-4 rounded-xl border-2 cursor-pointer transition-all ${
-                    currentGateConfig.sourceType === "CLIENT_UVC"
-                      ? "border-blue-600 bg-blue-50/50 shadow-xs"
-                      : "border-slate-200 hover:border-slate-300 bg-white"
-                  }`}
-                >
-                  <div className="flex items-center gap-2 mb-2">
-                    <Camera className="w-5 h-5 text-blue-600" />
-                    <span className="font-semibold text-sm text-slate-900">1. UVC Camera Client</span>
-                  </div>
-                  <p className="text-xs text-slate-700">
-                    Sử dụng Webcam máy trạm USB/cổng trình duyệt thông qua MediaDevices API.
-                  </p>
-                </div>
-
-                {/* 2. RTSP */}
-                <div
-                  onClick={() => updateCurrentGate((prev) => ({ ...prev, sourceType: "RTSP" }))}
-                  className={`p-4 rounded-xl border-2 cursor-pointer transition-all ${
-                    currentGateConfig.sourceType === "RTSP"
-                      ? "border-indigo-600 bg-indigo-50/50 shadow-xs"
-                      : "border-slate-200 hover:border-slate-300 bg-white"
-                  }`}
-                >
-                  <div className="flex items-center gap-2 mb-2">
-                    <Video className="w-5 h-5 text-indigo-600" />
-                    <span className="font-semibold text-sm text-slate-900">2. Luồng URL RTSP</span>
-                  </div>
-                  <p className="text-xs text-slate-700">
-                    Đầu ghi NVR / Camera IP công nghiệp (Hikvision, Dahua, EZVIZ, IMOU).
-                  </p>
-                </div>
-
-                {/* 3. HTTP / MJPEG */}
-                <div
-                  onClick={() => updateCurrentGate((prev) => ({ ...prev, sourceType: "HTTP_MJPEG" }))}
-                  className={`p-4 rounded-xl border-2 cursor-pointer transition-all ${
-                    currentGateConfig.sourceType === "HTTP_MJPEG"
-                      ? "border-purple-600 bg-purple-50/50 shadow-xs"
-                      : "border-slate-200 hover:border-slate-300 bg-white"
-                  }`}
-                >
-                  <div className="flex items-center gap-2 mb-2">
-                    <Radio className="w-5 h-5 text-purple-600" />
-                    <span className="font-semibold text-sm text-slate-900">3. HTTP / MJPEG Stream</span>
-                  </div>
-                  <p className="text-xs text-slate-700">
-                    Luồng stream HTTP trực tiếp (ESP32-CAM, webcam server IP).
-                  </p>
-                </div>
-
-                {/* 4. Backend UVC */}
-                <div
-                  onClick={() => updateCurrentGate((prev) => ({ ...prev, sourceType: "BACKEND_UVC" }))}
-                  className={`p-4 rounded-xl border-2 cursor-pointer transition-all ${
-                    currentGateConfig.sourceType === "BACKEND_UVC"
-                      ? "border-emerald-600 bg-emerald-50/50 shadow-xs"
-                      : "border-slate-200 hover:border-slate-300 bg-white"
-                  }`}
-                >
-                  <div className="flex items-center gap-2 mb-2">
-                    <Server className="w-5 h-5 text-emerald-600" />
-                    <span className="font-semibold text-sm text-slate-900">4. UVC Backend Server</span>
-                  </div>
-                  <p className="text-xs text-slate-700">
-                    Webcam cắm trực tiếp vào máy chủ Linux qua cổng V4L2 (/dev/video0).
-                  </p>
-                </div>
-              </div>
-            </div>
-
-            {/* Dynamic Configuration Fields Based on Selected Source Type */}
-            {currentGateConfig.sourceType === "RTSP" && (
-              <div className="p-5 rounded-xl bg-slate-50 border border-slate-200 space-y-4 animate-in fade-in">
-                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
-                  <span className="text-sm font-semibold text-slate-800 flex items-center gap-2">
-                    <Video className="w-4 h-4 text-indigo-600" />
-                    Cấu Hình Chi Tiết Luồng RTSP (IP Camera)
-                  </span>
-                  {/* Quick Presets */}
-                  <div className="flex flex-wrap items-center gap-1.5">
-                    <span className="text-xs text-slate-700">Mẫu nhanh:</span>
-                    <button
-                      type="button"
-                      onClick={() => applyPreset("HIKVISION_LOCAL_101")}
-                      className="px-2.5 py-1 rounded-md text-xs bg-indigo-600 text-white hover:bg-indigo-700 font-semibold shadow-xs flex items-center gap-1"
-                      title="rtsp://viewCam:1234abcd@192.168.60.2:554/Streaming/Channels/101"
-                    >
-                      <Zap className="w-3 h-3" />
-                      192.168.60.2 (Kênh 101 Main)
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => applyPreset("HIKVISION_LOCAL_102")}
-                      className="px-2.5 py-1 rounded-md text-xs bg-indigo-100 text-indigo-800 hover:bg-indigo-200 font-semibold border border-indigo-200 flex items-center gap-1"
-                      title="rtsp://viewCam:1234abcd@192.168.60.2:554/Streaming/Channels/102"
-                    >
-                      192.168.60.2 (Kênh 102 Sub)
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => applyPreset("HIKVISION")}
-                      className="px-2 py-0.5 rounded text-xs bg-white border border-slate-300 hover:bg-slate-100 font-medium"
-                    >
-                      Hikvision Khác
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => applyPreset("DAHUA")}
-                      className="px-2 py-0.5 rounded text-xs bg-white border border-slate-300 hover:bg-slate-100 font-medium"
-                    >
-                      Dahua
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => applyPreset("EZVIZ")}
-                      className="px-2 py-0.5 rounded text-xs bg-white border border-slate-300 hover:bg-slate-100 font-medium"
-                    >
-                      EZVIZ
-                    </button>
-                  </div>
-                </div>
-
-                <div>
-                  <label className="block text-xs font-semibold text-slate-700 uppercase tracking-wider mb-1">
-                    URL Luồng RTSP (Bao gồm User/Password nếu có)
-                  </label>
-                  <input
-                    type="text"
-                    value={currentGateConfig.rtspUrl || ""}
-                    onChange={(e) =>
-                      updateCurrentGate((prev) => ({ ...prev, rtspUrl: e.target.value }))
-                    }
-                    className="w-full px-3.5 py-2.5 rounded-lg border border-slate-300 text-sm font-mono text-slate-800 bg-white focus:ring-2 focus:ring-indigo-500 outline-none"
-                    placeholder="rtsp://viewCam:1234abcd@192.168.60.2:554/Streaming/Channels/101"
-                  />
-                  <div className="flex flex-wrap items-center justify-between text-xs text-slate-700 mt-1.5 gap-2">
-                    <span>
-                      Cú pháp chuẩn: <code className="text-indigo-600 font-mono">rtsp://[user]:[password]@[ip]:[port]/[path]</code>
-                    </span>
-                    <button
-                      type="button"
-                      onClick={() => setShowHikvisionGuide((prev) => !prev)}
-                      className="text-indigo-600 hover:text-indigo-800 font-medium inline-flex items-center gap-1"
-                    >
-                      <HelpCircle className="w-3.5 h-3.5" />
-                      {showHikvisionGuide ? "Ẩn hướng dẫn camera 192.168.60.2" : "Xem hướng dẫn cấu hình luồng 192.168.60.2"}
-                      {showHikvisionGuide ? <ChevronUp className="w-3 h-3" /> : <ChevronDown className="w-3 h-3" />}
-                    </button>
-                  </div>
-                </div>
-
-                {/* EXPANDABLE COMPREHENSIVE GUIDE FOR LOCAL RTSP */}
-                {showHikvisionGuide && (
-                  <div className="rounded-xl border border-indigo-200 bg-indigo-50/50 p-4 space-y-3.5 text-xs text-slate-800 animate-in fade-in">
-                    <div className="flex items-center justify-between border-b border-indigo-100 pb-2">
-                      <div className="flex items-center gap-2 font-bold text-indigo-950 text-sm">
-                        <Info className="w-4 h-4 text-indigo-600" />
-                        Hướng Dẫn Cấu Hình Luồng RTSP Cục Bộ: <code className="font-mono text-indigo-700 bg-white px-1.5 py-0.5 rounded border border-indigo-200">rtsp://viewCam:1234abcd@192.168.60.2:554/Streaming/Channels/101</code>
-                      </div>
-                    </div>
-
-                    {/* Breakdown grid */}
-                    <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-2.5">
-                      <div className="bg-white p-2.5 rounded-lg border border-indigo-100">
-                        <div className="text-slate-500 font-semibold text-[11px]">ĐỊA CHỈ IP & PORT MẠNG LAN</div>
-                        <div className="font-mono font-bold text-slate-900 mt-0.5">192.168.60.2 : 554</div>
-                        <div className="text-[11px] text-slate-500 mt-0.5">IP tĩnh của camera trong mạng nội bộ</div>
-                      </div>
-                      <div className="bg-white p-2.5 rounded-lg border border-indigo-100">
-                        <div className="text-slate-500 font-semibold text-[11px]">TÀI KHOẢN & MẬT KHẨU</div>
-                        <div className="font-mono font-bold text-slate-900 mt-0.5">viewCam / 1234abcd</div>
-                        <div className="text-[11px] text-slate-500 mt-0.5">Xác thực Digest/Basic quyền xem luồng</div>
-                      </div>
-                      <div className="bg-white p-2.5 rounded-lg border border-indigo-100">
-                        <div className="text-slate-500 font-semibold text-[11px]">KÊNH 101 VS KÊNH 102</div>
-                        <div className="font-mono font-bold text-slate-900 mt-0.5">Channels/101 hoặc 102</div>
-                        <div className="text-[11px] text-slate-500 mt-0.5">101: Main (FullHD/4K) | 102: Sub (AI siêu mượt)</div>
-                      </div>
-                    </div>
-
-                    {/* Steps tab */}
-                    <div className="space-y-2.5 bg-white p-3 rounded-lg border border-indigo-100">
-                      <div className="font-bold text-slate-900 flex items-center gap-1.5">
-                        <Terminal className="w-3.5 h-3.5 text-indigo-600" />
-                        3 Bước Xác Thực & Triển Khai Thực Tế:
-                      </div>
-
-                      <div className="space-y-2 text-slate-700">
-                        <div className="flex items-start gap-2">
-                          <span className="w-4 h-4 rounded-full bg-indigo-600 text-white flex items-center justify-center font-bold text-[10px] shrink-0 mt-0.5">1</span>
-                          <div>
-                            <span className="font-semibold text-slate-900">Kiểm tra luồng qua phần mềm VLC Media Player:</span>
-                            <p className="text-[11px] text-slate-600 mt-0.5">
-                              Mở VLC trên máy tính cùng mạng WiFi/LAN văn phòng &rarr; Nhấn <kbd className="px-1 py-0.5 bg-slate-100 border rounded font-mono text-[10px]">Ctrl + N</kbd> (Open Network Stream) &rarr; Dán URL trên &rarr; Nhấn Play. Nếu phát được hình, camera đang hoạt động hoàn hảo!
-                            </p>
-                          </div>
-                        </div>
-
-                        <div className="flex items-start gap-2">
-                          <span className="w-4 h-4 rounded-full bg-indigo-600 text-white flex items-center justify-center font-bold text-[10px] shrink-0 mt-0.5">2</span>
-                          <div>
-                            <span className="font-semibold text-slate-900">Cấu hình trên giao diện Web camera Hikvision (http://192.168.60.2):</span>
-                            <ul className="list-disc pl-4 text-[11px] text-slate-600 space-y-0.5 mt-0.5">
-                              <li>Vào <b>Configuration &rarr; Network &rarr; Advanced Settings &rarr; Integration Protocol</b> &rarr; Bật <b>Enable Open Network Video Interface (ONVIF)</b> và thêm user <code className="text-indigo-700 font-bold">viewCam</code>.</li>
-                              <li>Vào <b>Configuration &rarr; System &rarr; Security &rarr; Authentication</b> &rarr; Mục <i>RTSP Authentication</i> chọn <b>digest/basic</b>.</li>
-                            </ul>
-                          </div>
-                        </div>
-
-                        <div className="flex items-start gap-2">
-                          <span className="w-4 h-4 rounded-full bg-indigo-600 text-white flex items-center justify-center font-bold text-[10px] shrink-0 mt-0.5">3</span>
-                          <div>
-                            <span className="font-semibold text-slate-900">Lưu ý quan trọng về môi trường máy chủ (Cloud vs On-Premise):</span>
-                            <p className="text-[11px] text-slate-600 mt-0.5">
-                              <code className="text-amber-700 bg-amber-50 px-1 py-0.5 rounded font-mono">192.168.60.2</code> là dải IP riêng tư (Private LAN). Nếu bạn đang mở web từ Cloud (Render/Cloud Run), máy chủ Cloud không thể tự vào mạng LAN văn phòng của bạn. Để chạy luồng này, bạn có 2 giải pháp:
-                            </p>
-                            <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 mt-2">
-                              <div className="p-2.5 rounded border border-emerald-200 bg-emerald-50/70 text-[11px]">
-                                <div className="font-bold text-emerald-900 flex items-center gap-1">
-                                  <Check className="w-3.5 h-3.5 text-emerald-600" />
-                                  Cách 1 (Khuyên dùng): Chạy Backend Cục Bộ
-                                </div>
-                                <div className="text-emerald-800 mt-1">
-                                  Chạy server trực tiếp trên PC/Laptop hoặc mini server cắm cùng mạng LAN văn phòng (192.168.60.x). Backend sẽ nhận diện khuôn mặt trực tiếp không có độ trễ:
-                                </div>
-                                <div className="mt-1.5 flex items-center justify-between bg-white px-2 py-1 rounded border border-emerald-300 font-mono text-[10px]">
-                                  <span>npm install && npm run dev</span>
-                                  <button
-                                    type="button"
-                                    onClick={() => copyToClipboard("npm install && npm run dev", "npm-dev")}
-                                    className="text-emerald-700 hover:text-emerald-900 font-bold flex items-center gap-1"
-                                  >
-                                    {copiedKey === "npm-dev" ? <Check className="w-3 h-3" /> : <Copy className="w-3 h-3" />}
-                                    {copiedKey === "npm-dev" ? "Đã chép" : "Copy"}
-                                  </button>
-                                </div>
-                              </div>
-
-                              <div className="p-2.5 rounded border border-blue-200 bg-blue-50/70 text-[11px]">
-                                <div className="font-bold text-blue-900 flex items-center gap-1">
-                                  <ShieldCheck className="w-3.5 h-3.5 text-blue-600" />
-                                  Cách 2: Cầu nối Tailscale / VPN / RTSP Bridge
-                                </div>
-                                <div className="text-blue-800 mt-1">
-                                  Cài đặt VPN Tailscale hoặc MediaMTX trên một máy trong mạng LAN để tạo đường hầm an toàn đưa luồng camera lên máy chủ Cloud:
-                                </div>
-                                <div className="mt-1.5 flex items-center justify-between bg-white px-2 py-1 rounded border border-blue-300 font-mono text-[10px]">
-                                  <span>docker run -d --net=host bluenviron/mediamtx</span>
-                                  <button
-                                    type="button"
-                                    onClick={() => copyToClipboard("docker run -d --net=host bluenviron/mediamtx", "docker-mtx")}
-                                    className="text-blue-700 hover:text-blue-900 font-bold flex items-center gap-1"
-                                  >
-                                    {copiedKey === "docker-mtx" ? <Check className="w-3 h-3" /> : <Copy className="w-3 h-3" />}
-                                    {copiedKey === "docker-mtx" ? "Đã chép" : "Copy"}
-                                  </button>
-                                </div>
-                              </div>
-                            </div>
-                          </div>
-                        </div>
-                      </div>
-                    </div>
-                  </div>
-                )}
-
-                <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 pt-2">
-                  <div>
-                    <label className="block text-xs font-semibold text-slate-700 mb-1">
-                      Giao Thức Truyền Tải (RTSP Transport Protocol)
-                    </label>
-                    <select
-                      value={currentGateConfig.rtspTransport || "TCP"}
-                      onChange={(e) =>
-                        updateCurrentGate((prev) => ({
-                          ...prev,
-                          rtspTransport: e.target.value as "TCP" | "UDP",
-                        }))
-                      }
-                      className="w-full px-3 py-2 rounded-lg border border-slate-300 text-sm bg-white outline-none"
-                    >
-                      <option value="TCP">TCP (Khuyến nghị: Chống mất gói hình ảnh, ổn định cao)</option>
-                      <option value="UDP">UDP (Độ trễ siêu thấp, phù hợp mạng LAN nội bộ chuẩn Gigabit)</option>
-                    </select>
-                  </div>
-
-                  <div>
-                    <label className="block text-xs font-semibold text-slate-700 mb-1">
-                      Kiểm Tra Kết Nối Socket TCP Luồng RTSP
-                    </label>
-                    <button
-                      type="button"
-                      onClick={() => handleTestConnection(currentGateConfig)}
-                      disabled={testingConnection}
-                      className="w-full flex items-center justify-center gap-2 px-3 py-2 rounded-lg border border-indigo-200 bg-indigo-50 text-indigo-700 hover:bg-indigo-100 text-sm font-semibold transition-colors disabled:opacity-50"
-                    >
-                      <Radio className={`w-4 h-4 ${testingConnection ? "animate-pulse" : ""}`} />
-                      {testingConnection ? "Đang Kiểm Tra Ping..." : "Kiểm Tra Kết Nối Luồng"}
-                    </button>
-                  </div>
-                </div>
-
-                {testResultData && (
-                  <div
-                    className={`p-3.5 rounded-xl border text-xs space-y-1.5 animate-in fade-in ${
-                      testResultData.tcpConnected
-                        ? "bg-emerald-50 border-emerald-200 text-emerald-900"
-                        : testResultData.isPrivateLan
-                        ? "bg-amber-50 border-amber-200 text-amber-950"
-                        : "bg-rose-50 border-rose-200 text-rose-900"
-                    }`}
-                  >
-                    <div className="flex items-center gap-2 font-bold text-sm">
-                      {testResultData.tcpConnected ? (
-                        <>
-                          <CheckCircle2 className="w-4 h-4 text-emerald-600" />
-                          <span>KẾT NỐI RTSP THÀNH CÔNG</span>
-                        </>
-                      ) : testResultData.isPrivateLan ? (
-                        <>
-                          <AlertTriangle className="w-4 h-4 text-amber-600" />
-                          <span>ĐỊA CHỈ MẠNG LAN NỘI BỘ (PRIVATE IP)</span>
-                        </>
-                      ) : (
-                        <>
-                          <XCircle className="w-4 h-4 text-rose-600" />
-                          <span>KHÔNG THỂ KẾT NỐI TỚI CAMERA</span>
-                        </>
-                      )}
-                    </div>
-                    <p>{testStatusMessage}</p>
-                    {testResultData.details && (
-                      <div className="font-mono text-[11px] opacity-80 pt-1">
-                        Host: {testResultData.details.host}:{testResultData.details.port} | Transport: {testResultData.details.transport} | Latency: {testResultData.details.latencyMs}ms
-                      </div>
-                    )}
-                  </div>
-                )}
-              </div>
-            )}
-
-            {currentGateConfig.sourceType === "CLIENT_UVC" && (
-              <div className="p-5 rounded-xl bg-slate-50 border border-slate-200 space-y-4 animate-in fade-in">
-                <div className="flex items-center justify-between">
-                  <span className="text-sm font-semibold text-slate-800 flex items-center gap-2">
-                    <Camera className="w-4 h-4 text-blue-600" />
-                    Cấu Hình Thiết Bị UVC Trình Duyệt (Client MediaDevices)
-                  </span>
-                  <button
-                    type="button"
-                    onClick={detectClientCameras}
-                    className="flex items-center gap-1.5 px-2.5 py-1 rounded-md text-xs font-semibold bg-white border border-slate-300 text-slate-700 hover:bg-slate-100"
-                  >
-                    <RefreshCw className="w-3.5 h-3.5 text-blue-600" />
-                    Quét Lại Camera
+              {streamActionError && (
+                <div className="p-3 rounded-lg bg-rose-50 border border-rose-200 text-xs text-rose-800 flex items-center gap-2 animate-in fade-in">
+                  <AlertTriangle className="w-4 h-4 text-rose-600 shrink-0" />
+                  <span className="flex-1">{streamActionError}</span>
+                  <button type="button" onClick={() => setStreamActionError(null)} className="text-rose-700 hover:text-rose-900">
+                    <X className="w-3.5 h-3.5" />
                   </button>
                 </div>
-
-                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                  <div>
-                    <label className="block text-xs font-semibold text-slate-700 uppercase tracking-wider mb-1">
-                      Chọn Thiết Bị Webcam Cắm Ngoài
-                    </label>
-                    <select
-                      value={currentGateConfig.uvcDeviceId || "default"}
-                      onChange={(e) => {
-                        const newDeviceId = e.target.value;
-                        const dev = availableCameras.find((c) => c.deviceId === newDeviceId);
-                        const updated = {
-                          ...currentGateConfig,
-                          uvcDeviceId: newDeviceId,
-                          uvcDeviceLabel: dev ? dev.label : "Mặc định",
-                        };
-                        updateCurrentGate((prev) => ({
-                          ...prev,
-                          uvcDeviceId: newDeviceId,
-                          uvcDeviceLabel: dev ? dev.label : "Mặc định",
-                        }));
-                        if (isPreviewActive && currentGateConfig.sourceType === "CLIENT_UVC") {
-                          startPreview(updated);
-                        }
-                      }}
-                      className="w-full px-3 py-2.5 rounded-lg border border-slate-300 text-sm bg-white outline-none font-medium"
-                    >
-                      <option value="default">Camera Mặc Định Trình Duyệt</option>
-                      {availableCameras.map((cam) => (
-                        <option key={cam.deviceId} value={cam.deviceId}>
-                          {cam.label}
-                        </option>
-                      ))}
-                    </select>
-                  </div>
-
-                  <div>
-                    <label className="block text-xs font-semibold text-slate-700 uppercase tracking-wider mb-1">
-                      Độ Phân Giải Mục Tiêu (Resolution)
-                    </label>
-                    <select
-                      value={currentGateConfig.resolution || "1280x720"}
-                      onChange={(e) => {
-                        const newRes = e.target.value as any;
-                        const updated = {
-                          ...currentGateConfig,
-                          resolution: newRes,
-                        };
-                        updateCurrentGate((prev) => ({
-                          ...prev,
-                          resolution: newRes,
-                        }));
-                        if (isPreviewActive && currentGateConfig.sourceType === "CLIENT_UVC") {
-                          startPreview(updated);
-                        }
-                      }}
-                      className="w-full px-3 py-2.5 rounded-lg border border-slate-300 text-sm bg-white outline-none font-medium"
-                    >
-                      <option value="1920x1080">1080p Full HD (1920 x 1080) - Chi tiết cao nhất</option>
-                      <option value="1280x720">720p HD (1280 x 720) - Chuẩn tối ưu AI</option>
-                      <option value="640x480">480p SD (640 x 480) - Tiết kiệm băng thông</option>
-                      <option value="AUTO">Tự Động (Theo khả năng thiết bị)</option>
-                    </select>
-                  </div>
+              )}
+              {streamActionNotice && (
+                <div className="p-3 rounded-lg bg-amber-50 border border-amber-200 text-xs text-amber-900 flex items-center gap-2 animate-in fade-in">
+                  <Info className="w-4 h-4 text-amber-600 shrink-0" />
+                  <span className="flex-1">{streamActionNotice}</span>
+                  <button type="button" onClick={() => setStreamActionNotice(null)} className="text-amber-700 hover:text-amber-900">
+                    <X className="w-3.5 h-3.5" />
+                  </button>
                 </div>
-              </div>
-            )}
+              )}
 
-            {currentGateConfig.sourceType === "HTTP_MJPEG" && (
-              <div className="p-5 rounded-xl bg-slate-50 border border-slate-200 space-y-4 animate-in fade-in">
-                <span className="text-sm font-semibold text-slate-800 flex items-center gap-2">
-                  <Radio className="w-4 h-4 text-purple-600" />
-                  Cấu Hình Luồng HTTP / MJPEG
-                </span>
-                <div>
-                  <label className="block text-xs font-semibold text-slate-700 uppercase tracking-wider mb-1">
-                    URL Luồng Stream HTTP
-                  </label>
-                  <input
-                    type="text"
-                    value={currentGateConfig.httpUrl || ""}
-                    onChange={(e) =>
-                      updateCurrentGate((prev) => ({ ...prev, httpUrl: e.target.value }))
-                    }
-                    className="w-full px-3.5 py-2.5 rounded-lg border border-slate-300 text-sm font-mono text-slate-800 bg-white focus:ring-2 focus:ring-purple-500 outline-none"
-                    placeholder="http://192.168.1.75:81/stream"
-                  />
-                  <p className="text-xs text-slate-700 mt-1">
-                    Phù hợp cho ESP32-CAM, mjpg-streamer, hoặc các module camera nhúng.
-                  </p>
-                </div>
-              </div>
-            )}
+              {addFormOpen &&
+                renderStreamForm("ADD", addForm, setAddForm, addFormError, handleAddStream, () => {
+                  setAddFormOpen(false);
+                  setAddFormError(null);
+                })}
 
-            {currentGateConfig.sourceType === "BACKEND_UVC" && (
-              <div className="p-5 rounded-xl bg-slate-50 border border-slate-200 space-y-4 animate-in fade-in">
-                <span className="text-sm font-semibold text-slate-800 flex items-center gap-2">
-                  <Server className="w-4 h-4 text-emerald-600" />
-                  Cấu Hình Thiết Bị V4L2 Máy Chủ
-                </span>
-                <div>
-                  <label className="block text-xs font-semibold text-slate-700 uppercase tracking-wider mb-1">
-                    Đường Dẫn Thiết Bị Linux (Device Path)
-                  </label>
-                  <input
-                    type="text"
-                    value={currentGateConfig.backendDevicePath || "/dev/video0"}
-                    onChange={(e) =>
-                      updateCurrentGate((prev) => ({ ...prev, backendDevicePath: e.target.value }))
-                    }
-                    className="w-full px-3.5 py-2.5 rounded-lg border border-slate-300 text-sm font-mono text-slate-800 bg-white focus:ring-2 focus:ring-emerald-500 outline-none"
-                    placeholder="/dev/video0"
-                  />
-                  <p className="text-xs text-slate-700 mt-1">
-                    Cần phân quyền truy cập thiết bị (vd: video group) trong môi trường triển khai docker/container.
-                  </p>
+              {loading && currentStreams.length === 0 ? (
+                <div className="p-6 rounded-xl border border-dashed border-slate-300 text-center text-xs text-slate-500 flex items-center justify-center gap-2">
+                  <RefreshCw className="w-4 h-4 animate-spin text-indigo-600" />
+                  Đang tải danh sách luồng camera...
                 </div>
-              </div>
-            )}
+              ) : currentStreams.length === 0 ? (
+                <div className="p-6 rounded-xl border border-dashed border-slate-300 text-center space-y-1">
+                  <Video className="w-8 h-8 text-slate-300 mx-auto" />
+                  <p className="text-sm font-medium text-slate-700">Cổng này chưa có luồng camera nào</p>
+                  <p className="text-xs text-slate-500">Nhấn "Thêm luồng" để khai báo nguồn RTSP, HTTP hoặc UVC.</p>
+                </div>
+              ) : (
+                <div className="space-y-2">{currentStreams.map((s, index) => renderStreamRow(s, index))}</div>
+              )}
+            </div>
 
             {/* ---------------- LIVE STREAM TEST PREVIEW PLAYER ---------------- */}
             <div className="border-t border-slate-200 pt-6 space-y-4">
@@ -1342,7 +2066,24 @@ export const CameraStreamConfigPage: React.FC = () => {
                 </div>
 
                 <div className="flex flex-wrap items-center gap-2">
-                  {currentGateConfig.sourceType === "RTSP" && (
+                  {currentStreams.length > 1 && (
+                    <select
+                      value={previewStream?.id || ""}
+                      onChange={(e) => selectPreviewStream(e.target.value)}
+                      className="px-2.5 py-1.5 rounded-lg border border-slate-300 text-xs font-semibold bg-white outline-none"
+                      title="Chọn luồng để xem thử"
+                    >
+                      {currentStreams.map((s) => (
+                        <option key={s.id} value={s.id}>
+                          {s.label}
+                          {currentPrimary?.id === s.id ? " (Chính)" : ""}
+                          {!s.enabled ? " - đã tắt" : ""}
+                        </option>
+                      ))}
+                    </select>
+                  )}
+
+                  {previewStream?.sourceType === "RTSP" && (
                     <>
                       {/* RTSP Mode Switcher */}
                       <div className="flex items-center bg-slate-100 p-0.5 rounded-lg text-xs font-semibold">
@@ -1381,7 +2122,7 @@ export const CameraStreamConfigPage: React.FC = () => {
                         onClick={handleScanRtsp}
                         disabled={isScanningRtsp}
                         className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-indigo-50 border border-indigo-200 text-indigo-700 hover:bg-indigo-100 text-xs font-semibold shadow-xs transition-colors disabled:opacity-50"
-                        title="Chụp 1 khung hình từ RTSP và chuyển vào Worker Threads nhận diện"
+                        title="Chụp 1 khung hình từ luồng đang xem và chuyển vào Worker Threads nhận diện"
                       >
                         <ScanFace className={`w-3.5 h-3.5 text-indigo-600 ${isScanningRtsp ? "animate-spin" : ""}`} />
                         {isScanningRtsp ? "Đang Quét AI..." : "Quét Nhận Diện Từ RTSP"}
@@ -1392,8 +2133,9 @@ export const CameraStreamConfigPage: React.FC = () => {
                   {!isPreviewActive ? (
                     <button
                       type="button"
-                      onClick={startPreview}
-                      className="flex items-center gap-2 px-4 py-2 rounded-lg bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-semibold shadow-xs transition-colors"
+                      onClick={() => startPreview()}
+                      disabled={!previewStream}
+                      className="flex items-center gap-2 px-4 py-2 rounded-lg bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-semibold shadow-xs transition-colors disabled:opacity-50"
                     >
                       <Play className="w-3.5 h-3.5" />
                       Bật Xem Trực Tiếp
@@ -1426,8 +2168,8 @@ export const CameraStreamConfigPage: React.FC = () => {
                   </div>
                 )}
 
-                {isPreviewActive ? (
-                  currentGateConfig.sourceType === "CLIENT_UVC" ? (
+                {isPreviewActive && previewStream ? (
+                  previewStream.sourceType === "CLIENT_UVC" ? (
                     <video
                       ref={attachVideoRef}
                       autoPlay
@@ -1440,42 +2182,49 @@ export const CameraStreamConfigPage: React.FC = () => {
                       }}
                       className="w-full h-full object-cover"
                     />
-                  ) : currentGateConfig.sourceType === "RTSP" ? (
+                  ) : previewStream.sourceType === "RTSP" ? (
                     rtspViewMode === "MJPEG" ? (
                       <img
-                        key={`mjpeg-${previewTimestamp}`}
-                        src={`/api/camera-streams/mjpeg?gate=${activeGateTab.toLowerCase()}&url=${encodeURIComponent(
-                          currentGateConfig.rtspUrl || ""
-                        )}&t=${previewTimestamp}`}
+                        key={`mjpeg-${previewStream.id}-${previewTimestamp}`}
+                        src={`/api/camera-streams/mjpeg?gate=${currentGateKey}&stream=${encodeURIComponent(previewStream.id)}&t=${previewTimestamp}`}
                         alt="RTSP Live MJPEG"
                         onError={() => {
                           // If proxy fails (e.g. cloud cannot reach private LAN), fallback gracefully
-                          setRtspViewMode("SIMULATION");
+                          setRtspViewMode("SNAPSHOT");
+                          setPreviewTimestamp(Date.now());
                         }}
                         className="w-full h-full object-contain"
                       />
                     ) : rtspViewMode === "SNAPSHOT" ? (
                       <img
-                        key={`snap-${previewTimestamp}`}
-                        src={`/api/camera-streams/snapshot?gate=${activeGateTab.toLowerCase()}&url=${encodeURIComponent(
-                          currentGateConfig.rtspUrl || ""
-                        )}&t=${previewTimestamp}`}
+                        key={`snap-${previewStream.id}-${previewTimestamp}`}
+                        src={`/api/camera-streams/snapshot?gate=${currentGateKey}&stream=${encodeURIComponent(previewStream.id)}&t=${previewTimestamp}`}
                         alt="RTSP Snapshot"
                         className="w-full h-full object-contain"
                       />
                     ) : (
                       <img
-                        src={`/api/camera-streams/test-frame?gate=${activeGateTab.toLowerCase()}&source=${encodeURIComponent(
-                          currentGateConfig.sourceType
+                        src={`/api/camera-streams/test-frame?gate=${currentGateKey}&source=${encodeURIComponent(
+                          previewStream.sourceType
                         )}&t=${previewTimestamp}`}
                         alt="Camera Stream Simulation"
                         className="w-full h-full object-contain"
                       />
                     )
+                  ) : previewStream.sourceType === "HTTP_MJPEG" && previewStream.httpUrl ? (
+                    <img
+                      key={`http-${previewStream.id}-${previewTimestamp}`}
+                      src={previewStream.httpUrl}
+                      alt="HTTP MJPEG Stream"
+                      onError={(e) => {
+                        (e.target as HTMLImageElement).src = `/api/camera-streams/test-frame?gate=${currentGateKey}&source=HTTP_MJPEG&t=${previewTimestamp}`;
+                      }}
+                      className="w-full h-full object-contain"
+                    />
                   ) : (
                     <img
-                      src={`/api/camera-streams/test-frame?gate=${activeGateTab.toLowerCase()}&source=${encodeURIComponent(
-                        currentGateConfig.sourceType
+                      src={`/api/camera-streams/test-frame?gate=${currentGateKey}&source=${encodeURIComponent(
+                        previewStream.sourceType
                       )}&t=${previewTimestamp}`}
                       alt="Camera Stream Test"
                       className="w-full h-full object-contain"
@@ -1488,26 +2237,31 @@ export const CameraStreamConfigPage: React.FC = () => {
                       Trình xem thử nghiệm đang ở trạng thái chờ
                     </p>
                     <p className="text-xs text-slate-500 max-w-sm mx-auto">
-                      Nhấn nút "Bật Xem Trực Tiếp" hoặc chọn chế độ Proxy/Snapshot để kết nối kiểm tra luồng <code className="text-indigo-400">192.168.60.2</code>.
+                      {previewStream
+                        ? <>Nhấn "Bật Xem Trực Tiếp" để kết nối luồng <code className="text-indigo-400">{previewStream.label}</code>.</>
+                        : "Hãy thêm ít nhất một luồng camera cho cổng này."}
                     </p>
                   </div>
                 )}
 
                 {/* Overlays during active preview */}
-                {isPreviewActive && (
+                {isPreviewActive && previewStream && (
                   <>
                     <div className="absolute top-3 left-3 bg-black/70 backdrop-blur-xs text-white text-xs px-3 py-1.5 rounded-lg flex items-center gap-2 font-mono">
                       <span className="w-2.5 h-2.5 rounded-full bg-emerald-500 animate-ping" />
-                      <span>{currentGateConfig.name}</span>
+                      <span>{previewStream.label}</span>
+                      {currentPrimary?.id === previewStream.id && (
+                        <span className="text-[10px] px-1.5 py-0.5 rounded bg-indigo-600 text-white font-bold">Chính</span>
+                      )}
                       <span className="text-slate-400">|</span>
                       <span className="text-emerald-400 font-bold">
-                        {currentGateConfig.sourceType}
-                        {currentGateConfig.sourceType === "RTSP" ? ` (${rtspViewMode})` : ""}
+                        {previewStream.sourceType}
+                        {previewStream.sourceType === "RTSP" ? ` (${rtspViewMode})` : ""}
                       </span>
                     </div>
 
                     <div className="absolute top-3 right-3 bg-black/70 backdrop-blur-xs text-white text-xs px-3 py-1.5 rounded-lg font-mono">
-                      {currentGateConfig.resolution || "1920x1080"} • {previewFps} FPS
+                      {previewStream.resolution || "1920x1080"} • {previewStream.fps || previewFps} FPS
                     </div>
 
                     <div className="absolute bottom-3 left-3 bg-black/70 backdrop-blur-xs text-white text-xs px-3 py-1.5 rounded-lg flex items-center gap-2">
@@ -1522,9 +2276,11 @@ export const CameraStreamConfigPage: React.FC = () => {
               {rtspScanResult && (
                 <div
                   className={`p-4 rounded-xl border text-xs space-y-2 animate-in fade-in ${
-                    rtspScanResult.success && rtspScanResult.matchedEmployee
+                    rtspScanResult.success && rtspScanResult.recognized
                       ? "bg-emerald-50 border-emerald-300 text-emerald-950"
                       : rtspScanResult.success
+                      ? "bg-amber-50 border-amber-300 text-amber-950"
+                      : rtspScanResult.overloaded
                       ? "bg-amber-50 border-amber-300 text-amber-950"
                       : "bg-rose-50 border-rose-300 text-rose-950"
                   }`}
@@ -1532,10 +2288,13 @@ export const CameraStreamConfigPage: React.FC = () => {
                   <div className="flex items-center justify-between font-bold text-sm">
                     <div className="flex items-center gap-2">
                       <ScanFace className="w-4 h-4" />
-                      <span>KẾT QUẢ QUÉT NHẬN DIỆN TỪ LUỒNG RTSP ({activeGateTab})</span>
+                      <span>
+                        KẾT QUẢ QUÉT NHẬN DIỆN ({activeGateTab}
+                        {rtspScanResult.streamLabel ? ` • ${rtspScanResult.streamLabel}` : ""})
+                      </span>
                     </div>
                     <span className="text-xs px-2 py-0.5 rounded font-mono bg-white/70">
-                      {rtspScanResult.multiThreadUsed ? "⚡ Multi-Thread Worker" : "Chế độ tuần tự"}
+                      {rtspScanResult.multiThreadUsed ? "⚡ Multi-Thread Worker" : rtspScanResult.engineUsed || "Chế độ tuần tự"}
                     </span>
                   </div>
 
@@ -1543,19 +2302,25 @@ export const CameraStreamConfigPage: React.FC = () => {
                     <div className="grid grid-cols-1 sm:grid-cols-3 gap-2 pt-1 font-mono">
                       <div>
                         <span className="opacity-75">Đối tượng: </span>
-                        <b>{rtspScanResult.matchedEmployee ? rtspScanResult.matchedEmployee.name : "Người lạ (Stranger)"}</b>
+                        <b>
+                          {rtspScanResult.recognized && rtspScanResult.employee
+                            ? rtspScanResult.employee.name
+                            : (rtspScanResult.totalFacesDetected || 0) > 0
+                            ? `${rtspScanResult.totalFacesDetected} khuôn mặt (chưa khớp hồ sơ)`
+                            : "Không phát hiện khuôn mặt"}
+                        </b>
                       </div>
                       <div>
-                        <span className="opacity-75">Độ tương đồng: </span>
-                        <b>{Math.round((rtspScanResult.similarityScore || 0) * 100)}%</b>
+                        <span className="opacity-75">Độ tin cậy: </span>
+                        <b>{Math.round(Number(rtspScanResult.confidence || 0))}%</b>
                       </div>
                       <div>
                         <span className="opacity-75">Thời gian xử lý: </span>
-                        <b>{rtspScanResult.processDurationMs || 12}ms (Lấy frame: {rtspScanResult.frameCaptureDurationMs || 0}ms)</b>
+                        <b>{rtspScanResult.processingTimeMs ?? rtspScanResult.processDurationMs ?? 0}ms (Lấy frame: {rtspScanResult.frameCaptureDurationMs || 0}ms)</b>
                       </div>
                     </div>
                   ) : (
-                    <p className="text-rose-800 font-medium">
+                    <p className={`font-medium ${rtspScanResult.overloaded ? "text-amber-900" : "text-rose-800"}`}>
                       {rtspScanResult.error || "Không thể lấy khung hình hoặc nhận diện"}
                     </p>
                   )}
@@ -1571,60 +2336,78 @@ export const CameraStreamConfigPage: React.FC = () => {
                 Giám Sát Đồng Thời Cả 2 Cổng (Cổng Vào & Cổng Ra)
               </h3>
               <p className="text-xs text-slate-700">
-                Màn hình kép phân giải cao hỗ trợ bảo vệ an ninh kiểm soát lưu lượng cả 2 chiều song song.
+                Màn hình kép hiển thị snapshot của toàn bộ luồng đang bật ở cả 2 cổng, hỗ trợ bảo vệ an ninh kiểm soát lưu lượng song song.
               </p>
             </div>
 
             <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-              {/* Entry Gate Box */}
-              <div className="space-y-2">
-                <div className="flex items-center justify-between">
-                  <span className="text-sm font-semibold text-slate-800 flex items-center gap-2">
-                    <span className="w-2.5 h-2.5 rounded-full bg-emerald-500" />
-                    {config.entryGate.name}
-                  </span>
-                  <span className="text-xs px-2 py-0.5 rounded-md bg-emerald-50 text-emerald-700 font-bold border border-emerald-200">
-                    {config.entryGate.sourceType}
-                  </span>
-                </div>
-                <div className="relative aspect-video bg-slate-900 rounded-xl overflow-hidden border border-slate-800 flex items-center justify-center">
-                  <img
-                    src={`/api/camera-streams/test-frame?gate=entry&source=${encodeURIComponent(
-                      config.entryGate.sourceType
-                    )}&t=${Date.now()}`}
-                    alt="Cổng Vào"
-                    className="w-full h-full object-contain"
-                  />
-                  <div className="absolute top-2 left-2 bg-black/60 text-white text-[11px] px-2 py-1 rounded font-mono">
-                    CỔNG VÀO (ENTRY)
+              {(["entry", "exit"] as GateKey[]).map((key) => {
+                const gate = config[gateFieldOf(key)];
+                const streams = deriveGateStreams(gate, key).filter((s) => s.enabled);
+                const primary = getPrimaryStream(streams);
+                const isEntry = key === "entry";
+                return (
+                  <div key={key} className="space-y-2">
+                    <div className="flex items-center justify-between">
+                      <span className="text-sm font-semibold text-slate-800 flex items-center gap-2">
+                        <span className={`w-2.5 h-2.5 rounded-full ${isEntry ? "bg-emerald-500" : "bg-blue-500"}`} />
+                        {gate?.name}
+                      </span>
+                      <span
+                        className={`text-xs px-2 py-0.5 rounded-md font-bold border ${
+                          isEntry ? "bg-emerald-50 text-emerald-700 border-emerald-200" : "bg-blue-50 text-blue-700 border-blue-200"
+                        }`}
+                      >
+                        {streams.length} luồng bật
+                      </span>
+                    </div>
+                    {streams.length === 0 ? (
+                      <div className="aspect-video bg-slate-900 rounded-xl border border-slate-800 flex items-center justify-center text-xs text-slate-400">
+                        Chưa có luồng nào được bật
+                      </div>
+                    ) : (
+                      <div className={`grid gap-3 ${streams.length > 1 ? "grid-cols-1 sm:grid-cols-2" : "grid-cols-1"}`}>
+                        {streams.map((s) => (
+                          <div
+                            key={s.id}
+                            className="relative aspect-video bg-slate-900 rounded-xl overflow-hidden border border-slate-800 flex items-center justify-center"
+                          >
+                            <img
+                              src={
+                                s.sourceType === "RTSP" || s.sourceType === "BACKEND_UVC"
+                                  ? `/api/camera-streams/snapshot?gate=${key}&stream=${encodeURIComponent(s.id)}&t=${previewTimestamp}`
+                                  : `/api/camera-streams/test-frame?gate=${key}&source=${encodeURIComponent(s.sourceType)}&t=${previewTimestamp}`
+                              }
+                              alt={s.label}
+                              onError={(e) => {
+                                (e.target as HTMLImageElement).src = `/api/camera-streams/test-frame?gate=${key}&source=${encodeURIComponent(s.sourceType)}%20Offline`;
+                              }}
+                              className="w-full h-full object-contain"
+                            />
+                            <div className="absolute top-2 left-2 bg-black/60 text-white text-[11px] px-2 py-1 rounded font-mono flex items-center gap-1.5">
+                              {isEntry ? "VÀO" : "RA"} • {s.label}
+                              {primary?.id === s.id && (
+                                <span className="text-[9px] px-1 py-0.5 rounded bg-indigo-600 text-white font-bold">Chính</span>
+                              )}
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    )}
                   </div>
-                </div>
-              </div>
+                );
+              })}
+            </div>
 
-              {/* Exit Gate Box */}
-              <div className="space-y-2">
-                <div className="flex items-center justify-between">
-                  <span className="text-sm font-semibold text-slate-800 flex items-center gap-2">
-                    <span className="w-2.5 h-2.5 rounded-full bg-blue-500" />
-                    {config.exitGate.name}
-                  </span>
-                  <span className="text-xs px-2 py-0.5 rounded-md bg-blue-50 text-blue-700 font-bold border border-blue-200">
-                    {config.exitGate.sourceType}
-                  </span>
-                </div>
-                <div className="relative aspect-video bg-slate-900 rounded-xl overflow-hidden border border-slate-800 flex items-center justify-center">
-                  <img
-                    src={`/api/camera-streams/test-frame?gate=exit&source=${encodeURIComponent(
-                      config.exitGate.sourceType
-                    )}&t=${Date.now()}`}
-                    alt="Cổng Ra"
-                    className="w-full h-full object-contain"
-                  />
-                  <div className="absolute top-2 left-2 bg-black/60 text-white text-[11px] px-2 py-1 rounded font-mono">
-                    CỔNG RA (EXIT)
-                  </div>
-                </div>
-              </div>
+            <div className="flex justify-center">
+              <button
+                type="button"
+                onClick={() => setPreviewTimestamp(Date.now())}
+                className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg border border-slate-300 text-slate-700 hover:bg-slate-50 text-xs font-semibold"
+              >
+                <RefreshCw className="w-3.5 h-3.5 text-indigo-600" />
+                Chụp lại toàn bộ snapshot
+              </button>
             </div>
           </div>
         )}
@@ -1660,7 +2443,7 @@ export const CameraStreamConfigPage: React.FC = () => {
 
             <div className="flex items-center justify-between text-xs text-slate-700 p-1">
               <span>Chu kỳ tự động thử kết nối lại luồng:</span>
-              <span className="font-semibold text-slate-900">{config.entryGate.reconnectIntervalSeconds || 5} giây</span>
+              <span className="font-semibold text-slate-900">{config.entryGate?.reconnectIntervalSeconds || 5} giây</span>
             </div>
           </div>
         </div>
@@ -1682,6 +2465,10 @@ export const CameraStreamConfigPage: React.FC = () => {
             </p>
             <p>
               • <strong>Worker Threads (Worker Pool):</strong> Chạy trên các CPU Core độc lập để trích xuất 512-D Face Embeddings, so sánh ma trận Cosine và phân tích liveness chống giả mạo hình ảnh.
+            </p>
+            <p className="flex items-center gap-1.5">
+              <Settings className="w-3.5 h-3.5 text-slate-500" />
+              <span>Mỗi cổng có thể quét đồng thời nhiều luồng RTSP; kết quả được gộp theo từng luồng.</span>
             </p>
           </div>
         </div>
