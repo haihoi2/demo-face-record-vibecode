@@ -6,3 +6,6 @@ coverage/
 *.log
 .env*
 !.env.example
+
+# Runtime data (SQLite DB, JSON fallback, uploads) - written by the container, never versioned
+data/
