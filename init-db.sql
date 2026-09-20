@@ -97,6 +97,14 @@ CREATE TABLE IF NOT EXISTS resolved_stranger_clusters (
   "resolvedBy" VARCHAR(255)
 );
 
+-- AI recognition engine settings (engine mode, Gemini model, thresholds).
+-- Single row id = 'default'; the server hydrates it into memory at startup.
+CREATE TABLE IF NOT EXISTS ai_recognition_config (
+  id VARCHAR(64) PRIMARY KEY,
+  config_json JSONB NOT NULL,
+  "updatedAt" VARCHAR(64)
+);
+
 -- Indices for rapid query performance
 CREATE INDEX IF NOT EXISTS idx_access_logs_timestamp ON access_logs (timestamp DESC);
 CREATE INDEX IF NOT EXISTS idx_notifications_timestamp ON mobile_notifications (timestamp DESC);

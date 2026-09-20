@@ -141,7 +141,7 @@ export interface DoorApiLogRecord {
 export const DEFAULT_DOOR_CONTROLLER_CONFIG: DoorControllerConfigRecord = {
   enabled: true,
   apiUrl: "https://smartlock.eton.vn/api/door/control",
-  apiToken: "eton_door_secret_token_2026_secure_key",
+  apiToken: "" /* set via the Door Controller page; never ship a real token in source */,
   authHeaderType: "BEARER",
   customHeaderName: "X-Door-Token",
   openMethod: "POST",
@@ -219,6 +219,57 @@ export const DEFAULT_CAMERA_STREAMS_CONFIG: CameraStreamsConfigRecord = {
   maxFpsPerStream: 30,
   backendCaptureFps: 15,
 };
+
+// ================= AI RECOGNITION CONFIG =================
+export type AiEngineMode = "GOOGLE_GEMINI" | "LOCAL_BIOMETRIC" | "HYBRID_AUTO";
+
+export interface AiRecognitionConfigRecord {
+  engineMode: AiEngineMode;
+  googleAi: {
+    model: string;
+    temperature: number;
+    minConfidence: number;
+    useSystemFallback: boolean;
+    customPrompt?: string;
+  };
+  localModel: {
+    modelArchitecture: string;
+    similarityThreshold: number;
+    livenessSensitivity: "LOW" | "MEDIUM" | "HIGH";
+    maxFaces: number;
+    autoContrast: boolean;
+    antiSpoofing: boolean;
+  };
+  hybridSettings: {
+    localPreFilterThreshold: number;
+    fallbackToCloudOnUnknown: boolean;
+  };
+}
+
+export const AI_ENGINE_MODES: AiEngineMode[] = ["GOOGLE_GEMINI", "LOCAL_BIOMETRIC", "HYBRID_AUTO"];
+
+/**
+ * Lays a persisted (possibly partial / older) AI config over the defaults so
+ * that fields introduced after the row was written still receive a default.
+ * Sections are merged one level deep; an unknown engineMode falls back to the
+ * default one instead of poisoning the runtime.
+ */
+export function mergeAiRecognitionConfig(
+  defaults: AiRecognitionConfigRecord,
+  persisted: Partial<AiRecognitionConfigRecord> | null | undefined
+): AiRecognitionConfigRecord {
+  const p: any = persisted && typeof persisted === "object" ? persisted : {};
+  const engineMode = AI_ENGINE_MODES.includes(p.engineMode) ? (p.engineMode as AiEngineMode) : defaults.engineMode;
+  return {
+    engineMode,
+    googleAi: { ...defaults.googleAi, ...(p.googleAi && typeof p.googleAi === "object" ? p.googleAi : {}) },
+    localModel: { ...defaults.localModel, ...(p.localModel && typeof p.localModel === "object" ? p.localModel : {}) },
+    hybridSettings: {
+      ...defaults.hybridSettings,
+      ...(p.hybridSettings && typeof p.hybridSettings === "object" ? p.hybridSettings : {}),
+    },
+  };
+}
 
 // Database wrapper supporting PostgreSQL (via DATABASE_URL), native Node 22 SQLite, and fallback JSON
 class SQLiteStorage {
@@ -610,8 +661,15 @@ class SQLiteStorage {
           "resolvedAt" VARCHAR(64),
           "resolvedBy" VARCHAR(255)
         );
+
+        CREATE TABLE IF NOT EXISTS ai_recognition_config (
+          id VARCHAR(64) PRIMARY KEY,
+          config_json JSONB NOT NULL,
+          "updatedAt" VARCHAR(64)
+        );
       `);
       await this.loadResolvedStrangerClusters();
+      await this.loadAiRecognitionConfig();
       console.log("[PostgreSQL] Các bảng dữ liệu đã sẵn sàng trên PostgreSQL!");
     } catch (err) {
       console.error("[PostgreSQL] Lỗi khởi tạo bảng:", err);
@@ -753,6 +811,12 @@ class SQLiteStorage {
         id TEXT PRIMARY KEY,
         config_json TEXT NOT NULL
       );
+
+      CREATE TABLE IF NOT EXISTS ai_recognition_config (
+        id TEXT PRIMARY KEY,
+        config_json TEXT NOT NULL,
+        updatedAt TEXT
+      );
     `);
   }
 
@@ -768,6 +832,7 @@ class SQLiteStorage {
     door_api_logs: DoorApiLogRecord[];
     camera_streams_config?: CameraStreamsConfigRecord;
     resolved_stranger_clusters?: string[];
+    ai_recognition_config?: AiRecognitionConfigRecord;
   } = {
     employees: [],
     access_logs: [],
@@ -1539,6 +1604,127 @@ class SQLiteStorage {
       }
     }
     this.fallbackData.camera_streams_config = config;
+    this.saveFallback();
+  }
+
+  // ================= AI RECOGNITION CONFIG =================
+  // Engine mode / Gemini model / thresholds edited from the AI settings page.
+  // The read path is synchronous (the config is consulted on every
+  // recognition), so the PostgreSQL row is hydrated into memory at startup
+  // and every save goes to each active store best-effort. On hosts where
+  // ./data is bind-mounted read-only for the container, SQLite and the JSON
+  // fallback cannot be written - PostgreSQL is the store that survives.
+  private aiConfigCache: AiRecognitionConfigRecord | null = null;
+  private aiConfigLoadedCallbacks: Array<(config: AiRecognitionConfigRecord) => void> = [];
+
+  /** Fires once the PostgreSQL row has been hydrated (only when PostgreSQL is active and holds a row). */
+  public onAiRecognitionConfigLoaded(cb: (config: AiRecognitionConfigRecord) => void) {
+    this.aiConfigLoadedCallbacks.push(cb);
+  }
+
+  private parseAiConfigRow(value: unknown): AiRecognitionConfigRecord | null {
+    if (!value) return null;
+    try {
+      const parsed = typeof value === "string" ? JSON.parse(value) : value;
+      return parsed && typeof parsed === "object" ? (parsed as AiRecognitionConfigRecord) : null;
+    } catch {
+      return null;
+    }
+  }
+
+  private async loadAiRecognitionConfig() {
+    if (!this.pgPool) return;
+    try {
+      const res = await this.pgPool.query(
+        "SELECT config_json FROM ai_recognition_config WHERE id = 'default'"
+      );
+      const parsed = this.parseAiConfigRow(res.rows[0]?.config_json);
+      if (parsed) {
+        this.aiConfigCache = parsed;
+        console.log(
+          `[PostgreSQL] Đã nạp cấu hình AI nhận diện (engine: ${parsed.engineMode}, model: ${parsed.googleAi?.model}).`
+        );
+        for (const cb of this.aiConfigLoadedCallbacks) {
+          try {
+            cb(parsed);
+          } catch (e: any) {
+            console.error("[PostgreSQL] Lỗi callback cấu hình AI:", e?.message);
+          }
+        }
+      }
+    } catch (err) {
+      console.error("[PostgreSQL] Lỗi nạp cấu hình AI nhận diện:", err);
+    }
+  }
+
+  /**
+   * Returns the persisted AI config merged over `defaults`.
+   * Precedence: PostgreSQL (hydrated cache) > native SQLite row > JSON fallback > defaults.
+   */
+  getAiRecognitionConfig(defaults: AiRecognitionConfigRecord): AiRecognitionConfigRecord {
+    if (this.aiConfigCache) {
+      return mergeAiRecognitionConfig(defaults, this.aiConfigCache);
+    }
+    if (this.isNativeSqlite && this.db) {
+      try {
+        const row: any = this.db
+          .prepare("SELECT config_json FROM ai_recognition_config WHERE id = 'default'")
+          .get();
+        const parsed = this.parseAiConfigRow(row?.config_json);
+        if (parsed) return mergeAiRecognitionConfig(defaults, parsed);
+      } catch (err) {
+        console.error("[SQLite] Lỗi getAiRecognitionConfig:", err);
+      }
+    }
+    return mergeAiRecognitionConfig(defaults, this.fallbackData.ai_recognition_config);
+  }
+
+  saveAiRecognitionConfig(config: AiRecognitionConfigRecord): void {
+    const snapshot: AiRecognitionConfigRecord = JSON.parse(JSON.stringify(config));
+    const updatedAt = new Date().toISOString();
+    const json = JSON.stringify(snapshot);
+
+    if (this.pgPool && this.isPostgres) {
+      // Cache first so the next read reflects the change even before the row lands.
+      this.aiConfigCache = snapshot;
+      this.pgPool
+        .query(
+          `INSERT INTO ai_recognition_config (id, config_json, "updatedAt")
+           VALUES ('default', $1::jsonb, $2)
+           ON CONFLICT (id) DO UPDATE SET
+             config_json = EXCLUDED.config_json,
+             "updatedAt" = EXCLUDED."updatedAt"`,
+          [json, updatedAt]
+        )
+        .catch((err: any) =>
+          console.error("[PostgreSQL] Lỗi lưu cấu hình AI nhận diện:", err?.message)
+        );
+    }
+
+    if (this.isNativeSqlite && this.db) {
+      try {
+        this.db.exec(`
+          CREATE TABLE IF NOT EXISTS ai_recognition_config (
+            id TEXT PRIMARY KEY,
+            config_json TEXT NOT NULL,
+            updatedAt TEXT
+          )
+        `);
+        this.db
+          .prepare(
+            `INSERT INTO ai_recognition_config (id, config_json, updatedAt)
+             VALUES ('default', ?, ?)
+             ON CONFLICT(id) DO UPDATE SET
+               config_json = excluded.config_json,
+               updatedAt = excluded.updatedAt`
+          )
+          .run(json, updatedAt);
+      } catch (err) {
+        console.error("[SQLite] Lỗi saveAiRecognitionConfig:", err);
+      }
+    }
+
+    this.fallbackData.ai_recognition_config = snapshot;
     this.saveFallback();
   }
 

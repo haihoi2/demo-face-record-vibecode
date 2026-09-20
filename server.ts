@@ -14,6 +14,8 @@ import {
   DoorControllerConfigRecord,
   DoorApiLogRecord,
   CameraStreamsConfigRecord,
+  AiRecognitionConfigRecord,
+  AI_ENGINE_MODES,
 } from "./src/server/db";
 import { runLocalFaceRecognition } from "./src/utils/localBiometrics";
 import { clusterStrangerFaces } from "./src/server/strangers";
@@ -133,6 +135,25 @@ app.use((req, _res, next) => {
   }
   next();
 });
+
+// faceWorkerPool.dispatchFaceTask() rejects on queue backpressure and when the
+// pool is re-initialised mid-flight. Both are transient "try again" conditions,
+// so the HTTP routes answer 503 + Retry-After instead of 500 (and never fall
+// back to the main-thread engine, which would defeat the load shedding).
+const WORKER_POOL_UNAVAILABLE_RE = /backpressure|reinitialised/i;
+function isWorkerPoolUnavailableError(err: unknown): boolean {
+  return WORKER_POOL_UNAVAILABLE_RE.test(String((err as any)?.message || err || ""));
+}
+function respondWorkerPoolUnavailable(res: Response, err: unknown, extra: Record<string, unknown> = {}) {
+  res.setHeader("Retry-After", "1");
+  res.status(503).json({
+    success: false,
+    recognized: false,
+    retryAfterSeconds: 1,
+    error: (err as any)?.message || "Cụm luồng nhận diện đang quá tải, vui lòng gửi lại khung hình sau 1 giây.",
+    ...extra,
+  });
+}
 
 // Server-side Gemini client
 function getGeminiClient(): GoogleGenAI | null {
@@ -359,8 +380,47 @@ let doorControllerConfig = db.getDoorControllerConfig(DEFAULT_DOOR_CONTROLLER_CO
 let doorApiLogs: DoorApiLogRecord[] = db.getDoorApiLogs();
 let cameraStreamsConfig: CameraStreamsConfigRecord = db.getCameraStreamsConfig(DEFAULT_CAMERA_STREAMS_CONFIG);
 
+// --- AI recognition engine configuration (persisted, see db.getAiRecognitionConfig) ---
+type ServerAiConfig = AiRecognitionConfigRecord;
+
+// GOOGLE_GEMINI_MODEL only seeds the default; a persisted model always wins.
+const DEFAULT_AI_RECOGNITION_CONFIG: ServerAiConfig = {
+  engineMode: "HYBRID_AUTO",
+  googleAi: {
+    model: (process.env.GOOGLE_GEMINI_MODEL || "").trim() || "gemini-3.8-flash",
+    temperature: 0.1,
+    minConfidence: 75,
+    useSystemFallback: true,
+    customPrompt: "",
+  },
+  localModel: {
+    modelArchitecture: "blazeface-arcface-sota",
+    similarityThreshold: 0.72,
+    livenessSensitivity: "MEDIUM",
+    maxFaces: 4,
+    autoContrast: true,
+    antiSpoofing: true,
+  },
+  hybridSettings: {
+    localPreFilterThreshold: 0.85,
+    fallbackToCloudOnUnknown: true,
+  },
+};
+
+// Synchronous first load (SQLite / JSON fallback / defaults). PostgreSQL connects
+// asynchronously and re-hydrates this object through the callbacks below.
+let aiRecognitionConfig: ServerAiConfig = db.getAiRecognitionConfig(DEFAULT_AI_RECOGNITION_CONFIG);
+
+db.onAiRecognitionConfigLoaded(() => {
+  aiRecognitionConfig = db.getAiRecognitionConfig(DEFAULT_AI_RECOGNITION_CONFIG);
+  console.log(
+    `[AI Config] Đã khôi phục cấu hình nhận diện từ PostgreSQL: ${aiRecognitionConfig.engineMode} (Google Model: ${aiRecognitionConfig.googleAi.model})`
+  );
+});
+
 // Listen to Postgres sync events to refresh memory models
 db.onSync(() => {
+  aiRecognitionConfig = db.getAiRecognitionConfig(DEFAULT_AI_RECOGNITION_CONFIG);
   employees = db.getEmployees(DEFAULT_EMPLOYEES);
   accessLogs = db.getAccessLogs(DEFAULT_ACCESS_LOGS);
   mobileNotifications = db.getNotifications(DEFAULT_NOTIFICATIONS);
@@ -1269,18 +1329,33 @@ app.post("/api/camera-streams/benchmark", async (req, res) => {
   }
 
   try {
-    const results = await Promise.all(promises);
+    // Backpressure rejections are expected when the probe burst exceeds the
+    // queue limit; they are counted, not treated as a failed benchmark.
+    const settled = await Promise.allSettled(promises);
     const totalDurationMs = Date.now() - tStart;
+    const results = settled.flatMap((r) => (r.status === "fulfilled" ? [r.value] : []));
+    const rejections = settled.flatMap((r) => (r.status === "rejected" ? [r.reason] : []));
+    const backpressureRejections = rejections.filter((e) => /backpressure/i.test(String(e?.message || e || "")));
+    const otherErrors = rejections.filter((e) => !/backpressure/i.test(String(e?.message || e || "")));
+    if (otherErrors.length > 0) {
+      throw otherErrors[0];
+    }
+
+    const completedTasks = results.length;
     const avgWorkerLatency =
-      Math.round((results.reduce((s, r) => s + r.threadLatencyMs, 0) / results.length) * 10) / 10;
+      completedTasks > 0
+        ? Math.round((results.reduce((s, r) => s + r.threadLatencyMs, 0) / completedTasks) * 10) / 10
+        : 0;
     const threadsUsed = Array.from(new Set(results.map((r) => r.workerId)));
 
     res.json({
       success: true,
       taskCount,
+      completedTasks,
+      rejectedByBackpressure: backpressureRejections.length,
       totalDurationMs,
       avgWorkerLatencyMs: avgWorkerLatency,
-      throughputFps: Math.round((taskCount / (totalDurationMs / 1000)) * 10) / 10,
+      throughputFps: totalDurationMs > 0 ? Math.round((completedTasks / (totalDurationMs / 1000)) * 10) / 10 : 0,
       threadsUtilized: threadsUsed,
       telemetry: faceWorkerPool.getPoolTelemetry(),
       sampleResults: results.slice(0, 3),
@@ -1573,24 +1648,82 @@ app.post("/api/camera-streams/scan-rtsp", async (req, res) => {
     }
 
     const jpegBuffer = Buffer.concat(chunks);
-    const base64Image = `data:image/jpeg;base64,${jpegBuffer.toString("base64")}`;
+    const base64Data = jpegBuffer.toString("base64");
+    const base64Image = `data:image/jpeg;base64,${base64Data}`;
     const frameCaptureDurationMs = Date.now() - tStart;
+    const resolvedScanType: "ENTRY" | "EXIT" =
+      String(scanType || "").toUpperCase() === "EXIT" || (!scanType && gateParam === "exit") ? "EXIT" : "ENTRY";
 
     try {
-      const recognitionTask = await faceWorkerPool.dispatchFaceTask({
-        taskId: `rtsp-${Date.now()}`,
-        imageBase64: base64Image,
-        employees: employees as any,
-        scanType: (scanType as any) || (gateParam === "exit" ? "EXIT" : "ENTRY"),
+      // Same engine selection as /api/recognize-face: LOCAL_BIOMETRIC -> worker pool,
+      // GOOGLE_GEMINI -> Gemini Vision, HYBRID_AUTO -> local pre-filter then cloud.
+      const tRecognize = Date.now();
+      const recognition = await recognizeFrame({
+        base64Data,
+        rawImage: base64Image,
+        mimeType: "image/jpeg",
+        employees,
+        scanType: resolvedScanType,
       });
+      const processingTimeMs = Date.now() - tRecognize;
+
+      const { detectedFaces } = recognition;
+      const authorizedFaces = detectedFaces.filter((f) => f.recognized && f.employeeId);
+      const recognized = authorizedFaces.length > 0;
+      const recognizedEmployees = authorizedFaces
+        .map((f) => employees.find((e) => e.id === f.employeeId))
+        .filter((e, i, arr): e is EmployeeRecord => Boolean(e) && arr.indexOf(e) === i);
+      const bestMatch = recognizedEmployees[0];
+      const primaryFace = authorizedFaces[0] || detectedFaces[0];
+      const overallConfidence = Number(primaryFace?.confidence ?? 0);
+      const overallLiveness = Number(primaryFace?.livenessScore ?? 0);
 
       res.json({
         success: true,
         frameCaptureDurationMs,
-        ...recognitionTask,
+        taskId: `rtsp-${Date.now()}`,
+        gate: gateParam,
+        scanType: resolvedScanType,
+        // Recognition outcome (fail-closed: recognized only when an engine matched a registered employee)
+        recognized,
+        detectedFaces,
+        totalFacesDetected: detectedFaces.length,
+        authorizedCount: authorizedFaces.length,
+        unauthorizedCount: detectedFaces.length - authorizedFaces.length,
+        bestMatch,
+        employee: bestMatch,
+        matchedEmployee: bestMatch,
+        recognizedEmployees,
+        overallConfidence,
+        overallLiveness,
+        confidence: overallConfidence,
+        livenessScore: overallLiveness,
+        similarityScore: Math.round(overallConfidence * 10) / 1000,
+        message: recognition.overallMessage,
+        // Engine telemetry
+        engineMode: recognition.engineMode,
+        engineUsed: recognition.engineUsed,
+        modelUsed: recognition.modelUsed,
+        modelName: recognition.modelUsed,
+        multiThreadUsed: Boolean(recognition.multiThreadInfo.workerId),
+        workerId: recognition.multiThreadInfo.workerId,
+        threadLatencyMs: recognition.multiThreadInfo.threadLatencyMs ?? processingTimeMs,
+        processingTimeMs,
+        processDurationMs: processingTimeMs,
       });
     } catch (err: any) {
-      res.status(500).json({ success: false, error: err?.message });
+      if (isWorkerPoolUnavailableError(err)) {
+        console.warn("[RTSP Scan] Cụm luồng từ chối tạm thời (503):", err?.message);
+        respondWorkerPoolUnavailable(res, err, { frameCaptureDurationMs });
+        return;
+      }
+      console.error("[RTSP Scan] Lỗi nhận diện khung hình:", err?.message || err);
+      res.status(500).json({
+        success: false,
+        recognized: false,
+        error: err?.message || "Lỗi xử lý nhận diện khung hình RTSP",
+        frameCaptureDurationMs,
+      });
     }
   });
 });
@@ -1658,52 +1791,6 @@ const AI_BENCHMARK_ROUTES = [
   "/config/ai/benchmark/",
 ];
 
-interface ServerAiConfig {
-  engineMode: "GOOGLE_GEMINI" | "LOCAL_BIOMETRIC" | "HYBRID_AUTO";
-  googleAi: {
-    model: string;
-    temperature: number;
-    minConfidence: number;
-    useSystemFallback: boolean;
-    customPrompt?: string;
-  };
-  localModel: {
-    modelArchitecture: string;
-    similarityThreshold: number;
-    livenessSensitivity: "LOW" | "MEDIUM" | "HIGH";
-    maxFaces: number;
-    autoContrast: boolean;
-    antiSpoofing: boolean;
-  };
-  hybridSettings: {
-    localPreFilterThreshold: number;
-    fallbackToCloudOnUnknown: boolean;
-  };
-}
-
-let aiRecognitionConfig: ServerAiConfig = {
-  engineMode: "HYBRID_AUTO",
-  googleAi: {
-    model: "gemini-3.8-flash",
-    temperature: 0.1,
-    minConfidence: 75,
-    useSystemFallback: true,
-    customPrompt: "",
-  },
-  localModel: {
-    modelArchitecture: "blazeface-arcface-sota",
-    similarityThreshold: 0.72,
-    livenessSensitivity: "MEDIUM",
-    maxFaces: 4,
-    autoContrast: true,
-    antiSpoofing: true,
-  },
-  hybridSettings: {
-    localPreFilterThreshold: 0.85,
-    fallbackToCloudOnUnknown: true,
-  },
-};
-
 app.get(AI_CONFIG_ROUTES, (_req, res) => {
   const geminiAvailable = Boolean(process.env.GEMINI_API_KEY && process.env.GEMINI_API_KEY !== "MY_GEMINI_API_KEY");
   res.json({
@@ -1735,10 +1822,21 @@ app.post(AI_CONFIG_ROUTES, (req, res) => {
     } catch {}
   }
 
+  if (body.engineMode !== undefined && !AI_ENGINE_MODES.includes(body.engineMode)) {
+    res.status(400).json({
+      success: false,
+      error: `Chế độ nhận diện không hợp lệ: '${String(body.engineMode)}'. Chỉ chấp nhận: ${AI_ENGINE_MODES.join(", ")}.`,
+    });
+    return;
+  }
+
   if (body.engineMode) aiRecognitionConfig.engineMode = body.engineMode;
   if (body.googleAi) aiRecognitionConfig.googleAi = { ...aiRecognitionConfig.googleAi, ...body.googleAi };
   if (body.localModel) aiRecognitionConfig.localModel = { ...aiRecognitionConfig.localModel, ...body.localModel };
   if (body.hybridSettings) aiRecognitionConfig.hybridSettings = { ...aiRecognitionConfig.hybridSettings, ...body.hybridSettings };
+
+  // Persist so the selection survives a container rebuild / restart.
+  db.saveAiRecognitionConfig(aiRecognitionConfig);
 
   console.log(`[AI Config] Đã cập nhật chế độ nhận diện: ${aiRecognitionConfig.engineMode} (Google Model: ${aiRecognitionConfig.googleAi.model}, Local: ${aiRecognitionConfig.localModel.modelArchitecture})`);
 
@@ -2259,6 +2357,348 @@ app.post(["/api/strangers/merge", "/api/strangers/assign"], (req, res) => {
 });
 
 // --- AI Face Recognition Routes (Multi-Face & High-Speed Recognition) ---
+interface DetectedFaceItem {
+  id: string;
+  box2d: [number, number, number, number]; // [ymin, xmin, ymax, xmax] 0-1000
+  employeeId?: string;
+  employeeName?: string;
+  employeeCode?: string;
+  department?: string;
+  confidence: number;
+  livenessScore: number;
+  recognized: boolean;
+  message: string;
+}
+
+interface RecognizeFrameInput {
+  /** Base64 payload with any data-URL prefix stripped (what Gemini receives). */
+  base64Data: string;
+  /** Original image string (data URL or raw base64) handed to the local engines. */
+  rawImage: string;
+  mimeType: string;
+  employees: EmployeeRecord[];
+  scanType: "ENTRY" | "EXIT";
+  /** Optional per-request override sent by the client (`body.config`). */
+  clientConfig?: Partial<ServerAiConfig> | null;
+  /** Faces already produced upstream (simulation shortcuts). Engines are skipped when non-empty. */
+  initialDetectedFaces?: DetectedFaceItem[];
+  initialMessage?: string;
+}
+
+interface RecognizeFrameResult {
+  detectedFaces: DetectedFaceItem[];
+  overallMessage: string;
+  modelUsed: string;
+  engineUsed: string;
+  engineMode: ServerAiConfig["engineMode"];
+  multiThreadInfo: { workerId?: number; threadLatencyMs?: number };
+}
+
+/**
+ * Engine-selection + recognition core shared by POST /api/recognize-face and
+ * POST /api/camera-streams/scan-rtsp. Honours `aiRecognitionConfig.engineMode`
+ * (optionally overridden by `clientConfig`):
+ *   STEP A  LOCAL_BIOMETRIC / HYBRID_AUTO -> multi-thread worker pool (sync fallback)
+ *   STEP B  GOOGLE_GEMINI / hybrid escalation -> Gemini Vision with model failover
+ *   Fail-closed: when no engine produced a face, the frame is reported as
+ *   `recognized:false` - never a fabricated match.
+ * Pure with respect to HTTP and access-log side effects; callers own those.
+ */
+async function recognizeFrame({
+  base64Data,
+  rawImage,
+  mimeType,
+  employees,
+  scanType,
+  clientConfig,
+  initialDetectedFaces = [],
+  initialMessage = "",
+}: RecognizeFrameInput): Promise<RecognizeFrameResult> {
+  let detectedFaces: DetectedFaceItem[] = [...initialDetectedFaces];
+  let overallMessage = initialMessage;
+
+  // Engine Selection and Configuration
+  const activeEngineMode = clientConfig?.engineMode || aiRecognitionConfig.engineMode;
+  const activeLocalArch = clientConfig?.localModel?.modelArchitecture || aiRecognitionConfig.localModel.modelArchitecture;
+  const activeGoogleModel = clientConfig?.googleAi?.model || aiRecognitionConfig.googleAi.model;
+
+  let engineUsed =
+    activeEngineMode === "LOCAL_BIOMETRIC"
+      ? "Local Edge Biometrics"
+      : activeEngineMode === "HYBRID_AUTO"
+      ? "Hybrid SOTA Pipeline"
+      : "Google Cloud AI";
+  let modelUsed =
+    activeEngineMode === "LOCAL_BIOMETRIC"
+      ? (activeLocalArch === "blazeface-arcface-sota"
+          ? "BlazeFace V2 + ArcFace SOTA (512-D)"
+          : activeLocalArch === "mediapipe-facemesh-dense"
+          ? "MediaPipe FaceMesh (468 3D)"
+          : "MobileFaceNet INT8 Edge")
+      : activeGoogleModel;
+
+  let multiThreadInfo: { workerId?: number; threadLatencyMs?: number } = {};
+
+  // STEP A: If LOCAL_BIOMETRIC or HYBRID_AUTO mode, run local SOTA biometric engine (Multi-Threaded via Worker Pool)
+  if (detectedFaces.length === 0 && base64Data && employees.length > 0) {
+    if (activeEngineMode === "LOCAL_BIOMETRIC" || activeEngineMode === "HYBRID_AUTO") {
+      if (cameraStreamsConfig.multiThreadEnabled) {
+        try {
+          const workerResult = await faceWorkerPool.dispatchFaceTask({
+            taskId: "task-" + Date.now() + "-" + Math.random().toString(36).substring(2, 6),
+            imageBase64: rawImage,
+            employees: employees as any,
+            scanType: scanType === "EXIT" ? "EXIT" : "ENTRY",
+            modelArchitecture: activeLocalArch as any,
+            similarityThreshold:
+              clientConfig?.localModel?.similarityThreshold ||
+              aiRecognitionConfig.localModel.similarityThreshold,
+            livenessSensitivity:
+              clientConfig?.localModel?.livenessSensitivity ||
+              aiRecognitionConfig.localModel.livenessSensitivity,
+          });
+
+          multiThreadInfo = {
+            workerId: workerResult.workerId,
+            threadLatencyMs: workerResult.threadLatencyMs,
+          };
+
+          const meetsHybridThreshold =
+            activeEngineMode === "HYBRID_AUTO" &&
+            workerResult.cosineSimilarity >=
+              (aiRecognitionConfig.hybridSettings?.localPreFilterThreshold || 0.85);
+
+          if (activeEngineMode === "LOCAL_BIOMETRIC" || (meetsHybridThreshold && workerResult.recognized)) {
+            detectedFaces = workerResult.detectedFaces as any;
+            overallMessage = workerResult.recognized
+              ? `[Worker #${workerResult.workerId}] Đã xác thực thành công ${workerResult.bestMatch?.name || "nhân viên"}`
+              : `[Worker #${workerResult.workerId}] Từ chối: Vector Cosine không đạt ngưỡng (${workerResult.cosineSimilarity.toFixed(2)})`;
+            modelUsed = workerResult.modelName;
+            engineUsed =
+              activeEngineMode === "LOCAL_BIOMETRIC"
+                ? `Backend Multi-Thread (Worker #${workerResult.workerId})`
+                : `Hybrid SOTA Multi-Thread (Worker #${workerResult.workerId})`;
+          }
+        } catch (workerErr: any) {
+          if (isWorkerPoolUnavailableError(workerErr)) {
+            // Backpressure / pool re-init: surface to the caller (503) - do not shed load onto the main thread.
+            throw workerErr;
+          }
+          console.warn("[WorkerPool] Thất bại xử lý worker, fallback sang sync:", workerErr?.message);
+        }
+      }
+
+      // Fallback sync execution if not handled by multi-thread worker
+      if (detectedFaces.length === 0) {
+        const localRes = runLocalFaceRecognition({
+          imageBase64: rawImage,
+          employees: employees as any,
+          modelArchitecture: activeLocalArch as any,
+          similarityThreshold:
+            clientConfig?.localModel?.similarityThreshold ||
+            aiRecognitionConfig.localModel.similarityThreshold,
+          livenessSensitivity:
+            clientConfig?.localModel?.livenessSensitivity ||
+            aiRecognitionConfig.localModel.livenessSensitivity,
+        });
+
+        const meetsHybridThreshold =
+          activeEngineMode === "HYBRID_AUTO" &&
+          localRes.cosineSimilarity >=
+            (aiRecognitionConfig.hybridSettings?.localPreFilterThreshold || 0.85);
+
+        if (activeEngineMode === "LOCAL_BIOMETRIC" || (meetsHybridThreshold && localRes.recognized)) {
+          detectedFaces = localRes.detectedFaces as any;
+          overallMessage = localRes.recognized
+            ? `[${localRes.modelName}] Đã xác thực thành công ${localRes.bestMatch?.name || "nhân viên"}`
+            : `[${localRes.modelName}] Từ chối: Vector Cosine không đạt ngưỡng (${localRes.cosineSimilarity.toFixed(2)})`;
+          modelUsed = localRes.modelName;
+          engineUsed =
+            activeEngineMode === "LOCAL_BIOMETRIC"
+              ? "Local Edge Biometrics"
+              : "Hybrid SOTA (Local Fast-Path)";
+        }
+      }
+    }
+  }
+
+  // STEP B: Call Gemini Vision AI (if not purely local or if hybrid escalated to cloud)
+  const ai = getGeminiClient();
+  if (detectedFaces.length === 0 && base64Data && ai && employees.length > 0 && activeEngineMode !== "LOCAL_BIOMETRIC") {
+    const employeeProfilesSummary = employees
+      .map(
+        (e, i) =>
+          `[${i + 1}] ID: "${e.id}", Code: "${e.employeeCode}", Name: "${e.name}", Department: "${e.department}"`
+      )
+      .join("\n");
+
+    const prompt = `Bạn là hệ thống AI đa mục tiêu siêu tốc (Multi-Face High-Speed Access Control).
+Nhiệm vụ: Phát hiện và nhận diện TẤT CẢ các khuôn mặt người xuất hiện trong TOÀN BỘ khung hình này (không giới hạn vị trí hay số lượng người).
+
+Danh sách nhân viên hợp lệ đã đăng ký trong hệ thống:
+${employeeProfilesSummary}
+
+Yêu cầu phân tích:
+1. Quét toàn bộ khung hình, tìm tất cả các khuôn mặt.
+2. Với mỗi khuôn mặt:
+ - Xác định tọa độ hộp giới hạn box2d: [ymin, xmin, ymax, xmax] trong thang đo 0 đến 1000.
+ - So sánh đặc điểm khuôn mặt với danh sách nhân viên đã đăng ký.
+ - Nếu khớp nhân viên đã đăng ký, gán recognized = true, employeeId, employeeName, confidence (75-100).
+ - Nếu không khớp hoặc người lạ, recognized = false, employeeId = null, employeeName = null, confidence (<50).
+ - Đánh giá độ sống thật chống giả mạo livenessScore (0-100).
+3. Đưa ra thông điệp tổng quan overallMessage bằng tiếng Việt.`;
+
+    // Candidate models in priority order for maximum resilience against 503 spikes
+    const candidateModels = [
+      activeGoogleModel,
+      "gemini-3.8-flash",
+      "gemini-flash-latest",
+      "gemini-3.1-flash-lite",
+    ];
+
+    for (const modelName of candidateModels) {
+      let succeeded = false;
+      // Attempt with short jitter retry for temporary spikes
+      for (let attempt = 0; attempt < 2; attempt++) {
+        try {
+          const response = await ai.models.generateContent({
+            model: modelName,
+            contents: {
+              parts: [
+                {
+                  inlineData: {
+                    data: base64Data,
+                    mimeType,
+                  },
+                },
+                { text: prompt },
+              ],
+            },
+            config: {
+              responseMimeType: "application/json",
+              responseSchema: {
+                type: Type.OBJECT,
+                properties: {
+                  detectedFaces: {
+                    type: Type.ARRAY,
+                    items: {
+                      type: Type.OBJECT,
+                      properties: {
+                        box2d: {
+                          type: Type.ARRAY,
+                          items: { type: Type.NUMBER },
+                        },
+                        employeeId: { type: Type.STRING, nullable: true },
+                        employeeName: { type: Type.STRING, nullable: true },
+                        confidence: { type: Type.NUMBER },
+                        livenessScore: { type: Type.NUMBER },
+                        recognized: { type: Type.BOOLEAN },
+                        message: { type: Type.STRING },
+                      },
+                      required: ["box2d", "confidence", "livenessScore", "recognized", "message"],
+                    },
+                  },
+                  overallMessage: { type: Type.STRING },
+                },
+                required: ["detectedFaces", "overallMessage"],
+              },
+            },
+          });
+
+          const rawText = response.text?.trim();
+          if (rawText) {
+            const parsed = JSON.parse(rawText);
+            if (Array.isArray(parsed.detectedFaces) && parsed.detectedFaces.length > 0) {
+              detectedFaces = parsed.detectedFaces.map((f: any, idx: number) => {
+                const matchedEmp = f.employeeId
+                  ? employees.find((e) => e.id === f.employeeId)
+                  : null;
+
+                const box: [number, number, number, number] =
+                  Array.isArray(f.box2d) && f.box2d.length === 4
+                    ? [f.box2d[0], f.box2d[1], f.box2d[2], f.box2d[3]]
+                    : [200, 300, 700, 700];
+
+                return {
+                  id: `face-${idx}-${Date.now()}`,
+                  box2d: box,
+                  employeeId: matchedEmp ? matchedEmp.id : f.employeeId || undefined,
+                  employeeName: matchedEmp ? matchedEmp.name : f.employeeName || undefined,
+                  employeeCode: matchedEmp ? matchedEmp.employeeCode : undefined,
+                  department: matchedEmp ? matchedEmp.department : undefined,
+                  confidence: Number(f.confidence) || 50,
+                  livenessScore: Number(f.livenessScore) || 95,
+                  recognized: Boolean(f.recognized && (matchedEmp || f.employeeId)),
+                  message: f.message || (f.recognized ? "Nhận diện thành công" : "Chưa đăng ký"),
+                };
+              });
+              overallMessage = parsed.overallMessage || "Đã phân tích toàn bộ khung hình";
+              succeeded = true;
+              break;
+            }
+          }
+        } catch (modelErr: any) {
+          const errStr = String(modelErr?.message || modelErr || "");
+          const isDemandSpikeOrTransient =
+            errStr.includes("503") ||
+            errStr.includes("UNAVAILABLE") ||
+            errStr.includes("high demand") ||
+            errStr.includes("429") ||
+            errStr.includes("RESOURCE_EXHAUSTED");
+
+          if (isDemandSpikeOrTransient && attempt === 0) {
+            // Wait briefly and retry once
+            await new Promise((resolve) => setTimeout(resolve, 350));
+            continue;
+          }
+          // Move on to alternative candidate model quietly
+          break;
+        }
+      }
+
+      if (succeeded) {
+        break;
+      }
+    }
+  }
+
+  // No engine produced a match. This previously granted access to
+  // employees[0] at a hard-coded 96.5% whenever detectedFaces was empty -
+  // which is also the state for an empty frame, a wall, or darkness, so any
+  // unrecognised image opened the door. Recognition failure must deny.
+  if (detectedFaces.length === 0) {
+    if (employees.length > 0) {
+      detectedFaces = [
+        {
+          id: "face-nomatch-" + Date.now(),
+          box2d: [190, 270, 750, 730],
+          confidence: 0,
+          livenessScore: 0,
+          recognized: false,
+          message:
+            "Không nhận diện được khuôn mặt hợp lệ trong khung hình. Cửa giữ trạng thái khóa.",
+        },
+      ];
+      overallMessage =
+        "Không nhận diện được nhân viên nào trong khung hình. Từ chối mở khóa.";
+    } else {
+      detectedFaces = [
+        {
+          id: "face-un-" + Date.now(),
+          box2d: [200, 300, 700, 700],
+          confidence: 25,
+          livenessScore: 85,
+          recognized: false,
+          message: "Hệ thống chưa có nhân viên nào được đăng ký",
+        },
+      ];
+      overallMessage = "Không có nhân viên trong hệ thống";
+    }
+  }
+
+  return { detectedFaces, overallMessage, modelUsed, engineUsed, engineMode: activeEngineMode, multiThreadInfo };
+}
+
 const RECOGNIZE_FACE_ROUTES = [
   "/api/recognize-face",
   "/api/recognize-face/",
@@ -2399,19 +2839,6 @@ app.post(RECOGNIZE_FACE_ROUTES, async (req, res) => {
     const mimeMatch = rawImage.match(/^data:(image\/\w+);base64,/);
     const mimeType = mimeMatch ? mimeMatch[1] : "image/jpeg";
 
-    interface DetectedFaceItem {
-      id: string;
-      box2d: [number, number, number, number]; // [ymin, xmin, ymax, xmax] 0-1000
-      employeeId?: string;
-      employeeName?: string;
-      employeeCode?: string;
-      department?: string;
-      confidence: number;
-      livenessScore: number;
-      recognized: boolean;
-      message: string;
-    }
-
     let detectedFaces: DetectedFaceItem[] = [];
     let overallMessage = "";
 
@@ -2528,281 +2955,21 @@ app.post(RECOGNIZE_FACE_ROUTES, async (req, res) => {
       }
     }
 
-    // Engine Selection and Configuration
+    // Engine selection + recognition core shared with /api/camera-streams/scan-rtsp
     const clientConfig = req.body?.config;
-    const activeEngineMode = clientConfig?.engineMode || aiRecognitionConfig.engineMode;
-    const activeLocalArch = clientConfig?.localModel?.modelArchitecture || aiRecognitionConfig.localModel.modelArchitecture;
-    const activeGoogleModel = clientConfig?.googleAi?.model || aiRecognitionConfig.googleAi.model;
-
-    let engineUsed =
-      activeEngineMode === "LOCAL_BIOMETRIC"
-        ? "Local Edge Biometrics"
-        : activeEngineMode === "HYBRID_AUTO"
-        ? "Hybrid SOTA Pipeline"
-        : "Google Cloud AI";
-    let modelUsed =
-      activeEngineMode === "LOCAL_BIOMETRIC"
-        ? (activeLocalArch === "blazeface-arcface-sota"
-            ? "BlazeFace V2 + ArcFace SOTA (512-D)"
-            : activeLocalArch === "mediapipe-facemesh-dense"
-            ? "MediaPipe FaceMesh (468 3D)"
-            : "MobileFaceNet INT8 Edge")
-        : activeGoogleModel;
-
-    let multiThreadInfo: { workerId?: number; threadLatencyMs?: number } = {};
-
-    // STEP A: If LOCAL_BIOMETRIC or HYBRID_AUTO mode, run local SOTA biometric engine (Multi-Threaded via Worker Pool)
-    if (detectedFaces.length === 0 && base64Data && employees.length > 0) {
-      if (activeEngineMode === "LOCAL_BIOMETRIC" || activeEngineMode === "HYBRID_AUTO") {
-        if (cameraStreamsConfig.multiThreadEnabled) {
-          try {
-            const workerResult = await faceWorkerPool.dispatchFaceTask({
-              taskId: "task-" + Date.now() + "-" + Math.random().toString(36).substring(2, 6),
-              imageBase64: rawImage,
-              employees: employees as any,
-              scanType: scanType === "EXIT" ? "EXIT" : "ENTRY",
-              modelArchitecture: activeLocalArch as any,
-              similarityThreshold:
-                clientConfig?.localModel?.similarityThreshold ||
-                aiRecognitionConfig.localModel.similarityThreshold,
-              livenessSensitivity:
-                clientConfig?.localModel?.livenessSensitivity ||
-                aiRecognitionConfig.localModel.livenessSensitivity,
-            });
-
-            multiThreadInfo = {
-              workerId: workerResult.workerId,
-              threadLatencyMs: workerResult.threadLatencyMs,
-            };
-
-            const meetsHybridThreshold =
-              activeEngineMode === "HYBRID_AUTO" &&
-              workerResult.cosineSimilarity >=
-                (aiRecognitionConfig.hybridSettings?.localPreFilterThreshold || 0.85);
-
-            if (activeEngineMode === "LOCAL_BIOMETRIC" || (meetsHybridThreshold && workerResult.recognized)) {
-              detectedFaces = workerResult.detectedFaces as any;
-              overallMessage = workerResult.recognized
-                ? `[Worker #${workerResult.workerId}] Đã xác thực thành công ${workerResult.bestMatch?.name || "nhân viên"}`
-                : `[Worker #${workerResult.workerId}] Từ chối: Vector Cosine không đạt ngưỡng (${workerResult.cosineSimilarity.toFixed(2)})`;
-              modelUsed = workerResult.modelName;
-              engineUsed =
-                activeEngineMode === "LOCAL_BIOMETRIC"
-                  ? `Backend Multi-Thread (Worker #${workerResult.workerId})`
-                  : `Hybrid SOTA Multi-Thread (Worker #${workerResult.workerId})`;
-            }
-          } catch (workerErr: any) {
-            console.warn("[WorkerPool] Thất bại xử lý worker, fallback sang sync:", workerErr?.message);
-          }
-        }
-
-        // Fallback sync execution if not handled by multi-thread worker
-        if (detectedFaces.length === 0) {
-          const localRes = runLocalFaceRecognition({
-            imageBase64: rawImage,
-            employees: employees as any,
-            modelArchitecture: activeLocalArch as any,
-            similarityThreshold:
-              clientConfig?.localModel?.similarityThreshold ||
-              aiRecognitionConfig.localModel.similarityThreshold,
-            livenessSensitivity:
-              clientConfig?.localModel?.livenessSensitivity ||
-              aiRecognitionConfig.localModel.livenessSensitivity,
-          });
-
-          const meetsHybridThreshold =
-            activeEngineMode === "HYBRID_AUTO" &&
-            localRes.cosineSimilarity >=
-              (aiRecognitionConfig.hybridSettings?.localPreFilterThreshold || 0.85);
-
-          if (activeEngineMode === "LOCAL_BIOMETRIC" || (meetsHybridThreshold && localRes.recognized)) {
-            detectedFaces = localRes.detectedFaces as any;
-            overallMessage = localRes.recognized
-              ? `[${localRes.modelName}] Đã xác thực thành công ${localRes.bestMatch?.name || "nhân viên"}`
-              : `[${localRes.modelName}] Từ chối: Vector Cosine không đạt ngưỡng (${localRes.cosineSimilarity.toFixed(2)})`;
-            modelUsed = localRes.modelName;
-            engineUsed =
-              activeEngineMode === "LOCAL_BIOMETRIC"
-                ? "Local Edge Biometrics"
-                : "Hybrid SOTA (Local Fast-Path)";
-          }
-        }
-      }
-    }
-
-    // STEP B: Call Gemini Vision AI (if not purely local or if hybrid escalated to cloud)
-    const ai = getGeminiClient();
-    if (detectedFaces.length === 0 && base64Data && ai && employees.length > 0 && activeEngineMode !== "LOCAL_BIOMETRIC") {
-      const employeeProfilesSummary = employees
-        .map(
-          (e, i) =>
-            `[${i + 1}] ID: "${e.id}", Code: "${e.employeeCode}", Name: "${e.name}", Department: "${e.department}"`
-        )
-        .join("\n");
-
-      const prompt = `Bạn là hệ thống AI đa mục tiêu siêu tốc (Multi-Face High-Speed Access Control).
-Nhiệm vụ: Phát hiện và nhận diện TẤT CẢ các khuôn mặt người xuất hiện trong TOÀN BỘ khung hình này (không giới hạn vị trí hay số lượng người).
-
-Danh sách nhân viên hợp lệ đã đăng ký trong hệ thống:
-${employeeProfilesSummary}
-
-Yêu cầu phân tích:
-1. Quét toàn bộ khung hình, tìm tất cả các khuôn mặt.
-2. Với mỗi khuôn mặt:
-   - Xác định tọa độ hộp giới hạn box2d: [ymin, xmin, ymax, xmax] trong thang đo 0 đến 1000.
-   - So sánh đặc điểm khuôn mặt với danh sách nhân viên đã đăng ký.
-   - Nếu khớp nhân viên đã đăng ký, gán recognized = true, employeeId, employeeName, confidence (75-100).
-   - Nếu không khớp hoặc người lạ, recognized = false, employeeId = null, employeeName = null, confidence (<50).
-   - Đánh giá độ sống thật chống giả mạo livenessScore (0-100).
-3. Đưa ra thông điệp tổng quan overallMessage bằng tiếng Việt.`;
-
-      // Candidate models in priority order for maximum resilience against 503 spikes
-      const candidateModels = [
-        activeGoogleModel,
-        "gemini-3.8-flash",
-        "gemini-flash-latest",
-        "gemini-3.1-flash-lite",
-      ];
-
-      for (const modelName of candidateModels) {
-        let succeeded = false;
-        // Attempt with short jitter retry for temporary spikes
-        for (let attempt = 0; attempt < 2; attempt++) {
-          try {
-            const response = await ai.models.generateContent({
-              model: modelName,
-              contents: {
-                parts: [
-                  {
-                    inlineData: {
-                      data: base64Data,
-                      mimeType,
-                    },
-                  },
-                  { text: prompt },
-                ],
-              },
-              config: {
-                responseMimeType: "application/json",
-                responseSchema: {
-                  type: Type.OBJECT,
-                  properties: {
-                    detectedFaces: {
-                      type: Type.ARRAY,
-                      items: {
-                        type: Type.OBJECT,
-                        properties: {
-                          box2d: {
-                            type: Type.ARRAY,
-                            items: { type: Type.NUMBER },
-                          },
-                          employeeId: { type: Type.STRING, nullable: true },
-                          employeeName: { type: Type.STRING, nullable: true },
-                          confidence: { type: Type.NUMBER },
-                          livenessScore: { type: Type.NUMBER },
-                          recognized: { type: Type.BOOLEAN },
-                          message: { type: Type.STRING },
-                        },
-                        required: ["box2d", "confidence", "livenessScore", "recognized", "message"],
-                      },
-                    },
-                    overallMessage: { type: Type.STRING },
-                  },
-                  required: ["detectedFaces", "overallMessage"],
-                },
-              },
-            });
-
-            const rawText = response.text?.trim();
-            if (rawText) {
-              const parsed = JSON.parse(rawText);
-              if (Array.isArray(parsed.detectedFaces) && parsed.detectedFaces.length > 0) {
-                detectedFaces = parsed.detectedFaces.map((f: any, idx: number) => {
-                  const matchedEmp = f.employeeId
-                    ? employees.find((e) => e.id === f.employeeId)
-                    : null;
-
-                  const box: [number, number, number, number] =
-                    Array.isArray(f.box2d) && f.box2d.length === 4
-                      ? [f.box2d[0], f.box2d[1], f.box2d[2], f.box2d[3]]
-                      : [200, 300, 700, 700];
-
-                  return {
-                    id: `face-${idx}-${Date.now()}`,
-                    box2d: box,
-                    employeeId: matchedEmp ? matchedEmp.id : f.employeeId || undefined,
-                    employeeName: matchedEmp ? matchedEmp.name : f.employeeName || undefined,
-                    employeeCode: matchedEmp ? matchedEmp.employeeCode : undefined,
-                    department: matchedEmp ? matchedEmp.department : undefined,
-                    confidence: Number(f.confidence) || 50,
-                    livenessScore: Number(f.livenessScore) || 95,
-                    recognized: Boolean(f.recognized && (matchedEmp || f.employeeId)),
-                    message: f.message || (f.recognized ? "Nhận diện thành công" : "Chưa đăng ký"),
-                  };
-                });
-                overallMessage = parsed.overallMessage || "Đã phân tích toàn bộ khung hình";
-                succeeded = true;
-                break;
-              }
-            }
-          } catch (modelErr: any) {
-            const errStr = String(modelErr?.message || modelErr || "");
-            const isDemandSpikeOrTransient =
-              errStr.includes("503") ||
-              errStr.includes("UNAVAILABLE") ||
-              errStr.includes("high demand") ||
-              errStr.includes("429") ||
-              errStr.includes("RESOURCE_EXHAUSTED");
-
-            if (isDemandSpikeOrTransient && attempt === 0) {
-              // Wait briefly and retry once
-              await new Promise((resolve) => setTimeout(resolve, 350));
-              continue;
-            }
-            // Move on to alternative candidate model quietly
-            break;
-          }
-        }
-
-        if (succeeded) {
-          break;
-        }
-      }
-    }
-
-    // No engine produced a match. This previously granted access to
-    // employees[0] at a hard-coded 96.5% whenever detectedFaces was empty -
-    // which is also the state for an empty frame, a wall, or darkness, so any
-    // unrecognised image opened the door. Recognition failure must deny.
-    if (detectedFaces.length === 0) {
-      if (employees.length > 0) {
-        detectedFaces = [
-          {
-            id: "face-nomatch-" + Date.now(),
-            box2d: [190, 270, 750, 730],
-            confidence: 0,
-            livenessScore: 0,
-            recognized: false,
-            message:
-              "Không nhận diện được khuôn mặt hợp lệ trong khung hình. Cửa giữ trạng thái khóa.",
-          },
-        ];
-        overallMessage =
-          "Không nhận diện được nhân viên nào trong khung hình. Từ chối mở khóa.";
-      } else {
-        detectedFaces = [
-          {
-            id: "face-un-" + Date.now(),
-            box2d: [200, 300, 700, 700],
-            confidence: 25,
-            livenessScore: 85,
-            recognized: false,
-            message: "Hệ thống chưa có nhân viên nào được đăng ký",
-          },
-        ];
-        overallMessage = "Không có nhân viên trong hệ thống";
-      }
-    }
+    const recognition = await recognizeFrame({
+      base64Data,
+      rawImage,
+      mimeType,
+      employees,
+      scanType,
+      clientConfig,
+      initialDetectedFaces: detectedFaces,
+      initialMessage: overallMessage,
+    });
+    detectedFaces = recognition.detectedFaces;
+    overallMessage = recognition.overallMessage;
+    const { engineUsed, modelUsed, multiThreadInfo } = recognition;
 
     // Determine recognition status
     const authorizedFaces = detectedFaces.filter((f) => f.recognized && f.employeeId);
@@ -3007,6 +3174,11 @@ Yêu cầu phân tích:
       });
     }
   } catch (error: any) {
+    if (isWorkerPoolUnavailableError(error)) {
+      console.warn("[WorkerPool] Từ chối tạm thời (503):", error?.message);
+      respondWorkerPoolUnavailable(res, error);
+      return;
+    }
     console.error("Error recognizing face:", error);
     res.status(500).json({ error: error.message || "Lỗi xử lý nhận diện khuôn mặt" });
   }
