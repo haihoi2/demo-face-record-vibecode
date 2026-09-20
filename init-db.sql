@@ -105,6 +105,20 @@ CREATE TABLE IF NOT EXISTS ai_recognition_config (
   "updatedAt" VARCHAR(64)
 );
 
+CREATE TABLE IF NOT EXISTS face_templates (
+  id VARCHAR(64) PRIMARY KEY,
+  "employeeId" VARCHAR(64) NOT NULL,
+  embedding BYTEA NOT NULL,        -- float32 little-endian, `dims` values, L2-normalised
+  dims INTEGER NOT NULL,
+  "modelTag" VARCHAR(64) NOT NULL, -- e.g. arcface_w600k_r50; never compare across tags
+  source VARCHAR(32) NOT NULL,     -- enrollment | merge | manual | auto
+  quality REAL,
+  "capturedAt" VARCHAR(64),
+  "sourceLogId" VARCHAR(64),
+  "streamId" VARCHAR(64)
+);
+CREATE INDEX IF NOT EXISTS idx_face_templates_emp ON face_templates ("employeeId");
+
 -- Indices for rapid query performance
 CREATE INDEX IF NOT EXISTS idx_access_logs_timestamp ON access_logs (timestamp DESC);
 CREATE INDEX IF NOT EXISTS idx_notifications_timestamp ON mobile_notifications (timestamp DESC);

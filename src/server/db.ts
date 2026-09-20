@@ -284,6 +284,46 @@ export interface GateStreamConfigRecord {
   reconnectIntervalSeconds: number;
 }
 
+/** One enrolled face embedding (Phase 1 real engine). Embedding is L2-normalised. */
+export interface FaceTemplateRecord {
+  id: string;
+  employeeId: string;
+  embedding: number[];
+  dims: number;
+  modelTag: string;
+  source: "enrollment" | "merge" | "manual" | "auto";
+  quality: number;
+  capturedAt: string;
+  sourceLogId?: string;
+  streamId?: string;
+}
+
+// float32 little-endian <-> number[] for BYTEA/BLOB storage of embeddings
+function embeddingToBuffer(e: number[]): Buffer {
+  return Buffer.from(new Float32Array(e).buffer);
+}
+function bufferToEmbedding(b: Buffer | Uint8Array | null | undefined, dims?: number): number[] {
+  if (!b || b.length === 0) return [];
+  const u8 = Buffer.isBuffer(b) ? b : Buffer.from(b);
+  const f = new Float32Array(u8.buffer, u8.byteOffset, Math.floor(u8.byteLength / 4));
+  const out = Array.from(f);
+  return dims && out.length > dims ? out.slice(0, dims) : out;
+}
+function rowToFaceTemplate(r: any): FaceTemplateRecord {
+  return {
+    id: r.id,
+    employeeId: r.employeeId,
+    embedding: bufferToEmbedding(r.embedding, r.dims),
+    dims: r.dims,
+    modelTag: r.modelTag,
+    source: r.source,
+    quality: Number(r.quality) || 0,
+    capturedAt: r.capturedAt,
+    sourceLogId: r.sourceLogId || undefined,
+    streamId: r.streamId || undefined,
+  };
+}
+
 export interface CameraStreamsConfigRecord {
   entryGate: GateStreamConfigRecord;
   exitGate: GateStreamConfigRecord;
@@ -820,6 +860,20 @@ class SQLiteStorage {
           "resolvedBy" VARCHAR(255)
         );
 
+        CREATE TABLE IF NOT EXISTS face_templates (
+          id VARCHAR(64) PRIMARY KEY,
+          "employeeId" VARCHAR(64) NOT NULL,
+          embedding BYTEA NOT NULL,
+          dims INTEGER NOT NULL,
+          "modelTag" VARCHAR(64) NOT NULL,
+          source VARCHAR(32) NOT NULL,
+          quality REAL,
+          "capturedAt" VARCHAR(64),
+          "sourceLogId" VARCHAR(64),
+          "streamId" VARCHAR(64)
+        );
+        CREATE INDEX IF NOT EXISTS idx_face_templates_emp ON face_templates ("employeeId");
+
         CREATE TABLE IF NOT EXISTS ai_recognition_config (
           id VARCHAR(64) PRIMARY KEY,
           config_json JSONB NOT NULL,
@@ -831,6 +885,7 @@ class SQLiteStorage {
       `);
       await this.loadResolvedStrangerClusters();
       await this.loadAiRecognitionConfig();
+      await this.loadFaceTemplates();
       console.log("[PostgreSQL] Các bảng dữ liệu đã sẵn sàng trên PostgreSQL!");
     } catch (err) {
       console.error("[PostgreSQL] Lỗi khởi tạo bảng:", err);
@@ -1003,6 +1058,7 @@ class SQLiteStorage {
     door_api_logs: DoorApiLogRecord[];
     camera_streams_config?: CameraStreamsConfigRecord;
     resolved_stranger_clusters?: string[];
+    face_templates?: FaceTemplateRecord[];
     ai_recognition_config?: AiRecognitionConfigRecord;
   } = {
     employees: [],
@@ -2042,6 +2098,139 @@ class SQLiteStorage {
       this.fallbackData.resolved_stranger_clusters = [...current, clusterId];
       this.saveFallback();
     }
+  }
+
+  // ================= FACE TEMPLATES (real engine gallery) =================
+  // Matching runs synchronously inside request handling, so the gallery lives
+  // in memory, hydrated from PostgreSQL at startup; every write goes to all
+  // active stores. Embeddings are stored as float32 bytes (BYTEA / BLOB).
+  private faceTemplatesCache: FaceTemplateRecord[] = [];
+  private faceTemplatesHydrated = false;
+
+  private async loadFaceTemplates() {
+    if (!this.pgPool) return;
+    try {
+      const res = await this.pgPool.query(
+        'SELECT id, "employeeId", embedding, dims, "modelTag", source, quality, "capturedAt", "sourceLogId", "streamId" FROM face_templates'
+      );
+      this.faceTemplatesCache = res.rows.map(rowToFaceTemplate);
+      this.faceTemplatesHydrated = true;
+      if (this.faceTemplatesCache.length > 0) {
+        console.log(`[PostgreSQL] Đã nạp ${this.faceTemplatesCache.length} mẫu khuôn mặt (face templates).`);
+      }
+    } catch (err) {
+      console.error("[PostgreSQL] Lỗi nạp face_templates:", err);
+    }
+  }
+
+  private ensureSqliteFaceTemplates() {
+    if (!(this.isNativeSqlite && this.db)) return;
+    try {
+      this.db.exec(`
+        CREATE TABLE IF NOT EXISTS face_templates (
+          id TEXT PRIMARY KEY,
+          employeeId TEXT NOT NULL,
+          embedding BLOB NOT NULL,
+          dims INTEGER NOT NULL,
+          modelTag TEXT NOT NULL,
+          source TEXT NOT NULL,
+          quality REAL,
+          capturedAt TEXT,
+          sourceLogId TEXT,
+          streamId TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_face_templates_emp ON face_templates (employeeId);
+      `);
+    } catch {}
+  }
+
+  /** All templates (in-memory gallery). Hydrated from PostgreSQL; falls back to SQLite / JSON. */
+  getFaceTemplates(): FaceTemplateRecord[] {
+    if (this.faceTemplatesHydrated || this.faceTemplatesCache.length > 0) return this.faceTemplatesCache;
+    if (this.isNativeSqlite && this.db) {
+      try {
+        this.ensureSqliteFaceTemplates();
+        const rows = this.db.prepare("SELECT * FROM face_templates").all() as any[];
+        this.faceTemplatesCache = rows.map(rowToFaceTemplate);
+        return this.faceTemplatesCache;
+      } catch {}
+    }
+    this.faceTemplatesCache = this.fallbackData.face_templates || [];
+    return this.faceTemplatesCache;
+  }
+
+  getFaceTemplatesForEmployee(employeeId: string): FaceTemplateRecord[] {
+    return this.getFaceTemplates().filter((t) => t.employeeId === employeeId);
+  }
+
+  /** Insert or replace by id. Writes through to every active store. */
+  saveFaceTemplate(t: FaceTemplateRecord): FaceTemplateRecord {
+    const rec: FaceTemplateRecord = { ...t, dims: t.dims || t.embedding.length };
+    this.getFaceTemplates();
+    const idx = this.faceTemplatesCache.findIndex((x) => x.id === rec.id);
+    if (idx >= 0) this.faceTemplatesCache[idx] = rec; else this.faceTemplatesCache.push(rec);
+
+    const buf = embeddingToBuffer(rec.embedding);
+    if (this.pgPool && this.isPostgres) {
+      this.pgPool
+        .query(
+          `INSERT INTO face_templates (id, "employeeId", embedding, dims, "modelTag", source, quality, "capturedAt", "sourceLogId", "streamId")
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+           ON CONFLICT (id) DO UPDATE SET "employeeId" = EXCLUDED."employeeId", embedding = EXCLUDED.embedding, dims = EXCLUDED.dims,
+             "modelTag" = EXCLUDED."modelTag", source = EXCLUDED.source, quality = EXCLUDED.quality,
+             "capturedAt" = EXCLUDED."capturedAt", "sourceLogId" = EXCLUDED."sourceLogId", "streamId" = EXCLUDED."streamId"`,
+          [rec.id, rec.employeeId, buf, rec.dims, rec.modelTag, rec.source, rec.quality, rec.capturedAt, rec.sourceLogId || null, rec.streamId || null]
+        )
+        .catch((e: any) => console.error("[PostgreSQL] Lỗi saveFaceTemplate:", e?.message));
+    }
+    if (this.isNativeSqlite && this.db) {
+      try {
+        this.ensureSqliteFaceTemplates();
+        this.db
+          .prepare(
+            `INSERT OR REPLACE INTO face_templates (id, employeeId, embedding, dims, modelTag, source, quality, capturedAt, sourceLogId, streamId)
+             VALUES (?,?,?,?,?,?,?,?,?,?)`
+          )
+          .run(rec.id, rec.employeeId, buf, rec.dims, rec.modelTag, rec.source, rec.quality, rec.capturedAt, rec.sourceLogId || null, rec.streamId || null);
+      } catch (err) {
+        console.error("[SQLite] Lỗi saveFaceTemplate:", err);
+      }
+    }
+    const fb = this.fallbackData.face_templates || [];
+    const fi = fb.findIndex((x) => x.id === rec.id);
+    if (fi >= 0) fb[fi] = rec; else fb.push(rec);
+    this.fallbackData.face_templates = fb;
+    this.saveFallback();
+    return rec;
+  }
+
+  deleteFaceTemplate(id: string): boolean {
+    this.getFaceTemplates();
+    const before = this.faceTemplatesCache.length;
+    this.faceTemplatesCache = this.faceTemplatesCache.filter((t) => t.id !== id);
+    if (this.pgPool && this.isPostgres) {
+      this.pgPool.query("DELETE FROM face_templates WHERE id = $1", [id]).catch(() => {});
+    }
+    if (this.isNativeSqlite && this.db) {
+      try { this.ensureSqliteFaceTemplates(); this.db.prepare("DELETE FROM face_templates WHERE id = ?").run(id); } catch {}
+    }
+    this.fallbackData.face_templates = (this.fallbackData.face_templates || []).filter((t) => t.id !== id);
+    this.saveFallback();
+    return this.faceTemplatesCache.length < before;
+  }
+
+  /** Remove every template of an employee (used when an employee is deleted). */
+  deleteFaceTemplatesForEmployee(employeeId: string): number {
+    const ids = this.getFaceTemplates().filter((t) => t.employeeId === employeeId).map((t) => t.id);
+    for (const id of ids) this.deleteFaceTemplate(id);
+    return ids.length;
+  }
+
+  /** Move an employee's templates to another (used by employee merge). */
+  reassignFaceTemplates(fromEmployeeId: string, toEmployeeId: string): number {
+    const moved = this.getFaceTemplates().filter((t) => t.employeeId === fromEmployeeId);
+    for (const t of moved) this.saveFaceTemplate({ ...t, employeeId: toEmployeeId });
+    return moved.length;
   }
 
   unmarkStrangerClusterResolved(clusterId: string): void {

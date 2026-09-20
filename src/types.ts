@@ -333,6 +333,85 @@ export interface GateStreamConfig {
   reconnectIntervalSeconds: number;
 }
 
+// ----------------- REAL FACE ENGINE (Phase 1): TEMPLATES & MULTI-STREAM FUSION -----------------
+
+/** One enrolled face embedding for an employee. An employee may have many. */
+export interface FaceTemplate {
+  id: string;
+  employeeId: string;
+  /** L2-normalised embedding; length must match `dims`. */
+  embedding: number[];
+  dims: number;
+  /** Which model produced it, e.g. "arcface_w600k_r50". Never compare across tags. */
+  modelTag: string;
+  source: "enrollment" | "merge" | "manual" | "auto";
+  /** 0-1 capture quality (size × sharpness × detector score). */
+  quality: number;
+  capturedAt: string;
+  sourceLogId?: string;
+  /** Which camera stream captured it, when known. */
+  streamId?: string;
+}
+
+/** One detected face from one frame of one stream, already embedded. */
+export interface FaceObservation {
+  streamId: string;
+  streamLabel?: string;
+  frameIndex?: number;
+  embedding: number[];
+  /** 0-1 capture quality; weights this observation in fusion. */
+  quality: number;
+  detectorScore: number;
+  /** Face box in source-frame pixels [x1, y1, x2, y2]. */
+  box?: [number, number, number, number];
+}
+
+/** Best gallery match for one observation. */
+export interface ObservationMatch {
+  streamId: string;
+  frameIndex?: number;
+  employeeId?: string;
+  /** Best cosine against that employee's templates (max over templates). */
+  cosine: number;
+  /** Runner-up employee cosine, for margin/ambiguity checks. */
+  secondCosine: number;
+  secondEmployeeId?: string;
+  quality: number;
+}
+
+export interface FusionThresholds {
+  /** Single-observation accept threshold (one strong view is enough). */
+  acceptSingle: number;
+  /** Minimum per-observation cosine for an observation to count as agreeing evidence. */
+  minEvidence: number;
+  /** Quality-weighted mean cosine required when accepting on multi-view agreement. */
+  acceptFused: number;
+  /** Observations (frames × streams) that must agree for a fused accept. */
+  minAgreeing: number;
+  /** Minimum gap between best and runner-up identity to avoid ambiguous accepts. */
+  minMargin: number;
+}
+
+export interface FusionDecision {
+  recognized: boolean;
+  employeeId?: string;
+  /** 0-1 confidence derived from fused cosine, agreement and margin. */
+  confidence: number;
+  /** Quality-weighted mean cosine of the agreeing observations for the winner. */
+  fusedCosine: number;
+  /** Best single cosine for the winner. */
+  bestCosine: number;
+  /** How many observations agreed on the winner, and across how many distinct streams. */
+  agreeingObservations: number;
+  agreeingStreams: number;
+  /** "single-strong" | "multi-agree" | "rejected-weak" | "rejected-ambiguous" | "rejected-no-face" */
+  basis: string;
+  /** Per-identity evidence, best first - for UI/audit. */
+  candidates: Array<{ employeeId: string; fusedCosine: number; bestCosine: number; observations: number; streams: number }>;
+  perObservation: ObservationMatch[];
+  thresholds: FusionThresholds;
+}
+
 /** Per-stream outcome inside a multi-stream gate scan (`POST /api/camera-streams/scan-rtsp`). */
 export interface GateStreamScanResult {
   streamId: string;
