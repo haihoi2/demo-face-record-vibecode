@@ -3048,10 +3048,17 @@ async function annotateSnapshotWithBoxes(
   const clamp = (v: number) => Math.min(1000, Math.max(0, Number(v) || 0)) / 1000;
   const filters = drawable.map((f) => {
     const [y1, x1, y2, x2] = f.box2d;
-    const x = clamp(Math.min(x1, x2));
-    const y = clamp(Math.min(y1, y2));
-    const w = Math.max(0.01, clamp(Math.max(x1, x2)) - x);
-    const h = Math.max(0.01, clamp(Math.max(y1, y2)) - y);
+    // Detector box, then padded so a distant face (a 20 px head on a wide
+    // shot) still gets a marker an operator can spot: expand ~35% per side and
+    // enforce a minimum size (~7% of width, ~12% of height), centred on the
+    // detection and clamped to the frame.
+    const bx = clamp(Math.min(x1, x2)), by = clamp(Math.min(y1, y2));
+    const bw = Math.max(0.005, clamp(Math.max(x1, x2)) - bx), bh = Math.max(0.005, clamp(Math.max(y1, y2)) - by);
+    const cx = bx + bw / 2, cy = by + bh / 2;
+    const w = Math.min(1, Math.max(bw * 1.7, 0.07));
+    const h = Math.min(1, Math.max(bh * 1.7, 0.12));
+    const x = Math.min(1 - w, Math.max(0, cx - w / 2));
+    const y = Math.min(1 - h, Math.max(0, cy - h / 2));
     // thickness ~1/120 of the width, never thinner than 5 px
     return `drawbox=x=iw*${x.toFixed(4)}:y=ih*${y.toFixed(4)}:w=iw*${w.toFixed(4)}:h=ih*${h.toFixed(4)}:color=0x00FF00@1:t=max(5\\,iw/120)`;
   });
