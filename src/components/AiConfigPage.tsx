@@ -1111,68 +1111,72 @@ export const AiConfigPage: React.FC<AiConfigPageProps> = ({
           <div className="space-y-2">
             <label className="text-xs font-semibold text-slate-700 uppercase tracking-wider flex items-center gap-2">
               Kiến Trúc Mô Hình Cục Bộ (Model Architecture)
-              {!LOCAL_MODEL_SUPPORT.modelArchitecture && (
-                <span className="normal-case tracking-normal text-[10px] font-semibold px-2 py-0.5 rounded-full bg-amber-100 text-amber-800">
-                  {NOT_IMPLEMENTED_BADGE}
-                </span>
-              )}
+              <span className="normal-case tracking-normal text-[10px] font-semibold px-2 py-0.5 rounded-full bg-slate-200 text-slate-700">
+                Máy chủ quyết định
+              </span>
             </label>
+            <p className="text-[11px] text-slate-500">
+              Kiến trúc do máy chủ nạp lúc khởi động, không chọn được từ giao diện. Bảng dưới hiển
+              thị đúng mô hình đang chạy theo báo cáo của máy chủ.
+            </p>
             <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
               {[
                 {
-                  id: "blazeface-arcface-sota",
-                  title: "BlazeFace V2 + ArcFace (512-D)",
-                  desc: "Tiêu chuẩn SOTA sinh trắc học công nghiệp. Nhúng vector 512 chiều với hàm mất mát Additive Angular Margin.",
-                  badge: "Chuẩn SOTA",
+                  key: "active",
+                  // Real, server-reported engine. Names come from the status endpoint so this
+                  // card can never drift from what is actually loaded.
+                  title: engineOperational
+                    ? `${engineInfo.detector || "SCRFD"} + ${engineInfo.recognizer || "ArcFace"}`
+                    : "Bộ trích xuất ONNX (SCRFD + ArcFace)",
+                  desc: engineOperational
+                    ? `Phát hiện khuôn mặt bằng SCRFD, trích xuất vector ${
+                        engineInfo.dims || 512
+                      } chiều bằng ArcFace. Đây là mô hình đang thực sự chạy${
+                        engineInfo.modelTag ? ` (modelTag: ${engineInfo.modelTag})` : ""
+                      }.`
+                    : "Bộ trích xuất thật của hệ thống. Máy chủ hiện chưa báo là sẵn sàng - xem bảng trạng thái động cơ ở đầu trang.",
+                  state: engineOperational ? "active" : "unready",
                 },
                 {
-                  id: "mediapipe-facemesh-dense",
+                  key: "mediapipe",
                   title: "MediaPipe FaceMesh (468 Điểm 3D)",
-                  desc: "Phân tích lưới cấu trúc hình học 3D khuôn mặt, chống giả mạo bằng phân tích cử động vi mô (Micro-motion).",
-                  badge: "3D Lưới điểm",
+                  desc: "Lưới hình học 3D khuôn mặt. Không được đóng gói trong image này.",
+                  state: "absent",
                 },
                 {
-                  id: "mobilefacenet-quantized",
+                  key: "mobilefacenet",
                   title: "MobileFaceNet INT8",
-                  desc: "Mô hình siêu nhẹ tối ưu lượng tử hóa INT8 cho vi xử lý tiết kiệm điện và thiết bị phần cứng IoT nhúng.",
-                  badge: "IoT Edge",
+                  desc: "Mô hình siêu nhẹ lượng tử hóa INT8 cho thiết bị nhúng. Không được đóng gói trong image này.",
+                  state: "absent",
                 },
               ].map((arch) => (
                 <div
-                  key={arch.id}
-                  onClick={() => {
-                    if (!LOCAL_MODEL_SUPPORT.modelArchitecture) return;
-                    setConfig({
-                      ...config,
-                      localModel: {
-                        ...config.localModel,
-                        modelArchitecture: arch.id as any,
-                      },
-                    });
-                  }}
-                  aria-disabled={!LOCAL_MODEL_SUPPORT.modelArchitecture}
-                  title={LOCAL_MODEL_SUPPORT.modelArchitecture ? undefined : NOT_IMPLEMENTED_HINT}
+                  key={arch.key}
                   className={`p-4 rounded-xl border transition-all ${
-                    LOCAL_MODEL_SUPPORT.modelArchitecture
-                      ? "cursor-pointer"
-                      : "cursor-not-allowed opacity-60 bg-slate-50"
-                  } ${
-                    config.localModel.modelArchitecture === arch.id
+                    arch.state === "active"
                       ? "border-emerald-600 bg-emerald-50/50 shadow-xs"
-                      : "border-slate-200"
+                      : arch.state === "unready"
+                      ? "border-rose-300 bg-rose-50/40"
+                      : "border-slate-200 bg-slate-50 opacity-70"
                   }`}
                 >
-                  <div className="flex items-center justify-between">
-                    <span className="font-bold text-xs text-slate-900">{arch.title}</span>
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="font-bold text-xs text-slate-900 break-all">{arch.title}</span>
                   </div>
                   <span
                     className={`inline-block mt-1 text-[10px] font-semibold px-2 py-0.5 rounded-full ${
-                      LOCAL_MODEL_SUPPORT.modelArchitecture
+                      arch.state === "active"
                         ? "bg-emerald-100 text-emerald-800"
+                        : arch.state === "unready"
+                        ? "bg-rose-100 text-rose-800"
                         : "bg-slate-200 text-slate-600"
                     }`}
                   >
-                    {LOCAL_MODEL_SUPPORT.modelArchitecture ? arch.badge : NOT_IMPLEMENTED_BADGE}
+                    {arch.state === "active"
+                      ? "Đang chạy"
+                      : arch.state === "unready"
+                      ? "Chưa sẵn sàng"
+                      : "Không đóng gói"}
                   </span>
                   <p className="text-xs text-slate-500 mt-2">{arch.desc}</p>
                 </div>
