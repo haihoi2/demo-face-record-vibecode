@@ -1,10 +1,11 @@
 /**
  * Unit tests for the multi-thread face worker pool (src/server/faceWorkerPool.ts).
  *
- * The pool is exercised with (a) the real inline worker script for the happy
- * path and (b) a stub worker script injected through the `createWorker`
+ * The pool is exercised with (a) the real worker MODULE (src/server/faceWorker.ts,
+ * resolved by resolveFaceWorkerEntry()) for the happy path and (b) a stub
+ * worker script injected through the `createWorker`
  * option that can be told to stall, crash, echo a foreign taskId or report a
- * TASK_ERROR. That keeps the production script free of test-only branches
+ * TASK_ERROR. That keeps the production worker free of test-only branches
  * while still covering timeout, respawn, backpressure and re-init behaviour.
  */
 
@@ -12,12 +13,16 @@ import { describe, it, mock } from "node:test";
 import assert from "node:assert/strict";
 import { Worker } from "node:worker_threads";
 
+import fs from "node:fs";
+import path from "node:path";
+
 import {
   FaceWorkerPoolManager,
   FaceWorkerPoolOptions,
   FaceTaskPayload,
   DEFAULT_FACE_TASK_TIMEOUT_MS,
   DEFAULT_FACE_TASK_QUEUE_MAX,
+  resolveFaceWorkerEntry,
 } from "../src/server/faceWorkerPool";
 import { Employee } from "../src/types";
 
@@ -148,7 +153,36 @@ describe("FaceWorkerPoolManager - configuration", () => {
   });
 });
 
-describe("FaceWorkerPoolManager - real worker script", () => {
+describe("resolveFaceWorkerEntry", () => {
+  it("resolves to an existing worker module file", () => {
+    const entry = resolveFaceWorkerEntry();
+    assert.ok(fs.existsSync(entry), `resolved entry must exist: ${entry}`);
+    assert.match(path.basename(entry), /^faceWorker\.(ts|cjs|js)$/);
+  });
+
+  it("under a TS loader (no __dirname) prefers the .ts source over a built bundle", () => {
+    // These tests run as ESM via `node --import tsx`, i.e. exactly the dev
+    // runtime. A stale dist/faceWorker.cjs must not shadow live sources.
+    assert.equal(typeof (globalThis as any).__dirname, "undefined");
+    assert.equal(resolveFaceWorkerEntry(), path.join(process.cwd(), "src", "server", "faceWorker.ts"));
+  });
+
+  it("honours FACE_WORKER_PATH and rejects an override that does not exist", () => {
+    const previous = process.env.FACE_WORKER_PATH;
+    try {
+      process.env.FACE_WORKER_PATH = path.join(process.cwd(), "src", "server", "faceWorker.ts");
+      assert.equal(resolveFaceWorkerEntry(), path.join(process.cwd(), "src", "server", "faceWorker.ts"));
+
+      process.env.FACE_WORKER_PATH = path.join(process.cwd(), "dist", "definitely-not-here.cjs");
+      assert.throws(() => resolveFaceWorkerEntry(), /FACE_WORKER_PATH points at a missing file/);
+    } finally {
+      if (previous === undefined) delete process.env.FACE_WORKER_PATH;
+      else process.env.FACE_WORKER_PATH = previous;
+    }
+  });
+});
+
+describe("FaceWorkerPoolManager - real worker module", () => {
   it("resolves a normal dispatch with a matching taskId and measured latency", async () => {
     const c = quietConsole();
     try {
@@ -373,6 +407,29 @@ describe("FaceWorkerPoolManager - message hygiene", () => {
 });
 
 describe("FaceWorkerPoolManager - fail-closed fallback", () => {
+  it("denies recognition when the resolved worker entry is unusable", async () => {
+    // Exercises the *default* createWorker (real resolution + real `new Worker`),
+    // not an injected throwing stub: a broken FACE_WORKER_PATH must deny, never
+    // fabricate a match. This is the door-unlock regression guard for the
+    // module-resolution rewrite.
+    const c = quietConsole();
+    const previous = process.env.FACE_WORKER_PATH;
+    process.env.FACE_WORKER_PATH = path.join(process.cwd(), "dist", "definitely-not-here.cjs");
+    try {
+      await withPool(1, {}, async (pool) => {
+        const result = await pool.dispatchFaceTask(makePayload({ testEmployeeId: "EMP-0001" }));
+        assert.equal(result.recognized, false);
+        assert.equal(result.bestMatch, undefined);
+        assert.deepEqual(result.detectedFaces, []);
+        assert.match(result.engineUsed, /unavailable/);
+      });
+    } finally {
+      if (previous === undefined) delete process.env.FACE_WORKER_PATH;
+      else process.env.FACE_WORKER_PATH = previous;
+      c.restore();
+    }
+  });
+
   it("denies recognition when no worker thread can be started", async () => {
     const c = quietConsole();
     try {

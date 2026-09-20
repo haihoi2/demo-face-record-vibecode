@@ -1,5 +1,7 @@
 import { Worker } from "node:worker_threads";
 import os from "node:os";
+import fs from "node:fs";
+import path from "node:path";
 import {
   Employee,
   DetectedFace,
@@ -51,9 +53,10 @@ export interface FaceWorkerPoolOptions {
   /** Delay before respawning a worker that exited on its own. Default 500 ms. */
   respawnDelayMs?: number;
   /**
-   * Factory for the underlying worker thread. Production uses the inline
-   * WORKER_SCRIPT; tests inject slow / crashing / misbehaving scripts here so
-   * the production script needs no test-only branches.
+   * Factory for the underlying worker thread. Production loads the real
+   * module resolved by resolveFaceWorkerEntry(); tests inject slow / crashing
+   * / misbehaving stubs here so the production worker needs no test-only
+   * branches.
    */
   createWorker?: () => Worker;
 }
@@ -75,215 +78,80 @@ function readPositiveIntEnv(name: string, fallback: number): number {
   return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
 }
 
-// Inline worker script string for bulletproof execution across ESM/CJS and bundlers (tsx & esbuild)
-const WORKER_SCRIPT = `
-const { parentPort } = require('node:worker_threads');
-
-function generateFaceEmbedding(seed, dimension = 128) {
-  let hash = 0;
-  for (let i = 0; i < seed.length; i++) {
-    hash = (hash << 5) - hash + seed.charCodeAt(i);
-    hash |= 0;
-  }
-  const vector = [];
-  let norm = 0;
-  for (let i = 0; i < dimension; i++) {
-    const val = Math.sin(hash * (i + 1) * 0.1743) * Math.cos(i * 1.3141);
-    vector.push(val);
-    norm += val * val;
-  }
-  norm = Math.sqrt(norm);
-  return vector.map((v) => (norm > 0 ? v / norm : 0));
-}
-
-function computeCosineSimilarity(vecA, vecB) {
-  if (!vecA || !vecB || vecA.length !== vecB.length || vecA.length === 0) return 0;
-  let dotProduct = 0;
-  for (let i = 0; i < vecA.length; i++) {
-    dotProduct += vecA[i] * vecB[i];
-  }
-  return Math.max(-1, Math.min(1, dotProduct));
-}
-
-function evaluateAntiSpoofing(imageBase64, sensitivity = 'MEDIUM') {
-  let entropySum = 0;
-  const sampleLength = Math.min(imageBase64.length, 1200);
-  for (let i = 0; i < sampleLength; i += 4) {
-    entropySum += imageBase64.charCodeAt(i);
-  }
-  const baseLiveness = 94 + ((entropySum % 60) / 10);
-  const threshold = sensitivity === 'HIGH' ? 92 : sensitivity === 'MEDIUM' ? 85 : 75;
-  return {
-    livenessScore: Math.round(baseLiveness * 10) / 10,
-    passed: baseLiveness >= threshold,
-  };
-}
-
-function executeBiometrics(payload, workerId) {
-  const t0 = Date.now();
-  const {
-    taskId,
-    imageBase64,
-    employees = [],
-    modelArchitecture = 'blazeface-arcface-sota',
-    similarityThreshold = 0.72,
-    livenessSensitivity = 'MEDIUM',
-    testEmployeeId,
-  } = payload;
-
-  const antiSpoof = evaluateAntiSpoofing(imageBase64 || '', livenessSensitivity);
-
-  let modelName = 'BlazeFace V2 + ArcFace SOTA (512-D Multi-Thread)';
-  if (modelArchitecture === 'mediapipe-facemesh-dense') {
-    modelName = 'MediaPipe FaceMesh (468 3D Multi-Thread)';
-  } else if (modelArchitecture === 'mobilefacenet-quantized') {
-    modelName = 'MobileFaceNet Edge INT8 (Multi-Thread)';
+/**
+ * Resolve the entry file for the face worker thread.
+ *
+ * The worker body used to be an inline JavaScript string started with
+ * `new Worker(script, { eval: true })`. An eval'd string can never
+ * `require`/`import` project modules, so the ONNX face-embedding engine could
+ * not run inside a worker at all. The body now lives in ./faceWorker.ts and is
+ * loaded as a real module; this function finds the right copy of it for
+ * whichever runtime we happen to be in.
+ *
+ * Candidates, in order:
+ *   1. FACE_WORKER_PATH - explicit operator/test override. Strict: a missing
+ *      file throws rather than silently running some *other* worker.
+ *   2. Next to this module, when `__dirname` exists:
+ *        - esbuild CJS bundle  -> __dirname is dist/, so dist/faceWorker.cjs
+ *          (emitted by `npm run build:worker`);
+ *        - tsx's CommonJS path -> __dirname is src/server/, so faceWorker.ts.
+ *      `.cjs`/`.js` are tried before `.ts`; they never coexist in one directory.
+ *   3. Relative to process.cwd(), for ESM under tsx (`tsx server.ts`,
+ *      `node --import tsx --test`), where a module has no `__dirname` at all.
+ *      The `.ts` source is tried before `dist/faceWorker.cjs` so a stale bundle
+ *      can never shadow live sources during development.
+ *
+ * `new Worker(new URL('./faceWorker.js', import.meta.url))` is deliberately
+ * NOT used: `import.meta` does not survive esbuild's CJS bundling (it is
+ * replaced by an empty object), and no single expression is valid in both the
+ * ESM source and the CJS bundle.
+ *
+ * Throwing here is safe: spawnWorker() catches it and the pool falls back to
+ * its fail-closed path (recognized:false, no bestMatch).
+ */
+export function resolveFaceWorkerEntry(): string {
+  // Deliberately not memoised: it runs only when a thread is spawned (a
+  // handful of times per pool epoch), and an operator changing
+  // FACE_WORKER_PATH must take effect on the next respawn.
+  const override = process.env.FACE_WORKER_PATH?.trim();
+  if (override) {
+    const resolved = path.resolve(override);
+    if (!fs.existsSync(resolved)) {
+      throw new Error(`FACE_WORKER_PATH points at a missing file: ${resolved}`);
+    }
+    return resolved;
   }
 
-  // threadLatencyMs is the measured wall-clock time of this function only.
-  // No per-architecture padding is added: telemetry must reflect real work.
-  const measuredLatency = () => Date.now() - t0;
+  const candidates: string[] = [];
 
-  // Handle test shortcuts
-  if (testEmployeeId === 'UNKNOWN' || testEmployeeId === 'UNKNOWN_VISITOR') {
-    return {
-      taskId,
-      workerId,
-      threadLatencyMs: measuredLatency(),
-      detectedFaces: [
-        {
-          id: 'worker-face-unknown-' + Date.now(),
-          box2d: [190, 270, 750, 730],
-          confidence: 34.2,
-          livenessScore: antiSpoof.livenessScore,
-          recognized: false,
-          message: 'Khuôn mặt lạ - Không khớp dữ liệu nhân viên (Multi-Thread Worker #' + workerId + ')',
-        },
-      ],
-      bestMatch: undefined,
-      overallConfidence: 34.2,
-      overallLiveness: antiSpoof.livenessScore,
-      cosineSimilarity: 0.34,
-      modelName,
-      recognized: false,
-      engineUsed: 'Backend Multi-Thread Worker #' + workerId,
-    };
-  }
-
-  if (testEmployeeId && testEmployeeId !== 'MULTI_EMPLOYEES' && testEmployeeId !== 'MULTI_MIXED') {
-    // A test hook that names nobody must not degrade into "grant the first employee".
-    const matched = employees.find(
-      (e) => e.id === testEmployeeId || e.employeeCode.toUpperCase() === String(testEmployeeId).toUpperCase()
+  // `typeof` (not a bare reference) so this cannot throw in an ESM realm,
+  // where `__dirname` is not declared at all.
+  const moduleDir = typeof __dirname === "string" ? __dirname : null;
+  if (moduleDir) {
+    candidates.push(
+      path.join(moduleDir, "faceWorker.cjs"),
+      path.join(moduleDir, "faceWorker.js"),
+      path.join(moduleDir, "faceWorker.ts")
     );
-
-    if (matched) {
-      return {
-        taskId,
-        workerId,
-        threadLatencyMs: measuredLatency(),
-        detectedFaces: [
-          {
-            id: 'worker-face-' + matched.id + '-' + Date.now(),
-            box2d: [170, 270, 730, 730],
-            employeeId: matched.id,
-            employeeName: matched.name,
-            employeeCode: matched.employeeCode,
-            department: matched.department,
-            confidence: 97.5,
-            livenessScore: antiSpoof.livenessScore,
-            recognized: true,
-            message: 'Nhận diện thành công: ' + matched.name + ' (' + matched.employeeCode + ') [Worker #' + workerId + ']',
-          },
-        ],
-        bestMatch: matched,
-        overallConfidence: 97.5,
-        overallLiveness: antiSpoof.livenessScore,
-        cosineSimilarity: 0.94,
-        modelName,
-        recognized: true,
-        engineUsed: 'Backend Multi-Thread Worker #' + workerId,
-      };
-    }
   }
 
-  // Probe vector calculation
-  const probeVector = generateFaceEmbedding(imageBase64 || 'default-probe-seed');
+  const cwd = process.cwd();
+  candidates.push(path.join(cwd, "src", "server", "faceWorker.ts"), path.join(cwd, "dist", "faceWorker.cjs"));
 
-  let bestSim = -1;
-  let bestEmp = undefined;
-
-  for (const emp of employees) {
-    const enrolledSeed = emp.photoUrl || (emp.name + '-' + emp.employeeCode);
-    const enrolledVector = generateFaceEmbedding(enrolledSeed);
-    const sim = computeCosineSimilarity(probeVector, enrolledVector);
-    if (sim > bestSim) {
-      bestSim = sim;
-      bestEmp = emp;
-    }
+  for (const candidate of candidates) {
+    if (fs.existsSync(candidate)) return candidate;
   }
 
-  const recognized = Boolean(bestSim >= similarityThreshold && bestEmp && antiSpoof.passed);
-  const confidence = recognized
-    ? Math.round((70 + (bestSim - similarityThreshold) * 75) * 10) / 10
-    : Math.round(Math.max(20, bestSim * 70) * 10) / 10;
-
-  const detectedFaces = [];
-  if (recognized && bestEmp) {
-    detectedFaces.push({
-      id: 'worker-face-' + bestEmp.id,
-      box2d: [180, 270, 720, 720],
-      employeeId: bestEmp.id,
-      employeeName: bestEmp.name,
-      employeeCode: bestEmp.employeeCode,
-      department: bestEmp.department,
-      confidence,
-      livenessScore: antiSpoof.livenessScore,
-      recognized: true,
-      message: 'Nhận diện thành công: ' + bestEmp.name + ' (Cosine: ' + bestSim.toFixed(2) + ') [Worker #' + workerId + ']',
-    });
-  } else if (employees.length > 0) {
-    detectedFaces.push({
-      id: 'worker-face-unknown-' + Date.now(),
-      box2d: [190, 270, 750, 730],
-      confidence,
-      livenessScore: antiSpoof.livenessScore,
-      recognized: false,
-      message: 'Không tìm thấy nhân viên phù hợp (Độ tương đồng Cosine: ' + bestSim.toFixed(2) + ') [Worker #' + workerId + ']',
-    });
-  }
-
-  return {
-    taskId,
-    workerId,
-    threadLatencyMs: measuredLatency(),
-    detectedFaces,
-    bestMatch: recognized ? bestEmp : undefined,
-    overallConfidence: confidence,
-    overallLiveness: antiSpoof.livenessScore,
-    cosineSimilarity: Math.round(bestSim * 100) / 100,
-    modelName,
-    recognized,
-    engineUsed: 'Backend Multi-Thread Worker #' + workerId,
-  };
+  throw new Error(
+    `Face worker entry not found. Tried: ${candidates.join(", ")}. ` +
+      `Run \`npm run build:worker\` or set FACE_WORKER_PATH.`
+  );
 }
 
-if (parentPort) {
-  parentPort.on('message', (msg) => {
-    if (msg.type === 'PROCESS_FACE') {
-      try {
-        const result = executeBiometrics(msg.payload, msg.workerId);
-        parentPort.postMessage({ type: 'TASK_SUCCESS', result });
-      } catch (err) {
-        parentPort.postMessage({
-          type: 'TASK_ERROR',
-          taskId: msg.payload?.taskId,
-          error: String(err && err.message ? err.message : err),
-        });
-      }
-    }
-  });
+/** Default worker factory: a real module file, so it can import project code. */
+function createDefaultFaceWorker(): Worker {
+  return new Worker(resolveFaceWorkerEntry());
 }
-`;
 
 interface QueuedTask {
   payload: FaceTaskPayload;
@@ -341,7 +209,7 @@ export class FaceWorkerPoolManager {
       options.taskTimeoutMs ?? readPositiveIntEnv("FACE_TASK_TIMEOUT_MS", DEFAULT_FACE_TASK_TIMEOUT_MS);
     this.queueMax = options.queueMax ?? readPositiveIntEnv("FACE_TASK_QUEUE_MAX", DEFAULT_FACE_TASK_QUEUE_MAX);
     this.respawnDelayMs = options.respawnDelayMs ?? DEFAULT_RESPAWN_DELAY_MS;
-    this.createWorker = options.createWorker ?? (() => new Worker(WORKER_SCRIPT, { eval: true }));
+    this.createWorker = options.createWorker ?? createDefaultFaceWorker;
   }
 
   public setBroadcastSSE(callback: (event: string, data: any) => void) {
