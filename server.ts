@@ -19,11 +19,33 @@ import {
   AiRecognitionConfigRecord,
   AI_ENGINE_MODES,
   DEFAULT_STRANGER_WEBHOOK_CONFIG,
+  FaceTemplateRecord,
 } from "./src/server/db";
 import { STRANGER_DEEP_LINK_HASH } from "./src/types";
+import type {
+  FaceObservation,
+  FusionDecision,
+  FusionThresholds,
+  ObservationMatch,
+} from "./src/types";
 import { runLocalFaceRecognition } from "./src/utils/localBiometrics";
 import { clusterStrangerFaces } from "./src/server/strangers";
 import { faceWorkerPool } from "./src/server/faceWorkerPool";
+import {
+  extractFaces,
+  getFaceEngine,
+  getFaceEngineInfo,
+  isFaceEngineReady,
+  loadImage,
+} from "./src/server/faceEmbedding";
+import type { ExtractedFace } from "./src/server/faceEmbedding";
+import {
+  buildGallery,
+  fuseDecision,
+  recognizeObservations,
+  DEFAULT_FUSION_THRESHOLDS,
+} from "./src/server/faceFusion";
+import type { FaceGallery } from "./src/server/faceFusion";
 
 dotenv.config();
 
@@ -663,6 +685,428 @@ db.onSync(() => {
   cameraStreamsConfig = loadCameraStreamsConfig();
   console.log(`[Server] Bộ nhớ In-Memory đã tự động đồng bộ từ PostgreSQL: ${employees.length} NV, ${accessLogs.length} logs, ${mobileNotifications.length} thông báo.`);
 });
+
+// =========================================================================
+// REAL FACE ENGINE (SCRFD detector + ArcFace recogniser) - selection, gallery,
+// observations and decision fusion.
+//
+// Engine selection (env FACE_ENGINE):
+//   unset / "auto"  -> ONNX when the models loaded, otherwise the legacy hash
+//                      matcher (the historical demo behaviour).
+//   "onnx"          -> ONNX ONLY. When the models are missing the gateway
+//                      FAILS CLOSED: no access decision is taken by the hash
+//                      matcher, every frame is denied and the lock stays
+//                      LOCKED. The failure is logged loudly once at startup.
+//   "hash"          -> legacy hash matcher only (demo / offline development).
+//
+// Measured on this site (probe run, 20 Sep): within cam02 the same person
+// scores cosine 0.50-0.62 and an impostor <= 0.145, but ACROSS cameras the
+// same person only reaches 0.139-0.304 - inside the impostor range. Templates
+// therefore carry `streamId` and operators enrol per camera; matching is
+// max-over-templates across the employee's whole gallery, which handles the
+// cross-camera case once both cameras are enrolled. No cross-camera score
+// fudging exists anywhere below, by design.
+// =========================================================================
+type FaceEngineSetting = "auto" | "onnx" | "hash";
+/** What actually decides a frame. "unavailable" = fail-closed (onnx demanded, models absent). */
+type ActiveFaceEngine = "onnx" | "hash" | "unavailable";
+
+const FACE_ENGINE_SETTING: FaceEngineSetting = (() => {
+  const raw = String(process.env.FACE_ENGINE || "").trim().toLowerCase();
+  if (raw === "hash") return "hash";
+  if (raw === "onnx") return "onnx";
+  return "auto";
+})();
+
+function envFloat(name: string, fallback: number, min = 0, max = 1): number {
+  const v = Number(process.env[name]);
+  return Number.isFinite(v) && v >= min && v <= max ? v : fallback;
+}
+function envInt(name: string, fallback: number, min: number, max: number): number {
+  const v = Number(process.env[name]);
+  return Number.isInteger(v) && v >= min && v <= max ? v : fallback;
+}
+
+/** Minimum capture quality an enrolment frame must reach to become a template. */
+const FACE_ENROLL_MIN_QUALITY = envFloat("FACE_ENROLL_MIN_QUALITY", 0.25);
+/** Maximum templates kept per employee; the lowest-quality one is evicted when full. */
+const FACE_TEMPLATE_MAX = envInt("FACE_TEMPLATE_MAX", 12, 1, 200);
+/**
+ * Hard cap on observations fused in ONE decision. Latency is dominated by the
+ * engine (~110 ms decode + ~480 ms detect + ~360 ms per face embed), so the
+ * real bound is frames x streams (<= 5 x 4); this cap additionally bounds the
+ * evidence set, keeping the highest-quality observations when it bites.
+ */
+const FACE_MAX_OBSERVATIONS = envInt("FACE_MAX_OBSERVATIONS", 12, 1, 64);
+/** Multi-frame scan limits (`frames` / `frameIntervalMs` in the scan + capture bodies). */
+const FACE_SCAN_MAX_FRAMES = 5;
+const FACE_SCAN_DEFAULT_FRAME_INTERVAL_MS = 300;
+const FACE_SCAN_MAX_FRAME_INTERVAL_MS = 3000;
+
+/**
+ * Model identity stamped on every template. Embeddings from different models
+ * are NEVER comparable, so `buildGallery` drops templates whose tag differs
+ * from the running recogniser.
+ */
+function faceModelTag(): string {
+  const info = getFaceEngineInfo();
+  const base = String(info.recognizerModel || "unknown").replace(/\.onnx$/i, "");
+  return `arcface_${base}`;
+}
+
+function activeFaceEngine(): ActiveFaceEngine {
+  if (FACE_ENGINE_SETTING === "hash") return "hash";
+  if (isFaceEngineReady()) return "onnx";
+  return FACE_ENGINE_SETTING === "onnx" ? "unavailable" : "hash";
+}
+
+/** True when the real engine is loaded and selected: the only path that may grant. */
+function faceEngineActive(): boolean {
+  return activeFaceEngine() === "onnx";
+}
+
+/**
+ * Effective fusion thresholds. `aiRecognitionConfig.localModel.similarityThreshold`
+ * (the existing AI-config store, editable through POST /api/config/ai) maps onto
+ * `acceptSingle`; everything else comes from DEFAULT_FUSION_THRESHOLDS unless an
+ * env override is set. Nothing new is persisted - there is one config store.
+ */
+function currentFusionThresholds(clientConfig?: Partial<ServerAiConfig> | null): FusionThresholds {
+  const th: FusionThresholds = { ...DEFAULT_FUSION_THRESHOLDS };
+  const configured = Number(
+    clientConfig?.localModel?.similarityThreshold ?? aiRecognitionConfig.localModel?.similarityThreshold
+  );
+  if (Number.isFinite(configured) && configured > 0 && configured < 1) th.acceptSingle = configured;
+  th.acceptSingle = envFloat("FACE_ACCEPT_SINGLE", th.acceptSingle, 0.01, 0.999);
+  th.acceptFused = envFloat("FACE_ACCEPT_FUSED", th.acceptFused, 0.01, 0.999);
+  th.minEvidence = envFloat("FACE_MIN_EVIDENCE", th.minEvidence, 0.01, 0.999);
+  th.minMargin = envFloat("FACE_MIN_MARGIN", th.minMargin, 0, 0.999);
+  th.minAgreeing = envInt("FACE_MIN_AGREEING", th.minAgreeing, 1, 32);
+  return th;
+}
+
+/** The enrolled gallery for the RUNNING model only (foreign tags are skipped). */
+function currentGallery(): FaceGallery {
+  return buildGallery(db.getFaceTemplates(), faceModelTag());
+}
+
+const clampUnit = (v: number) => Math.min(1, Math.max(0, Number.isFinite(v) ? v : 0));
+
+/** Pixel box -> [ymin, xmin, ymax, xmax] on the 0-1000 scale the annotator/UI use. */
+function boxToBox2d(
+  box: readonly [number, number, number, number],
+  width: number,
+  height: number
+): [number, number, number, number] {
+  const w = width > 0 ? width : 1;
+  const h = height > 0 ? height : 1;
+  const x1 = Math.min(box[0], box[2]), x2 = Math.max(box[0], box[2]);
+  const y1 = Math.min(box[1], box[3]), y2 = Math.max(box[1], box[3]);
+  return [
+    Math.round(clampUnit(y1 / h) * 1000),
+    Math.round(clampUnit(x1 / w) * 1000),
+    Math.round(clampUnit(y2 / h) * 1000),
+    Math.round(clampUnit(x2 / w) * 1000),
+  ];
+}
+
+/** One detected+embedded face, with everything needed to fuse it and to report it. */
+interface EngineObservation {
+  observation: FaceObservation;
+  face: ExtractedFace;
+  width: number;
+  height: number;
+  streamId: string;
+  streamLabel: string;
+  frameIndex: number;
+  /** false when the observation-cap dropped it from the fused evidence. */
+  fused: boolean;
+}
+
+/**
+ * Decode once, detect + embed, and turn every face into an observation tagged
+ * with its stream. Never throws: a bad frame yields an empty list.
+ */
+async function observeFrame(
+  image: Buffer | string,
+  streamId: string,
+  streamLabel: string,
+  frameIndex: number
+): Promise<EngineObservation[]> {
+  try {
+    const rgb = await loadImage(image);
+    if (!rgb) return [];
+    const faces = await extractFaces(rgb);
+    return faces.map((f) => ({
+      observation: {
+        streamId,
+        streamLabel,
+        frameIndex,
+        embedding: Array.from(f.embedding),
+        quality: f.quality,
+        detectorScore: f.score,
+        box: [f.box[0], f.box[1], f.box[2], f.box[3]] as [number, number, number, number],
+      },
+      face: f,
+      width: rgb.width,
+      height: rgb.height,
+      streamId,
+      streamLabel,
+      frameIndex,
+      fused: true,
+    }));
+  } catch (err: any) {
+    console.warn("[FaceEngine] observeFrame lỗi:", err?.message || err);
+    return [];
+  }
+}
+
+/**
+ * Apply the observation cap: the highest-quality observations stay in the fused
+ * evidence, the rest are reported as detected but marked `fused:false`.
+ * Returns the list of observations that feed `recognizeObservations`.
+ */
+function capObservations(all: EngineObservation[]): FaceObservation[] {
+  if (all.length <= FACE_MAX_OBSERVATIONS) return all.map((o) => o.observation);
+  const ranked = [...all].sort((a, b) => b.observation.quality - a.observation.quality);
+  const keep = new Set(ranked.slice(0, FACE_MAX_OBSERVATIONS));
+  for (const o of all) o.fused = keep.has(o);
+  return all.filter((o) => o.fused).map((o) => o.observation);
+}
+
+/**
+ * Turn engine observations + a fusion decision into the `detectedFaces` the UI,
+ * the access log and the green-box annotator consume.
+ *
+ * Only observations that AGREED with the winning identity are marked
+ * `recognized` - a second person standing in the same frame stays unrecognised.
+ * `boxSource:"detector"` is set because these boxes are real detections, so the
+ * annotator may draw them. `livenessScore` reports CAPTURE QUALITY: this engine
+ * has no anti-spoofing model and nothing here may be read as a liveness check.
+ */
+function facesFromDecision(
+  observed: EngineObservation[],
+  decision: FusionDecision,
+  roster: EmployeeRecord[]
+): Array<DetectedFaceItem & { streamId: string; streamLabel: string }> {
+  // perObservation is parallel to the (capped) observation list handed to fusion.
+  const fusedOnly = observed.filter((o) => o.fused);
+  const matchByObs = new Map<EngineObservation, ObservationMatch>();
+  fusedOnly.forEach((o, i) => {
+    const m = decision.perObservation[i];
+    if (m) matchByObs.set(o, m);
+  });
+  const winner = decision.recognized ? decision.employeeId : undefined;
+  const th = decision.thresholds;
+
+  return observed.map((o, idx) => {
+    const m = matchByObs.get(o);
+    const agreed = Boolean(
+      winner && m && m.employeeId === winner && m.cosine >= th.minEvidence
+    );
+    const emp = agreed ? roster.find((e) => e.id === winner) : undefined;
+    const cosine = m ? m.cosine : 0;
+    return {
+      id: `face-${o.streamId}-${o.frameIndex}-${idx}-${Date.now().toString(36)}`,
+      box2d: boxToBox2d(o.face.box, o.width, o.height),
+      boxSource: "detector" as const,
+      employeeId: emp?.id,
+      employeeName: emp?.name,
+      employeeCode: emp?.employeeCode,
+      department: emp?.department,
+      // Confidence is the fused decision confidence for the accepted identity,
+      // and the raw best cosine (as a percentage) for everything else. Nothing
+      // is invented: an unmatched face reports the number it actually scored.
+      confidence: agreed
+        ? Math.round(decision.confidence * 1000) / 10
+        : Math.round(Math.max(0, cosine) * 1000) / 10,
+      livenessScore: Math.round(clampUnit(o.face.quality) * 1000) / 10,
+      recognized: agreed && Boolean(emp),
+      message: !o.fused
+        ? `Đã phát hiện nhưng vượt hạn mức ${FACE_MAX_OBSERVATIONS} quan sát/lượt - không tham gia so khớp`
+        : agreed && emp
+        ? `Nhận diện ${emp.name} (${emp.employeeCode}) - cosine ${cosine.toFixed(3)}, cơ sở ${decision.basis}`
+        : decision.basis === "rejected-ambiguous"
+        ? `Từ chối: mơ hồ giữa nhiều danh tính (cosine ${cosine.toFixed(3)})`
+        : `Không khớp mẫu đã đăng ký (cosine tốt nhất ${cosine.toFixed(3)})`,
+      streamId: o.streamId,
+      streamLabel: o.streamLabel,
+    };
+  });
+}
+
+/** An empty, honest decision for paths where the real engine never ran. */
+function emptyFusionDecision(thresholds?: FusionThresholds): FusionDecision {
+  return fuseDecision([], thresholds || currentFusionThresholds());
+}
+
+/**
+ * Startup warm-up. Loading two ONNX sessions takes seconds, so it happens once
+ * here instead of on the first camera frame. A missing model set is reported
+ * LOUDLY: with FACE_ENGINE=onnx the gateway then denies every frame rather than
+ * quietly handing access decisions to the hash matcher.
+ */
+function warmUpFaceEngine(): void {
+  if (FACE_ENGINE_SETTING === "hash") {
+    console.warn(
+      "[FaceEngine] FACE_ENGINE=hash: đang dùng bộ so khớp giả lập (hash). KHÔNG dùng cho cửa thật."
+    );
+    return;
+  }
+  getFaceEngine()
+    .then((engine) => {
+      if (engine) {
+        const info = getFaceEngineInfo();
+        console.log(
+          `[FaceEngine] ✅ Engine thực đã sẵn sàng (${info.detectorModel} + ${info.recognizerModel}, ${info.loadTimeMs}ms, tag=${faceModelTag()}), ` +
+            `${db.getFaceTemplates().length} mẫu khuôn mặt trong thư viện.`
+        );
+        return;
+      }
+      const info = getFaceEngineInfo();
+      if (FACE_ENGINE_SETTING === "onnx") {
+        console.error(
+          `[FaceEngine] ❌ FACE_ENGINE=onnx nhưng KHÔNG nạp được mô hình từ ${info.modelDir} (${info.lastError || "không rõ lỗi"}). ` +
+            "FAIL-CLOSED: mọi khung hình sẽ bị TỪ CHỐI và khóa cửa giữ nguyên LOCKED. " +
+            "Hệ thống KHÔNG tự động quay về bộ so khớp hash."
+        );
+      } else {
+        console.warn(
+          `[FaceEngine] ⚠️ Không nạp được mô hình ONNX từ ${info.modelDir} (${info.lastError || "không rõ lỗi"}). ` +
+            "FACE_ENGINE chưa được đặt nên tạm dùng bộ so khớp hash (chế độ demo)."
+        );
+      }
+    })
+    .catch(() => {});
+}
+warmUpFaceEngine();
+
+/** GET /api/face-engine/status - what is running, what is enrolled, what decides. */
+app.get(["/api/face-engine/status", "/api/face-engine/status/", "/api/face-engine", "/api/face-engine/"], (_req, res) => {
+  const templates = db.getFaceTemplates();
+  const modelTag = faceModelTag();
+  const byEmployee: Record<string, number> = {};
+  for (const t of templates) byEmployee[t.employeeId] = (byEmployee[t.employeeId] || 0) + 1;
+  const engine = activeFaceEngine();
+  res.json({
+    success: true,
+    engine,
+    requestedEngine: FACE_ENGINE_SETTING,
+    ready: isFaceEngineReady(),
+    failClosed: engine === "unavailable",
+    info: getFaceEngineInfo(),
+    templates: {
+      total: templates.length,
+      byEmployee,
+      modelTag,
+      matchingModelTag: templates.filter((t) => t.modelTag === modelTag).length,
+    },
+    thresholds: currentFusionThresholds(),
+    limits: {
+      maxObservationsPerDecision: FACE_MAX_OBSERVATIONS,
+      maxFramesPerStream: FACE_SCAN_MAX_FRAMES,
+      maxConcurrentStreams: SCAN_RTSP_MAX_CONCURRENT_STREAMS,
+      templatesPerEmployee: FACE_TEMPLATE_MAX,
+      enrollMinQuality: FACE_ENROLL_MIN_QUALITY,
+    },
+  });
+});
+
+// ---------------- Enrolment (templates) ----------------
+
+/**
+ * Keep an employee's gallery within FACE_TEMPLATE_MAX by evicting the
+ * lowest-quality template(s). Returns the ids that were evicted.
+ */
+function enforceTemplateCap(employeeId: string, keepRoom = 0): string[] {
+  const existing = db.getFaceTemplatesForEmployee(employeeId);
+  const limit = Math.max(0, FACE_TEMPLATE_MAX - keepRoom);
+  if (existing.length <= limit) return [];
+  const evicted = [...existing]
+    .sort((a, b) => a.quality - b.quality)
+    .slice(0, existing.length - limit);
+  for (const t of evicted) db.deleteFaceTemplate(t.id);
+  return evicted.map((t) => t.id);
+}
+
+interface EnrollOutcome {
+  saved?: {
+    id: string;
+    quality: number;
+    source: string;
+    capturedAt: string;
+    streamId?: string;
+    sourceLogId?: string;
+    dims: number;
+    modelTag: string;
+  };
+  evicted?: string[];
+  rejected?: string;
+  /** Best quality seen, when a face was found but rejected for quality. */
+  quality?: number;
+  detectedFaces?: number;
+}
+
+/**
+ * Extract the single best-quality face from one image and store it as a
+ * template. NEVER throws: enrolment is always best-effort so that creating an
+ * employee (or merging a stranger cluster) cannot fail because of the engine.
+ */
+async function enrollTemplateFromImage(
+  employeeId: string,
+  image: string | Buffer,
+  opts: { source: "enrollment" | "merge" | "manual" | "auto"; streamId?: string; sourceLogId?: string; minQuality?: number }
+): Promise<EnrollOutcome> {
+  if (!faceEngineActive()) {
+    return { rejected: activeFaceEngine() === "unavailable" ? "engine-unavailable" : "engine-disabled" };
+  }
+  const minQuality = opts.minQuality ?? FACE_ENROLL_MIN_QUALITY;
+  try {
+    const faces = await extractFaces(image);
+    if (faces.length === 0) return { rejected: "no-face", detectedFaces: 0 };
+    const best = faces.reduce((a, b) => (b.quality > a.quality ? b : a));
+    if (best.quality < minQuality) {
+      return { rejected: "low-quality", quality: Math.round(best.quality * 1000) / 1000, detectedFaces: faces.length };
+    }
+    const evicted = enforceTemplateCap(employeeId, 1);
+    const rec = db.saveFaceTemplate({
+      id: `FT-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`,
+      employeeId,
+      embedding: Array.from(best.embedding),
+      dims: best.embedding.length,
+      modelTag: faceModelTag(),
+      source: opts.source,
+      quality: Math.round(best.quality * 1000) / 1000,
+      capturedAt: new Date().toISOString(),
+      sourceLogId: opts.sourceLogId,
+      streamId: opts.streamId,
+    });
+    return {
+      saved: {
+        id: rec.id,
+        quality: rec.quality,
+        source: rec.source,
+        capturedAt: rec.capturedAt,
+        streamId: rec.streamId,
+        sourceLogId: rec.sourceLogId,
+        dims: rec.dims,
+        modelTag: rec.modelTag,
+      },
+      evicted,
+      detectedFaces: faces.length,
+    };
+  } catch (err: any) {
+    console.warn(`[FaceEngine] Không tạo được mẫu khuôn mặt cho ${employeeId}:`, err?.message || err);
+    return { rejected: "engine-error" };
+  }
+}
+
+/** Only images we actually hold bytes for can be enrolled (a remote URL cannot). */
+function isEnrollableImage(value: unknown): value is string {
+  if (typeof value !== "string" || value.length < 64) return false;
+  if (/^data:image\/(jpeg|jpg|png);base64,/i.test(value)) return true;
+  return !/^https?:\/\//i.test(value) && /^[A-Za-z0-9+/=\s]+$/.test(value.slice(0, 256));
+}
 
 async function sendEtonWebhook({
   userName,
@@ -2413,17 +2857,34 @@ app.get("/api/camera-streams/mjpeg", (req, res) => {
   }
 });
 
-// Scan and recognize face directly from one or all RTSP streams of a gate.
-//   body { gate, stream?, url?, scanType? }
+// Scan and recognise faces from one or all RTSP streams of a gate.
+//   body { gate, stream?, url?, scanType?, frames?, frameIntervalMs? }
 //   - `stream` (id) or `url` -> scan that single stream (legacy behaviour);
-//   - neither -> scan every enabled RTSP stream of the gate concurrently (max 4)
-//     and aggregate; per-stream outcomes are returned in `streams[]`.
+//   - neither -> scan every enabled RTSP stream of the gate concurrently (max 4).
+//
+// With the real engine active this is TRUE MULTI-STREAM FUSION, not an
+// aggregation of independent verdicts: every frame of every stream is detected
+// and embedded, all observations are POOLED (each tagged with its streamId and
+// frameIndex) and ONE `recognizeObservations` call decides. Agreement between
+// views raises confidence; a single weak or contradictory view cannot open the
+// door. `frames` (1..5, default 1) takes several frames from each stream
+// `frameIntervalMs` apart (default 300 ms) - the cheapest way to lift a
+// marginal camera - and the pooled evidence is capped at FACE_MAX_OBSERVATIONS
+// (default 12, highest quality kept) so latency stays bounded.
+//
+// Without the real engine each stream still goes through recognizeFrame as
+// before, and `fusion` reports an honest empty decision.
 const SCAN_RTSP_MAX_CONCURRENT_STREAMS = 4;
 
 interface ScanStreamOutcome {
   stream: GateStreamSourceRecord;
   url: string;
-  grab: RtspFrameGrab;
+  /** One grab per requested frame, in capture order. */
+  grabs: RtspFrameGrab[];
+  /** True once at least one frame was captured. */
+  ok: boolean;
+  /** Real-engine observations from this stream's frames (empty in hash mode). */
+  observed: EngineObservation[];
   recognition?: RecognizeFrameResult;
   faces: Array<DetectedFaceItem & { streamId: string; streamLabel: string }>;
   error?: string;
@@ -2431,8 +2892,23 @@ interface ScanStreamOutcome {
   recognitionError?: unknown;
 }
 
+/** Grab `frames` JPEGs from one stream, `intervalMs` apart. Never rejects. */
+async function grabRtspFrames(
+  streamUrl: string,
+  transport: "tcp" | "udp",
+  frames: number,
+  intervalMs: number
+): Promise<RtspFrameGrab[]> {
+  const out: RtspFrameGrab[] = [];
+  for (let i = 0; i < frames; i++) {
+    if (i > 0 && intervalMs > 0) await new Promise((r) => setTimeout(r, intervalMs));
+    out.push(await grabRtspFrame(streamUrl, transport));
+  }
+  return out;
+}
+
 app.post("/api/camera-streams/scan-rtsp", async (req, res) => {
-  const { gate, stream, url, scanType } = req.body || {};
+  const { gate, stream, url, scanType, frames, frameIntervalMs } = req.body || {};
   const resolved = resolveGateStream(gate, stream);
   if (resolved.error) {
     return res.status(400).json({ success: false, error: resolved.error });
@@ -2465,34 +2941,70 @@ app.post("/api/camera-streams/scan-rtsp", async (req, res) => {
 
   const resolvedScanType: "ENTRY" | "EXIT" =
     String(scanType || "").toUpperCase() === "EXIT" || (!scanType && gateParam === "exit") ? "EXIT" : "ENTRY";
+
+  const faceEngine = activeFaceEngine();
+  const fusionThresholds = currentFusionThresholds(req.body?.config);
+  // Multi-frame only helps the real engine (the hash matcher ignores pixels),
+  // so the legacy path stays at one frame per stream.
+  const requestedFrames = Number(frames);
+  const framesPerStream =
+    faceEngine === "onnx" && Number.isFinite(requestedFrames)
+      ? Math.min(FACE_SCAN_MAX_FRAMES, Math.max(1, Math.floor(requestedFrames)))
+      : 1;
+  const requestedInterval = Number(frameIntervalMs);
+  const intervalMs = Number.isFinite(requestedInterval)
+    ? Math.min(FACE_SCAN_MAX_FRAME_INTERVAL_MS, Math.max(0, Math.floor(requestedInterval)))
+    : FACE_SCAN_DEFAULT_FRAME_INTERVAL_MS;
   const tWall = Date.now();
 
-  // Grab + recognise every target concurrently. Each stream owns its own ffmpeg
-  // process (same tuned args, same 9 s kill); a failure on one never aborts another.
+  // Phase 1 - capture (and, with the real engine, detect + embed) every target
+  // concurrently. Each stream owns its own ffmpeg process (same tuned args,
+  // same 9 s kill); a failure on one never aborts another.
   const outcomes: ScanStreamOutcome[] = await Promise.all(
     targets.map(async ({ stream: target, url: streamUrl }): Promise<ScanStreamOutcome> => {
       const transport = target.rtspTransport === "UDP" ? "udp" : "tcp";
-      const grab = await grabRtspFrame(streamUrl, transport);
-      const outcome: ScanStreamOutcome = { stream: target, url: streamUrl, grab, faces: [] };
-      if (!grab.ok || !grab.jpeg) {
+      const grabs = await grabRtspFrames(streamUrl, transport, framesPerStream, intervalMs);
+      const outcome: ScanStreamOutcome = {
+        stream: target,
+        url: streamUrl,
+        grabs,
+        ok: grabs.some((g) => g.ok && g.jpeg),
+        observed: [],
+        faces: [],
+      };
+      if (!outcome.ok) {
         outcome.error =
           "Không thể lấy khung hình từ luồng RTSP. Hãy kiểm tra địa chỉ IP, tài khoản/mật khẩu hoặc kết nối mạng LAN.";
         return outcome;
       }
-      const base64Data = grab.jpeg.toString("base64");
+
+      if (faceEngine === "onnx") {
+        // Observations only - the decision is fused ACROSS streams below.
+        for (let i = 0; i < grabs.length; i++) {
+          const g = grabs[i];
+          if (!g.ok || !g.jpeg) continue;
+          outcome.observed.push(...(await observeFrame(g.jpeg, target.id, target.label, i)));
+        }
+        return outcome;
+      }
+
+      // Legacy per-stream path (hash matcher / fail-closed): identical to before.
+      const firstOk = grabs.find((g) => g.ok && g.jpeg)!;
+      const base64Data = firstOk.jpeg!.toString("base64");
       try {
-        // Same engine selection as /api/recognize-face: LOCAL_BIOMETRIC -> worker pool,
-        // GOOGLE_GEMINI -> Gemini Vision, HYBRID_AUTO -> local pre-filter then cloud.
         const recognition = await recognizeFrame({
           base64Data,
           rawImage: `data:image/jpeg;base64,${base64Data}`,
           mimeType: "image/jpeg",
           employees,
           scanType: resolvedScanType,
+          streamId: target.id,
+          streamLabel: target.label,
         });
         outcome.recognition = recognition;
         outcome.faces = recognition.detectedFaces.map((f) => ({ ...f, streamId: target.id, streamLabel: target.label }));
       } catch (err: any) {
+        outcome.ok = false;
         if (isWorkerPoolUnavailableError(err)) {
           outcome.poolUnavailableError = err;
         } else {
@@ -2504,19 +3016,49 @@ app.post("/api/camera-streams/scan-rtsp", async (req, res) => {
     })
   );
 
+  // Phase 2 - ONE fused decision over the pooled observations of every stream.
+  let fusion: FusionDecision = emptyFusionDecision(fusionThresholds);
+  let observationsPooled = 0;
+  if (faceEngine === "onnx") {
+    const allObserved = outcomes.flatMap((o) => o.observed);
+    const pooled = capObservations(allObserved); // marks the dropped ones `fused:false`
+    observationsPooled = pooled.length;
+    fusion = recognizeObservations(pooled, currentGallery(), fusionThresholds);
+    // Built from the SAME ordered list that was fused, then split per stream.
+    const allFaces = facesFromDecision(allObserved, fusion, employees);
+    for (const o of outcomes) o.faces = allFaces.filter((f) => f.streamId === o.stream.id);
+  }
+
   const processingTimeMs = Date.now() - tWall;
-  const frameCaptureDurationMs = outcomes.reduce((max, o) => Math.max(max, o.grab.durationMs), 0);
+  const frameCaptureDurationMs = outcomes.reduce(
+    (max, o) => Math.max(max, ...o.grabs.map((g) => g.durationMs), 0),
+    0
+  );
   const streamResults = outcomes.map((o) => ({
     streamId: o.stream.id,
     streamLabel: o.stream.label,
-    success: Boolean(o.recognition),
-    frameCaptureDurationMs: o.grab.durationMs,
+    success: o.ok,
+    frameCaptureDurationMs: o.grabs.reduce((max, g) => Math.max(max, g.durationMs), 0),
+    framesCaptured: o.grabs.filter((g) => g.ok && g.jpeg).length,
+    framesRequested: framesPerStream,
+    observations: o.observed.length,
     recognized: o.faces.some((f) => f.recognized && f.employeeId),
     totalFacesDetected: o.faces.length,
     detectedFaces: o.faces,
     error: o.error,
   }));
-  const successful = outcomes.filter((o) => o.recognition);
+  const successful = outcomes.filter((o) => o.ok);
+  const fusionSummary = {
+    ...fusion,
+    engine: faceEngine,
+    observations: observationsPooled,
+    observationCap: FACE_MAX_OBSERVATIONS,
+    framesPerStream,
+    frameIntervalMs: intervalMs,
+    streamsPooled: new Set(outcomes.flatMap((o) => o.observed).map((o) => o.streamId)).size,
+    galleryTemplates: faceEngine === "onnx" ? db.getFaceTemplates().length : 0,
+    modelTag: faceModelTag(),
+  };
 
   if (successful.length === 0) {
     // Nothing usable came back from any stream: keep today's status codes.
@@ -2527,6 +3069,7 @@ app.post("/api/camera-streams/scan-rtsp", async (req, res) => {
         gate: gateParam,
         frameCaptureDurationMs,
         streams: streamResults,
+        fusion: fusionSummary,
       });
       return;
     }
@@ -2540,6 +3083,7 @@ app.post("/api/camera-streams/scan-rtsp", async (req, res) => {
         error: recognitionFailed.error || "Lỗi xử lý nhận diện khung hình RTSP",
         frameCaptureDurationMs,
         streams: streamResults,
+        fusion: fusionSummary,
       });
     }
     return res.status(502).json({
@@ -2547,9 +3091,10 @@ app.post("/api/camera-streams/scan-rtsp", async (req, res) => {
       recognized: false,
       gate: gateParam,
       error: "Không thể lấy khung hình từ luồng RTSP. Hãy kiểm tra địa chỉ IP, tài khoản/mật khẩu hoặc kết nối mạng LAN.",
-      details: outcomes[0]?.grab.errorLog || "",
+      details: outcomes[0]?.grabs[0]?.errorLog || "",
       frameCaptureDurationMs,
       streams: streamResults,
+      fusion: fusionSummary,
     });
   }
 
@@ -2564,12 +3109,31 @@ app.post("/api/camera-streams/scan-rtsp", async (req, res) => {
   const primaryFace = authorizedFaces[0] || detectedFaces[0];
   const overallConfidence = Number(primaryFace?.confidence ?? 0);
   const overallLiveness = Number(primaryFace?.livenessScore ?? 0);
-  const first = successful[0].recognition!;
+  const engineInfo = getFaceEngineInfo();
+  const first = successful.find((o) => o.recognition)?.recognition;
   const workerInfo = successful.find((o) => o.recognition?.multiThreadInfo.workerId)?.recognition?.multiThreadInfo;
+
   const message =
-    successful.length === 1
-      ? first.overallMessage
-      : successful.map((o) => `[${o.stream.label}] ${o.recognition!.overallMessage}`).join(" | ");
+    faceEngine === "onnx"
+      ? recognized && bestMatch
+        ? `Nhận diện ${bestMatch.name} (${bestMatch.employeeCode}) từ ${fusion.agreeingObservations} quan sát trên ${fusion.agreeingStreams} luồng - cosine hợp nhất ${fusion.fusedCosine.toFixed(3)} (${fusion.basis})`
+        : observationsPooled === 0
+        ? "Không phát hiện khuôn mặt nào trong các khung hình đã lấy. Cửa giữ trạng thái khóa."
+        : `Không xác thực được danh tính từ ${observationsPooled} quan sát (${fusion.basis}, cosine tốt nhất ${fusion.bestCosine.toFixed(3)}). Cửa giữ trạng thái khóa.`
+      : successful.length === 1
+      ? first?.overallMessage || ""
+      : successful
+          .filter((o) => o.recognition)
+          .map((o) => `[${o.stream.label}] ${o.recognition!.overallMessage}`)
+          .join(" | ");
+
+  const engineUsed =
+    faceEngine === "onnx"
+      ? `Real Face Engine (SCRFD ${engineInfo.detectorModel} + ArcFace ${engineInfo.recognizerModel}, hợp nhất đa luồng)`
+      : faceEngine === "unavailable"
+      ? "Real Face Engine (FAIL-CLOSED: mô hình ONNX không khả dụng)"
+      : first?.engineUsed || "Local Edge Biometrics";
+  const modelUsed = faceEngine === "onnx" ? faceModelTag() : first?.modelUsed || aiRecognitionConfig.localModel.modelArchitecture;
 
   res.json({
     success: true,
@@ -2583,6 +3147,8 @@ app.post("/api/camera-streams/scan-rtsp", async (req, res) => {
     streamsScanned: outcomes.length,
     streamsSucceeded: successful.length,
     streams: streamResults,
+    framesPerStream,
+    frameIntervalMs: intervalMs,
     // Recognition outcome (fail-closed: recognized only when an engine matched a registered employee)
     recognized,
     detectedFaces,
@@ -2597,13 +3163,17 @@ app.post("/api/camera-streams/scan-rtsp", async (req, res) => {
     overallLiveness,
     confidence: overallConfidence,
     livenessScore: overallLiveness,
-    similarityScore: Math.round(overallConfidence * 10) / 1000,
+    similarityScore: faceEngine === "onnx" ? fusion.fusedCosine : Math.round(overallConfidence * 10) / 1000,
     message,
-    // Engine telemetry (from the first successful stream)
-    engineMode: first.engineMode,
-    engineUsed: first.engineUsed,
-    modelUsed: first.modelUsed,
-    modelName: first.modelUsed,
+    // The whole fused decision: basis, cosines, agreeing observations/streams,
+    // per-candidate evidence and every per-observation cosine.
+    fusion: fusionSummary,
+    // Engine telemetry
+    faceEngine,
+    engineMode: first?.engineMode || aiRecognitionConfig.engineMode,
+    engineUsed,
+    modelUsed,
+    modelName: modelUsed,
     multiThreadUsed: Boolean(workerInfo?.workerId),
     workerId: workerInfo?.workerId,
     threadLatencyMs: workerInfo?.threadLatencyMs ?? processingTimeMs,
@@ -2910,10 +3480,343 @@ app.post(EMPLOYEE_ROUTES, async (req, res) => {
   broadcastSSE("notification", notif);
   broadcastSSE("employee_registered", newEmployee);
 
+  // Real-engine enrolment: the registration photo becomes this employee's first
+  // template, so a roster entry is never left with an empty gallery. Strictly
+  // best-effort - a missing model, a face-less photo or a remote URL we hold no
+  // bytes for must never fail the registration itself.
+  const enrolled = isEnrollableImage(photoUrl)
+    ? await enrollTemplateFromImage(newEmployee.id, photoUrl, { source: "enrollment" })
+    : { rejected: "unsupported-image" as const };
+  if (enrolled.rejected) {
+    console.warn(
+      `[FaceEngine] Không tạo được mẫu khuôn mặt khi đăng ký ${newEmployee.name}: ${enrolled.rejected}` +
+        (enrolled.quality !== undefined ? ` (chất lượng ${enrolled.quality})` : "")
+    );
+  }
+
   res.json({
     success: true,
     message: "Đăng ký khuôn mặt nhân viên thành công",
     employee: newEmployee,
+    faceTemplate: enrolled.saved || null,
+    faceTemplateRejected: enrolled.rejected || null,
+    faceEngine: activeFaceEngine(),
+  });
+});
+
+
+// ---- Face templates: the enrolled gallery an employee is recognised from ----
+// Measured on this site: the SAME person scores 0.50-0.62 within cam02 but only
+// 0.139-0.304 between cam01 and cam02 - inside the impostor range. So an
+// employee is enrolled PER CAMERA from the live stream, each template keeping
+// its `streamId`; matching is max-over-templates, which makes the cross-camera
+// case work once both cameras are enrolled. Raw embeddings never leave the
+// server: they are biometric data and nothing in the UI needs them.
+const EMPLOYEE_TEMPLATE_ROUTES = ["/api/employees/:id/templates", "/employees/:id/templates"];
+const EMPLOYEE_TEMPLATE_CAPTURE_ROUTES = [
+  "/api/employees/:id/templates/capture",
+  "/employees/:id/templates/capture",
+];
+const EMPLOYEE_TEMPLATE_ITEM_ROUTES = [
+  "/api/employees/:id/templates/:templateId",
+  "/employees/:id/templates/:templateId",
+];
+
+function publicTemplate(t: FaceTemplateRecord) {
+  return {
+    id: t.id,
+    quality: t.quality,
+    source: t.source,
+    capturedAt: t.capturedAt,
+    streamId: t.streamId,
+    dims: t.dims,
+    modelTag: t.modelTag,
+    sourceLogId: t.sourceLogId,
+  };
+}
+
+app.get(EMPLOYEE_TEMPLATE_ROUTES, (req, res) => {
+  const employee = employees.find((e) => e.id === req.params.id);
+  if (!employee) {
+    res.status(404).json({ success: false, error: `Không tìm thấy nhân viên ${req.params.id}` });
+    return;
+  }
+  const rows = db.getFaceTemplatesForEmployee(employee.id);
+  const modelTag = faceModelTag();
+  res.json({
+    success: true,
+    employeeId: employee.id,
+    employeeName: employee.name,
+    modelTag,
+    count: rows.length,
+    max: FACE_TEMPLATE_MAX,
+    usableCount: rows.filter((t) => t.modelTag === modelTag).length,
+    byStream: rows.reduce<Record<string, number>>((acc, t) => {
+      const key = t.streamId || "unknown";
+      acc[key] = (acc[key] || 0) + 1;
+      return acc;
+    }, {}),
+    templates: rows
+      .slice()
+      .sort((a, b) => String(b.capturedAt).localeCompare(String(a.capturedAt)))
+      .map(publicTemplate),
+  });
+});
+
+/**
+ * POST /api/employees/:id/templates
+ *   body { image | imageBase64 | photoUrl, streamId?, source?, minQuality? }
+ *
+ * Enrol ONE template for an existing employee from a supplied still (a data
+ * URL or bare base64 JPEG/PNG). This is the offline counterpart of
+ * `/templates/capture`: same quality gate, same per-employee cap, but the frame
+ * comes from the operator instead of from a live RTSP grab. `streamId` should
+ * name the camera the still came from, because templates are matched
+ * per-camera and the gallery is only as good as that label.
+ */
+app.post(EMPLOYEE_TEMPLATE_ROUTES, async (req, res) => {
+  const employee = employees.find((e) => e.id === req.params.id);
+  if (!employee) {
+    res.status(404).json({ success: false, error: `Không tìm thấy nhân viên ${req.params.id}` });
+    return;
+  }
+  const body = req.body || {};
+  const image = body.image || body.imageBase64 || body.photoUrl || body.photo || body.base64;
+  if (!isEnrollableImage(image)) {
+    res.status(400).json({
+      success: false,
+      error: "Cần ảnh khuôn mặt dạng data URL hoặc base64 (JPEG/PNG) trong trường 'image'.",
+    });
+    return;
+  }
+  const engine = activeFaceEngine();
+  if (engine !== "onnx") {
+    res.status(503).json({
+      success: false,
+      engine,
+      ready: isFaceEngineReady(),
+      error:
+        engine === "unavailable"
+          ? "Không nạp được mô hình nhận diện (FACE_ENGINE=onnx). Không thể tạo mẫu khuôn mặt."
+          : "Engine nhận diện thực chưa được bật (FACE_ENGINE=hash). Không thể tạo mẫu khuôn mặt.",
+      info: getFaceEngineInfo(),
+    });
+    return;
+  }
+
+  const wantedQuality = Number(body.minQuality);
+  const qualityGate =
+    Number.isFinite(wantedQuality) && wantedQuality >= 0 && wantedQuality <= 1
+      ? wantedQuality
+      : FACE_ENROLL_MIN_QUALITY;
+  const source: "enrollment" | "manual" = body.source === "manual" ? "manual" : "enrollment";
+  const outcome = await enrollTemplateFromImage(employee.id, image, {
+    source,
+    streamId: optionalTrimmedString(body.streamId),
+    minQuality: qualityGate,
+  });
+  const templates = db.getFaceTemplatesForEmployee(employee.id);
+  if (!outcome.saved) {
+    res.status(422).json({
+      success: false,
+      employeeId: employee.id,
+      rejected: outcome.rejected,
+      quality: outcome.quality,
+      detectedFaces: outcome.detectedFaces ?? 0,
+      minQuality: qualityGate,
+      templateCount: templates.length,
+      error:
+        outcome.rejected === "no-face"
+          ? "Không phát hiện khuôn mặt nào trong ảnh."
+          : outcome.rejected === "low-quality"
+          ? `Khuôn mặt có chất lượng ${outcome.quality} < ngưỡng ${qualityGate}.`
+          : "Không tạo được mẫu khuôn mặt từ ảnh này.",
+    });
+    return;
+  }
+  broadcastSSE("face_templates_updated", {
+    employeeId: employee.id,
+    added: 1,
+    total: templates.length,
+  });
+  res.json({
+    success: true,
+    employeeId: employee.id,
+    employeeName: employee.name,
+    modelTag: faceModelTag(),
+    minQuality: qualityGate,
+    saved: outcome.saved,
+    evictedTemplateIds: outcome.evicted || [],
+    detectedFaces: outcome.detectedFaces ?? 0,
+    templateCount: templates.length,
+    templateMax: FACE_TEMPLATE_MAX,
+  });
+});
+
+/**
+ * POST /api/employees/:id/templates/capture
+ *   body { gate, stream?, frames?, frameIntervalMs?, minQuality? }
+ *
+ * Grab `frames` (1..5) live frames from a gate stream `frameIntervalMs` apart,
+ * keep the single best-quality face of each, and store one template per
+ * accepted frame - tagged with that camera's `streamId`. Frames whose best face
+ * is below FACE_ENROLL_MIN_QUALITY (default 0.25) are reported as rejected with
+ * the reason, never silently enrolled: a blurred or tiny face poisons a gallery.
+ */
+app.post(EMPLOYEE_TEMPLATE_CAPTURE_ROUTES, async (req, res) => {
+  const employee = employees.find((e) => e.id === req.params.id);
+  if (!employee) {
+    res.status(404).json({ success: false, error: `Không tìm thấy nhân viên ${req.params.id}` });
+    return;
+  }
+  const engine = activeFaceEngine();
+  if (engine !== "onnx") {
+    res.status(503).json({
+      success: false,
+      engine,
+      ready: isFaceEngineReady(),
+      error:
+        engine === "unavailable"
+          ? "Không nạp được mô hình nhận diện (FACE_ENGINE=onnx). Không thể tạo mẫu khuôn mặt."
+          : "Engine nhận diện thực chưa được bật (FACE_ENGINE=hash). Không thể tạo mẫu khuôn mặt.",
+      info: getFaceEngineInfo(),
+    });
+    return;
+  }
+
+  const { gate, stream, frames, frameIntervalMs, minQuality } = req.body || {};
+  const resolved = resolveGateStream(gate, stream);
+  if (resolved.error) {
+    res.status(400).json({ success: false, error: resolved.error });
+    return;
+  }
+  const target = resolved.stream;
+  const streamUrl = String(target.rtspUrl || "").trim();
+  if (!isRtspUrl(streamUrl)) {
+    res.status(400).json({
+      success: false,
+      error: `Luồng "${target.id}" không phải RTSP nên không thể lấy khung hình để đăng ký mẫu.`,
+    });
+    return;
+  }
+
+  const wantedFrames = Number(frames);
+  const framesRequested = Number.isFinite(wantedFrames)
+    ? Math.min(FACE_SCAN_MAX_FRAMES, Math.max(1, Math.floor(wantedFrames)))
+    : 1;
+  const wantedInterval = Number(frameIntervalMs);
+  const intervalMs = Number.isFinite(wantedInterval)
+    ? Math.min(FACE_SCAN_MAX_FRAME_INTERVAL_MS, Math.max(0, Math.floor(wantedInterval)))
+    : FACE_SCAN_DEFAULT_FRAME_INTERVAL_MS;
+  const wantedQuality = Number(minQuality);
+  const qualityGate =
+    Number.isFinite(wantedQuality) && wantedQuality >= 0 && wantedQuality <= 1
+      ? wantedQuality
+      : FACE_ENROLL_MIN_QUALITY;
+
+  const transport = target.rtspTransport === "UDP" ? "udp" : "tcp";
+  const tStart = Date.now();
+  const grabs = await grabRtspFrames(streamUrl, transport, framesRequested, intervalMs);
+
+  const saved: Array<Record<string, unknown>> = [];
+  const rejected: Array<Record<string, unknown>> = [];
+  for (let i = 0; i < grabs.length; i++) {
+    const g = grabs[i];
+    if (!g.ok || !g.jpeg) {
+      rejected.push({ frameIndex: i, reason: "frame-grab-failed", detail: g.errorLog.slice(-160) });
+      continue;
+    }
+    const outcome = await enrollTemplateFromImage(employee.id, g.jpeg, {
+      source: "enrollment",
+      streamId: target.id,
+      minQuality: qualityGate,
+    });
+    if (outcome.saved) {
+      saved.push({ ...outcome.saved, frameIndex: i, evictedTemplateIds: outcome.evicted || [] });
+    } else {
+      rejected.push({
+        frameIndex: i,
+        reason: outcome.rejected,
+        quality: outcome.quality,
+        detectedFaces: outcome.detectedFaces ?? 0,
+        minQuality: qualityGate,
+      });
+    }
+  }
+
+  const framesCaptured = grabs.filter((g) => g.ok && g.jpeg).length;
+  if (framesCaptured === 0) {
+    res.status(502).json({
+      success: false,
+      error: "Không thể lấy khung hình từ luồng RTSP. Hãy kiểm tra địa chỉ IP, tài khoản/mật khẩu hoặc kết nối mạng LAN.",
+      gate: resolved.gateKey,
+      streamId: target.id,
+      streamLabel: target.label,
+      framesRequested,
+      framesCaptured,
+      saved,
+      rejected,
+    });
+    return;
+  }
+
+  const templates = db.getFaceTemplatesForEmployee(employee.id);
+  if (saved.length > 0) {
+    console.log(
+      `[FaceEngine] Đã đăng ký ${saved.length}/${framesRequested} mẫu khuôn mặt cho ${employee.name} (${employee.employeeCode}) từ luồng ${target.id}.`
+    );
+    broadcastSSE("face_templates_updated", {
+      employeeId: employee.id,
+      streamId: target.id,
+      added: saved.length,
+      total: templates.length,
+    });
+  }
+
+  res.json({
+    success: true,
+    employeeId: employee.id,
+    employeeName: employee.name,
+    gate: resolved.gateKey,
+    streamId: target.id,
+    streamLabel: target.label,
+    framesRequested,
+    framesCaptured,
+    frameIntervalMs: intervalMs,
+    minQuality: qualityGate,
+    modelTag: faceModelTag(),
+    saved,
+    rejected,
+    templateCount: templates.length,
+    templateMax: FACE_TEMPLATE_MAX,
+    captureDurationMs: Date.now() - tStart,
+  });
+});
+
+app.delete(EMPLOYEE_TEMPLATE_ITEM_ROUTES, (req, res) => {
+  const { id, templateId } = req.params;
+  const employee = employees.find((e) => e.id === id);
+  if (!employee) {
+    res.status(404).json({ success: false, error: `Không tìm thấy nhân viên ${id}` });
+    return;
+  }
+  const found = db.getFaceTemplatesForEmployee(employee.id).find((t) => t.id === templateId);
+  if (!found) {
+    res.status(404).json({
+      success: false,
+      error: `Không tìm thấy mẫu khuôn mặt ${templateId} của nhân viên ${employee.name}`,
+    });
+    return;
+  }
+  db.deleteFaceTemplate(found.id);
+  const remaining = db.getFaceTemplatesForEmployee(employee.id).length;
+  broadcastSSE("face_templates_updated", { employeeId: employee.id, removed: found.id, total: remaining });
+  res.json({
+    success: true,
+    message: `Đã xóa mẫu khuôn mặt ${found.id}`,
+    employeeId: employee.id,
+    removed: publicTemplate(found),
+    remaining,
   });
 });
 
@@ -2926,8 +3829,15 @@ app.delete(["/api/employees/:id", "/employees/:id"], (req, res) => {
   }
   const removed = employees.splice(index, 1)[0];
   db.deleteEmployee(removed.id);
-  broadcastSSE("employee_deleted", { id: removed.id });
-  res.json({ success: true, message: `Đã xóa nhân viên ${removed.name}` });
+  // The gallery follows the roster: leaving templates behind would let a
+  // deleted employee keep opening the door.
+  const removedTemplates = db.deleteFaceTemplatesForEmployee(removed.id);
+  broadcastSSE("employee_deleted", { id: removed.id, removedTemplates });
+  res.json({
+    success: true,
+    message: `Đã xóa nhân viên ${removed.name}`,
+    removedTemplates,
+  });
 });
 
 // Merge two employee records that turn out to be the same person: every
@@ -2977,6 +3887,12 @@ app.post(["/api/employees/merge", "/employees/merge"], (req, res) => {
   // Store-wide, so rows beyond the cached window are covered as well.
   db.reassignEmployeeReferences(source.id, target);
 
+  // The two records are the same person, so the source's enrolled faces are
+  // valid samples of the target. Move them, then trim back to the per-employee
+  // cap by dropping the weakest captures.
+  const reassignedTemplates = db.reassignFaceTemplates(source.id, target.id);
+  const evictedTemplates = enforceTemplateCap(target.id);
+
   employees.splice(sourceIdx, 1);
   db.deleteEmployee(source.id);
 
@@ -3006,6 +3922,8 @@ app.post(["/api/employees/merge", "/employees/merge"], (req, res) => {
     removed: { id: source.id, name: source.name, employeeCode: source.employeeCode },
     reattributedLogs,
     reattributedNotifications,
+    reassignedTemplates,
+    evictedTemplates,
     photoKept: keepPhoto === "source" ? "source" : "target",
   });
 });
@@ -3077,7 +3995,7 @@ app.get(["/api/strangers/clusters", "/api/strangers", "/api/strangers/"], (_req,
   }
 });
 
-app.post(["/api/strangers/quick-register", "/api/strangers/register"], (req, res) => {
+app.post(["/api/strangers/quick-register", "/api/strangers/register"], async (req, res) => {
   try {
     const {
       name,
@@ -3148,6 +4066,12 @@ app.post(["/api/strangers/quick-register", "/api/strangers/register"], (req, res
     // Retire the cluster so it stops being offered once it has an owner.
     if (clusterId) db.markStrangerClusterResolved(String(clusterId));
 
+    // Enrol from the supplied photo exactly as POST /api/employees does, so a
+    // quick-registered person is actually recognisable afterwards. Best-effort.
+    const enrolled = isEnrollableImage(photoUrl)
+      ? await enrollTemplateFromImage(newEmployee.id, photoUrl, { source: "enrollment" })
+      : { rejected: "unsupported-image" as const };
+
     broadcastSSE("employee_added", newEmployee);
     broadcastSSE("notification", notif);
     broadcastSSE("stranger_registered", {
@@ -3166,6 +4090,9 @@ app.post(["/api/strangers/quick-register", "/api/strangers/register"], (req, res
       updatedLogsCount,
       clusterId: clusterId || null,
       clusterResolved: Boolean(clusterId),
+      faceTemplate: enrolled.saved || null,
+      faceTemplateRejected: enrolled.rejected || null,
+      faceEngine: activeFaceEngine(),
     });
   } catch (err: any) {
     console.error("[Strangers] Lỗi khai báo nhanh nhân viên:", err);
@@ -3255,7 +4182,7 @@ app.get(["/api/strangers/search-employees", "/api/strangers/employees"], (req, r
 // Merge a stranger cluster into an EXISTING employee. Used when the recognition
 // engine failed to match a person who is in fact already enrolled: the operator
 // picks the right employee and the cluster's history is reattributed to them.
-app.post(["/api/strangers/merge", "/api/strangers/assign"], (req, res) => {
+app.post(["/api/strangers/merge", "/api/strangers/assign"], async (req, res) => {
   try {
     const {
       employeeId,
@@ -3339,6 +4266,27 @@ app.post(["/api/strangers/merge", "/api/strangers/assign"], (req, res) => {
     // Retire the cluster so it stops being offered once it has an owner.
     if (clusterId) db.markStrangerClusterResolved(String(clusterId));
 
+    // An operator confirming "this captured face IS this employee" is a
+    // labelled sample - the most valuable kind, because it comes from the gate
+    // camera under real lighting. Enrol it (source "merge", carrying the
+    // sighting's log id and stream) so the next pass recognises them without
+    // help. Best-effort: never fails the merge.
+    const sightingLog = clusterLogIds
+      .map((logId: string) => accessLogs.find((l) => l.id === logId))
+      .find((l: AccessLogRecord | undefined) => Boolean(l && l.photoSnapshot));
+    const sampleImage = newPhoto || sightingLog?.photoSnapshot || "";
+    const enrolled = isEnrollableImage(sampleImage)
+      ? await enrollTemplateFromImage(target.id, sampleImage, {
+          source: "merge",
+          sourceLogId: sightingLog?.id || (clusterLogIds.length === 1 ? String(clusterLogIds[0]) : undefined),
+        })
+      : { rejected: "unsupported-image" as const };
+    if (enrolled.saved) {
+      console.log(
+        `[FaceEngine] Đã tạo mẫu khuôn mặt (merge) cho ${target.name} từ ảnh người lạ ${enrolled.saved.sourceLogId || ""} (chất lượng ${enrolled.saved.quality}).`
+      );
+    }
+
     broadcastSSE("notification", notif);
     broadcastSSE("stranger_merged", {
       employee: target,
@@ -3364,6 +4312,9 @@ app.post(["/api/strangers/merge", "/api/strangers/assign"], (req, res) => {
       photoUpdated,
       clusterId: clusterId || null,
       clusterResolved: Boolean(clusterId),
+      faceTemplate: enrolled.saved || null,
+      faceTemplateRejected: enrolled.rejected || null,
+      faceEngine: activeFaceEngine(),
     });
   } catch (err: any) {
     console.error("[Strangers] Lỗi gộp cụm ảnh vào nhân viên:", err);
@@ -3459,6 +4410,9 @@ interface RecognizeFrameInput {
   /** Faces already produced upstream (simulation shortcuts). Engines are skipped when non-empty. */
   initialDetectedFaces?: DetectedFaceItem[];
   initialMessage?: string;
+  /** Which camera produced this frame; tags the real engine's observations. */
+  streamId?: string;
+  streamLabel?: string;
 }
 
 interface RecognizeFrameResult {
@@ -3468,6 +4422,10 @@ interface RecognizeFrameResult {
   engineUsed: string;
   engineMode: ServerAiConfig["engineMode"];
   multiThreadInfo: { workerId?: number; threadLatencyMs?: number };
+  /** Present whenever the real engine ran: the full fused decision, for audit. */
+  fusion?: FusionDecision;
+  /** Which engine actually decided this frame. */
+  faceEngine: ActiveFaceEngine;
 }
 
 /**
@@ -3489,6 +4447,8 @@ async function recognizeFrame({
   clientConfig,
   initialDetectedFaces = [],
   initialMessage = "",
+  streamId,
+  streamLabel,
 }: RecognizeFrameInput): Promise<RecognizeFrameResult> {
   let detectedFaces: DetectedFaceItem[] = [...initialDetectedFaces];
   let overallMessage = initialMessage;
@@ -3515,8 +4475,60 @@ async function recognizeFrame({
 
   let multiThreadInfo: { workerId?: number; threadLatencyMs?: number } = {};
 
+  // -----------------------------------------------------------------------
+  // STEP 0: REAL FACE ENGINE (SCRFD + ArcFace) - the only path that may grant
+  // when it is active. Detect + embed every face in the frame, match each one
+  // against the enrolled gallery (max-over-templates per employee) and fuse.
+  //
+  // When the real engine is active it OWNS the identity decision: the hash
+  // worker pool (STEP A) is not consulted at all, because a placeholder
+  // matcher must never be able to open a door the real engine did not open.
+  // Gemini (STEP B) still runs when the detector found nothing, so stranger
+  // capture keeps working - and it remains detection-only regardless.
+  //
+  // With FACE_ENGINE=onnx and the models missing the engine reports
+  // "unavailable" and STEP A is skipped too: the frame is DENIED (fail-closed)
+  // instead of silently handed to the hash matcher.
+  // -----------------------------------------------------------------------
+  const faceEngine = activeFaceEngine();
+  let fusion: FusionDecision | undefined;
+
+  if (faceEngine === "onnx" && detectedFaces.length === 0 && rawImage) {
+    const engineInfo = getFaceEngineInfo();
+    engineUsed = `Real Face Engine (SCRFD ${engineInfo.detectorModel} + ArcFace ${engineInfo.recognizerModel})`;
+    modelUsed = faceModelTag();
+    const tEngine = Date.now();
+    const observed = await observeFrame(
+      rawImage,
+      streamId || "frame",
+      streamLabel || streamId || "frame",
+      0
+    );
+    const thresholds = currentFusionThresholds(clientConfig);
+    fusion = recognizeObservations(capObservations(observed), currentGallery(), thresholds);
+    multiThreadInfo = { threadLatencyMs: Date.now() - tEngine };
+
+    if (observed.length > 0) {
+      detectedFaces = facesFromDecision(observed, fusion, employees);
+      const winner = fusion.recognized
+        ? employees.find((e) => e.id === fusion!.employeeId)
+        : undefined;
+      overallMessage =
+        fusion.recognized && winner
+          ? `Nhận diện ${winner.name} (${winner.employeeCode}) - cosine hợp nhất ${fusion.fusedCosine.toFixed(3)}, cơ sở ${fusion.basis}, ${fusion.agreeingObservations} quan sát/${fusion.agreeingStreams} luồng`
+          : `Phát hiện ${observed.length} khuôn mặt nhưng KHÔNG khớp nhân viên nào (${fusion.basis}, cosine tốt nhất ${fusion.bestCosine.toFixed(3)}). Cửa giữ trạng thái khóa.`;
+    }
+  } else if (faceEngine === "unavailable") {
+    const engineInfo = getFaceEngineInfo();
+    engineUsed = "Real Face Engine (FAIL-CLOSED: mô hình ONNX không khả dụng)";
+    modelUsed = faceModelTag();
+    console.error(
+      `[FaceEngine] FAIL-CLOSED: FACE_ENGINE=onnx nhưng mô hình chưa nạp được (${engineInfo.lastError || engineInfo.modelDir}). Từ chối khung hình.`
+    );
+  }
+
   // STEP A: If LOCAL_BIOMETRIC or HYBRID_AUTO mode, run local SOTA biometric engine (Multi-Threaded via Worker Pool)
-  if (detectedFaces.length === 0 && base64Data && employees.length > 0) {
+  if (faceEngine === "hash" && detectedFaces.length === 0 && base64Data && employees.length > 0) {
     if (activeEngineMode === "LOCAL_BIOMETRIC" || activeEngineMode === "HYBRID_AUTO") {
       if (cameraStreamsConfig.multiThreadEnabled) {
         try {
@@ -3797,7 +4809,16 @@ Yêu cầu phân tích:
     }
   }
 
-  return { detectedFaces, overallMessage, modelUsed, engineUsed, engineMode: activeEngineMode, multiThreadInfo };
+  return {
+    detectedFaces,
+    overallMessage,
+    modelUsed,
+    engineUsed,
+    engineMode: activeEngineMode,
+    multiThreadInfo,
+    fusion,
+    faceEngine,
+  };
 }
 
 const RECOGNIZE_FACE_ROUTES = [
@@ -4071,6 +5092,9 @@ app.post(RECOGNIZE_FACE_ROUTES, async (req, res) => {
     detectedFaces = recognition.detectedFaces;
     overallMessage = recognition.overallMessage;
     const { engineUsed, modelUsed, multiThreadInfo } = recognition;
+    // Full fused decision (real engine only): basis, cosines, per-observation
+    // evidence. Audit surface - never used to grant on its own.
+    const fusion = recognition.fusion || null;
 
     // Determine recognition status
     const authorizedFaces = detectedFaces.filter((f) => f.recognized && f.employeeId);
@@ -4202,6 +5226,8 @@ app.post(RECOGNIZE_FACE_ROUTES, async (req, res) => {
         logs: generatedLogs,
         engineUsed,
         modelUsed,
+        faceEngine: recognition.faceEngine,
+        fusion,
         multiThreadUsed: Boolean(multiThreadInfo.workerId),
         workerId: multiThreadInfo.workerId,
         threadLatencyMs: multiThreadInfo.threadLatencyMs,
@@ -4280,6 +5306,8 @@ app.post(RECOGNIZE_FACE_ROUTES, async (req, res) => {
         logs: [accessLog],
         engineUsed,
         modelUsed,
+        faceEngine: recognition.faceEngine,
+        fusion,
         multiThreadUsed: Boolean(multiThreadInfo.workerId),
         workerId: multiThreadInfo.workerId,
         threadLatencyMs: multiThreadInfo.threadLatencyMs,
