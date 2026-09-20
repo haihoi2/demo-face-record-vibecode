@@ -22,6 +22,7 @@ import {
   Unlock,
   AlertCircle,
   HelpCircle,
+  AlertTriangle,
 } from "lucide-react";
 import {
   AiRecognitionConfig,
@@ -42,6 +43,28 @@ interface AiConfigPageProps {
   employees: Employee[];
   onNavigateToScanner?: () => void;
 }
+
+/**
+ * Which "Local Model SOTA" controls the backend actually honours today.
+ * Audited against server.ts / src/server/faceWorkerPool.ts:
+ *  - modelArchitecture: only swaps a display string; no different computation runs.
+ *  - similarityThreshold: REAL - gates `bestSim >= similarityThreshold` and feeds confidence.
+ *  - livenessSensitivity: thresholds 92/85/75 are compared against a score hardcoded
+ *    to 94-100, so the check can never fail.
+ *  - autoContrast / antiSpoofing: stored in config and never read by any code path.
+ * Flip an entry to true only when the matching backend work actually lands.
+ */
+const LOCAL_MODEL_SUPPORT = {
+  modelArchitecture: false,
+  similarityThreshold: true,
+  livenessSensitivity: false,
+  autoContrast: false,
+  antiSpoofing: false,
+} as const;
+
+const NOT_IMPLEMENTED_BADGE = "Chưa triển khai";
+const NOT_IMPLEMENTED_HINT =
+  "Tùy chọn này chưa được triển khai ở backend - thay đổi sẽ được lưu nhưng không ảnh hưởng đến kết quả nhận diện.";
 
 export const AiConfigPage: React.FC<AiConfigPageProps> = ({
   employees,
@@ -723,10 +746,27 @@ export const AiConfigPage: React.FC<AiConfigPageProps> = ({
             </span>
           </div>
 
+          {/* Honest status of this section: most controls are not wired to any engine yet. */}
+          <div className="flex items-start gap-3 p-3 rounded-xl bg-amber-50 border border-amber-200">
+            <AlertTriangle className="w-4 h-4 text-amber-600 mt-0.5 shrink-0" />
+            <div className="text-[11px] text-amber-900 leading-relaxed">
+              <strong>Phần lớn tùy chọn dưới đây chưa được triển khai.</strong> Hệ thống hiện chưa có
+              bộ trích xuất đặc trưng khuôn mặt thật (ONNX/ArcFace), nên việc chọn kiến trúc mô hình,
+              độ nhạy chống giả mạo và các tùy chọn tiền xử lý <em>không làm thay đổi</em> kết quả nhận
+              diện. Chúng bị khóa để tránh hiểu nhầm. Chỉ{" "}
+              <strong>Ngưỡng Tương Đồng Cosine</strong> đang thực sự có hiệu lực.
+            </div>
+          </div>
+
           {/* Local Architecture Selection */}
           <div className="space-y-2">
-            <label className="text-xs font-semibold text-slate-700 uppercase tracking-wider">
+            <label className="text-xs font-semibold text-slate-700 uppercase tracking-wider flex items-center gap-2">
               Kiến Trúc Mô Hình Cục Bộ (Model Architecture)
+              {!LOCAL_MODEL_SUPPORT.modelArchitecture && (
+                <span className="normal-case tracking-normal text-[10px] font-semibold px-2 py-0.5 rounded-full bg-amber-100 text-amber-800">
+                  {NOT_IMPLEMENTED_BADGE}
+                </span>
+              )}
             </label>
             <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
               {[
@@ -751,26 +791,39 @@ export const AiConfigPage: React.FC<AiConfigPageProps> = ({
               ].map((arch) => (
                 <div
                   key={arch.id}
-                  onClick={() =>
+                  onClick={() => {
+                    if (!LOCAL_MODEL_SUPPORT.modelArchitecture) return;
                     setConfig({
                       ...config,
                       localModel: {
                         ...config.localModel,
                         modelArchitecture: arch.id as any,
                       },
-                    })
-                  }
-                  className={`p-4 rounded-xl border cursor-pointer transition-all ${
+                    });
+                  }}
+                  aria-disabled={!LOCAL_MODEL_SUPPORT.modelArchitecture}
+                  title={LOCAL_MODEL_SUPPORT.modelArchitecture ? undefined : NOT_IMPLEMENTED_HINT}
+                  className={`p-4 rounded-xl border transition-all ${
+                    LOCAL_MODEL_SUPPORT.modelArchitecture
+                      ? "cursor-pointer"
+                      : "cursor-not-allowed opacity-60 bg-slate-50"
+                  } ${
                     config.localModel.modelArchitecture === arch.id
                       ? "border-emerald-600 bg-emerald-50/50 shadow-xs"
-                      : "border-slate-200 hover:border-slate-300"
+                      : "border-slate-200"
                   }`}
                 >
                   <div className="flex items-center justify-between">
                     <span className="font-bold text-xs text-slate-900">{arch.title}</span>
                   </div>
-                  <span className="inline-block mt-1 text-[10px] font-semibold px-2 py-0.5 rounded-full bg-emerald-100 text-emerald-800">
-                    {arch.badge}
+                  <span
+                    className={`inline-block mt-1 text-[10px] font-semibold px-2 py-0.5 rounded-full ${
+                      LOCAL_MODEL_SUPPORT.modelArchitecture
+                        ? "bg-emerald-100 text-emerald-800"
+                        : "bg-slate-200 text-slate-600"
+                    }`}
+                  >
+                    {LOCAL_MODEL_SUPPORT.modelArchitecture ? arch.badge : NOT_IMPLEMENTED_BADGE}
                   </span>
                   <p className="text-xs text-slate-500 mt-2">{arch.desc}</p>
                 </div>
@@ -783,8 +836,13 @@ export const AiConfigPage: React.FC<AiConfigPageProps> = ({
             {/* Cosine Similarity Threshold */}
             <div className="space-y-2">
               <div className="flex items-center justify-between text-xs">
-                <span className="font-semibold text-slate-700">
+                <span className="font-semibold text-slate-700 flex items-center gap-2">
                   Ngưỡng Tương Đồng Cosine (Similarity Threshold):
+                  {LOCAL_MODEL_SUPPORT.similarityThreshold && (
+                    <span className="text-[10px] font-semibold px-2 py-0.5 rounded-full bg-emerald-100 text-emerald-800">
+                      Đang hoạt động
+                    </span>
+                  )}
                 </span>
                 <span className="font-mono font-bold text-emerald-600">
                   {config.localModel.similarityThreshold.toFixed(2)}
@@ -816,24 +874,31 @@ export const AiConfigPage: React.FC<AiConfigPageProps> = ({
 
             {/* Liveness Sensitivity */}
             <div className="space-y-2">
-              <label className="text-xs font-semibold text-slate-700">
+              <label className="text-xs font-semibold text-slate-700 flex items-center gap-2">
                 Độ Nhạy Chống Giả Mạo (Anti-Spoofing Liveness):
+                {!LOCAL_MODEL_SUPPORT.livenessSensitivity && (
+                  <span className="text-[10px] font-semibold px-2 py-0.5 rounded-full bg-amber-100 text-amber-800">
+                    {NOT_IMPLEMENTED_BADGE}
+                  </span>
+                )}
               </label>
               <div className="grid grid-cols-3 gap-2">
                 {(["LOW", "MEDIUM", "HIGH"] as const).map((lvl) => (
                   <button
                     key={lvl}
                     type="button"
+                    disabled={!LOCAL_MODEL_SUPPORT.livenessSensitivity}
+                    title={LOCAL_MODEL_SUPPORT.livenessSensitivity ? undefined : NOT_IMPLEMENTED_HINT}
                     onClick={() =>
                       setConfig({
                         ...config,
                         localModel: { ...config.localModel, livenessSensitivity: lvl },
                       })
                     }
-                    className={`py-2 text-xs font-semibold rounded-lg border transition-all ${
+                    className={`py-2 text-xs font-semibold rounded-lg border transition-all disabled:cursor-not-allowed disabled:opacity-60 ${
                       config.localModel.livenessSensitivity === lvl
                         ? "bg-emerald-600 text-white border-emerald-600"
-                        : "bg-white text-slate-700 border-slate-200 hover:bg-slate-50"
+                        : "bg-white text-slate-700 border-slate-200 enabled:hover:bg-slate-50"
                     }`}
                   >
                     {lvl === "LOW" ? "Cơ Bản" : lvl === "MEDIUM" ? "Tiêu Chuẩn" : "Nghiêm Ngặt"}
@@ -843,14 +908,28 @@ export const AiConfigPage: React.FC<AiConfigPageProps> = ({
               <p className="text-[11px] text-slate-500">
                 Phát hiện ảnh in giấy, màn hình điện thoại hoặc video phát lại.
               </p>
+              {!LOCAL_MODEL_SUPPORT.livenessSensitivity && (
+                <p className="text-[11px] text-amber-700">
+                  Chưa triển khai: điểm "sống thật" hiện luôn nằm trong khoảng 94-100 nên không mức
+                  nào có thể từ chối được khung hình.
+                </p>
+              )}
             </div>
           </div>
 
           {/* Feature toggles */}
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 pt-2">
-            <label className="flex items-center gap-3 p-3 bg-slate-50 rounded-xl border border-slate-200 cursor-pointer">
+            <label
+              title={LOCAL_MODEL_SUPPORT.autoContrast ? undefined : NOT_IMPLEMENTED_HINT}
+              className={`flex items-center gap-3 p-3 rounded-xl border ${
+                LOCAL_MODEL_SUPPORT.autoContrast
+                  ? "bg-slate-50 border-slate-200 cursor-pointer"
+                  : "bg-slate-100 border-slate-200 opacity-60 cursor-not-allowed"
+              }`}
+            >
               <input
                 type="checkbox"
+                disabled={!LOCAL_MODEL_SUPPORT.autoContrast}
                 checked={config.localModel.autoContrast}
                 onChange={(e) =>
                   setConfig({
@@ -865,12 +944,25 @@ export const AiConfigPage: React.FC<AiConfigPageProps> = ({
               />
               <span className="text-xs text-slate-700 font-medium">
                 Cân bằng tương phản ảnh tự động (Histogram Equalization)
+                {!LOCAL_MODEL_SUPPORT.autoContrast && (
+                  <span className="ml-2 text-[10px] font-semibold px-2 py-0.5 rounded-full bg-amber-100 text-amber-800">
+                    {NOT_IMPLEMENTED_BADGE}
+                  </span>
+                )}
               </span>
             </label>
 
-            <label className="flex items-center gap-3 p-3 bg-slate-50 rounded-xl border border-slate-200 cursor-pointer">
+            <label
+              title={LOCAL_MODEL_SUPPORT.antiSpoofing ? undefined : NOT_IMPLEMENTED_HINT}
+              className={`flex items-center gap-3 p-3 rounded-xl border ${
+                LOCAL_MODEL_SUPPORT.antiSpoofing
+                  ? "bg-slate-50 border-slate-200 cursor-pointer"
+                  : "bg-slate-100 border-slate-200 opacity-60 cursor-not-allowed"
+              }`}
+            >
               <input
                 type="checkbox"
+                disabled={!LOCAL_MODEL_SUPPORT.antiSpoofing}
                 checked={config.localModel.antiSpoofing}
                 onChange={(e) =>
                   setConfig({
@@ -885,6 +977,11 @@ export const AiConfigPage: React.FC<AiConfigPageProps> = ({
               />
               <span className="text-xs text-slate-700 font-medium">
                 Kích hoạt kiểm tra sống thật đa lớp (Multi-stage Anti-Spoofing)
+                {!LOCAL_MODEL_SUPPORT.antiSpoofing && (
+                  <span className="ml-2 text-[10px] font-semibold px-2 py-0.5 rounded-full bg-amber-100 text-amber-800">
+                    {NOT_IMPLEMENTED_BADGE}
+                  </span>
+                )}
               </span>
             </label>
           </div>
