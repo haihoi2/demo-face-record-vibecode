@@ -2064,6 +2064,86 @@ app.delete(["/api/employees/:id", "/employees/:id"], (req, res) => {
   res.json({ success: true, message: `Đã xóa nhân viên ${removed.name}` });
 });
 
+// Merge two employee records that turn out to be the same person: every
+// access log and notification of `sourceId` is reattributed to `targetId`,
+// then the source record is removed. `keepPhoto` = "target" (default) | "source".
+app.post(["/api/employees/merge", "/employees/merge"], (req, res) => {
+  const { sourceId, targetId, keepPhoto = "target" } = req.body || {};
+  if (!sourceId || !targetId) {
+    res.status(400).json({ success: false, error: "Cần cả sourceId (hồ sơ bị gộp) và targetId (hồ sơ giữ lại)" });
+    return;
+  }
+  if (sourceId === targetId) {
+    res.status(400).json({ success: false, error: "sourceId và targetId phải khác nhau" });
+    return;
+  }
+  const sourceIdx = employees.findIndex((e) => e.id === sourceId);
+  const target = employees.find((e) => e.id === targetId);
+  if (sourceIdx === -1 || !target) {
+    res.status(404).json({ success: false, error: `Không tìm thấy nhân viên (${sourceIdx === -1 ? sourceId : targetId})` });
+    return;
+  }
+  const source = employees[sourceIdx];
+
+  if (keepPhoto === "source" && source.photoUrl) {
+    target.photoUrl = source.photoUrl;
+    db.saveEmployee(target);
+  }
+
+  let reattributedLogs = 0;
+  for (const log of accessLogs) {
+    if (log.employeeId === source.id) {
+      log.employeeId = target.id;
+      log.employeeName = target.name;
+      log.employeeCode = target.employeeCode;
+      log.department = target.department;
+      reattributedLogs++;
+    }
+  }
+  let reattributedNotifications = 0;
+  for (const n of mobileNotifications) {
+    if (n.employeeId === source.id) {
+      n.employeeId = target.id;
+      n.employeeName = target.name;
+      reattributedNotifications++;
+    }
+  }
+  // Store-wide, so rows beyond the cached window are covered as well.
+  db.reassignEmployeeReferences(source.id, target);
+
+  employees.splice(sourceIdx, 1);
+  db.deleteEmployee(source.id);
+
+  const notif: MobileNotificationRecord = {
+    id: "NOTIF-" + Date.now(),
+    title: "Đã gộp hồ sơ nhân viên",
+    body: `Hồ sơ ${source.name} (${source.employeeCode}) đã được gộp vào ${target.name} (${target.employeeCode}); ${reattributedLogs} nhật ký được gán lại.`,
+    timestamp: new Date().toISOString(),
+    type: "SUCCESS",
+    read: false,
+    employeeId: target.id,
+    employeeName: target.name,
+  };
+  mobileNotifications.unshift(notif);
+  db.saveNotification(notif);
+
+  broadcastSSE("employee_deleted", { id: source.id });
+  broadcastSSE("employee_updated", target);
+  broadcastSSE("employee_merged", { sourceId: source.id, targetId: target.id, reattributedLogs, reattributedNotifications });
+  broadcastSSE("notification", notif);
+
+  console.log(`[Employees] Đã gộp ${source.name} (${source.employeeCode}) -> ${target.name} (${target.employeeCode}): ${reattributedLogs} logs, ${reattributedNotifications} thông báo.`);
+  res.json({
+    success: true,
+    message: `Đã gộp ${source.name} vào ${target.name}`,
+    target,
+    removed: { id: source.id, name: source.name, employeeCode: source.employeeCode },
+    reattributedLogs,
+    reattributedNotifications,
+    photoKept: keepPhoto === "source" ? "source" : "target",
+  });
+});
+
 // --- Access Logs Endpoints ---
 const LOG_ROUTES = [
   "/api/logs",

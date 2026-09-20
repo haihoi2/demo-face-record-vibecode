@@ -955,6 +955,51 @@ class SQLiteStorage {
     this.saveFallback();
   }
 
+  /**
+   * Point every access log and notification that references `sourceId` at
+   * `target`. Runs against the stores directly so rows outside the in-memory
+   * window are covered too; the caller updates the cached arrays itself.
+   */
+  reassignEmployeeReferences(
+    sourceId: string,
+    target: { id: string; name: string; employeeCode: string; department: string }
+  ) {
+    if (this.pgPool && this.isPostgres) {
+      this.pgPool
+        .query(
+          `UPDATE access_logs SET "employeeId"=$1, "employeeName"=$2, "employeeCode"=$3, department=$4 WHERE "employeeId"=$5`,
+          [target.id, target.name, target.employeeCode, target.department, sourceId]
+        )
+        .catch((e) => console.error("[PostgreSQL] Lỗi reassign access_logs:", e.message));
+      this.pgPool
+        .query(`UPDATE mobile_notifications SET "employeeId"=$1, "employeeName"=$2 WHERE "employeeId"=$3`, [
+          target.id, target.name, sourceId,
+        ])
+        .catch((e) => console.error("[PostgreSQL] Lỗi reassign mobile_notifications:", e.message));
+    }
+    if (this.isNativeSqlite && this.db) {
+      try {
+        this.db
+          .prepare("UPDATE access_logs SET employeeId=?, employeeName=?, employeeCode=?, department=? WHERE employeeId=?")
+          .run(target.id, target.name, target.employeeCode, target.department, sourceId);
+        this.db
+          .prepare("UPDATE mobile_notifications SET employeeId=?, employeeName=? WHERE employeeId=?")
+          .run(target.id, target.name, sourceId);
+      } catch (err) {
+        console.error("[SQLite] Lỗi reassignEmployeeReferences:", err);
+      }
+    }
+    for (const l of this.fallbackData.access_logs) {
+      if (l.employeeId === sourceId) {
+        l.employeeId = target.id; l.employeeName = target.name; l.employeeCode = target.employeeCode; l.department = target.department;
+      }
+    }
+    for (const n of this.fallbackData.mobile_notifications) {
+      if (n.employeeId === sourceId) { n.employeeId = target.id; n.employeeName = target.name; }
+    }
+    this.saveFallback();
+  }
+
   // ================= ACCESS LOGS =================
   getAccessLogs(defaults: AccessLogRecord[]): AccessLogRecord[] {
     if (this.isNativeSqlite && this.db) {
