@@ -24,8 +24,17 @@ import {
   Terminal,
   Trash2,
   RotateCcw,
+  UserX,
+  Link2,
+  Timer,
 } from "lucide-react";
-import { WebhookConfig, WebhookLog, Employee, MobileNotification } from "../types";
+import {
+  WebhookConfig,
+  WebhookLog,
+  Employee,
+  MobileNotification,
+  STRANGER_DEEP_LINK_HASH,
+} from "../types";
 import { safeJsonFetch } from "../utils/api";
 import { soundEffects } from "../utils/audio";
 import {
@@ -42,6 +51,57 @@ export { dispatchDirectWebhook };
 export const CANONICAL_ETON_WEBHOOK_URL =
   "https://chat-room.eton.vn/hooks/6aa4dfb6928518a18ba27a13/mguNArZoWHY7AegnWFw7d7TwyfnoT4JZWpmwvxtLmfi7iGuY";
 
+// ---- Stranger ("người lạ") alert defaults, per the WebhookConfig contract ----
+export const STRANGER_ALERT_DEFAULTS = {
+  strangerAlertEnabled: true,
+  strangerTitle: "[[CẢNH BÁO NGƯỜI LẠ]]",
+  strangerLinkLabel: "Xem cụm ảnh người lạ",
+  appBaseUrl: "",
+  strangerCooldownSeconds: 60,
+};
+
+/** Sample id used only for the click-through link preview. */
+const SAMPLE_STRANGER_LOG_ID = "LOG-123456";
+
+/** Fills in the stranger-alert defaults for configs saved before these fields existed. */
+function withStrangerDefaults(raw: WebhookConfig): WebhookConfig {
+  const cooldown = Number(raw?.strangerCooldownSeconds);
+  return {
+    ...raw,
+    strangerAlertEnabled:
+      typeof raw?.strangerAlertEnabled === "boolean"
+        ? raw.strangerAlertEnabled
+        : STRANGER_ALERT_DEFAULTS.strangerAlertEnabled,
+    strangerTitle: raw?.strangerTitle || STRANGER_ALERT_DEFAULTS.strangerTitle,
+    strangerLinkLabel: raw?.strangerLinkLabel || STRANGER_ALERT_DEFAULTS.strangerLinkLabel,
+    appBaseUrl: typeof raw?.appBaseUrl === "string" ? raw.appBaseUrl : "",
+    strangerCooldownSeconds: Number.isFinite(cooldown)
+      ? Math.max(0, Math.round(cooldown))
+      : STRANGER_ALERT_DEFAULTS.strangerCooldownSeconds,
+  };
+}
+
+/**
+ * Reads the documented `GET /api/webhook/config` shape (a WebhookConfig object;
+ * a `{ config: ... }` envelope is also accepted). Returns null for anything else
+ * so we never feed an error page into the form.
+ */
+function extractWebhookConfig(data: any): WebhookConfig | null {
+  if (!data || typeof data !== "object") return null;
+  const raw =
+    data.config && typeof data.config === "object" ? data.config : data;
+  if (typeof raw.url !== "string" && typeof raw.enabled !== "boolean") return null;
+  return raw as WebhookConfig;
+}
+
+/** `<appBaseUrl or current origin>/#strangers/<logId>` — what the chat message will contain. */
+export function buildStrangerDeepLink(appBaseUrl?: string, logId?: string): string {
+  const base =
+    (appBaseUrl || "").trim().replace(/\/+$/, "") ||
+    (typeof window !== "undefined" ? window.location.origin : "");
+  return `${base}/#${STRANGER_DEEP_LINK_HASH}/${logId || SAMPLE_STRANGER_LOG_ID}`;
+}
+
 interface WebhookIntegrationProps {
   employees: Employee[];
   onNewNotification?: (notif: MobileNotification) => void;
@@ -51,13 +111,15 @@ export const WebhookIntegration: React.FC<WebhookIntegrationProps> = ({
   employees,
   onNewNotification,
 }) => {
-  const [config, setConfig] = useState<WebhookConfig>({
-    enabled: false,
-    url: "https://chat-room.eton.vn/hooks/YOUR_WEBHOOK_TOKEN",
-    gateInTitle: "[[CỔNG VÀO]]",
-    gateOutTitle: "[[CỔNG RA]]",
-    includeEmployeeCode: true,
-  });
+  const [config, setConfig] = useState<WebhookConfig>(
+    withStrangerDefaults({
+      enabled: false,
+      url: "https://chat-room.eton.vn/hooks/YOUR_WEBHOOK_TOKEN",
+      gateInTitle: "[[CỔNG VÀO]]",
+      gateOutTitle: "[[CỔNG RA]]",
+      includeEmployeeCode: true,
+    })
+  );
 
   const [logs, setLogs] = useState<WebhookLog[]>([]);
   const [loading, setLoading] = useState<boolean>(false);
@@ -75,6 +137,11 @@ export const WebhookIntegration: React.FC<WebhookIntegrationProps> = ({
   const [copiedPayload, setCopiedPayload] = useState<boolean>(false);
   const [clientTestResult, setClientTestResult] = useState<{
     status: string;
+    msg: string;
+  } | null>(null);
+  const [strangerTesting, setStrangerTesting] = useState<boolean>(false);
+  const [strangerTestResult, setStrangerTestResult] = useState<{
+    status: "SUCCESS" | "WARNING" | "ERROR";
     msg: string;
   } | null>(null);
 
@@ -140,12 +207,14 @@ export const WebhookIntegration: React.FC<WebhookIntegrationProps> = ({
         setIpInfo(resIp.data);
       }
 
-      if (resConf.ok && resConf.data) {
-        setConfig(resConf.data);
-        saveStoredWebhookConfig(resConf.data);
+      const loadedConf = resConf.ok ? extractWebhookConfig(resConf.data) : null;
+      if (loadedConf) {
+        const merged = withStrangerDefaults(loadedConf);
+        setConfig(merged);
+        saveStoredWebhookConfig(merged);
       } else {
         const storedConf = getStoredWebhookConfig();
-        if (storedConf) setConfig(storedConf);
+        if (storedConf) setConfig(withStrangerDefaults(storedConf));
       }
 
       if (resLogs.ok && Array.isArray(resLogs.data) && resLogs.data.length > 0) {
@@ -160,7 +229,7 @@ export const WebhookIntegration: React.FC<WebhookIntegrationProps> = ({
     } catch (err) {
       console.error("Lỗi tải cấu hình webhook:", err);
       const storedConf = getStoredWebhookConfig();
-      if (storedConf) setConfig(storedConf);
+      if (storedConf) setConfig(withStrangerDefaults(storedConf));
       const storedLogs = getStoredWebhookLogs();
       if (storedLogs && storedLogs.length > 0) setLogs(storedLogs);
     } finally {
@@ -239,11 +308,13 @@ export const WebhookIntegration: React.FC<WebhookIntegrationProps> = ({
 
   // Handle saving config
   const handleSaveConfig = async () => {
-    let cleanConfig = { ...config };
+    // Stranger-alert fields travel inside the SAME config object as the gate titles.
+    let cleanConfig: WebhookConfig = withStrangerDefaults({ ...config });
+    cleanConfig.appBaseUrl = (cleanConfig.appBaseUrl || "").trim().replace(/\/+$/, "");
     if (!cleanConfig.url || cleanConfig.url.includes("...") || cleanConfig.url.endsWith("/hooks/") || cleanConfig.url.endsWith("/hooks")) {
       cleanConfig.url = CANONICAL_ETON_WEBHOOK_URL;
-      setConfig(cleanConfig);
     }
+    setConfig(cleanConfig);
 
     saveStoredWebhookConfig(cleanConfig);
     setSaveSuccess(true);
@@ -431,6 +502,83 @@ export const WebhookIntegration: React.FC<WebhookIntegrationProps> = ({
       setClientTesting(false);
     }
   };
+
+  // Test the stranger ("người lạ") alert. The backend builds the sample payload,
+  // so no request body is required here.
+  const handleTestStranger = async () => {
+    setStrangerTesting(true);
+    setStrangerTestResult(null);
+
+    const res = await safeJsonFetch<{
+      success?: boolean;
+      log?: WebhookLog;
+      notification?: MobileNotification;
+      link?: string;
+      error?: string;
+    }>("/api/webhook/test-stranger", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: "{}",
+    });
+
+    // The endpoint may not exist yet (older backend) — or a static host may serve
+    // index.html for /api/*, which safeJsonFetch reports as an HTML error page.
+    const notSupported =
+      res.status === 404 ||
+      res.status === 405 ||
+      res.status === 501 ||
+      /HTML/i.test(res.error || "");
+
+    if (notSupported) {
+      setStrangerTestResult({
+        status: "WARNING",
+        msg: "Máy chủ chưa hỗ trợ (cần cập nhật): thiếu endpoint POST /api/webhook/test-stranger.",
+      });
+      setStrangerTesting(false);
+      return;
+    }
+
+    // The endpoint answers HTTP 200 with `success: false` when the alert was
+    // skipped (webhook off / cooldown) or the chat server rejected it.
+    const sentLog = res.data?.log || null;
+    if (sentLog) {
+      setLogs((prev) => [sentLog, ...prev.filter((l) => l.id !== sentLog.id)]);
+      saveStoredWebhookLogs([sentLog, ...getStoredWebhookLogs()]);
+    }
+
+    if (!res.ok || res.data?.success === false) {
+      const detail =
+        res.data?.error ||
+        sentLog?.error ||
+        (sentLog?.statusCode
+          ? `Máy chủ chat phản hồi HTTP ${sentLog.statusCode} ${sentLog.statusText || ""}`.trim()
+          : res.error) ||
+        "Không rõ nguyên nhân";
+      setStrangerTestResult({
+        status: "ERROR",
+        msg: `Gửi cảnh báo người lạ thất bại${!res.ok && res.status ? ` (HTTP ${res.status})` : ""}: ${detail}`,
+      });
+      setStrangerTesting(false);
+      return;
+    }
+
+    if (res.data?.notification && onNewNotification) {
+      onNewNotification(res.data.notification);
+    }
+    soundEffects.playSuccess();
+
+    setStrangerTestResult({
+      status: "SUCCESS",
+      msg: `Đã gửi thử cảnh báo người lạ thành công. Liên kết đính kèm: ${
+        res.data?.link || strangerLinkPreview
+      }`,
+    });
+    setStrangerTesting(false);
+  };
+
+  // Live preview of the click-through link that the chat message will contain
+  const strangerLinkPreview = buildStrangerDeepLink(config.appBaseUrl);
+  const strangerBaseIsFallback = !(config.appBaseUrl || "").trim();
 
   // Generate real-time live preview payload
   const currentPreviewPayload = {
@@ -879,6 +1027,181 @@ export const WebhookIntegration: React.FC<WebhookIntegrationProps> = ({
                 >
                   Kèm mã số nhân viên vào USER (ví dụ: <code className="font-mono text-indigo-700">Nguyễn Hoàng Minh (NV-1082)</code>)
                 </label>
+              </div>
+
+              {/* ---------------- Stranger ("người lạ") alert section ---------------- */}
+              <div className="mt-5 pt-4 border-t-2 border-dashed border-slate-200 space-y-4">
+                <div className="flex items-center gap-2">
+                  <span className="p-1.5 rounded-lg bg-amber-100 text-amber-700 border border-amber-200">
+                    <UserX className="w-3.5 h-3.5" />
+                  </span>
+                  <div>
+                    <h4 className="text-sm font-bold text-slate-900">Cảnh báo người lạ</h4>
+                    <p className="text-[11px] text-slate-500">
+                      Gửi cảnh báo kèm liên kết mở thẳng bảng cụm ảnh người lạ
+                    </p>
+                  </div>
+                </div>
+
+                {/* Enable toggle */}
+                <div className="flex items-center justify-between p-3 bg-amber-50/70 rounded-xl border border-amber-200">
+                  <div>
+                    <p className="font-bold text-slate-800">Bật cảnh báo người lạ</p>
+                    <p className="text-[11px] text-slate-600">
+                      Gửi webhook mỗi khi camera ghi nhận khuôn mặt chưa đăng ký
+                    </p>
+                  </div>
+                  <input
+                    type="checkbox"
+                    id="chk-stranger-alert-enabled"
+                    checked={config.strangerAlertEnabled !== false}
+                    onChange={(e) =>
+                      setConfig((prev) => ({ ...prev, strangerAlertEnabled: e.target.checked }))
+                    }
+                    className="w-5 h-5 text-amber-600 rounded cursor-pointer"
+                  />
+                </div>
+
+                {/* Stranger alert title */}
+                <div>
+                  <label htmlFor="input-stranger-title" className="block font-semibold text-slate-700 mb-1">
+                    Tiêu đề cảnh báo người lạ:
+                  </label>
+                  <input
+                    type="text"
+                    id="input-stranger-title"
+                    value={config.strangerTitle ?? ""}
+                    onChange={(e) =>
+                      setConfig((prev) => ({ ...prev, strangerTitle: e.target.value }))
+                    }
+                    placeholder={STRANGER_ALERT_DEFAULTS.strangerTitle}
+                    className="w-full px-3 py-2 rounded-xl border border-slate-200 font-mono text-xs bg-slate-50 text-slate-800 focus:bg-white focus:border-amber-500 focus:outline-hidden"
+                  />
+                </div>
+
+                {/* Link label */}
+                <div>
+                  <label htmlFor="input-stranger-link-label" className="block font-semibold text-slate-700 mb-1">
+                    Nhãn liên kết trong tin nhắn:
+                  </label>
+                  <input
+                    type="text"
+                    id="input-stranger-link-label"
+                    value={config.strangerLinkLabel ?? ""}
+                    onChange={(e) =>
+                      setConfig((prev) => ({ ...prev, strangerLinkLabel: e.target.value }))
+                    }
+                    placeholder={STRANGER_ALERT_DEFAULTS.strangerLinkLabel}
+                    className="w-full px-3 py-2 rounded-xl border border-slate-200 text-xs bg-slate-50 text-slate-800 focus:bg-white focus:border-amber-500 focus:outline-hidden"
+                  />
+                </div>
+
+                {/* App base URL */}
+                <div>
+                  <label htmlFor="input-stranger-app-base-url" className="block font-semibold text-slate-700 mb-1">
+                    Địa chỉ công khai của ứng dụng (App Base URL):
+                  </label>
+                  <input
+                    type="text"
+                    id="input-stranger-app-base-url"
+                    value={config.appBaseUrl ?? ""}
+                    onChange={(e) =>
+                      setConfig((prev) => ({ ...prev, appBaseUrl: e.target.value }))
+                    }
+                    placeholder="https://stg-gate-watch.vota.vn"
+                    className="w-full px-3 py-2 rounded-xl border border-slate-200 font-mono text-[11px] bg-slate-50 text-slate-800 focus:bg-white focus:border-amber-500 focus:outline-hidden"
+                  />
+                  <p className="mt-1 text-[11px] text-slate-500 leading-relaxed">
+                    Dùng để tạo liên kết bấm vào trong tin nhắn chat. Để trống thì máy chủ tự dùng
+                    biến môi trường <code className="font-mono text-indigo-700">APP_URL</code>, sau
+                    đó mới đến origin hiện tại của yêu cầu.
+                  </p>
+                </div>
+
+                {/* Cooldown */}
+                <div>
+                  <label htmlFor="input-stranger-cooldown" className="block font-semibold text-slate-700 mb-1 flex items-center gap-1">
+                    <Timer className="w-3.5 h-3.5 text-amber-600" />
+                    Giãn cách giữa 2 cảnh báo (giây):
+                  </label>
+                  <input
+                    type="number"
+                    min={0}
+                    step={1}
+                    id="input-stranger-cooldown"
+                    value={config.strangerCooldownSeconds ?? STRANGER_ALERT_DEFAULTS.strangerCooldownSeconds}
+                    onChange={(e) => {
+                      const parsed = Number(e.target.value);
+                      setConfig((prev) => ({
+                        ...prev,
+                        strangerCooldownSeconds: Number.isFinite(parsed)
+                          ? Math.max(0, Math.round(parsed))
+                          : 0,
+                      }));
+                    }}
+                    className="w-full px-3 py-2 rounded-xl border border-slate-200 font-mono text-xs bg-slate-50 text-slate-800 focus:bg-white focus:border-amber-500 focus:outline-hidden"
+                  />
+                  <p className="mt-1 text-[11px] text-slate-500">0 = gửi mọi lần</p>
+                </div>
+
+                {/* Live link preview */}
+                <div className="p-3 rounded-xl bg-slate-900 border border-slate-700 text-[11px] space-y-1.5">
+                  <div className="flex items-center gap-1.5 text-slate-300 font-semibold">
+                    <Link2 className="w-3.5 h-3.5 text-cyan-400" />
+                    Liên kết sẽ gửi kèm cảnh báo:
+                  </div>
+                  <code
+                    id="preview-stranger-deep-link"
+                    className="block font-mono text-emerald-300 break-all"
+                  >
+                    {strangerLinkPreview}
+                  </code>
+                  <p className="text-slate-400">
+                    Hiển thị trong chat dưới dạng:{" "}
+                    <span className="text-slate-200 font-semibold">
+                      {config.strangerLinkLabel || STRANGER_ALERT_DEFAULTS.strangerLinkLabel}
+                    </span>
+                    {strangerBaseIsFallback && (
+                      <span className="block mt-1 text-amber-300">
+                        Đang dùng origin hiện tại của trình duyệt vì chưa nhập App Base URL.
+                      </span>
+                    )}
+                  </p>
+                </div>
+
+                {/* Test stranger alert */}
+                <button
+                  type="button"
+                  id="btn-test-stranger-webhook"
+                  onClick={handleTestStranger}
+                  disabled={strangerTesting}
+                  className="w-full py-2.5 rounded-xl bg-amber-600 hover:bg-amber-700 disabled:opacity-50 text-white text-xs font-bold shadow-xs transition flex items-center justify-center gap-2 cursor-pointer"
+                >
+                  <ShieldAlert className={`w-4 h-4 ${strangerTesting ? "animate-spin" : ""}`} />
+                  {strangerTesting ? "Đang gửi..." : "Gửi thử cảnh báo người lạ"}
+                </button>
+
+                {strangerTestResult && (
+                  <div
+                    id="stranger-test-result"
+                    className={`p-3 rounded-xl border text-xs flex items-start gap-2 break-words ${
+                      strangerTestResult.status === "SUCCESS"
+                        ? "bg-emerald-50 border-emerald-200 text-emerald-900"
+                        : strangerTestResult.status === "WARNING"
+                        ? "bg-amber-50 border-amber-200 text-amber-900"
+                        : "bg-rose-50 border-rose-200 text-rose-900"
+                    }`}
+                  >
+                    {strangerTestResult.status === "SUCCESS" ? (
+                      <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0 mt-0.5" />
+                    ) : strangerTestResult.status === "WARNING" ? (
+                      <AlertTriangle className="w-4 h-4 text-amber-600 shrink-0 mt-0.5" />
+                    ) : (
+                      <XCircle className="w-4 h-4 text-rose-600 shrink-0 mt-0.5" />
+                    )}
+                    <span className="flex-1">{strangerTestResult.msg}</span>
+                  </div>
+                )}
               </div>
 
               {/* Save Config Button */}

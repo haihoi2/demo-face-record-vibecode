@@ -17,6 +17,7 @@ import {
   SmartLockState,
   MobileNotification,
   FaceRecognitionResult,
+  STRANGER_DEEP_LINK_HASH,
 } from "./types";
 import { Bell, CheckCircle2, AlertTriangle, Sparkles, X, Code2, Copy, Check, Camera, ScanFace } from "lucide-react";
 import { soundEffects } from "./utils/audio";
@@ -34,6 +35,56 @@ import {
   clientDoorUnlock,
   clientEventBus,
 } from "./utils/offlineEngine";
+
+/**
+ * Minimal hash deep-link support (no router). Only two shapes are recognised:
+ *   #strangers            -> open the stranger-cluster panel
+ *   #strangers/<logId>    -> open it with the cluster holding that sighting selected
+ * plus a few optional aliases that jump straight to an existing tab.
+ */
+const HASH_TAB_ALIASES: Record<string, NavTabType> = {
+  "camera-streams": "cameras",
+  cameras: "cameras",
+  scanner: "scanner",
+  manual: "manual",
+  register: "register",
+  logs: "logs",
+  mobile: "mobile",
+  webhook: "webhook",
+  door: "door",
+  config: "config",
+};
+
+/** Normalizes `#/strangers/LOG-1%20/` -> `strangers/LOG-1`. */
+function normalizeHash(rawHash: string): string {
+  let hash = (rawHash || "").trim();
+  if (hash.startsWith("#")) hash = hash.slice(1);
+  // Tolerate hash-router style "#/strangers"
+  hash = hash.replace(/^\/+/, "").replace(/\/+$/, "");
+  // Ignore any query-string appended to the hash
+  const queryIndex = hash.indexOf("?");
+  if (queryIndex >= 0) hash = hash.slice(0, queryIndex);
+  return hash;
+}
+
+function parseStrangerDeepLink(rawHash: string): { open: boolean; logId: string | null } {
+  const hash = normalizeHash(rawHash);
+  if (!hash) return { open: false, logId: null };
+  const segments = hash.split("/");
+  if (segments[0].toLowerCase() !== STRANGER_DEEP_LINK_HASH) {
+    return { open: false, logId: null };
+  }
+  const rawId = segments.slice(1).join("/");
+  if (!rawId) return { open: true, logId: null };
+  let logId = rawId;
+  try {
+    logId = decodeURIComponent(rawId);
+  } catch {
+    // Malformed percent-encoding: keep the raw segment rather than crashing.
+  }
+  logId = logId.trim();
+  return { open: true, logId: logId || null };
+}
 
 export default function App() {
   const [activeTab, setActiveTab] = useState<NavTabType>("scanner");
@@ -64,10 +115,42 @@ export default function App() {
   const [pingStatus, setPingStatus] = useState<{ testing: boolean; success?: boolean; message?: string } | null>(null);
   const [isStrangerModalOpen, setIsStrangerModalOpen] = useState<boolean>(false);
   const [preselectedStrangerPhoto, setPreselectedStrangerPhoto] = useState<string | null>(null);
+  const [preselectedStrangerLogId, setPreselectedStrangerLogId] = useState<string | null>(null);
 
   const handleOpenStrangerModal = (photo?: string) => {
     setPreselectedStrangerPhoto(photo || null);
+    setPreselectedStrangerLogId(null);
     setIsStrangerModalOpen(true);
+  };
+
+  // --- Deep link: webhook alerts link to <base>/#strangers/<logId> ---
+  const applyHashRoute = useCallback(() => {
+    if (typeof window === "undefined") return;
+    const deepLink = parseStrangerDeepLink(window.location.hash);
+    if (deepLink.open) {
+      setPreselectedStrangerPhoto(null);
+      setPreselectedStrangerLogId(deepLink.logId);
+      setIsStrangerModalOpen(true);
+      return;
+    }
+    const alias = HASH_TAB_ALIASES[normalizeHash(window.location.hash).toLowerCase()];
+    if (alias) setActiveTab(alias);
+  }, []);
+
+  useEffect(() => {
+    applyHashRoute();
+    window.addEventListener("hashchange", applyHashRoute);
+    return () => window.removeEventListener("hashchange", applyHashRoute);
+  }, [applyHashRoute]);
+
+  const handleCloseStrangerModal = () => {
+    setIsStrangerModalOpen(false);
+    setPreselectedStrangerPhoto(null);
+    setPreselectedStrangerLogId(null);
+    // Drop the #strangers hash so a refresh doesn't reopen the panel.
+    if (typeof window !== "undefined" && parseStrangerDeepLink(window.location.hash).open) {
+      window.history.replaceState(null, "", window.location.pathname + window.location.search);
+    }
   };
 
   const handleSaveBackendUrl = (url: string) => {
@@ -640,11 +723,9 @@ export default function App() {
       {/* Stranger Cluster Management & Quick Registration Modal */}
       <StrangerClusterModal
         isOpen={isStrangerModalOpen}
-        onClose={() => {
-          setIsStrangerModalOpen(false);
-          setPreselectedStrangerPhoto(null);
-        }}
+        onClose={handleCloseStrangerModal}
         initialPreselectedPhoto={preselectedStrangerPhoto}
+        initialPreselectedLogId={preselectedStrangerLogId}
         onEmployeeAdded={(emp) => {
           setEmployees((prev) => [emp, ...prev.filter((e) => e.id !== emp.id)]);
         }}

@@ -40,6 +40,11 @@ interface StrangerClusterModalProps {
   onEmployeeAdded: (employee: Employee) => void;
   onLogsUpdated?: () => void;
   initialPreselectedPhoto?: string | null;
+  /**
+   * Access-log id carried by a deep link (`#strangers/<logId>`), used to select
+   * the cluster containing that sighting. A URL cannot carry a data-URL photo.
+   */
+  initialPreselectedLogId?: string | null;
 }
 
 export const StrangerClusterModal: React.FC<StrangerClusterModalProps> = ({
@@ -48,6 +53,7 @@ export const StrangerClusterModal: React.FC<StrangerClusterModalProps> = ({
   onEmployeeAdded,
   onLogsUpdated,
   initialPreselectedPhoto,
+  initialPreselectedLogId,
 }) => {
   const [clusters, setClusters] = useState<StrangerCluster[]>([]);
   const [loading, setLoading] = useState<boolean>(true);
@@ -65,6 +71,8 @@ export const StrangerClusterModal: React.FC<StrangerClusterModalProps> = ({
   const [submitting, setSubmitting] = useState<boolean>(false);
   const [successToast, setSuccessToast] = useState<string | null>(null);
   const [previewEnlargedPhoto, setPreviewEnlargedPhoto] = useState<string | null>(null);
+  // Shown when a deep link points at a sighting that is no longer in any cluster.
+  const [preselectMissNotice, setPreselectMissNotice] = useState<string | null>(null);
 
   // --- Merge-into-existing-employee mode ---
   // Used when the recognition engine failed on somebody who is already enrolled.
@@ -85,37 +93,71 @@ export const StrangerClusterModal: React.FC<StrangerClusterModalProps> = ({
     "Khách Thường Trực / Đối Tác",
   ];
 
+  /**
+   * Selects the cluster addressed by the caller: either by photo (in-app click)
+   * or by access-log id (deep link from a chat webhook alert).
+   */
+  const applyPreselection = (list: StrangerCluster[]) => {
+    if (initialPreselectedPhoto) {
+      const match = list.find((c) =>
+        c.photos.some((p) => p.photoSnapshot === initialPreselectedPhoto)
+      );
+      if (match) {
+        setPreselectMissNotice(null);
+        handleOpenRegister(match, initialPreselectedPhoto);
+        return;
+      }
+    }
+
+    const targetLogId = (initialPreselectedLogId || "").trim();
+    if (!targetLogId) return;
+
+    let matchedPhoto: StrangerPhoto | undefined;
+    const match = list.find((c) => {
+      const photo = c.photos.find((p) => p.logId === targetLogId);
+      if (photo) {
+        matchedPhoto = photo;
+        return true;
+      }
+      return false;
+    });
+
+    if (match) {
+      setPreselectMissNotice(null);
+      handleOpenRegister(match, matchedPhoto?.photoSnapshot);
+      return;
+    }
+
+    // Already registered, merged or dismissed: keep listing the rest, just say so.
+    setPreselectMissNotice(
+      `Không tìm thấy cụm ảnh cho lượt quét ${targetLogId} (có thể đã được xử lý hoặc từ chối).`
+    );
+  };
+
   // Fetch clusters from API (or generate from local logs fallback)
   const loadClusters = async () => {
     setLoading(true);
     setError(null);
+    setPreselectMissNotice(null);
     try {
       const res = await safeJsonFetch<{ success: boolean; clusters: StrangerCluster[] }>(
         "/api/strangers/clusters"
       );
-      if (res.ok && res.data && res.data.clusters) {
+      if (res.ok && res.data && Array.isArray(res.data.clusters)) {
         setClusters(res.data.clusters);
-        // If initial preselected photo provided, select matching cluster
-        if (initialPreselectedPhoto) {
-          const match = res.data.clusters.find((c) =>
-            c.photos.some((p) => p.photoSnapshot === initialPreselectedPhoto)
-          );
-          if (match) {
-            handleOpenRegister(match, initialPreselectedPhoto);
-          }
-        }
+        applyPreselection(res.data.clusters);
       } else {
         // Fallback using local logs
-        buildFallbackClusters();
+        applyPreselection(buildFallbackClusters());
       }
     } catch {
-      buildFallbackClusters();
+      applyPreselection(buildFallbackClusters());
     } finally {
       setLoading(false);
     }
   };
 
-  const buildFallbackClusters = () => {
+  const buildFallbackClusters = (): StrangerCluster[] => {
     const localLogs = getStoredLogs();
     const denied = localLogs.filter((l) => l.status === "DENIED" || !l.employeeId);
 
@@ -217,13 +259,16 @@ export const StrangerClusterModal: React.FC<StrangerClusterModalProps> = ({
     }
 
     setClusters(defaultClusters);
+    return defaultClusters;
   };
 
+  // Reload (and re-apply the preselection) when opened, or when a new deep link
+  // arrives while the panel is already open.
   useEffect(() => {
     if (isOpen) {
       loadClusters();
     }
-  }, [isOpen]);
+  }, [isOpen, initialPreselectedLogId]);
 
   const handleOpenRegister = (cluster: StrangerCluster, defaultPhoto?: string) => {
     setSelectedCluster(cluster);
@@ -552,6 +597,23 @@ export const StrangerClusterModal: React.FC<StrangerClusterModalProps> = ({
           <div className="mx-6 mt-4 p-3.5 bg-emerald-50 border border-emerald-200 rounded-2xl flex items-center gap-3 text-emerald-800 text-sm font-medium animate-in slide-in-from-top duration-300">
             <CheckCircle2 className="w-5 h-5 text-emerald-600 shrink-0" />
             <span>{successToast}</span>
+          </div>
+        )}
+
+        {/* Deep-link miss notice (log id no longer belongs to any cluster) */}
+        {preselectMissNotice && (
+          <div className="mx-6 mt-4 p-3 bg-amber-50 border border-amber-200 rounded-2xl flex items-start gap-2.5 text-amber-900 text-xs animate-in slide-in-from-top duration-300">
+            <AlertTriangle className="w-4 h-4 text-amber-600 shrink-0 mt-0.5" />
+            <span className="flex-1 leading-relaxed">{preselectMissNotice}</span>
+            <button
+              id="btn-dismiss-preselect-notice"
+              type="button"
+              onClick={() => setPreselectMissNotice(null)}
+              title="Đóng thông báo"
+              className="p-1 rounded-lg text-amber-600 hover:text-amber-900 hover:bg-amber-100 transition-colors shrink-0"
+            >
+              <X className="w-3.5 h-3.5" />
+            </button>
           </div>
         )}
 
