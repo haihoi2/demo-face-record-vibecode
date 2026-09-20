@@ -136,9 +136,15 @@ export function clusterStrangerFaces(
   // Real clusters disappear on their own once their logs flip to GRANTED; the
   // seeded demo clusters have no real logs, so they need this explicit list.
   const resolved = new Set(resolvedClusterIds);
+  // Individual sightings rejected by an operator are stored as "log:<id>".
+  const dismissedLogs = new Set(
+    resolvedClusterIds.filter((id) => id.startsWith("log:")).map((id) => id.slice(4))
+  );
   // 1. Gather all actual stranger logs from the access log history
   const deniedLogs = accessLogs.filter(
-    (log) => log.status === "DENIED" || !log.employeeId || log.employeeName === "Không xác định"
+    (log) =>
+      !dismissedLogs.has(log.id) &&
+      (log.status === "DENIED" || !log.employeeId || log.employeeName === "Không xác định")
   );
 
   const clusterMap: Record<string, StrangerPhoto[]> = {};

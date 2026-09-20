@@ -375,6 +375,38 @@ export const StrangerClusterModal: React.FC<StrangerClusterModalProps> = ({
     }
   };
 
+  const [dismissingId, setDismissingId] = useState<string | null>(null);
+
+  // Reject a cluster: it disappears from the panel without becoming an employee.
+  // Logs are kept; the server retires the cluster and its sightings. Falls back to
+  // hiding it locally for this session when the API is unreachable.
+  const handleDismissCluster = async (cluster: StrangerCluster) => {
+    const ok = window.confirm(
+      `Từ chối ${cluster.photos.length} ảnh của "${cluster.label}"?\nCụm ảnh sẽ bị ẩn khỏi danh sách (không tạo nhân viên, nhật ký vẫn được giữ).`
+    );
+    if (!ok) return;
+    setDismissingId(cluster.clusterId);
+    try {
+      await safeJsonFetch<{ success: boolean }>("/api/strangers/dismiss", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          clusterId: cluster.clusterId,
+          clusterLogIds: cluster.photos.map((p) => p.logId),
+          reason: "Từ chối thủ công từ bảng người lạ",
+        }),
+      });
+    } catch {
+      // offline: hide locally only
+    } finally {
+      setClusters((prev) => prev.filter((c) => c.clusterId !== cluster.clusterId));
+      if (selectedCluster?.clusterId === cluster.clusterId) setSelectedCluster(null);
+      setDismissingId(null);
+      setSuccessToast(`Đã từ chối và ẩn cụm ảnh "${cluster.label}"`);
+      setTimeout(() => setSuccessToast(null), 3500);
+    }
+  };
+
   const handleSubmitQuickRegister = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!name.trim()) {
@@ -595,8 +627,19 @@ export const StrangerClusterModal: React.FC<StrangerClusterModalProps> = ({
                         </div>
                       </div>
 
-                      {/* Action Button */}
-                      <div>
+                      {/* Action Buttons */}
+                      <div className="flex items-center gap-2">
+                        <button
+                          id={`btn-dismiss-cluster-${cluster.clusterId}`}
+                          type="button"
+                          onClick={() => handleDismissCluster(cluster)}
+                          disabled={dismissingId === cluster.clusterId}
+                          title="Từ chối ảnh người lạ - ẩn khỏi danh sách, không tạo nhân viên"
+                          className="inline-flex items-center gap-2 px-3 py-2 rounded-xl text-xs font-semibold border border-rose-200 text-rose-700 bg-white hover:bg-rose-50 transition-colors disabled:opacity-50"
+                        >
+                          <UserX className="w-3.5 h-3.5" />
+                          <span>{dismissingId === cluster.clusterId ? "Đang ẩn..." : "Từ chối ảnh"}</span>
+                        </button>
                         <button
                           id={`btn-quick-register-${cluster.clusterId}`}
                           onClick={() => handleOpenRegister(cluster)}

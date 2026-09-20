@@ -2829,6 +2829,57 @@ app.post(["/api/strangers/quick-register", "/api/strangers/register"], (req, res
   }
 });
 
+// Reject a stranger cluster ("ảnh người lạ") without registering or merging it.
+// The cluster id is retired (covers the seeded demo clusters) and each of its
+// log ids is retired as "log:<id>" so those sightings stop feeding the
+// clustering. Logs themselves are kept - the access history is not rewritten,
+// only the panel stops offering them. Reversible via /api/strangers/restore.
+app.post(["/api/strangers/dismiss", "/api/strangers/reject"], (req, res) => {
+  try {
+    const { clusterId, clusterLogIds = [], reason } = req.body || {};
+    const logIds: string[] = Array.isArray(clusterLogIds) ? clusterLogIds.map(String) : [];
+    if (!clusterId && logIds.length === 0) {
+      res.status(400).json({ success: false, error: "Cần clusterId hoặc danh sách clusterLogIds để từ chối" });
+      return;
+    }
+    const retired: string[] = [];
+    if (clusterId) { db.markStrangerClusterResolved(String(clusterId), "dismissed"); retired.push(String(clusterId)); }
+    for (const logId of logIds) {
+      const key = `log:${logId}`;
+      db.markStrangerClusterResolved(key, "dismissed");
+      retired.push(key);
+      const log = accessLogs.find((l) => l.id === logId);
+      if (log) {
+        log.reason = `${log.reason ? log.reason + " | " : ""}Đã từ chối ảnh người lạ${reason ? ": " + String(reason).slice(0, 120) : ""}`;
+        db.saveAccessLog(log);
+      }
+    }
+    broadcastSSE("stranger_dismissed", { clusterId: clusterId || null, clusterLogIds: logIds, reason: reason || null });
+    console.log(`[Strangers] Đã từ chối cụm ảnh người lạ ${clusterId || "(logs)"}: ${logIds.length} ảnh.`);
+    res.json({ success: true, message: "Đã từ chối và ẩn cụm ảnh người lạ", clusterId: clusterId || null, retired });
+  } catch (err: any) {
+    console.error("[Strangers] Lỗi từ chối cụm ảnh người lạ:", err);
+    res.status(500).json({ success: false, error: err?.message || "Lỗi xử lý từ chối ảnh người lạ" });
+  }
+});
+
+app.post("/api/strangers/restore", (req, res) => {
+  try {
+    const { clusterId, clusterLogIds = [] } = req.body || {};
+    const logIds: string[] = Array.isArray(clusterLogIds) ? clusterLogIds.map(String) : [];
+    if (!clusterId && logIds.length === 0) {
+      res.status(400).json({ success: false, error: "Cần clusterId hoặc clusterLogIds để khôi phục" });
+      return;
+    }
+    if (clusterId) db.unmarkStrangerClusterResolved(String(clusterId));
+    for (const logId of logIds) db.unmarkStrangerClusterResolved(`log:${logId}`);
+    broadcastSSE("stranger_restored", { clusterId: clusterId || null, clusterLogIds: logIds });
+    res.json({ success: true, message: "Đã khôi phục cụm ảnh người lạ" });
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: err?.message || "Lỗi khôi phục" });
+  }
+});
+
 // Search the existing roster so an unrecognized stranger cluster can be merged
 // into the employee it actually belongs to, instead of creating a duplicate.
 app.get(["/api/strangers/search-employees", "/api/strangers/employees"], (req, res) => {
@@ -2977,9 +3028,63 @@ app.post(["/api/strangers/merge", "/api/strangers/assign"], (req, res) => {
 });
 
 // --- AI Face Recognition Routes (Multi-Face & High-Speed Recognition) ---
+/**
+ * Burn thick green boxes around every DETECTED face into a JPEG data URL so a
+ * stored stranger/access snapshot shows at a glance what was flagged. Boxes are
+ * [ymin, xmin, ymax, xmax] on a 0-1000 scale, mapped with ffmpeg's iw/ih so the
+ * frame size never needs to be known here. Only faces whose box came from a real
+ * detector are drawn - the hash engine's fixed placeholder boxes are skipped, so
+ * the picture never claims a detection that did not happen. Any failure returns
+ * the original image untouched.
+ */
+async function annotateSnapshotWithBoxes(
+  imageDataUrl: string,
+  faces: Array<{ box2d: [number, number, number, number]; boxSource?: "detector" }>
+): Promise<string> {
+  const drawable = faces.filter((f) => f.boxSource === "detector" && Array.isArray(f.box2d));
+  const m = /^data:(image\/\w+);base64,(.+)$/s.exec(imageDataUrl || "");
+  if (drawable.length === 0 || !m) return imageDataUrl;
+
+  const clamp = (v: number) => Math.min(1000, Math.max(0, Number(v) || 0)) / 1000;
+  const filters = drawable.map((f) => {
+    const [y1, x1, y2, x2] = f.box2d;
+    const x = clamp(Math.min(x1, x2));
+    const y = clamp(Math.min(y1, y2));
+    const w = Math.max(0.01, clamp(Math.max(x1, x2)) - x);
+    const h = Math.max(0.01, clamp(Math.max(y1, y2)) - y);
+    // thickness ~1/120 of the width, never thinner than 5 px
+    return `drawbox=x=iw*${x.toFixed(4)}:y=ih*${y.toFixed(4)}:w=iw*${w.toFixed(4)}:h=ih*${h.toFixed(4)}:color=0x00FF00@1:t=max(5\\,iw/120)`;
+  });
+
+  return new Promise<string>((resolve) => {
+    const input = Buffer.from(m[2], "base64");
+    const proc = spawn("ffmpeg", [
+      "-hide_banner", "-loglevel", "error",
+      "-f", "image2pipe", "-i", "pipe:0",
+      "-vf", filters.join(","),
+      "-q:v", "2", "-f", "image2", "-update", "1", "pipe:1",
+    ]);
+    const chunks: Buffer[] = [];
+    let settled = false;
+    const done = (out: string) => { if (!settled) { settled = true; resolve(out); } };
+    const timer = setTimeout(() => { try { proc.kill("SIGKILL"); } catch {} done(imageDataUrl); }, 4000);
+    proc.stdout.on("data", (c: Buffer) => chunks.push(c));
+    proc.on("error", () => { clearTimeout(timer); done(imageDataUrl); });
+    proc.on("close", (code) => {
+      clearTimeout(timer);
+      if (code === 0 && chunks.length > 0) done(`data:image/jpeg;base64,${Buffer.concat(chunks).toString("base64")}`);
+      else done(imageDataUrl);
+    });
+    proc.stdin.on("error", () => {});
+    proc.stdin.end(input);
+  });
+}
+
 interface DetectedFaceItem {
   id: string;
   box2d: [number, number, number, number]; // [ymin, xmin, ymax, xmax] 0-1000
+  /** "detector" when box2d came from a real detection; absent for placeholder boxes. */
+  boxSource?: "detector";
   employeeId?: string;
   employeeName?: string;
   employeeCode?: string;
@@ -3234,14 +3339,15 @@ Yêu cầu phân tích:
                   ? employees.find((e) => e.id === f.employeeId)
                   : null;
 
-                const box: [number, number, number, number] =
-                  Array.isArray(f.box2d) && f.box2d.length === 4
-                    ? [f.box2d[0], f.box2d[1], f.box2d[2], f.box2d[3]]
-                    : [200, 300, 700, 700];
+                const hasRealBox = Array.isArray(f.box2d) && f.box2d.length === 4;
+                const box: [number, number, number, number] = hasRealBox
+                  ? [f.box2d[0], f.box2d[1], f.box2d[2], f.box2d[3]]
+                  : [200, 300, 700, 700];
 
                 return {
                   id: `face-${idx}-${Date.now()}`,
                   box2d: box,
+                  boxSource: hasRealBox ? ("detector" as const) : undefined,
                   employeeId: matchedEmp ? matchedEmp.id : f.employeeId || undefined,
                   employeeName: matchedEmp ? matchedEmp.name : f.employeeName || undefined,
                   employeeCode: matchedEmp ? matchedEmp.employeeCode : undefined,
@@ -3617,6 +3723,8 @@ app.post(RECOGNIZE_FACE_ROUTES, async (req, res) => {
 
     // Determine recognition status
     const authorizedFaces = detectedFaces.filter((f) => f.recognized && f.employeeId);
+    // Snapshot stored on the log carries thick green boxes around detected faces.
+    const snapshotForLog = await annotateSnapshotWithBoxes(imageBase64, detectedFaces);
     const unauthorizedFaces = detectedFaces.filter((f) => !f.recognized);
     const hasAuthorized = authorizedFaces.length > 0;
 
@@ -3653,7 +3761,7 @@ app.post(RECOGNIZE_FACE_ROUTES, async (req, res) => {
           employeeName: emp.name,
           employeeCode: emp.employeeCode,
           department: emp.department,
-          photoSnapshot: imageBase64,
+          photoSnapshot: snapshotForLog,
           confidence: faceMatch ? faceMatch.confidence : 95,
           livenessScore: faceMatch ? faceMatch.livenessScore : 98,
           lockAction: "Mở chốt tự động qua API (SmartLock Gateway)",
@@ -3755,7 +3863,7 @@ app.post(RECOGNIZE_FACE_ROUTES, async (req, res) => {
         timestamp: new Date().toISOString(),
         type: actionType,
         status: "DENIED",
-        photoSnapshot: imageBase64,
+        photoSnapshot: snapshotForLog,
         confidence: detectedFaces[0]?.confidence || 25,
         livenessScore: detectedFaces[0]?.livenessScore || 85,
         lockAction: "Khóa giữ nguyên trạng thái LOCKED",
