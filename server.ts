@@ -2651,6 +2651,30 @@ Yêu cầu phân tích:
                 };
               });
               overallMessage = parsed.overallMessage || "Đã phân tích toàn bộ khung hình";
+
+              // Gemini only ever receives the roster as TEXT (ids, codes, names) -
+              // never the enrolled photos - so any employeeId it returns is a
+              // guess from names, not a face comparison. Measured: the same
+              // person in two frames came back as two different employees, both
+              // at "98.5%", and the door opened both times. Until a real matcher
+              // exists, the cloud step is detection-only: faces are kept for
+              // stranger capture and logging, identity is stripped, and nothing
+              // it says can authorise. Only the demo flag re-enables the guess.
+              const geminiIdentityAllowed = process.env.ALLOW_SIMULATED_RECOGNITION === "true";
+              if (!geminiIdentityAllowed && detectedFaces.some((f) => f.recognized || f.employeeId)) {
+                detectedFaces = detectedFaces.map((f) => ({
+                  ...f,
+                  recognized: false,
+                  employeeId: undefined,
+                  employeeName: undefined,
+                  employeeCode: undefined,
+                  department: undefined,
+                  message:
+                    "Phát hiện khuôn mặt (Gemini) nhưng chưa xác thực danh tính: hệ thống chưa có bộ so khớp khuôn mặt thực.",
+                }));
+                overallMessage =
+                  "Đã phát hiện khuôn mặt nhưng không xác thực được danh tính (chưa có bộ so khớp). Từ chối mở khóa.";
+              }
               succeeded = true;
               break;
             }
