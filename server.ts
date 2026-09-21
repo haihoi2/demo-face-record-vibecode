@@ -2945,6 +2945,15 @@ interface ScanStreamOutcome {
   ok: boolean;
   /** Real-engine observations from this stream's frames (empty in hash mode). */
   observed: EngineObservation[];
+  /**
+   * `frameIndex -> JPEG`, kept ONLY for frames that actually contained a face.
+   * A gate scan needs the pixels AFTER the fused decision (to store the frame
+   * the winning observation came from), but holding every grab would pin up to
+   * 5 frames x 4 streams in memory on every tick, so a frame with no detection
+   * is dropped the moment it is observed - which is also why an empty corridor
+   * can never produce a stranger row.
+   */
+  frameJpegs: Map<number, Buffer>;
   recognition?: RecognizeFrameResult;
   faces: Array<DetectedFaceItem & { streamId: string; streamLabel: string }>;
   error?: string;
@@ -2967,9 +2976,500 @@ async function grabRtspFrames(
   return out;
 }
 
+// =========================================================================
+// ONE RECOGNITION OUTCOME - logs, snapshot, notifications, webhooks, unlock
+//
+// There used to be two recognition paths with different side effects:
+// POST /api/recognize-face recorded EVERYTHING (access log + annotated
+// snapshot + notification + Eton webhook + SSE + unlock, or a DENIED log +
+// stranger webhook), while `performGateScan` - the function BOTH the backend
+// gate watcher AND POST /api/camera-streams/scan-rtsp run - recorded NOTHING.
+// Live proof: the EXIT watcher had completed 4,574 scans and produced zero
+// access logs, zero snapshots and zero stranger captures, so the stranger
+// panel (which `clusterStrangerFaces` builds out of the DENIED access logs)
+// had nothing to group.
+//
+// Everything a recognition CAUSES now lives here, and both paths call it, so
+// the two cannot drift apart again. The DECISION is untouched: this function
+// is handed `detectedFaces` exactly as the engine produced them, never
+// re-decides, never invents a match, and grants only on
+// `face.recognized && face.employeeId` - a flag only a genuine engine match
+// (or an explicitly enabled simulation) ever sets.
+// =========================================================================
+
+/** Who asked for this recognition. Only the audit wording differs. */
+type RecognitionTrigger = "api" | "manual" | "watcher";
+
+/** Why a scan that DID decide something deliberately recorded nothing. */
+type OutcomeSuppression = "grant-cooldown" | "stranger-cooldown";
+
+/**
+ * Re-unlock / re-log dedupe for ONE employee at ONE gate.
+ *
+ * The exit watcher scans roughly every 5.4 s. Without this, one person
+ * standing in frame would re-unlock the door on every tick and write hundreds
+ * of near-identical GRANTED rows. It must stay comfortably longer than the
+ * lock's 6 s auto-relock, otherwise the cooldown would expire while the door
+ * is still open and the unlock would repeat anyway.
+ *
+ * A DIFFERENT employee at the same gate is never suppressed by this: the key
+ * is (gate, employeeId), so two people arriving together both get their row.
+ */
+const FACE_GRANT_COOLDOWN_SECONDS = envInt("FACE_GRANT_COOLDOWN_SECONDS", 20, 0, 86_400);
+/**
+ * At most one DENIED/stranger row per gate per this many seconds. Stranger
+ * rows carry a full JPEG each and feed the stranger clusters; an unknown face
+ * lingering in front of an exit camera must not write one every 5 s.
+ */
+const FACE_STRANGER_COOLDOWN_SECONDS = envInt("FACE_STRANGER_COOLDOWN_SECONDS", 60, 0, 86_400);
+
+/** Last GRANTED write per `${gate}:${employeeId}`. */
+const lastGrantAtByGateEmployee = new Map<string, number>();
+/** Last DENIED/stranger write per gate. */
+const lastStrangerLogAtByGate = new Map<string, number>();
+
+/** Counters so an operator can tell "nothing happened" from "it was deduped". */
+interface RecognitionOutcomeStats {
+  grantsWritten: number;
+  grantsSuppressed: number;
+  strangersWritten: number;
+  strangersSuppressed: number;
+  /**
+   * Stranger alerts that THIS path handed to `sendStrangerWebhook` and that it
+   * did not send - its own, independent cooldown, or the webhook being turned
+   * off. Counted rather than hidden; `/api/webhook/logs` says which.
+   */
+  strangerWebhooksNotSent: number;
+  unlocks: number;
+  lastLogId?: string;
+  lastLogAt?: string;
+  lastSuppressed?: OutcomeSuppression;
+  lastSuppressedAt?: string;
+}
+
+function newRecognitionOutcomeStats(): RecognitionOutcomeStats {
+  return {
+    grantsWritten: 0,
+    grantsSuppressed: 0,
+    strangersWritten: 0,
+    strangersSuppressed: 0,
+    strangerWebhooksNotSent: 0,
+    unlocks: 0,
+  };
+}
+
+const gateOutcomeStats: Record<"entry" | "exit", RecognitionOutcomeStats> = {
+  entry: newRecognitionOutcomeStats(),
+  exit: newRecognitionOutcomeStats(),
+};
+
+interface RecognitionOutcomeInput {
+  /** Faces exactly as the engine reported them. Never re-decided here. */
+  detectedFaces: DetectedFaceItem[];
+  /**
+   * The frame whose pixels get stored on the log (data URL or raw base64).
+   * Undefined/empty means "no image": with `denyWithoutFace:false` nothing is
+   * written at all, which is what keeps an empty corridor from manufacturing
+   * stranger rows.
+   */
+  frameImage?: string;
+  /**
+   * Boxes drawn on the stored snapshot - MUST belong to `frameImage`, or the
+   * green boxes would mark the wrong pixels. Defaults to `detectedFaces`
+   * (correct for the single-frame /api/recognize-face path).
+   */
+  annotateFaces?: Array<{ box2d: [number, number, number, number]; boxSource?: "detector" }>;
+  scanType: "ENTRY" | "EXIT";
+  trigger: RecognitionTrigger;
+  /** Which gate the decision belongs to; the cooldowns are keyed on it. */
+  gate?: "entry" | "exit";
+  streamId?: string;
+  streamLabel?: string;
+  processingTimeMs: number;
+  /** Overrides the trigger-derived unlock source. Used by /api/recognize-face. */
+  unlockSource?: string;
+  /** Base URL for the stranger deep link in the webhook. */
+  baseUrl?: string;
+  /**
+   * Apply the grant/stranger cooldowns. ON for the scan path (watcher +
+   * scan-rtsp), OFF for /api/recognize-face: that route is driven by a human
+   * or an external caller one frame at a time and its behaviour is the
+   * reference this extraction must not change.
+   */
+  cooldowns: boolean;
+  /**
+   * Write a DENIED log even when no real face was detected. TRUE for
+   * /api/recognize-face (unchanged: a grey frame still produces a stranger
+   * row there, and the stranger suite asserts it); FALSE for gate scans.
+   */
+  denyWithoutFace: boolean;
+  /**
+   * Image bytes to attach to the `stranger_detected` SSE. Only
+   * /api/recognize-face passes this (it always has), because a gate scan
+   * broadcasts to every dashboard on every tick and image bytes never go into
+   * a watcher SSE payload.
+   */
+  sseSnapshot?: string;
+}
+
+/** JSON-safe outcome report: ids, flags and counters - never image bytes. */
+interface RecognitionOutcomeSummary {
+  trigger: RecognitionTrigger;
+  gate: "entry" | "exit";
+  scanType: "ENTRY" | "EXIT";
+  granted: boolean;
+  /** True when THIS outcome actually drove `unlockDoor`. */
+  lockUnlocked: boolean;
+  /** "GRANTED" / "DENIED" when a row was written, absent when nothing was. */
+  status?: "GRANTED" | "DENIED";
+  logId?: string;
+  logIds: string[];
+  /** True when the written log carries a stored `photoSnapshot`. */
+  snapshotStored: boolean;
+  /** Set when a cooldown is the reason nothing was written. */
+  suppressed?: OutcomeSuppression;
+  /** Employees skipped by the grant cooldown (may be a subset). */
+  suppressedEmployeeIds: string[];
+  /** True when the stranger webhook was dispatched (its own cooldown may still drop it). */
+  strangerWebhookDispatched: boolean;
+  stats: RecognitionOutcomeStats;
+}
+
+interface RecognitionOutcomeResult {
+  granted: boolean;
+  /** GRANTED rows (one per employee) or the single DENIED row. */
+  logs: AccessLogRecord[];
+  log?: AccessLogRecord;
+  lockUnlocked: boolean;
+  /** Employees the engine matched, deduped, in detection order. */
+  recognizedEmployees: EmployeeRecord[];
+  summary: RecognitionOutcomeSummary;
+}
+
+/**
+ * Where an unlock came from, for `unlockDoor` and the lock audit trail.
+ *
+ * MUST contain "Nhận diện": `unlockDoor` matches that substring to pick the
+ * door controller's `triggerOnFaceRecognition` policy over
+ * `triggerOnManualUnlock`. A watcher unlock is a face-recognition unlock.
+ */
+function recognitionUnlockSource(trigger: RecognitionTrigger, gateKey: "entry" | "exit"): string {
+  const gateLabel = gateKey === "exit" ? "cổng ra" : "cổng vào";
+  if (trigger === "watcher") return `Watcher ${gateLabel} - Nhận diện khuôn mặt tự động`;
+  if (trigger === "manual") return `Quét RTSP thủ công ${gateLabel} - Nhận diện khuôn mặt`;
+  return "Nhận diện khuôn mặt AI (Đa nhân viên)";
+}
+
+/**
+ * Record (and act on) ONE recognition decision. Called by
+ * POST /api/recognize-face and by `performGateScan` (the watcher and
+ * POST /api/camera-streams/scan-rtsp), so a face seen by a watched camera has
+ * exactly the same consequences as the same face posted to the API.
+ */
+async function applyRecognitionOutcome(input: RecognitionOutcomeInput): Promise<RecognitionOutcomeResult> {
+  const detectedFaces = input.detectedFaces || [];
+  const actionType: "ENTRY" | "EXIT" = input.scanType === "EXIT" ? "EXIT" : "ENTRY";
+  const typeLabel = actionType === "ENTRY" ? "Vào" : "Ra";
+  const gateKey: "entry" | "exit" = input.gate || (actionType === "EXIT" ? "exit" : "entry");
+  // The counters describe the GATE SCAN recorder (watcher + scan-rtsp), which
+  // is the path with cooldowns to explain. /api/recognize-face is driven one
+  // frame at a time by a caller that already sees its own answer, so it writes
+  // into a throwaway so it cannot muddy a gate's suppressed/written ratio.
+  const stats = input.trigger === "api" ? newRecognitionOutcomeStats() : gateOutcomeStats[gateKey];
+  const processingTimeMs = input.processingTimeMs;
+  const nowMs = Date.now();
+
+  const authorizedFaces = detectedFaces.filter((f) => f.recognized && f.employeeId);
+  const unauthorizedFaces = detectedFaces.filter((f) => !f.recognized);
+  const recognizedEmployees: EmployeeRecord[] = [];
+  for (const face of authorizedFaces) {
+    const emp = employees.find((e) => e.id === face.employeeId);
+    if (emp && !recognizedEmployees.some((re) => re.id === emp.id)) recognizedEmployees.push(emp);
+  }
+  const hasAuthorized = recognizedEmployees.length > 0;
+
+  const summary: RecognitionOutcomeSummary = {
+    trigger: input.trigger,
+    gate: gateKey,
+    scanType: actionType,
+    granted: hasAuthorized,
+    lockUnlocked: false,
+    logIds: [],
+    snapshotStored: false,
+    suppressedEmployeeIds: [],
+    strangerWebhookDispatched: false,
+    stats,
+  };
+  const result: RecognitionOutcomeResult = {
+    granted: hasAuthorized,
+    logs: [],
+    lockUnlocked: false,
+    recognizedEmployees,
+    summary,
+  };
+
+  // ---- Step 1: decide what may be recorded, BEFORE any await. -----------
+  // The cooldown slots are claimed synchronously so two scans that overlap
+  // (a manual scan-rtsp landing inside a watcher tick) cannot both pass.
+  const grantCooldownMs = FACE_GRANT_COOLDOWN_SECONDS * 1000;
+  const strangerCooldownMs = FACE_STRANGER_COOLDOWN_SECONDS * 1000;
+  let grantable: EmployeeRecord[] = recognizedEmployees;
+
+  if (hasAuthorized) {
+    if (input.cooldowns && grantCooldownMs > 0) {
+      grantable = [];
+      for (const emp of recognizedEmployees) {
+        const key = `${gateKey}:${emp.id}`;
+        const last = lastGrantAtByGateEmployee.get(key) || 0;
+        if (last > 0 && nowMs - last < grantCooldownMs) {
+          summary.suppressedEmployeeIds.push(emp.id);
+          continue;
+        }
+        lastGrantAtByGateEmployee.set(key, nowMs);
+        grantable.push(emp);
+      }
+    }
+    if (grantable.length === 0) {
+      // Recognised, but every one of them is inside their cooldown: no
+      // re-unlock, no duplicate row - and the fact is counted, not hidden.
+      stats.grantsSuppressed += 1;
+      stats.lastSuppressed = "grant-cooldown";
+      stats.lastSuppressedAt = new Date(nowMs).toISOString();
+      summary.suppressed = "grant-cooldown";
+      return result;
+    }
+  } else {
+    const hasRealFace = detectedFaces.some((f) => f.boxSource === "detector");
+    const hasImage = Boolean(input.frameImage);
+    if (!input.denyWithoutFace && (!hasRealFace || !hasImage)) {
+      // An empty corridor. No face was detected (or no frame contained one),
+      // so there is nothing to show an operator: write no stranger row at all
+      // rather than filling the cluster panel with pictures of a doorway.
+      return result;
+    }
+    if (input.cooldowns && strangerCooldownMs > 0) {
+      const last = lastStrangerLogAtByGate.get(gateKey) || 0;
+      if (last > 0 && nowMs - last < strangerCooldownMs) {
+        stats.strangersSuppressed += 1;
+        stats.lastSuppressed = "stranger-cooldown";
+        stats.lastSuppressedAt = new Date(nowMs).toISOString();
+        summary.suppressed = "stranger-cooldown";
+        return result;
+      }
+      lastStrangerLogAtByGate.set(gateKey, nowMs);
+    }
+  }
+
+  // ---- Step 2: the stored image. ----------------------------------------
+  // Annotated with the REAL detector boxes of the frame being stored, so the
+  // picture an operator opens shows what was flagged. Non-data-URL inputs
+  // (and the no-image case) pass straight through, exactly as before.
+  const snapshotForLog = await annotateSnapshotWithBoxes(
+    input.frameImage as string,
+    (input.annotateFaces as Array<{ box2d: [number, number, number, number]; boxSource?: "detector" }>) || detectedFaces
+  );
+  summary.snapshotStored = Boolean(snapshotForLog);
+
+  const timestamp = new Date().toISOString();
+
+  if (hasAuthorized) {
+    summary.status = "GRANTED";
+
+    // 1. Unlock ONCE for everybody who passed the cooldown.
+    const namesList = grantable.map((e) => e.name).join(", ");
+    const unlockSource = input.unlockSource || recognitionUnlockSource(input.trigger, gateKey);
+    unlockDoor(unlockSource, namesList, grantable[0]?.id);
+    result.lockUnlocked = true;
+    summary.lockUnlocked = true;
+    stats.unlocks += 1;
+
+    // 2. One GRANTED row per employee, each with the stored snapshot.
+    for (const emp of grantable) {
+      const faceMatch = authorizedFaces.find((f) => f.employeeId === emp.id);
+      const accessLog: AccessLogRecord = {
+        id: "LOG-" + Date.now() + "-" + Math.floor(Math.random() * 1000),
+        timestamp: new Date().toISOString(),
+        type: actionType,
+        status: "GRANTED",
+        employeeId: emp.id,
+        employeeName: emp.name,
+        employeeCode: emp.employeeCode,
+        department: emp.department,
+        photoSnapshot: snapshotForLog,
+        confidence: faceMatch ? faceMatch.confidence : 95,
+        livenessScore: faceMatch ? faceMatch.livenessScore : 98,
+        lockAction: "Mở chốt tự động qua API (SmartLock Gateway)",
+        doorName: smartLockState.doorName,
+        reason:
+          `Nhận diện khuôn mặt trong khung hình (${faceMatch?.confidence || 95}% khớp - Xử lý trong ${processingTimeMs}ms)` +
+          recognitionSourceSuffix(input),
+      };
+      accessLogs.unshift(accessLog);
+      db.saveAccessLog(accessLog);
+      result.logs.push(accessLog);
+      summary.logIds.push(accessLog.id);
+      stats.grantsWritten += 1;
+      stats.lastLogId = accessLog.id;
+      stats.lastLogAt = accessLog.timestamp;
+
+      broadcastSSE("access_granted", {
+        log: accessLog,
+        employee: emp,
+      });
+
+      sendEtonWebhook({
+        userName: emp.name,
+        employeeCode: emp.employeeCode,
+        scanType: actionType,
+      }).catch((webhookErr) => {
+        console.warn("[Webhook] Background dispatch warning:", webhookErr);
+      });
+    }
+    result.log = result.logs[0];
+    summary.logId = result.logs[0]?.id;
+
+    // 3. Mobile push notification.
+    const notifTitle =
+      grantable.length > 1
+        ? `Mở cửa tự động (${grantable.length} nhân viên)`
+        : `Mở cửa tự động (${typeLabel})`;
+    const notifBody =
+      grantable.length > 1
+        ? `Phát hiện đồng thời ${grantable.map((e) => e.name).join(" & ")} điểm danh ${typeLabel} tại ${smartLockState.doorName}`
+        : `${grantable[0].name} (${grantable[0].employeeCode}) vừa điểm danh ${typeLabel} qua nhận diện khuôn mặt`;
+
+    const mobileNotif: MobileNotificationRecord = {
+      id: "NOTIF-" + Date.now(),
+      title: notifTitle,
+      body: notifBody,
+      timestamp: new Date().toISOString(),
+      type: "SUCCESS",
+      read: false,
+      employeeId: grantable[0]?.id,
+      employeeName: grantable[0]?.name,
+    };
+    mobileNotifications.unshift(mobileNotif);
+    db.saveNotification(mobileNotif);
+    broadcastSSE("notification", mobileNotif);
+
+    // 4. Someone unregistered walked in with them: security advisory only,
+    //    never a second decision.
+    if (unauthorizedFaces.length > 0) {
+      const warnNotif: MobileNotificationRecord = {
+        id: "NOTIF-" + (Date.now() + 1),
+        title: "Lưu ý an ninh: Người lạ đi cùng",
+        body: `Phát hiện ${unauthorizedFaces.length} người chưa đăng ký đi cùng nhóm nhân viên qua ${smartLockState.doorName}`,
+        timestamp: new Date().toISOString(),
+        type: "WARNING",
+        read: false,
+      };
+      mobileNotifications.unshift(warnNotif);
+      db.saveNotification(warnNotif);
+      broadcastSSE("notification", warnNotif);
+    }
+
+    return result;
+  }
+
+  // ---- Denied / stranger ------------------------------------------------
+  summary.status = "DENIED";
+  const accessLog: AccessLogRecord = {
+    id: "LOG-" + Date.now(),
+    timestamp,
+    type: actionType,
+    status: "DENIED",
+    photoSnapshot: snapshotForLog,
+    confidence: detectedFaces[0]?.confidence || 25,
+    livenessScore: detectedFaces[0]?.livenessScore || 85,
+    lockAction: "Khóa giữ nguyên trạng thái LOCKED",
+    doorName: smartLockState.doorName,
+    reason:
+      (detectedFaces[0]?.message || "Không có khuôn mặt nào khớp với cơ sở dữ liệu nhân viên") +
+      recognitionSourceSuffix(input),
+  };
+  accessLogs.unshift(accessLog);
+  db.saveAccessLog(accessLog);
+  result.logs.push(accessLog);
+  result.log = accessLog;
+  summary.logId = accessLog.id;
+  summary.logIds.push(accessLog.id);
+  stats.strangersWritten += 1;
+  stats.lastLogId = accessLog.id;
+  stats.lastLogAt = accessLog.timestamp;
+
+  const mobileNotif: MobileNotificationRecord = {
+    id: "NOTIF-" + Date.now(),
+    title: "🚨 Cảnh báo an ninh: Phát hiện người lạ chụp hình",
+    body: `Phát hiện khuôn mặt không xác định tại ${smartLockState.doorName} (Khóa cửa giữ an toàn). Đã tự động lưu trữ ảnh vào cụm giám sát người lạ.`,
+    timestamp: new Date().toISOString(),
+    type: "ALERT",
+    read: false,
+  };
+  mobileNotifications.unshift(mobileNotif);
+  db.saveNotification(mobileNotif);
+
+  broadcastSSE("access_denied", {
+    log: accessLog,
+    notification: mobileNotif,
+  });
+  broadcastSSE("stranger_detected", {
+    log: accessLog,
+    notification: mobileNotif,
+    // Image bytes ONLY on the single-frame API path, which has always carried
+    // them. A gate scan broadcasts on every tick, so it sends no pixels - the
+    // stored snapshot is fetched from the log / cluster endpoints instead.
+    snapshot: input.sseSnapshot,
+    doorName: smartLockState.doorName,
+    timestamp: accessLog.timestamp,
+  });
+  broadcastSSE("notification", mobileNotif);
+
+  // Cảnh báo người lạ qua webhook, kèm liên kết mở thẳng cụm ảnh người lạ.
+  // Fire-and-forget: một webhook chậm/chết không được làm trễ phản hồi HTTP,
+  // và lỗi gửi tin không bao giờ ảnh hưởng tới nhật ký ra vào ở trên.
+  //
+  // COOLDOWN INTERACTION - deliberate and explicit. `sendStrangerWebhook` owns
+  // a SECOND, independent cooldown (`webhookConfig.strangerCooldownSeconds`,
+  // default 60 s, GLOBAL rather than per-gate). The gate cooldown above only
+  // ever decides whether a ROW is written; whenever a row IS written the
+  // webhook is always invoked, never pre-filtered here, so this change can
+  // never silently swallow an alert for a log that exists. The webhook's own
+  // cooldown may still drop it (e.g. the other gate alerted 10 s ago) - that
+  // is the operator's configured webhook noise policy, so it is counted in
+  // `strangerWebhooksNotSent` and visible in the webhook log instead of being
+  // bypassed.
+  summary.strangerWebhookDispatched = true;
+  sendStrangerWebhook({
+    log: { id: accessLog.id, type: accessLog.type, reason: accessLog.reason },
+    doorName: smartLockState.doorName,
+    faceCount: detectedFaces.length,
+    baseUrl: input.baseUrl,
+  })
+    .then((sent) => {
+      if (!sent) stats.strangerWebhooksNotSent += 1;
+    })
+    .catch(() => {});
+
+  return result;
+}
+
+/** " - <trigger> <stream>" appended to a scan-path log reason; empty for the API path. */
+function recognitionSourceSuffix(input: RecognitionOutcomeInput): string {
+  if (input.trigger === "api") return "";
+  const who = input.trigger === "watcher" ? "Watcher tự động" : "Quét RTSP thủ công";
+  const where = input.streamLabel || input.streamId;
+  return where ? ` - ${who} [${where}]` : ` - ${who}`;
+}
+
 /** What a gate scan is asked to do - exactly the fields POST /scan-rtsp accepts. */
 interface GateScanRequest {
   gate?: unknown;
+  /**
+   * Who asked. Only the audit wording of the unlock/log differs - the
+   * decision, the thresholds and the recording rules are identical, because a
+   * watched scan and a manual scan are the same event.
+   */
+  trigger?: RecognitionTrigger;
   stream?: unknown;
   url?: unknown;
   scanType?: unknown;
@@ -3058,6 +3558,7 @@ async function performGateScan(input: GateScanRequest): Promise<GateScanResult> 
         grabs,
         ok: grabs.some((g) => g.ok && g.jpeg),
         observed: [],
+        frameJpegs: new Map<number, Buffer>(),
         faces: [],
       };
       if (!outcome.ok) {
@@ -3071,13 +3572,18 @@ async function performGateScan(input: GateScanRequest): Promise<GateScanResult> 
         for (let i = 0; i < grabs.length; i++) {
           const g = grabs[i];
           if (!g.ok || !g.jpeg) continue;
-          outcome.observed.push(...(await observeFrame(g.jpeg, target.id, target.label, i)));
+          const observed = await observeFrame(g.jpeg, target.id, target.label, i);
+          // Keep the pixels only when this frame contained a face; the fused
+          // decision below says which of those frames is worth storing.
+          if (observed.length > 0) outcome.frameJpegs.set(i, g.jpeg);
+          outcome.observed.push(...observed);
         }
         return outcome;
       }
 
       // Legacy per-stream path (hash matcher / fail-closed): identical to before.
-      const firstOk = grabs.find((g) => g.ok && g.jpeg)!;
+      const firstOkIndex = grabs.findIndex((g) => g.ok && g.jpeg);
+      const firstOk = grabs[firstOkIndex];
       const base64Data = firstOk.jpeg!.toString("base64");
       try {
         const recognition = await recognizeFrame({
@@ -3091,6 +3597,11 @@ async function performGateScan(input: GateScanRequest): Promise<GateScanResult> 
         });
         outcome.recognition = recognition;
         outcome.faces = recognition.detectedFaces.map((f) => ({ ...f, streamId: target.id, streamLabel: target.label }));
+        // One frame per stream on this path, so keeping it is cheap. Whether it
+        // is ever STORED is decided by applyRecognitionOutcome: `recognizeFrame`
+        // always returns at least a placeholder face, so a stranger row still
+        // requires a REAL detection (boxSource "detector").
+        outcome.frameJpegs.set(firstOkIndex, firstOk.jpeg!);
       } catch (err: any) {
         outcome.ok = false;
         if (isWorkerPoolUnavailableError(err)) {
@@ -3107,13 +3618,17 @@ async function performGateScan(input: GateScanRequest): Promise<GateScanResult> 
   // Phase 2 - ONE fused decision over the pooled observations of every stream.
   let fusion: FusionDecision = emptyFusionDecision(fusionThresholds);
   let observationsPooled = 0;
+  // Kept index-parallel (allFaces[i] describes allObserved[i]) so the frame the
+  // WINNING observation came from can be identified after the decision.
+  let allObserved: EngineObservation[] = [];
+  let allFaces: Array<DetectedFaceItem & { streamId: string; streamLabel: string }> = [];
   if (faceEngine === "onnx") {
-    const allObserved = outcomes.flatMap((o) => o.observed);
+    allObserved = outcomes.flatMap((o) => o.observed);
     const pooled = capObservations(allObserved); // marks the dropped ones `fused:false`
     observationsPooled = pooled.length;
     fusion = recognizeObservations(pooled, currentGallery(), fusionThresholds);
     // Built from the SAME ordered list that was fused, then split per stream.
-    const allFaces = facesFromDecision(allObserved, fusion, employees);
+    allFaces = facesFromDecision(allObserved, fusion, employees);
     for (const o of outcomes) o.faces = allFaces.filter((f) => f.streamId === o.stream.id);
   }
 
@@ -3232,6 +3747,79 @@ async function performGateScan(input: GateScanRequest): Promise<GateScanResult> 
       : first?.engineUsed || "Local Edge Biometrics";
   const modelUsed = faceEngine === "onnx" ? faceModelTag() : first?.modelUsed || aiRecognitionConfig.localModel.modelArchitecture;
 
+  // ---------------------------------------------------------------------
+  // WHICH FRAME GETS STORED
+  //
+  // A gate scan pools observations from several streams and possibly several
+  // frames, so "the frame" is a choice:
+  //   recognised -> the frame the WINNING observation came from (the picture
+  //                 that actually opened the door);
+  //   not        -> the best-quality frame that contained a face;
+  //   no face    -> nothing at all (and no stranger row, see
+  //                 applyRecognitionOutcome).
+  // The annotation uses only the detector boxes OF THAT FRAME: boxes from a
+  // different frame or stream would draw green rectangles over the wrong
+  // pixels.
+  // ---------------------------------------------------------------------
+  let snapshotJpeg: Buffer | undefined;
+  let snapshotStreamId: string | undefined;
+  let snapshotStreamLabel: string | undefined;
+  let snapshotFaces: Array<DetectedFaceItem & { streamId: string; streamLabel: string }> = [];
+
+  if (faceEngine === "onnx" && allObserved.length > 0) {
+    let pick = -1;
+    for (let i = 0; i < allObserved.length; i++) {
+      const f = allFaces[i];
+      if (!f || !f.recognized || !f.employeeId) continue;
+      if (pick < 0 || f.confidence > allFaces[pick].confidence) pick = i;
+    }
+    if (pick < 0) {
+      for (let i = 0; i < allObserved.length; i++) {
+        if (pick < 0 || allObserved[i].observation.quality > allObserved[pick].observation.quality) pick = i;
+      }
+    }
+    const chosen = allObserved[pick];
+    const owner = outcomes.find((o) => o.stream.id === chosen.streamId);
+    const jpeg = owner?.frameJpegs.get(chosen.frameIndex);
+    if (jpeg) {
+      snapshotJpeg = jpeg;
+      snapshotStreamId = chosen.streamId;
+      snapshotStreamLabel = chosen.streamLabel;
+      snapshotFaces = allFaces.filter(
+        (_, i) => allObserved[i].streamId === chosen.streamId && allObserved[i].frameIndex === chosen.frameIndex
+      );
+    }
+  } else if (faceEngine !== "onnx") {
+    // Legacy per-stream path: one frame per stream was recognised, so prefer
+    // the stream that matched somebody and fall back to the first that saw a face.
+    const owner =
+      outcomes.find((o) => o.frameJpegs.size > 0 && o.faces.some((f) => f.recognized && f.employeeId)) ||
+      outcomes.find((o) => o.frameJpegs.size > 0);
+    const entry = owner ? [...owner.frameJpegs.entries()][0] : undefined;
+    if (owner && entry) {
+      snapshotJpeg = entry[1];
+      snapshotStreamId = owner.stream.id;
+      snapshotStreamLabel = owner.stream.label;
+      snapshotFaces = owner.faces;
+    }
+  }
+
+  // The recording + unlocking side of the decision, shared verbatim with
+  // POST /api/recognize-face. Nothing below re-decides anything.
+  const outcome = await applyRecognitionOutcome({
+    detectedFaces,
+    frameImage: snapshotJpeg ? `data:image/jpeg;base64,${snapshotJpeg.toString("base64")}` : undefined,
+    annotateFaces: snapshotFaces,
+    scanType: resolvedScanType,
+    trigger: input?.trigger === "watcher" ? "watcher" : "manual",
+    gate: gateParam,
+    streamId: snapshotStreamId,
+    streamLabel: snapshotStreamLabel,
+    processingTimeMs,
+    cooldowns: true,
+    denyWithoutFace: false,
+  });
+
   return { status: 200, body: {
     success: true,
     frameCaptureDurationMs,
@@ -3276,11 +3864,22 @@ async function performGateScan(input: GateScanRequest): Promise<GateScanResult> 
     threadLatencyMs: workerInfo?.threadLatencyMs ?? processingTimeMs,
     processingTimeMs,
     processDurationMs: processingTimeMs,
+    // What the scan actually RECORDED and DID: log ids, whether the door was
+    // unlocked, and why nothing happened when a cooldown deduped it. Ids and
+    // flags only - the stored JPEG stays in the access log.
+    outcome: outcome.summary,
+    accessLogId: outcome.summary.logId,
+    accessLogIds: outcome.summary.logIds,
+    lockUnlocked: outcome.lockUnlocked,
+    suppressed: outcome.summary.suppressed,
+    snapshotStored: outcome.summary.snapshotStored,
   } };
 }
 
 app.post("/api/camera-streams/scan-rtsp", async (req, res) => {
-  const result = await performGateScan(req.body || {});
+  // `trigger` is set here, never taken from the body: a caller must not be
+  // able to label its own scan as the backend watcher in the audit trail.
+  const result = await performGateScan({ ...(req.body || {}), trigger: "manual" });
   if (result.retryAfterSeconds) res.setHeader("Retry-After", String(result.retryAfterSeconds));
   res.status(result.status).json(result.body);
 });
@@ -3352,6 +3951,8 @@ interface GateWatcherState {
   /** Why an enabled watcher is idling instead of scanning (logged once per cause). */
   idleReason?: string;
   loggedIdleReason?: string;
+  /** What the last completed scan RECORDED (log ids, unlock, suppression). */
+  lastOutcome?: RecognitionOutcomeSummary;
 }
 
 function newGateWatcherState(gateKey: GateWatchKey): GateWatcherState {
@@ -3383,8 +3984,23 @@ function gateWatchConfigOf(gateKey: GateWatchKey): GateWatchConfigRecord {
   return normalizeGateWatchConfig(gate?.watch);
 }
 
-/** The public runtime view (src/types.ts `GateWatchRuntime`). */
-function gateWatchRuntime(state: GateWatcherState): GateWatchRuntime {
+/**
+ * Recording/dedupe telemetry this watcher reports ON TOP of the shared
+ * `GateWatchRuntime` shape in src/types.ts, so an operator can tell "the
+ * corridor was empty" from "somebody was recognised but deduped".
+ */
+interface GateWatchOutcomeRuntime {
+  /** Summary of the last completed scan's side effects. */
+  lastOutcome?: RecognitionOutcomeSummary;
+  lastAccessLogId?: string;
+  lastUnlocked?: boolean;
+  lastSuppressed?: OutcomeSuppression;
+  /** Cumulative per-gate counters (written vs suppressed). */
+  outcomeStats: RecognitionOutcomeStats;
+}
+
+/** The public runtime view (src/types.ts `GateWatchRuntime`) + outcome telemetry. */
+function gateWatchRuntime(state: GateWatcherState): GateWatchRuntime & GateWatchOutcomeRuntime {
   return {
     gate: state.gate,
     enabled: state.enabled,
@@ -3400,6 +4016,11 @@ function gateWatchRuntime(state: GateWatcherState): GateWatchRuntime {
     consecutiveErrors: state.consecutiveErrors,
     totalRuns: state.totalRuns,
     nextRunAt: state.nextRunAt,
+    lastOutcome: state.lastOutcome,
+    lastAccessLogId: state.lastOutcome?.logId,
+    lastUnlocked: state.lastOutcome?.lockUnlocked,
+    lastSuppressed: state.lastOutcome?.suppressed,
+    outcomeStats: gateOutcomeStats[state.gateKey],
   };
 }
 
@@ -3496,7 +4117,7 @@ async function runGateWatchTick(state: GateWatcherState, generation: number) {
   let result: GateScanResult;
   try {
     // Exactly what POST /api/camera-streams/scan-rtsp runs, same arguments.
-    result = await performGateScan({ gate: state.gateKey, frames: state.frames });
+    result = await performGateScan({ gate: state.gateKey, frames: state.frames, trigger: "watcher" });
   } catch (err: any) {
     result = { status: 500, body: { success: false, error: err?.message || "Lỗi không xác định khi quét cổng" } };
   } finally {
@@ -3514,6 +4135,7 @@ async function runGateWatchTick(state: GateWatcherState, generation: number) {
   state.lastBasis = body.fusion?.basis;
   state.lastRecognized = ok ? Boolean(body.recognized) : false;
   state.lastEmployeeName = ok && body.recognized ? body.bestMatch?.name : undefined;
+  state.lastOutcome = ok ? (body.outcome as RecognitionOutcomeSummary | undefined) : undefined;
   if (ok) {
     state.consecutiveErrors = 0;
     state.lastError = undefined;
@@ -3571,6 +4193,13 @@ async function runGateWatchTick(state: GateWatcherState, generation: number) {
     modelUsed: body.modelUsed,
     // Per-stream rows exactly as the route reports them, detectedFaces included.
     streams: Array.isArray(body.streams) ? body.streams : [],
+    // ---- what the scan RECORDED (ids and flags only, never image bytes) ----
+    outcome: state.lastOutcome,
+    accessLogId: state.lastOutcome?.logId,
+    accessLogIds: state.lastOutcome?.logIds || [],
+    lockUnlocked: Boolean(state.lastOutcome?.lockUnlocked),
+    suppressed: state.lastOutcome?.suppressed,
+    snapshotStored: Boolean(state.lastOutcome?.snapshotStored),
   });
 
   // Stopped or reconfigured while the scan was in flight: do NOT reschedule.
@@ -3599,7 +4228,10 @@ function stopGateWatcher(state: GateWatcherState) {
  * Applies the persisted watch config of one gate to its watcher. Restarting is
  * always stop-then-start, so no timer and no in-flight scan survives a change.
  */
-function applyGateWatchConfig(gateKey: GateWatchKey, options: { silent?: boolean } = {}): GateWatchRuntime {
+function applyGateWatchConfig(
+  gateKey: GateWatchKey,
+  options: { silent?: boolean } = {}
+): GateWatchRuntime & GateWatchOutcomeRuntime {
   const state = gateWatchers[gateKey];
   const cfg = gateWatchConfigOf(gateKey);
   const unchanged =
@@ -3635,7 +4267,7 @@ function syncGateWatchers() {
   applyGateWatchConfig("exit");
 }
 
-function listGateWatchRuntimes(): GateWatchRuntime[] {
+function listGateWatchRuntimes(): Array<GateWatchRuntime & GateWatchOutcomeRuntime> {
   return [gateWatchRuntime(gateWatchers.entry), gateWatchRuntime(gateWatchers.exit)];
 }
 
@@ -5605,111 +6237,37 @@ app.post(RECOGNIZE_FACE_ROUTES, async (req, res) => {
 
     // Determine recognition status
     const authorizedFaces = detectedFaces.filter((f) => f.recognized && f.employeeId);
-    // Snapshot stored on the log carries thick green boxes around detected faces.
-    const snapshotForLog = await annotateSnapshotWithBoxes(imageBase64, detectedFaces);
     const unauthorizedFaces = detectedFaces.filter((f) => !f.recognized);
-    const hasAuthorized = authorizedFaces.length > 0;
-
-    const actionType: "ENTRY" | "EXIT" = scanType === "EXIT" ? "EXIT" : "ENTRY";
-    const typeLabel = actionType === "ENTRY" ? "Vào" : "Ra";
 
     const processingTimeMs = Math.max(85, Date.now() - startTime);
 
-    const generatedLogs: AccessLogRecord[] = [];
-    const recognizedEmployees: EmployeeRecord[] = [];
+    // EVERY side effect of a recognition - the annotated snapshot, the access
+    // log(s), the notification, the SSE events, the Eton/stranger webhooks and
+    // the unlock - lives in the ONE shared function that the gate scan path
+    // (watcher + POST /api/camera-streams/scan-rtsp) calls too, so the two can
+    // never again record different things for the same decision.
+    //
+    // This route is the REFERENCE behaviour and keeps it exactly: no cooldowns
+    // (a caller posts one frame at a time and reads its own answer), a DENIED
+    // row even when no face was found, the legacy unlock source string, and a
+    // `stranger_detected` SSE that still carries the posted frame.
+    const outcome = await applyRecognitionOutcome({
+      detectedFaces,
+      frameImage: imageBase64,
+      annotateFaces: detectedFaces,
+      scanType,
+      trigger: "api",
+      processingTimeMs,
+      unlockSource: "Nhận diện khuôn mặt AI (Đa nhân viên)",
+      baseUrl: resolveAppBaseUrl(req),
+      cooldowns: false,
+      denyWithoutFace: true,
+      sseSnapshot: imageBase64,
+    });
+    const recognizedEmployees = outcome.recognizedEmployees;
+    const generatedLogs = outcome.logs;
 
-    if (hasAuthorized) {
-      // 1. Gather all recognized employees
-      for (const face of authorizedFaces) {
-        const emp = employees.find((e) => e.id === face.employeeId);
-        if (emp && !recognizedEmployees.some((re) => re.id === emp.id)) {
-          recognizedEmployees.push(emp);
-        }
-      }
-
-      // 2. Trigger Smart Lock Unlock via API
-      const namesList = recognizedEmployees.map((e) => e.name).join(", ");
-      unlockDoor("Nhận diện khuôn mặt AI (Đa nhân viên)", namesList, recognizedEmployees[0]?.id);
-
-      // 3. Create Access Logs for each recognized employee
-      for (const emp of recognizedEmployees) {
-        const faceMatch = authorizedFaces.find((f) => f.employeeId === emp.id);
-        const accessLog: AccessLogRecord = {
-          id: "LOG-" + Date.now() + "-" + Math.floor(Math.random() * 1000),
-          timestamp: new Date().toISOString(),
-          type: actionType,
-          status: "GRANTED",
-          employeeId: emp.id,
-          employeeName: emp.name,
-          employeeCode: emp.employeeCode,
-          department: emp.department,
-          photoSnapshot: snapshotForLog,
-          confidence: faceMatch ? faceMatch.confidence : 95,
-          livenessScore: faceMatch ? faceMatch.livenessScore : 98,
-          lockAction: "Mở chốt tự động qua API (SmartLock Gateway)",
-          doorName: smartLockState.doorName,
-          reason: `Nhận diện khuôn mặt trong khung hình (${faceMatch?.confidence || 95}% khớp - Xử lý trong ${processingTimeMs}ms)`,
-        };
-        accessLogs.unshift(accessLog);
-        db.saveAccessLog(accessLog);
-        generatedLogs.push(accessLog);
-
-        // Broadcast per-employee event
-        broadcastSSE("access_granted", {
-          log: accessLog,
-          employee: emp,
-        });
-
-        // 3.1 Post Webhook to Eton Chat Room API with param json { text: "USER - TIMESTAMP", attachments: [{ title: "[[GATE]]" }] }
-        sendEtonWebhook({
-          userName: emp.name,
-          employeeCode: emp.employeeCode,
-          scanType: actionType,
-        }).catch((webhookErr) => {
-          console.warn("[Webhook] Background dispatch warning:", webhookErr);
-        });
-      }
-
-      // 4. Create Mobile Push Notification
-      const notifTitle =
-        recognizedEmployees.length > 1
-          ? `Mở cửa tự động (${recognizedEmployees.length} nhân viên)`
-          : `Mở cửa tự động (${typeLabel})`;
-
-      const notifBody =
-        recognizedEmployees.length > 1
-          ? `Phát hiện đồng thời ${recognizedEmployees.map((e) => e.name).join(" & ")} điểm danh ${typeLabel} tại ${smartLockState.doorName}`
-          : `${recognizedEmployees[0].name} (${recognizedEmployees[0].employeeCode}) vừa điểm danh ${typeLabel} qua nhận diện khuôn mặt`;
-
-      const mobileNotif: MobileNotificationRecord = {
-        id: "NOTIF-" + Date.now(),
-        title: notifTitle,
-        body: notifBody,
-        timestamp: new Date().toISOString(),
-        type: "SUCCESS",
-        read: false,
-        employeeId: recognizedEmployees[0]?.id,
-        employeeName: recognizedEmployees[0]?.name,
-      };
-      mobileNotifications.unshift(mobileNotif);
-      db.saveNotification(mobileNotif);
-      broadcastSSE("notification", mobileNotif);
-
-      // If mixed with unauthorized person, send security advisory
-      if (unauthorizedFaces.length > 0) {
-        const warnNotif: MobileNotificationRecord = {
-          id: "NOTIF-" + (Date.now() + 1),
-          title: "Lưu ý an ninh: Người lạ đi cùng",
-          body: `Phát hiện ${unauthorizedFaces.length} người chưa đăng ký đi cùng nhóm nhân viên qua ${smartLockState.doorName}`,
-          timestamp: new Date().toISOString(),
-          type: "WARNING",
-          read: false,
-        };
-        mobileNotifications.unshift(warnNotif);
-        db.saveNotification(warnNotif);
-        broadcastSSE("notification", warnNotif);
-      }
-
+    if (outcome.granted) {
       const primaryEmployee = recognizedEmployees[0];
       const primaryFace = authorizedFaces[0];
 
@@ -5727,7 +6285,7 @@ app.post(RECOGNIZE_FACE_ROUTES, async (req, res) => {
         message:
           overallMessage ||
           `Đã xác thực ${recognizedEmployees.length} nhân viên trong khung hình. Mở cửa!`,
-        lockUnlocked: true,
+        lockUnlocked: outcome.lockUnlocked,
         detectedFeatures: `Phát hiện ${detectedFaces.length} khuôn mặt toàn cảnh trong ${processingTimeMs}ms`,
         log: generatedLogs[0],
         logs: generatedLogs,
@@ -5739,59 +6297,11 @@ app.post(RECOGNIZE_FACE_ROUTES, async (req, res) => {
         workerId: multiThreadInfo.workerId,
         threadLatencyMs: multiThreadInfo.threadLatencyMs,
         threadPoolTelemetry: faceWorkerPool.getPoolTelemetry(),
+        outcome: outcome.summary,
       });
     } else {
       // Access Denied: No registered employees recognized
-      const accessLog: AccessLogRecord = {
-        id: "LOG-" + Date.now(),
-        timestamp: new Date().toISOString(),
-        type: actionType,
-        status: "DENIED",
-        photoSnapshot: snapshotForLog,
-        confidence: detectedFaces[0]?.confidence || 25,
-        livenessScore: detectedFaces[0]?.livenessScore || 85,
-        lockAction: "Khóa giữ nguyên trạng thái LOCKED",
-        doorName: smartLockState.doorName,
-        reason:
-          detectedFaces[0]?.message ||
-          "Không có khuôn mặt nào khớp với cơ sở dữ liệu nhân viên",
-      };
-      accessLogs.unshift(accessLog);
-      db.saveAccessLog(accessLog);
-
-      const mobileNotif: MobileNotificationRecord = {
-        id: "NOTIF-" + Date.now(),
-        title: "🚨 Cảnh báo an ninh: Phát hiện người lạ chụp hình",
-        body: `Phát hiện khuôn mặt không xác định tại ${smartLockState.doorName} (Khóa cửa giữ an toàn). Đã tự động lưu trữ ảnh vào cụm giám sát người lạ.`,
-        timestamp: new Date().toISOString(),
-        type: "ALERT",
-        read: false,
-      };
-      mobileNotifications.unshift(mobileNotif);
-      db.saveNotification(mobileNotif);
-
-      broadcastSSE("access_denied", {
-        log: accessLog,
-        notification: mobileNotif,
-      });
-      broadcastSSE("stranger_detected", {
-        log: accessLog,
-        notification: mobileNotif,
-        snapshot: imageBase64,
-        doorName: smartLockState.doorName,
-        timestamp: accessLog.timestamp,
-      });
-      broadcastSSE("notification", mobileNotif);
-
-      // Cảnh báo người lạ qua webhook, kèm liên kết mở thẳng cụm ảnh người lạ.
-      // Fire-and-forget: một webhook chậm/chết không được làm trễ phản hồi HTTP,
-      // và lỗi gửi tin không bao giờ ảnh hưởng tới nhật ký ra vào ở trên.
-      sendStrangerWebhook({
-        log: { id: accessLog.id, type: accessLog.type, reason: accessLog.reason },
-        doorName: smartLockState.doorName,
-        faceCount: detectedFaces.length,
-        baseUrl: resolveAppBaseUrl(req),
-      }).catch(() => {});
+      const accessLog = outcome.log;
 
       res.json({
         recognized: false,
@@ -5810,7 +6320,7 @@ app.post(RECOGNIZE_FACE_ROUTES, async (req, res) => {
         lockUnlocked: false,
         detectedFeatures: `Quét toàn khung hình (${detectedFaces.length} người) trong ${processingTimeMs}ms - Không khớp`,
         log: accessLog,
-        logs: [accessLog],
+        logs: accessLog ? [accessLog] : [],
         engineUsed,
         modelUsed,
         faceEngine: recognition.faceEngine,
@@ -5819,6 +6329,7 @@ app.post(RECOGNIZE_FACE_ROUTES, async (req, res) => {
         workerId: multiThreadInfo.workerId,
         threadLatencyMs: multiThreadInfo.threadLatencyMs,
         threadPoolTelemetry: faceWorkerPool.getPoolTelemetry(),
+        outcome: outcome.summary,
       });
     }
   } catch (error: any) {
