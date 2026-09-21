@@ -304,10 +304,51 @@ export interface GateStreamSource {
   priority: number;
 }
 
+/**
+ * Server-side auto-scan ("watch") for one gate. This replaces the browser
+ * timer that used to drive scanning: a backend job keeps watching whether or
+ * not anyone has the dashboard open.
+ */
+export interface GateWatchConfig {
+  enabled: boolean;
+  /**
+   * Seconds between the END of one scan and the start of the next. A scan of
+   * a 2-stream gate takes ~2.6 s at frames=1, so the real cadence is
+   * intervalSeconds + scan duration; ticks are never allowed to overlap.
+   */
+  intervalSeconds: number;
+  /** Frames per stream per scan (1-5). More frames = more evidence, more time. */
+  frames: number;
+}
+
+/** Live state of a gate's backend watcher, for the dashboard and diagnostics. */
+export interface GateWatchRuntime {
+  gate: "ENTRY" | "EXIT";
+  enabled: boolean;
+  intervalSeconds: number;
+  frames: number;
+  /** True while a scan is actually in flight. */
+  running: boolean;
+  lastRunAt?: string;
+  lastDurationMs?: number;
+  /** FusionDecision.basis of the last completed scan. */
+  lastBasis?: string;
+  lastRecognized?: boolean;
+  lastEmployeeName?: string;
+  lastError?: string;
+  /** Consecutive failed scans; the watcher backs off rather than hammering a dead camera. */
+  consecutiveErrors: number;
+  /** Scans completed since the watcher was last started. */
+  totalRuns: number;
+  nextRunAt?: string;
+}
+
 export interface GateStreamConfig {
   gateType: "ENTRY" | "EXIT";
   name: string;
   enabled: boolean;
+  /** Backend auto-scan for this gate. Absent means disabled. */
+  watch?: GateWatchConfig;
   /**
    * All video sources for this gate. Optional for backward compatibility:
    * when absent or empty, the server derives a single stream from the legacy

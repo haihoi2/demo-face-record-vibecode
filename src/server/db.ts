@@ -260,10 +260,24 @@ export interface GateStreamSourceRecord {
   priority: number;
 }
 
+/**
+ * Server-side auto-scan ("watch") for one gate (mirror of `GateWatchConfig` in
+ * src/types.ts). Persisted inside the `cameraStreamsConfig` JSON blob, so no
+ * schema change: blobs written before this field simply lack it and the server
+ * normalisation fills in the default (disabled).
+ */
+export interface GateWatchConfigRecord {
+  enabled: boolean;
+  intervalSeconds: number;
+  frames: number;
+}
+
 export interface GateStreamConfigRecord {
   gateType: "ENTRY" | "EXIT";
   name: string;
   enabled: boolean;
+  /** Backend auto-scan for this gate. Absent in older blobs -> disabled. */
+  watch?: GateWatchConfigRecord;
   /**
    * All video sources of the gate. Optional in persisted blobs written before
    * multi-stream support: the server derives one stream from the legacy fields
@@ -339,6 +353,9 @@ export const DEFAULT_CAMERA_STREAMS_CONFIG: CameraStreamsConfigRecord = {
     gateType: "ENTRY",
     name: "Camera Cổng Vào (Main Entry Gate)",
     enabled: true,
+    // Backend auto-scan is OFF by default: a job that can drive an unlock
+    // decision unattended has to be switched on deliberately.
+    watch: { enabled: false, intervalSeconds: 3, frames: 1 },
     streams: [
       {
         id: "entry-101",
@@ -372,6 +389,7 @@ export const DEFAULT_CAMERA_STREAMS_CONFIG: CameraStreamsConfigRecord = {
     gateType: "EXIT",
     name: "Camera Cổng Ra (Exit Gate B2)",
     enabled: true,
+    watch: { enabled: false, intervalSeconds: 3, frames: 1 },
     streams: [
       {
         id: "exit-102",

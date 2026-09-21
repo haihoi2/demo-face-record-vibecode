@@ -16,6 +16,7 @@ import {
   CameraStreamsConfigRecord,
   GateStreamConfigRecord,
   GateStreamSourceRecord,
+  GateWatchConfigRecord,
   AiRecognitionConfigRecord,
   AI_ENGINE_MODES,
   DEFAULT_STRANGER_WEBHOOK_CONFIG,
@@ -26,6 +27,7 @@ import type {
   FaceObservation,
   FusionDecision,
   FusionThresholds,
+  GateWatchRuntime,
   ObservationMatch,
 } from "./src/types";
 import { runLocalFaceRecognition } from "./src/utils/localBiometrics";
@@ -170,15 +172,18 @@ const WORKER_POOL_UNAVAILABLE_RE = /backpressure|reinitialised/i;
 function isWorkerPoolUnavailableError(err: unknown): boolean {
   return WORKER_POOL_UNAVAILABLE_RE.test(String((err as any)?.message || err || ""));
 }
-function respondWorkerPoolUnavailable(res: Response, err: unknown, extra: Record<string, unknown> = {}) {
-  res.setHeader("Retry-After", "1");
-  res.status(503).json({
+function workerPoolUnavailableBody(err: unknown, extra: Record<string, unknown> = {}) {
+  return {
     success: false,
     recognized: false,
     retryAfterSeconds: 1,
     error: (err as any)?.message || "Cụm luồng nhận diện đang quá tải, vui lòng gửi lại khung hình sau 1 giây.",
     ...extra,
-  });
+  };
+}
+function respondWorkerPoolUnavailable(res: Response, err: unknown, extra: Record<string, unknown> = {}) {
+  res.setHeader("Retry-After", "1");
+  res.status(503).json(workerPoolUnavailableBody(err, extra));
 }
 
 // Server-side Gemini client
@@ -544,13 +549,62 @@ function legacyFieldsFromStream(stream: GateStreamSourceRecord): GateLegacyStrea
   };
 }
 
+// ---- Backend auto-scan ("watch") config ----
+// Lives inside the gate object of the existing cameraStreamsConfig blob, so it
+// persists through db.saveCameraStreamsConfig with no schema change.
+const GATE_WATCH_MIN_INTERVAL_SECONDS = 1;
+const GATE_WATCH_MAX_INTERVAL_SECONDS = 300;
+/** Kept equal to FACE_SCAN_MAX_FRAMES (declared later in this file, so not referenced here). */
+const GATE_WATCH_MAX_FRAMES = 5;
+const DEFAULT_GATE_WATCH: GateWatchConfigRecord = {
+  // OFF by default. A backend job whose scans feed an unlock decision must be
+  // switched on deliberately, never by deploying a new build.
+  enabled: false,
+  intervalSeconds: 3,
+  frames: 1,
+};
+
+function clampInt(value: unknown, fallback: number, min: number, max: number): number {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.min(max, Math.max(min, Math.round(n)));
+}
+
+/**
+ * Normalises one gate's watch block. Missing / malformed values fall back to
+ * `fallback` (the gate's current values when patching, otherwise the defaults),
+ * `intervalSeconds` is clamped to 1..300 s and `frames` to 1..5.
+ */
+function normalizeGateWatchConfig(
+  raw: unknown,
+  fallback: GateWatchConfigRecord = DEFAULT_GATE_WATCH
+): GateWatchConfigRecord {
+  const src = raw && typeof raw === "object" ? (raw as Record<string, unknown>) : {};
+  const enabledRaw = src.enabled;
+  const enabled =
+    enabledRaw === undefined || enabledRaw === null
+      ? fallback.enabled
+      : enabledRaw === true || enabledRaw === "true" || enabledRaw === 1 || enabledRaw === "1";
+  return {
+    enabled,
+    intervalSeconds: clampInt(
+      src.intervalSeconds,
+      fallback.intervalSeconds,
+      GATE_WATCH_MIN_INTERVAL_SECONDS,
+      GATE_WATCH_MAX_INTERVAL_SECONDS
+    ),
+    frames: clampInt(src.frames, fallback.frames, 1, GATE_WATCH_MAX_FRAMES),
+  };
+}
+
 /**
  * Pure normalisation of one gate:
  *   1. missing/empty `streams` -> one stream derived from the legacy fields
  *      (id `${gate}-${rtsp channel}` e.g. `exit-501`, else `${gate}-primary`);
  *   2. every stream gets id / label / enabled / priority and whitelisted fields;
  *   3. duplicates by id are dropped (first wins), list capped, sorted by priority;
- *   4. the primary stream is mirrored back onto the legacy fields.
+ *   4. the primary stream is mirrored back onto the legacy fields;
+ *   5. the backend watch block is filled in (default: disabled, 3 s, 1 frame).
  */
 function normalizeGateConfig(gate: GateStreamConfigRecord): GateStreamConfigRecord {
   const gateType: "ENTRY" | "EXIT" = gate.gateType === "EXIT" ? "EXIT" : "ENTRY";
@@ -572,6 +626,7 @@ function normalizeGateConfig(gate: GateStreamConfigRecord): GateStreamConfigReco
   return {
     ...gate,
     gateType,
+    watch: normalizeGateWatchConfig(gate.watch),
     streams,
     ...legacyFieldsFromStream(primary),
   };
@@ -619,6 +674,8 @@ function applyGateConfigPatch(current: GateStreamConfigRecord, patch: any): Gate
     ...base,
     ...rest,
     gateType: base.gateType,
+    // A partial `watch` patch ({ enabled: true }) keeps the gate's other watch values.
+    watch: "watch" in rest ? normalizeGateWatchConfig(rest.watch, base.watch) : base.watch,
     streams: replaced ? patchStreams : base.streams,
   });
 
@@ -683,6 +740,7 @@ db.onSync(() => {
   doorControllerConfig = db.getDoorControllerConfig(DEFAULT_DOOR_CONTROLLER_CONFIG);
   doorApiLogs = db.getDoorApiLogs();
   cameraStreamsConfig = loadCameraStreamsConfig();
+  syncGateWatchers(); // a PostgreSQL rehydrate may carry a different watch config
   console.log(`[Server] Bộ nhớ In-Memory đã tự động đồng bộ từ PostgreSQL: ${employees.length} NV, ${accessLogs.length} logs, ${mobileNotifications.length} thông báo.`);
 });
 
@@ -2298,6 +2356,7 @@ app.post(CAMERA_CONFIG_ROUTES, (req, res) => {
   cameraStreamsConfig = updated;
   db.saveCameraStreamsConfig(updated);
   broadcastSSE("camera_config_updated", updated);
+  syncGateWatchers();
 
   res.json({
     success: true,
@@ -2326,6 +2385,7 @@ function commitGateStreams(gateKey: GateConfigKey, streams: GateStreamSourceReco
   cameraStreamsConfig = updated;
   db.saveCameraStreamsConfig(updated);
   broadcastSSE("camera_config_updated", updated);
+  syncGateWatchers(); // the watcher may now have (or have lost) something to scan
   return updated[gateKey];
 }
 
@@ -2907,11 +2967,36 @@ async function grabRtspFrames(
   return out;
 }
 
-app.post("/api/camera-streams/scan-rtsp", async (req, res) => {
-  const { gate, stream, url, scanType, frames, frameIntervalMs } = req.body || {};
+/** What a gate scan is asked to do - exactly the fields POST /scan-rtsp accepts. */
+interface GateScanRequest {
+  gate?: unknown;
+  stream?: unknown;
+  url?: unknown;
+  scanType?: unknown;
+  frames?: unknown;
+  frameIntervalMs?: unknown;
+  config?: Partial<ServerAiConfig> | null;
+}
+
+/** An HTTP answer as data, so the same scan can serve a route and the backend watcher. */
+interface GateScanResult {
+  status: number;
+  /** Set on 503 (worker-pool backpressure / re-init): the route mirrors it into the header. */
+  retryAfterSeconds?: number;
+  body: any;
+}
+
+/**
+ * THE gate scan. POST /api/camera-streams/scan-rtsp is a thin wrapper around
+ * this, and so is the backend watcher - there is exactly one capture +
+ * recognition + fusion path, so a watched scan can never take a looser
+ * decision than a manual one.
+ */
+async function performGateScan(input: GateScanRequest): Promise<GateScanResult> {
+  const { gate, stream, url, scanType, frames, frameIntervalMs } = input || {};
   const resolved = resolveGateStream(gate, stream);
   if (resolved.error) {
-    return res.status(400).json({ success: false, error: resolved.error });
+    return { status: 400, body: { success: false, error: resolved.error } };
   }
   const gateParam = resolved.gateKey;
   const targetGate = resolved.gate;
@@ -2921,7 +3006,7 @@ app.post("/api/camera-streams/scan-rtsp", async (req, res) => {
   if (singleStreamMode) {
     const streamUrl = String(url || resolved.stream.rtspUrl || "").trim();
     if (!isRtspUrl(streamUrl)) {
-      return res.status(400).json({ success: false, error: "Vui lòng chỉ định URL luồng RTSP hợp lệ" });
+      return { status: 400, body: { success: false, error: "Vui lòng chỉ định URL luồng RTSP hợp lệ" } };
     }
     targets.push({ stream: resolved.stream, url: streamUrl });
   } else {
@@ -2929,10 +3014,13 @@ app.post("/api/camera-streams/scan-rtsp", async (req, res) => {
       (s) => s.enabled && (s.sourceType === "RTSP" || !s.sourceType) && isRtspUrl(s.rtspUrl)
     );
     if (rtspStreams.length === 0) {
-      return res.status(400).json({
-        success: false,
-        error: "Cổng này chưa có luồng RTSP nào đang bật. Vui lòng chỉ định URL luồng RTSP hợp lệ",
-      });
+      return {
+        status: 400,
+        body: {
+          success: false,
+          error: "Cổng này chưa có luồng RTSP nào đang bật. Vui lòng chỉ định URL luồng RTSP hợp lệ",
+        },
+      };
     }
     for (const s of rtspStreams.slice(0, SCAN_RTSP_MAX_CONCURRENT_STREAMS)) {
       targets.push({ stream: s, url: String(s.rtspUrl).trim() });
@@ -2943,7 +3031,7 @@ app.post("/api/camera-streams/scan-rtsp", async (req, res) => {
     String(scanType || "").toUpperCase() === "EXIT" || (!scanType && gateParam === "exit") ? "EXIT" : "ENTRY";
 
   const faceEngine = activeFaceEngine();
-  const fusionThresholds = currentFusionThresholds(req.body?.config);
+  const fusionThresholds = currentFusionThresholds(input?.config);
   // Multi-frame only helps the real engine (the hash matcher ignores pixels),
   // so the legacy path stays at one frame per stream.
   const requestedFrames = Number(frames);
@@ -3065,37 +3153,46 @@ app.post("/api/camera-streams/scan-rtsp", async (req, res) => {
     const poolRejected = outcomes.find((o) => o.poolUnavailableError);
     if (poolRejected) {
       console.warn("[RTSP Scan] Cụm luồng từ chối tạm thời (503):", (poolRejected.poolUnavailableError as any)?.message);
-      respondWorkerPoolUnavailable(res, poolRejected.poolUnavailableError, {
-        gate: gateParam,
-        frameCaptureDurationMs,
-        streams: streamResults,
-        fusion: fusionSummary,
-      });
-      return;
+      return {
+        status: 503,
+        retryAfterSeconds: 1,
+        body: workerPoolUnavailableBody(poolRejected.poolUnavailableError, {
+          gate: gateParam,
+          frameCaptureDurationMs,
+          streams: streamResults,
+          fusion: fusionSummary,
+        }),
+      };
     }
     const recognitionFailed = outcomes.find((o) => o.recognitionError);
     if (recognitionFailed) {
       console.error("[RTSP Scan] Lỗi nhận diện khung hình:", (recognitionFailed.recognitionError as any)?.message || recognitionFailed.recognitionError);
-      return res.status(500).json({
+      return {
+        status: 500,
+        body: {
+          success: false,
+          recognized: false,
+          gate: gateParam,
+          error: recognitionFailed.error || "Lỗi xử lý nhận diện khung hình RTSP",
+          frameCaptureDurationMs,
+          streams: streamResults,
+          fusion: fusionSummary,
+        },
+      };
+    }
+    return {
+      status: 502,
+      body: {
         success: false,
         recognized: false,
         gate: gateParam,
-        error: recognitionFailed.error || "Lỗi xử lý nhận diện khung hình RTSP",
+        error: "Không thể lấy khung hình từ luồng RTSP. Hãy kiểm tra địa chỉ IP, tài khoản/mật khẩu hoặc kết nối mạng LAN.",
+        details: outcomes[0]?.grabs[0]?.errorLog || "",
         frameCaptureDurationMs,
         streams: streamResults,
         fusion: fusionSummary,
-      });
-    }
-    return res.status(502).json({
-      success: false,
-      recognized: false,
-      gate: gateParam,
-      error: "Không thể lấy khung hình từ luồng RTSP. Hãy kiểm tra địa chỉ IP, tài khoản/mật khẩu hoặc kết nối mạng LAN.",
-      details: outcomes[0]?.grabs[0]?.errorLog || "",
-      frameCaptureDurationMs,
-      streams: streamResults,
-      fusion: fusionSummary,
-    });
+      },
+    };
   }
 
   // Aggregate across streams (fail-closed: recognized only when an engine matched a registered employee).
@@ -3135,7 +3232,7 @@ app.post("/api/camera-streams/scan-rtsp", async (req, res) => {
       : first?.engineUsed || "Local Edge Biometrics";
   const modelUsed = faceEngine === "onnx" ? faceModelTag() : first?.modelUsed || aiRecognitionConfig.localModel.modelArchitecture;
 
-  res.json({
+  return { status: 200, body: {
     success: true,
     frameCaptureDurationMs,
     taskId: `rtsp-${Date.now()}`,
@@ -3179,7 +3276,417 @@ app.post("/api/camera-streams/scan-rtsp", async (req, res) => {
     threadLatencyMs: workerInfo?.threadLatencyMs ?? processingTimeMs,
     processingTimeMs,
     processDurationMs: processingTimeMs,
+  } };
+}
+
+app.post("/api/camera-streams/scan-rtsp", async (req, res) => {
+  const result = await performGateScan(req.body || {});
+  if (result.retryAfterSeconds) res.setHeader("Retry-After", String(result.retryAfterSeconds));
+  res.status(result.status).json(result.body);
+});
+
+// =========================================================================
+// BACKEND GATE WATCHERS (server-side auto-scan)
+//
+// Replaces the browser `setInterval` that used to drive auto-scan from
+// CameraDashboard. That timer had three defects this job fixes: nothing was
+// watched with the tab closed, two open dashboards doubled the load, and the
+// `if (!state.isScanning) return` guard silently dropped ~2/3 of the ticks at
+// a 1 s setting, so the interval control lied.
+//
+// SCHEDULING - a self-rescheduling setTimeout chain, never setInterval:
+//
+//     run -> await the scan -> wait intervalSeconds -> run -> ...
+//
+// Only one timer per gate exists at any moment and it is armed only AFTER the
+// previous scan settled, so two scans of the same gate can never overlap - no
+// queue, no dropped ticks, no guard flag doing the lying. The price is that
+// `intervalSeconds` is the GAP BETWEEN scans, not a period: a 2-stream exit
+// gate takes ~2.6 s at frames=1, so a 3 s setting scans every ~5.6 s. That is
+// deliberate and honest; a period-based timer would either overlap or drop
+// ticks.
+//
+// The scan itself is `performGateScan`, the very function POST
+// /api/camera-streams/scan-rtsp calls. There is no second, looser decision
+// path: fail-closed stays fail-closed, simulation stays behind
+// ALLOW_SIMULATED_RECOGNITION, and a 503 from worker-pool backpressure is an
+// error here, never a recognition.
+// =========================================================================
+
+/** Error backoff cap: a dead camera is retried at most once a minute. */
+const GATE_WATCH_MAX_BACKOFF_MS = 60_000;
+/** First run after a start/reconfigure, so a POST answer already carries nextRunAt. */
+const GATE_WATCH_START_DELAY_MS = 500;
+/**
+ * Re-check cadence while a watcher is enabled but has nothing to scan (gate
+ * off, no enabled RTSP stream, engine unavailable + fail-closed). It idles
+ * instead of spinning and picks the work up by itself once the cause clears.
+ */
+const GATE_WATCH_IDLE_RECHECK_MS = 15_000;
+
+type GateWatchKey = "entry" | "exit";
+
+interface GateWatcherState {
+  gateKey: GateWatchKey;
+  gate: "ENTRY" | "EXIT";
+  enabled: boolean;
+  intervalSeconds: number;
+  frames: number;
+  timer: NodeJS.Timeout | null;
+  /**
+   * Bumped by every stop / restart. A scan that is already in flight captures
+   * the generation it started with and reschedules ONLY if it still matches,
+   * so stopping a watcher can never be undone by a late scan result.
+   */
+  generation: number;
+  running: boolean;
+  consecutiveErrors: number;
+  totalRuns: number;
+  lastRunAt?: string;
+  lastDurationMs?: number;
+  lastBasis?: string;
+  lastRecognized?: boolean;
+  lastEmployeeName?: string;
+  lastError?: string;
+  nextRunAt?: string;
+  /** Why an enabled watcher is idling instead of scanning (logged once per cause). */
+  idleReason?: string;
+  loggedIdleReason?: string;
+}
+
+function newGateWatcherState(gateKey: GateWatchKey): GateWatcherState {
+  return {
+    gateKey,
+    gate: gateKey === "exit" ? "EXIT" : "ENTRY",
+    enabled: false,
+    intervalSeconds: DEFAULT_GATE_WATCH.intervalSeconds,
+    frames: DEFAULT_GATE_WATCH.frames,
+    timer: null,
+    generation: 0,
+    running: false,
+    consecutiveErrors: 0,
+    totalRuns: 0,
+  };
+}
+
+const gateWatchers: Record<GateWatchKey, GateWatcherState> = {
+  entry: newGateWatcherState("entry"),
+  exit: newGateWatcherState("exit"),
+};
+
+function gateConfigKeyOf(gateKey: GateWatchKey): "entryGate" | "exitGate" {
+  return gateKey === "exit" ? "exitGate" : "entryGate";
+}
+
+function gateWatchConfigOf(gateKey: GateWatchKey): GateWatchConfigRecord {
+  const gate = cameraStreamsConfig[gateConfigKeyOf(gateKey)];
+  return normalizeGateWatchConfig(gate?.watch);
+}
+
+/** The public runtime view (src/types.ts `GateWatchRuntime`). */
+function gateWatchRuntime(state: GateWatcherState): GateWatchRuntime {
+  return {
+    gate: state.gate,
+    enabled: state.enabled,
+    intervalSeconds: state.intervalSeconds,
+    frames: state.frames,
+    running: state.running,
+    lastRunAt: state.lastRunAt,
+    lastDurationMs: state.lastDurationMs,
+    lastBasis: state.lastBasis,
+    lastRecognized: state.lastRecognized,
+    lastEmployeeName: state.lastEmployeeName,
+    lastError: state.lastError || state.idleReason,
+    consecutiveErrors: state.consecutiveErrors,
+    totalRuns: state.totalRuns,
+    nextRunAt: state.nextRunAt,
+  };
+}
+
+function broadcastGateWatchState(state: GateWatcherState) {
+  broadcastSSE("gate_watch_state", gateWatchRuntime(state));
+}
+
+/**
+ * Is there anything to scan right now? A watcher that is enabled but has no
+ * work idles (and says why) instead of burning ffmpeg processes.
+ */
+function gateWatchBlockedReason(gateKey: GateWatchKey): string | null {
+  const gate = normalizeGateConfig(cameraStreamsConfig[gateConfigKeyOf(gateKey)]);
+  if (!gate.enabled) return "Cổng đang tắt (gate disabled)";
+  const rtspStreams = (gate.streams || []).filter(
+    (s) => s.enabled && (s.sourceType === "RTSP" || !s.sourceType) && isRtspUrl(s.rtspUrl)
+  );
+  if (rtspStreams.length === 0) return "Cổng chưa có luồng RTSP nào đang bật";
+  // FAIL-CLOSED: FACE_ENGINE=onnx with models that did not load. Every scan
+  // would be denied anyway, so idle and log once instead of hammering.
+  if (activeFaceEngine() === "unavailable") {
+    return "Engine nhận diện không khả dụng (FAIL-CLOSED) - watcher tạm dừng";
+  }
+  return null;
+}
+
+/** Delay before the next run: the configured gap, doubled per consecutive error, capped at 60 s. */
+function gateWatchDelayMs(state: GateWatcherState): number {
+  const base = state.intervalSeconds * 1000;
+  if (state.consecutiveErrors <= 0) return base;
+  const factor = Math.pow(2, Math.min(state.consecutiveErrors, 16));
+  return Math.min(GATE_WATCH_MAX_BACKOFF_MS, Math.round(base * factor));
+}
+
+/** Arms the ONE timer of this watcher. Callers must not have another armed. */
+function scheduleGateWatch(state: GateWatcherState, delayMs: number) {
+  const generation = state.generation;
+  if (state.timer) {
+    clearTimeout(state.timer);
+    state.timer = null;
+  }
+  state.nextRunAt = new Date(Date.now() + delayMs).toISOString();
+  state.timer = setTimeout(() => {
+    state.timer = null;
+    // A stop between arming and firing bumped the generation.
+    if (state.generation !== generation || !state.enabled) return;
+    void runGateWatchTick(state, generation);
+  }, delayMs);
+  // Never hold the process open just because a gate is being watched.
+  state.timer.unref?.();
+}
+
+/**
+ * An employee as an SSE event may carry them: identity fields only.
+ * `photoUrl` is dropped on purpose - it is usually a base64 data URL and no
+ * image bytes are ever broadcast.
+ */
+function watchEmployeeSummary(employee: any) {
+  if (!employee || typeof employee !== "object") return undefined;
+  return {
+    id: employee.id,
+    name: employee.name,
+    employeeCode: employee.employeeCode,
+    department: employee.department,
+    position: employee.position,
+    accessLevel: employee.accessLevel,
+  };
+}
+
+async function runGateWatchTick(state: GateWatcherState, generation: number) {
+  if (state.running) return; // unreachable via the chain; a cheap last line of defence
+  const blocked = gateWatchBlockedReason(state.gateKey);
+  if (blocked) {
+    state.idleReason = blocked;
+    if (state.loggedIdleReason !== blocked) {
+      console.warn(`[Gate Watch ${state.gate}] Tạm dừng quét: ${blocked}`);
+      state.loggedIdleReason = blocked;
+      broadcastGateWatchState(state);
+    }
+    if (state.generation === generation && state.enabled) {
+      scheduleGateWatch(state, Math.max(state.intervalSeconds * 1000, GATE_WATCH_IDLE_RECHECK_MS));
+    }
+    return;
+  }
+  if (state.idleReason) {
+    console.log(`[Gate Watch ${state.gate}] Tiếp tục quét (điều kiện tạm dừng đã hết).`);
+  }
+  state.idleReason = undefined;
+  state.loggedIdleReason = undefined;
+
+  state.running = true;
+  state.nextRunAt = undefined;
+  const startedAt = Date.now();
+  let result: GateScanResult;
+  try {
+    // Exactly what POST /api/camera-streams/scan-rtsp runs, same arguments.
+    result = await performGateScan({ gate: state.gateKey, frames: state.frames });
+  } catch (err: any) {
+    result = { status: 500, body: { success: false, error: err?.message || "Lỗi không xác định khi quét cổng" } };
+  } finally {
+    state.running = false;
+  }
+
+  const durationMs = Date.now() - startedAt;
+  const body = result.body || {};
+  // A 2xx from the one scan path is the ONLY thing counted as a completed
+  // scan; 503 backpressure / re-init rejections are errors, never decisions.
+  const ok = result.status === 200 && body.success === true;
+  state.totalRuns += 1;
+  state.lastRunAt = new Date(startedAt).toISOString();
+  state.lastDurationMs = durationMs;
+  state.lastBasis = body.fusion?.basis;
+  state.lastRecognized = ok ? Boolean(body.recognized) : false;
+  state.lastEmployeeName = ok && body.recognized ? body.bestMatch?.name : undefined;
+  if (ok) {
+    state.consecutiveErrors = 0;
+    state.lastError = undefined;
+  } else {
+    state.consecutiveErrors += 1;
+    state.lastError = body.error || `HTTP ${result.status}`;
+  }
+
+  // The dashboard rebuilds this into the shape a manual scan-rtsp response
+  // has, so it can reuse the fusion evidence panel, the per-stream rows and
+  // the face chips: a watched scan must not render as a degraded summary of
+  // the same event. Everything forwarded here is numbers, ids, boxes and
+  // labels; the ONLY thing deliberately dropped is image bytes - the captured
+  // JPEGs never leave performGateScan, and employee records are trimmed to
+  // `watchEmployeeSummary` because EmployeeRecord.photoUrl is usually a
+  // base64 data URL. That keeps an event at a few KB.
+  broadcastSSE("gate_watch_result", {
+    gate: state.gate,
+    at: state.lastRunAt,
+    durationMs,
+    status: result.status,
+    ok,
+    error: state.lastError,
+    consecutiveErrors: state.consecutiveErrors,
+    totalRuns: state.totalRuns,
+    // ---- mirror of the scan-rtsp response (minus image bytes) ----
+    success: body.success === true,
+    taskId: body.taskId,
+    scanType: body.scanType,
+    message: body.message,
+    recognized: state.lastRecognized === true,
+    employeeName: state.lastEmployeeName,
+    employee: watchEmployeeSummary(body.bestMatch),
+    recognizedEmployees: Array.isArray(body.recognizedEmployees)
+      ? body.recognizedEmployees.map(watchEmployeeSummary)
+      : [],
+    detectedFaces: Array.isArray(body.detectedFaces) ? body.detectedFaces : [],
+    totalFacesDetected: body.totalFacesDetected,
+    authorizedCount: body.authorizedCount,
+    unauthorizedCount: body.unauthorizedCount,
+    overallConfidence: body.overallConfidence,
+    overallLiveness: body.overallLiveness,
+    similarityScore: body.similarityScore,
+    // The WHOLE fused decision: recognized, basis, cosines, thresholds,
+    // per-candidate evidence and every per-observation cosine.
+    fusion: body.fusion,
+    streamsScanned: body.streamsScanned,
+    streamsSucceeded: body.streamsSucceeded,
+    framesPerStream: body.framesPerStream,
+    frameIntervalMs: body.frameIntervalMs,
+    frameCaptureDurationMs: body.frameCaptureDurationMs,
+    processingTimeMs: body.processingTimeMs,
+    faceEngine: body.faceEngine,
+    engineUsed: body.engineUsed,
+    modelUsed: body.modelUsed,
+    // Per-stream rows exactly as the route reports them, detectedFaces included.
+    streams: Array.isArray(body.streams) ? body.streams : [],
   });
+
+  // Stopped or reconfigured while the scan was in flight: do NOT reschedule.
+  if (state.generation !== generation || !state.enabled) {
+    broadcastGateWatchState(state);
+    return;
+  }
+  scheduleGateWatch(state, gateWatchDelayMs(state));
+  broadcastGateWatchState(state);
+}
+
+/** Stops a watcher: clears the timer and invalidates any in-flight scan's reschedule. */
+function stopGateWatcher(state: GateWatcherState) {
+  state.generation += 1;
+  if (state.timer) {
+    clearTimeout(state.timer);
+    state.timer = null;
+  }
+  state.enabled = false;
+  state.nextRunAt = undefined;
+  state.idleReason = undefined;
+  state.loggedIdleReason = undefined;
+}
+
+/**
+ * Applies the persisted watch config of one gate to its watcher. Restarting is
+ * always stop-then-start, so no timer and no in-flight scan survives a change.
+ */
+function applyGateWatchConfig(gateKey: GateWatchKey, options: { silent?: boolean } = {}): GateWatchRuntime {
+  const state = gateWatchers[gateKey];
+  const cfg = gateWatchConfigOf(gateKey);
+  const unchanged =
+    state.enabled === cfg.enabled &&
+    state.intervalSeconds === cfg.intervalSeconds &&
+    state.frames === cfg.frames;
+  if (unchanged && !cfg.enabled) return gateWatchRuntime(state);
+  if (unchanged && state.enabled && (state.timer || state.running)) return gateWatchRuntime(state);
+
+  const wasEnabled = state.enabled;
+  stopGateWatcher(state);
+  state.intervalSeconds = cfg.intervalSeconds;
+  state.frames = cfg.frames;
+  if (cfg.enabled) {
+    state.enabled = true;
+    state.consecutiveErrors = 0;
+    state.totalRuns = 0;
+    state.lastError = undefined;
+    scheduleGateWatch(state, GATE_WATCH_START_DELAY_MS);
+    console.log(
+      `[Gate Watch ${state.gate}] Bật: quét lại sau mỗi ${cfg.intervalSeconds}s (khoảng nghỉ giữa 2 lần quét), ${cfg.frames} khung/luồng.`
+    );
+  } else if (wasEnabled) {
+    console.log(`[Gate Watch ${state.gate}] Tắt.`);
+  }
+  if (!options.silent) broadcastGateWatchState(state);
+  return gateWatchRuntime(state);
+}
+
+/** Reconciles BOTH watchers with the current camera config (boot, config writes, DB sync). */
+function syncGateWatchers() {
+  applyGateWatchConfig("entry");
+  applyGateWatchConfig("exit");
+}
+
+function listGateWatchRuntimes(): GateWatchRuntime[] {
+  return [gateWatchRuntime(gateWatchers.entry), gateWatchRuntime(gateWatchers.exit)];
+}
+
+// ---- Watch endpoints ----
+
+app.get(["/api/camera-streams/watch", "/api/camera-streams/watch/"], (_req, res) => {
+  res.json({ success: true, watchers: listGateWatchRuntimes() });
+});
+
+app.post(["/api/camera-streams/:gate/watch", "/api/camera-streams/:gate/watch/"], (req, res) => {
+  const configKey = gateConfigKeyFromParam(req.params.gate);
+  if (!configKey) {
+    return res.status(400).json({ success: false, error: `Cổng không hợp lệ: "${req.params.gate}". Chỉ chấp nhận entry hoặc exit.` });
+  }
+  const gateKey: GateWatchKey = configKey === "exitGate" ? "exit" : "entry";
+  const body = req.body && typeof req.body === "object" ? req.body : {};
+
+  // Explicit 400 on out-of-range values instead of silently clamping a value
+  // the operator typed: a watcher that unlocks doors should not guess.
+  const numericBounds: Array<[string, number, number]> = [
+    ["intervalSeconds", GATE_WATCH_MIN_INTERVAL_SECONDS, GATE_WATCH_MAX_INTERVAL_SECONDS],
+    ["frames", 1, GATE_WATCH_MAX_FRAMES],
+  ];
+  for (const [field, min, max] of numericBounds) {
+    if (body[field] === undefined || body[field] === null) continue;
+    const value = Number(body[field]);
+    if (!Number.isFinite(value) || value < min || value > max) {
+      return res.status(400).json({
+        success: false,
+        error: `${field} phải nằm trong khoảng ${min}-${max} (nhận được: ${JSON.stringify(body[field])})`,
+      });
+    }
+  }
+  if (body.enabled !== undefined && typeof body.enabled !== "boolean") {
+    return res.status(400).json({ success: false, error: "enabled phải là true hoặc false" });
+  }
+
+  const current = loadCameraStreamsConfig();
+  const updated = normalizeCameraStreamsConfig({
+    ...current,
+    [configKey]: normalizeGateConfig({
+      ...current[configKey],
+      watch: normalizeGateWatchConfig(body, normalizeGateWatchConfig(current[configKey].watch)),
+    }),
+  });
+  cameraStreamsConfig = updated;
+  db.saveCameraStreamsConfig(updated);
+  broadcastSSE("camera_config_updated", updated);
+
+  const runtime = applyGateWatchConfig(gateKey);
+  res.json({ success: true, gate: runtime.gate, watch: updated[configKey].watch, watcher: runtime });
 });
 
 // Simulated RTSP/HTTP live test frame generator (SVG/JPEG)
@@ -5379,6 +5886,9 @@ async function startServer() {
 
   app.listen(PORT, "0.0.0.0", () => {
     console.log(`Server running on http://0.0.0.0:${PORT} (Mode: ${isProduction ? "production" : "development"})`);
+    // Backend gate watchers start here, AFTER the camera config is loaded and
+    // only for gates whose persisted `watch.enabled` is true.
+    syncGateWatchers();
   });
 }
 

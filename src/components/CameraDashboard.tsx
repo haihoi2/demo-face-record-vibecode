@@ -23,6 +23,12 @@ import {
   ChevronUp,
   Star,
   RefreshCw,
+  Server,
+  Timer,
+  Power,
+  Radio,
+  Hand,
+  Info,
 } from "lucide-react";
 import {
   CameraStreamsConfig,
@@ -36,9 +42,11 @@ import {
   DetectedFace,
   FusionDecision,
   FusionThresholds,
+  GateWatchConfig,
+  GateWatchRuntime,
 } from "../types";
 import { soundEffects } from "../utils/audio";
-import { safeJsonFetch, normalizeApiUrl, getApiBaseUrl } from "../utils/api";
+import { safeJsonFetch, normalizeApiUrl, getApiBaseUrl, buildEventSourceUrl } from "../utils/api";
 import { runLocalFaceRecognition } from "../utils/localBiometrics";
 import {
   isNetlifyOrStaticHost,
@@ -166,8 +174,83 @@ type FusionSummary = FusionDecision & {
   modelTag?: string;
 };
 
-/** Roughly how long one extra frame per stream costs (grab + detect + embed). */
-const FRAME_LATENCY_COST_MS = 1000;
+/**
+ * Measured on the deployed ONNX engine against the 2-stream exit gate:
+ * a whole-gate scan takes 2.58 s at frames=1 and 5.99 s at frames=2.
+ * These numbers are what the operator is shown; whenever the watcher reports a
+ * real `lastDurationMs`, the measurement wins over this estimate.
+ */
+const MEASURED_SCAN_SECONDS: Record<number, number> = { 1: 2.58, 2: 5.99 };
+/** The measurement above was taken on a gate with this many streams. */
+const MEASURED_STREAM_COUNT = 2;
+/** Cost of each extra frame per stream for a whole gate (5.99 - 2.58). */
+const EXTRA_FRAME_SECONDS = 3.41;
+
+const clampFrames = (n: unknown): number => Math.min(5, Math.max(1, Math.round(Number(n) || 1)));
+const clampInterval = (n: unknown): number => Math.min(300, Math.max(1, Math.round(Number(n) || 1)));
+
+/** Estimated duration of ONE whole-gate scan, used until a real one is measured. */
+const estimateScanSeconds = (frames: number): number => {
+  const f = clampFrames(frames);
+  const known = MEASURED_SCAN_SECONDS[f];
+  return typeof known === "number" ? known : MEASURED_SCAN_SECONDS[1] + (f - 1) * EXTRA_FRAME_SECONDS;
+};
+
+/** Seconds rendered with one decimal, or an em dash for a non-number. */
+const fmtSeconds = (s: number): string =>
+  !Number.isFinite(s) ? "—" : s >= 100 ? s.toFixed(0) : s.toFixed(1);
+
+/** "12 giây trước" / "3 phút trước". Never throws on a missing or malformed timestamp. */
+const relativeTime = (iso: string | undefined, now: number): string => {
+  if (!iso) return "chưa có";
+  const t = Date.parse(iso);
+  if (!Number.isFinite(t)) return "chưa có";
+  const diff = Math.round((now - t) / 1000);
+  if (diff < 0) return "vừa xong";
+  if (diff < 2) return "vừa xong";
+  if (diff < 60) return `${diff} giây trước`;
+  if (diff < 3600) return `${Math.floor(diff / 60)} phút trước`;
+  if (diff < 86400) return `${Math.floor(diff / 3600)} giờ trước`;
+  return `${Math.floor(diff / 86400)} ngày trước`;
+};
+
+/** Whole seconds until `iso`, or null when there is no usable timestamp. */
+const secondsUntil = (iso: string | undefined, now: number): number | null => {
+  if (!iso) return null;
+  const t = Date.parse(iso);
+  if (!Number.isFinite(t)) return null;
+  return Math.max(0, Math.round((t - now) / 1000));
+};
+
+/** Used before the server has told us anything about a gate's watcher. */
+const DEFAULT_WATCH: GateWatchConfig = { enabled: false, intervalSeconds: 3, frames: 1 };
+
+/**
+ * Tolerant normaliser for a watcher payload (REST or SSE). A partial object, a
+ * missing counter or an unknown gate must never crash or half-populate the panel.
+ */
+const normalizeWatchRuntime = (raw: any): GateWatchRuntime | null => {
+  if (!raw || typeof raw !== "object") return null;
+  const upper = String(raw.gate || "").toUpperCase();
+  if (upper !== "ENTRY" && upper !== "EXIT") return null;
+  const gate: "ENTRY" | "EXIT" = upper === "EXIT" ? "EXIT" : "ENTRY";
+  return {
+    gate,
+    enabled: raw.enabled === true,
+    intervalSeconds: clampInterval(raw.intervalSeconds ?? DEFAULT_WATCH.intervalSeconds),
+    frames: clampFrames(raw.frames ?? DEFAULT_WATCH.frames),
+    running: raw.running === true,
+    lastRunAt: typeof raw.lastRunAt === "string" ? raw.lastRunAt : undefined,
+    lastDurationMs: typeof raw.lastDurationMs === "number" ? raw.lastDurationMs : undefined,
+    lastBasis: typeof raw.lastBasis === "string" ? raw.lastBasis : undefined,
+    lastRecognized: typeof raw.lastRecognized === "boolean" ? raw.lastRecognized : undefined,
+    lastEmployeeName: typeof raw.lastEmployeeName === "string" ? raw.lastEmployeeName : undefined,
+    lastError: typeof raw.lastError === "string" ? raw.lastError : undefined,
+    consecutiveErrors: Number.isFinite(Number(raw.consecutiveErrors)) ? Number(raw.consecutiveErrors) : 0,
+    totalRuns: Number.isFinite(Number(raw.totalRuns)) ? Number(raw.totalRuns) : 0,
+    nextRunAt: typeof raw.nextRunAt === "string" ? raw.nextRunAt : undefined,
+  };
+};
 
 /** Readable chip for a fusion decision basis. */
 const describeBasis = (
@@ -232,8 +315,10 @@ interface StreamScanState {
   lastResult: GateScanResponse | null;
   lastScanTime: string | null;
   activeFaces: StreamFace[];
-  autoScanEnabled: boolean;
-  scanIntervalSeconds: number;
+  /** Where `lastResult` came from: a manual scan from THIS browser, or the backend watcher. */
+  resultOrigin: "MANUAL" | "WATCHER" | null;
+  /** ISO timestamp the backend reported for a watcher result (null for manual scans). */
+  resultAt: string | null;
   viewMode: "MJPEG" | "SNAPSHOT" | "SIMULATION";
   snapshotTs: number;
   hasError: boolean;
@@ -252,8 +337,8 @@ const createInitialScanState = (): StreamScanState => ({
   lastResult: null,
   lastScanTime: null,
   activeFaces: [],
-  autoScanEnabled: true,
-  scanIntervalSeconds: 3,
+  resultOrigin: null,
+  resultAt: null,
   viewMode: "MJPEG",
   snapshotTs: Date.now(),
   hasError: false,
@@ -288,6 +373,34 @@ export const CameraDashboard: React.FC<CameraDashboardProps> = ({
   const [config, setConfig] = useState<CameraStreamsConfig>(DEFAULT_STREAMS_CONFIG);
   const [loadingConfig, setLoadingConfig] = useState<boolean>(true);
   const [currentTime, setCurrentTime] = useState<string>("");
+  /** Ticks once a second so relative times and the next-run countdown stay live. */
+  const [nowMs, setNowMs] = useState<number>(() => Date.now());
+
+  // ---- Backend watcher (server-side auto-scan) state ----
+  const [watchers, setWatchers] = useState<Record<GateKey, GateWatchRuntime | null>>({
+    entry: null,
+    exit: null,
+  });
+  /** null = chưa biết (đang tải); false = máy chủ cũ không có endpoint watch. */
+  const [watchSupported, setWatchSupported] = useState<boolean | null>(null);
+  const [watchLoading, setWatchLoading] = useState<boolean>(true);
+  const [watchError, setWatchError] = useState<string | null>(null);
+  const [watchPending, setWatchPending] = useState<Record<GateKey, boolean>>({
+    entry: false,
+    exit: false,
+  });
+  const [watchFieldError, setWatchFieldError] = useState<Record<GateKey, string | null>>({
+    entry: null,
+    exit: null,
+  });
+  /** In-progress edit of the interval box; null = show the server's value. */
+  const [intervalDraft, setIntervalDraft] = useState<Record<GateKey, string | null>>({
+    entry: null,
+    exit: null,
+  });
+  /** Last alert signature per gate, so a person standing in frame does not
+   *  re-trigger the chime on every single backend cycle. */
+  const watchAlertRef = useRef<Record<GateKey, string>>({ entry: "", exit: "" });
 
   // Per-gate scan and view states
   const [entryState, setEntryState] = useState<StreamScanState>(createInitialScanState);
@@ -311,6 +424,7 @@ export const CameraDashboard: React.FC<CameraDashboardProps> = ({
           hour12: false,
         })
       );
+      setNowMs(now.getTime());
     };
     updateTime();
     const timer = setInterval(updateTime, 1000);
@@ -339,6 +453,324 @@ export const CameraDashboard: React.FC<CameraDashboardProps> = ({
     fetchConfig();
   }, [fetchConfig]);
 
+  // ---------------- BACKEND WATCHER: read, subscribe, control ----------------
+
+  /** Merge one runtime object (from REST or SSE) into the panel state. */
+  const applyWatcher = useCallback((raw: any) => {
+    const w = normalizeWatchRuntime(raw);
+    if (!w) return;
+    setWatchers((prev) => ({ ...prev, [gateKeyOf(w.gate)]: w }));
+    setWatchSupported(true);
+    setWatchError(null);
+  }, []);
+
+  /**
+   * Read every gate's watcher. This is the FALLBACK path (polled every 5 s);
+   * `gate_watch_state` over SSE is the fast path. A 404 means an older server
+   * with no watcher at all - the panel then says so and manual scanning stays.
+   */
+  const fetchWatchers = useCallback(async (silent = false) => {
+    if (!silent) setWatchLoading(true);
+    try {
+      const res = await safeJsonFetch<{
+        success?: boolean;
+        watchers?: GateWatchRuntime[];
+        error?: string;
+      }>("/api/camera-streams/watch");
+
+      if (res.status === 404 || res.status === 501) {
+        setWatchSupported(false);
+        setWatchError(null);
+        return;
+      }
+      const list = res.data?.watchers;
+      if (res.ok && Array.isArray(list)) {
+        const next: Record<GateKey, GateWatchRuntime | null> = { entry: null, exit: null };
+        for (const raw of list) {
+          const w = normalizeWatchRuntime(raw);
+          if (w) next[gateKeyOf(w.gate)] = w;
+        }
+        setWatchers(next);
+        setWatchSupported(true);
+        setWatchError(null);
+        return;
+      }
+      setWatchError(
+        res.status === 0
+          ? "Không kết nối được máy chủ để đọc trạng thái quét nền."
+          : res.data?.error || res.error || `Không đọc được trạng thái quét nền (HTTP ${res.status || 0}).`
+      );
+    } finally {
+      setWatchLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    fetchWatchers();
+  }, [fetchWatchers]);
+
+  // Modest polling fallback. Stops entirely once we know the server has no watcher.
+  useEffect(() => {
+    if (watchSupported === false) return;
+    const timer = setInterval(() => {
+      fetchWatchers(true);
+    }, 5000);
+    return () => clearInterval(timer);
+  }, [fetchWatchers, watchSupported]);
+
+  /**
+   * A scan completed on the SERVER. Rebuild the exact result shape a manual
+   * scan produces so the fusion evidence panel, the per-stream rows and the
+   * face chips render identically - only the origin label differs.
+   */
+  const applyWatchResult = useCallback(
+    (payload: any) => {
+      const upper = String(payload?.gate || "").toUpperCase();
+      if (upper !== "ENTRY" && upper !== "EXIT") return;
+      const gateType: "ENTRY" | "EXIT" = upper === "EXIT" ? "EXIT" : "ENTRY";
+      const key = gateKeyOf(gateType);
+      const setState = gateType === "ENTRY" ? setEntryState : setExitState;
+
+      const streamRows: GateStreamScanResult[] = Array.isArray(payload?.streams)
+        ? payload.streams.filter((r: any) => r && typeof r.streamId === "string")
+        : [];
+      const failed = payload?.ok === false;
+      const watchErrorText = typeof payload?.error === "string" ? payload.error : null;
+
+      // A refused / failed backend scan is shown as the refusal it is. It never
+      // becomes a green "result" and never gets a client-side substitute.
+      if (failed) {
+        const atLabelFail = new Date().toLocaleTimeString("vi-VN");
+        setState((prev) => {
+          const perStream = { ...prev.perStream };
+          for (const r of streamRows) {
+            perStream[r.streamId] = {
+              ...(perStream[r.streamId] || emptyPerStream()),
+              isScanning: false,
+              error: r.success ? null : r.error || watchErrorText || "Không lấy được khung hình",
+            };
+          }
+          return {
+            ...prev,
+            hasError: true,
+            errorMessage: `Watcher máy chủ quét lỗi lúc ${atLabelFail}: ${
+              watchErrorText || "không rõ nguyên nhân"
+            }`,
+            perStream,
+          };
+        });
+        watchAlertRef.current[key] = "error";
+        return;
+      }
+      const faces: StreamFace[] = [];
+      for (const row of streamRows) {
+        const rowFaces = (Array.isArray(row.detectedFaces) ? row.detectedFaces : []) as StreamFace[];
+        for (const f of rowFaces) {
+          if (!f) continue;
+          faces.push({
+            ...f,
+            streamId: f.streamId || row.streamId,
+            streamLabel: f.streamLabel || row.streamLabel,
+          });
+        }
+      }
+
+      const recognized = payload?.recognized === true;
+      // The watcher event is a SUMMARY: it carries the fusion basis and the
+      // per-stream outcome, but no boxes, no embeddings and no face list.
+      // Fill in the two fields the evidence panel reads from the top level so
+      // the decision header is not rendered as a refusal by accident.
+      const rawFusion = payload?.fusion && typeof payload.fusion === "object" ? payload.fusion : null;
+      const fusion: FusionSummary | undefined = rawFusion
+        ? ({
+            ...rawFusion,
+            recognized: typeof rawFusion.recognized === "boolean" ? rawFusion.recognized : recognized,
+          } as FusionSummary)
+        : undefined;
+      /** Faces the streams reported, even though their boxes are not in the event. */
+      const reportedFaceCount = streamRows.reduce(
+        (sum, r) => sum + (Number.isFinite(Number(r.totalFacesDetected)) ? Number(r.totalFacesDetected) : 0),
+        0
+      );
+      const employeeName = typeof payload?.employeeName === "string" ? payload.employeeName : undefined;
+      const matched =
+        employees.find((e) => e.id === fusion?.employeeId) ||
+        (employeeName ? employees.find((e) => e.name === employeeName) : undefined);
+      // Keep the operator informed even for an employee this browser has not
+      // loaded yet: show the name the server sent rather than "undefined".
+      const employee: Employee | undefined = !recognized
+        ? undefined
+        : matched ||
+          (employeeName
+            ? {
+                id: fusion?.employeeId || "unknown",
+                name: employeeName,
+                employeeCode: "—",
+                department: "",
+                position: "",
+                photoUrl: "",
+                registeredAt: "",
+                accessLevel: "RESTRICTED",
+              }
+            : undefined);
+
+      const atIso = typeof payload?.at === "string" && Number.isFinite(Date.parse(payload.at))
+        ? payload.at
+        : new Date().toISOString();
+      const atLabel = new Date(Date.parse(atIso)).toLocaleTimeString("vi-VN");
+      const durationMs = typeof payload?.durationMs === "number" ? payload.durationMs : undefined;
+
+      const result: GateScanResponse = {
+        success: true,
+        recognized,
+        employee,
+        detectedFaces: faces,
+        totalFacesDetected: faces.length > 0 ? faces.length : reportedFaceCount,
+        authorizedCount: faces.filter((f) => f.recognized).length,
+        unauthorizedCount: faces.filter((f) => !f.recognized).length,
+        processingTimeMs: typeof durationMs === "number" ? durationMs : 0,
+        confidence: typeof fusion?.confidence === "number" ? fusion.confidence * 100 : 0,
+        livenessScore: 0,
+        message: recognized
+          ? `Watcher máy chủ: ${employeeName || "nhân viên hợp lệ"}`
+          : "Watcher máy chủ: chưa khớp hồ sơ nhân viên nào",
+        lockUnlocked: recognized,
+        engineUsed: fusion?.engine ? `Watcher máy chủ (${fusion.engine})` : "Watcher máy chủ",
+        streams: streamRows,
+        fusion,
+      };
+
+      setState((prev) => {
+        const perStream = { ...prev.perStream };
+        for (const r of streamRows) {
+          perStream[r.streamId] = {
+            ...(perStream[r.streamId] || emptyPerStream()),
+            isScanning: false,
+            lastResult: r,
+            lastScanTime: atLabel,
+            error: r.success ? null : r.error || "Không lấy được khung hình",
+            snapshotTs: Date.now(),
+          };
+        }
+        return {
+          ...prev,
+          lastResult: result,
+          lastScanTime: atLabel,
+          resultOrigin: "WATCHER",
+          resultAt: atIso,
+          activeFaces: faces,
+          snapshotTs: Date.now(),
+          perStream,
+        };
+      });
+
+      // Alert only when the situation CHANGES, not on every backend cycle.
+      const seenFaces = faces.length > 0 ? faces.length : reportedFaceCount;
+      const alertKey = `${recognized ? "ok" : seenFaces > 0 ? "stranger" : "none"}:${employeeName || ""}`;
+      if (watchAlertRef.current[key] !== alertKey) {
+        watchAlertRef.current[key] = alertKey;
+        if (recognized) soundEffects.playSuccess();
+        else if (seenFaces > 0) soundEffects.playStrangerAlert();
+      }
+    },
+    [employees]
+  );
+
+  // The SSE connection must not be torn down every time `employees` changes.
+  const applyWatchResultRef = useRef<(payload: any) => void>(() => {});
+  useEffect(() => {
+    applyWatchResultRef.current = applyWatchResult;
+  }, [applyWatchResult]);
+
+  /**
+   * Fast path: the same `/api/events` stream the rest of the app listens to.
+   * `gate_watch_state` updates the control panel the instant the watcher
+   * starts, stops or is reconfigured; `gate_watch_result` renders a completed
+   * backend scan. The 5 s poll above stays as the safety net.
+   */
+  useEffect(() => {
+    if (isNetlifyOrStaticHost() && !getApiBaseUrl()) return;
+    let es: EventSource | null = null;
+    try {
+      es = new EventSource(buildEventSourceUrl("/api/events"));
+      es.addEventListener("gate_watch_state", (e: MessageEvent) => {
+        try {
+          const data = JSON.parse(e.data);
+          applyWatcher(data?.watcher ?? data);
+        } catch {}
+      });
+      es.addEventListener("gate_watch_result", (e: MessageEvent) => {
+        try {
+          applyWatchResultRef.current(JSON.parse(e.data));
+        } catch {}
+      });
+    } catch {
+      // No SSE here (static host / blocked proxy): polling still carries state.
+    }
+    return () => {
+      if (es) es.close();
+    };
+  }, [applyWatcher]);
+
+  /**
+   * Change one gate's watcher. The SERVER owns the truth: we never optimistically
+   * flip the switch, we render whatever runtime the server hands back.
+   */
+  const updateWatcher = useCallback(
+    async (gateType: "ENTRY" | "EXIT", patch: Partial<GateWatchConfig>) => {
+      const key = gateKeyOf(gateType);
+      setWatchPending((p) => ({ ...p, [key]: true }));
+      setWatchFieldError((p) => ({ ...p, [key]: null }));
+      try {
+        const res = await safeJsonFetch<{ success?: boolean; watcher?: GateWatchRuntime; error?: string }>(
+          `/api/camera-streams/${key}/watch`,
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(patch),
+          }
+        );
+
+        if (res.status === 404 || res.status === 501) {
+          setWatchSupported(false);
+          return;
+        }
+        if (res.ok && res.data?.watcher) {
+          applyWatcher(res.data.watcher);
+          return;
+        }
+        if (res.ok && res.data?.success !== false) {
+          // Accepted but nothing usable came back: re-read the real state.
+          await fetchWatchers(true);
+          return;
+        }
+        setWatchFieldError((p) => ({
+          ...p,
+          [key]:
+            res.data?.error ||
+            res.error ||
+            (res.status === 400
+              ? "Giá trị không hợp lệ (khoảng nghỉ 1-300 giây, số khung 1-5)."
+              : `Máy chủ từ chối thay đổi (HTTP ${res.status || 0}).`),
+        }));
+      } finally {
+        setWatchPending((p) => ({ ...p, [key]: false }));
+      }
+    },
+    [applyWatcher, fetchWatchers]
+  );
+
+  /** Commit the interval box (blur / Enter), clamped to the server's 1-300 range. */
+  const commitIntervalDraft = (gateType: "ENTRY" | "EXIT", current: number) => {
+    const key = gateKeyOf(gateType);
+    const draft = intervalDraft[key];
+    setIntervalDraft((p) => ({ ...p, [key]: null }));
+    if (draft === null || draft.trim() === "") return;
+    const next = clampInterval(draft);
+    if (next === current) return;
+    updateWatcher(gateType, { intervalSeconds: next });
+  };
+
   // Derived stream lists (sorted, legacy-tolerant)
   const entryStreams = deriveGateStreams(config.entryGate, "entry");
   const exitStreams = deriveGateStreams(config.exitGate, "exit");
@@ -364,6 +796,8 @@ export const CameraDashboard: React.FC<CameraDashboardProps> = ({
     (sum, g) => sum + g.streams.filter((s) => s.enabled).length,
     0
   );
+  /** How many gates currently have their backend watcher switched on. */
+  const activeWatcherCount = (["entry", "exit"] as GateKey[]).filter((k) => watchers[k]?.enabled).length;
 
   const gateHelpers = (gateType: "ENTRY" | "EXIT") => {
     const isEntry = gateType === "ENTRY";
@@ -678,6 +1112,8 @@ export const CameraDashboard: React.FC<CameraDashboardProps> = ({
             ...prev,
             lastResult: finalResult,
             lastScanTime: now,
+            resultOrigin: "MANUAL",
+            resultAt: new Date().toISOString(),
             activeFaces: faces,
             snapshotTs: Date.now(),
             perStream,
@@ -718,34 +1154,13 @@ export const CameraDashboard: React.FC<CameraDashboardProps> = ({
     }
   };
 
-  // Auto-scan cycle timers for each active gate (scan the whole gate = all enabled streams)
-  useEffect(() => {
-    let entryTimer: NodeJS.Timeout | null = null;
-    if (config.entryGate?.enabled && entryState.autoScanEnabled) {
-      entryTimer = setInterval(() => {
-        if (!entryState.isScanning) {
-          performStreamScan("ENTRY");
-        }
-      }, entryState.scanIntervalSeconds * 1000);
-    }
-    return () => {
-      if (entryTimer) clearInterval(entryTimer);
-    };
-  }, [config.entryGate?.enabled, entryState.autoScanEnabled, entryState.scanIntervalSeconds, entryState.isScanning, employees]);
-
-  useEffect(() => {
-    let exitTimer: NodeJS.Timeout | null = null;
-    if (config.exitGate?.enabled && exitState.autoScanEnabled) {
-      exitTimer = setInterval(() => {
-        if (!exitState.isScanning) {
-          performStreamScan("EXIT");
-        }
-      }, exitState.scanIntervalSeconds * 1000);
-    }
-    return () => {
-      if (exitTimer) clearInterval(exitTimer);
-    };
-  }, [config.exitGate?.enabled, exitState.autoScanEnabled, exitState.scanIntervalSeconds, exitState.isScanning, employees]);
+  // NOTE: the browser no longer schedules ANY repeating scan. The two
+  // `setInterval` auto-scan cycles that used to live here were removed: they
+  // only ran while a tab was open, doubled the camera/worker load with a second
+  // tab, and silently dropped every tick that landed during an in-flight scan
+  // (a "1 giây" setting really meant ~3 s). Periodic scanning is now a backend
+  // watcher; this component only controls it and renders what it finds.
+  // The manual "Quét" / "Quét tất cả luồng" buttons still call scan-rtsp directly.
 
   // Auto start UVC cameras if a gate's PRIMARY stream uses CLIENT_UVC
   useEffect(() => {
@@ -791,6 +1206,9 @@ export const CameraDashboard: React.FC<CameraDashboardProps> = ({
 
   // Face HUD tag used on tiles
   const renderFaceBox = (face: StreamFace, index: number, lastResult: GateScanResponse | null) => {
+    // A watcher payload may carry a face without a usable box: skip the HUD
+    // overlay rather than crashing the tile.
+    if (!face || !Array.isArray(face.box2d) || face.box2d.length < 4) return null;
     const [top, left, bottom, right] = face.box2d;
     const width = right - left;
     const height = bottom - top;
@@ -1240,6 +1658,28 @@ export const CameraDashboard: React.FC<CameraDashboardProps> = ({
 
     return (
       <div className="px-3.5 pb-3.5 bg-slate-950 space-y-2 text-xs animate-in fade-in">
+        {/* Who produced this result, and when */}
+        <div className="flex flex-wrap items-center gap-2 pt-2">
+          <span
+            className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-[10px] font-bold border ${
+              scanState.resultOrigin === "WATCHER"
+                ? "bg-indigo-950/80 text-indigo-300 border-indigo-700/70"
+                : "bg-slate-800 text-slate-300 border-slate-600"
+            }`}
+          >
+            {scanState.resultOrigin === "WATCHER" ? (
+              <Server className="w-3 h-3" />
+            ) : (
+              <Hand className="w-3 h-3" />
+            )}
+            {scanState.resultOrigin === "WATCHER" ? "Quét nền trên máy chủ" : "Quét thủ công từ trình duyệt này"}
+          </span>
+          <span className="text-[10px] font-mono text-slate-500">
+            {scanState.lastScanTime || "—"}
+            {scanState.resultAt ? ` • ${relativeTime(scanState.resultAt, nowMs)}` : ""}
+          </span>
+        </div>
+
         {/* Aggregate */}
         <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
           <div className="p-2 rounded-lg bg-slate-900 border border-slate-800">
@@ -1304,6 +1744,23 @@ export const CameraDashboard: React.FC<CameraDashboardProps> = ({
           ))}
         </div>
 
+        {/* Watcher events now carry the full fusion decision and per-stream
+            detectedFaces, so they render like a manual scan. The only thing an
+            event never carries is the captured JPEG - that stays on the server
+            to keep the SSE stream light. Only say something when the server
+            reported faces but none arrived, which would be a real mismatch. */}
+        {scanState.resultOrigin === "WATCHER" &&
+          faces.length === 0 &&
+          (result.totalFacesDetected ?? 0) > 0 && (
+            <div className="px-2.5 py-2 rounded-lg bg-slate-900 border border-slate-800 text-[11px] text-slate-400 flex items-start gap-1.5">
+              <Server className="w-3.5 h-3.5 text-slate-500 shrink-0 mt-0.5" />
+              <span>
+                Máy chủ báo có {result.totalFacesDetected} khuôn mặt trong lượt quét này nhưng sự
+                kiện không kèm chi tiết từng khuôn mặt. Bấm “Quét Ngay” để xem trực tiếp.
+              </span>
+            </div>
+          )}
+
         {/* Face cards with stream chip */}
         {faces.length > 0 && (
           <div className="flex flex-wrap gap-1.5">
@@ -1328,6 +1785,296 @@ export const CameraDashboard: React.FC<CameraDashboardProps> = ({
             ))}
           </div>
         )}
+      </div>
+    );
+  };
+
+  /**
+   * Control surface for ONE gate's backend watcher: an enable switch, the gap
+   * between scans, the frames per scan, plus its live status. Every control
+   * POSTs to `/api/camera-streams/:gate/watch` - nothing here schedules
+   * anything inside the browser.
+   */
+  const renderWatchPanel = (gateConfig: GateStreamConfig, enabledStreamCount: number) => {
+    const key = gateKeyOf(gateConfig.gateType);
+    const runtime = watchers[key];
+    const configured: GateWatchConfig = runtime
+      ? { enabled: runtime.enabled, intervalSeconds: runtime.intervalSeconds, frames: runtime.frames }
+      : gateConfig.watch || DEFAULT_WATCH;
+    const pending = !!watchPending[key];
+    const fieldError = watchFieldError[key];
+
+    // ---- Loading / unsupported / error states ----
+    if (watchSupported === null && watchLoading) {
+      return (
+        <div className="mx-3.5 mt-3 rounded-xl border border-slate-800 bg-slate-900/60 px-3 py-2.5 text-[11px] text-slate-400 flex items-center gap-2">
+          <RefreshCw className="w-3.5 h-3.5 animate-spin text-slate-500 shrink-0" />
+          Đang đọc trạng thái quét nền trên máy chủ...
+        </div>
+      );
+    }
+
+    if (watchSupported === false) {
+      return (
+        <div className="mx-3.5 mt-3 rounded-xl border border-amber-700/60 bg-amber-950/50 px-3 py-2.5 text-[11px] text-amber-200 flex items-start gap-2">
+          <AlertTriangle className="w-3.5 h-3.5 shrink-0 mt-0.5" />
+          <div className="space-y-0.5">
+            <div className="font-semibold">Máy chủ chưa hỗ trợ quét nền.</div>
+            <div className="text-amber-300/90">
+              Phiên bản máy chủ này không có endpoint watcher nên cổng sẽ không được quét lặp lại tự động.
+              Trình duyệt cố tình <b>không</b> tự hẹn giờ quét thay - hãy dùng nút “Quét Ngay” bên dưới
+              hoặc cập nhật máy chủ để bật watcher.
+            </div>
+            <button
+              id={`btn-retry-watch-${key}`}
+              onClick={() => fetchWatchers()}
+              className="mt-1 inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-amber-900/60 hover:bg-amber-800/70 text-amber-100 text-[10px] font-semibold border border-amber-700/70 cursor-pointer"
+              title="Kiểm tra lại xem máy chủ đã có watcher chưa"
+            >
+              <RefreshCw className={`w-3 h-3 ${watchLoading ? "animate-spin" : ""}`} />
+              Kiểm tra lại
+            </button>
+          </div>
+        </div>
+      );
+    }
+
+    // ---- Honest cadence maths ----
+    const measuredSec =
+      runtime && typeof runtime.lastDurationMs === "number" && runtime.lastDurationMs > 0
+        ? runtime.lastDurationMs / 1000
+        : null;
+    const scanSec = measuredSec !== null ? measuredSec : estimateScanSeconds(configured.frames);
+    const cycleSec = configured.intervalSeconds + scanSec;
+    const tooShort = configured.intervalSeconds < scanSec;
+    const nextIn = secondsUntil(runtime?.nextRunAt, nowMs);
+    const errors = runtime?.consecutiveErrors || 0;
+    const draft = intervalDraft[key];
+    const intervalValue = draft !== null ? draft : String(configured.intervalSeconds);
+
+    return (
+      <div className="mx-3.5 mt-3 rounded-xl border border-slate-800 bg-slate-900/70 overflow-hidden">
+        {/* Header: what this is + live running state */}
+        <div className="px-3 py-2 flex flex-wrap items-center gap-2 border-b border-slate-800">
+          <Server className="w-3.5 h-3.5 text-indigo-400 shrink-0" />
+          <span className="text-[11px] font-bold text-white">Quét nền trên máy chủ (watcher)</span>
+          {configured.enabled ? (
+            runtime?.running ? (
+              <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[9px] font-bold border bg-sky-950/80 text-sky-300 border-sky-700/70">
+                <Radio className="w-2.5 h-2.5 animate-pulse" />
+                ĐANG QUÉT
+              </span>
+            ) : (
+              <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[9px] font-bold border bg-emerald-950/80 text-emerald-300 border-emerald-700/70">
+                <Timer className="w-2.5 h-2.5" />
+                ĐANG NGHỈ GIỮA 2 LƯỢT
+              </span>
+            )
+          ) : (
+            <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[9px] font-bold border bg-slate-800 text-slate-400 border-slate-600">
+              <Power className="w-2.5 h-2.5" />
+              ĐÃ TẮT
+            </span>
+          )}
+          {pending && <RefreshCw className="w-3 h-3 animate-spin text-slate-400" />}
+          {!runtime && (
+            <span className="text-[10px] text-slate-500">
+              Máy chủ chưa báo cáo watcher cho cổng này - bật để khởi tạo.
+            </span>
+          )}
+          <button
+            id={`btn-refresh-watch-${key}`}
+            onClick={() => fetchWatchers()}
+            className="ml-auto inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-slate-800 hover:bg-slate-700 text-slate-300 text-[10px] font-semibold border border-slate-700 cursor-pointer"
+            title="Đọc lại trạng thái watcher từ máy chủ"
+          >
+            <RefreshCw className={`w-3 h-3 ${watchLoading ? "animate-spin" : ""}`} />
+            Làm mới
+          </button>
+        </div>
+
+        {watchError && (
+          <div className="px-3 py-1.5 bg-rose-950/50 border-b border-rose-800/60 text-[10px] text-rose-200 flex items-center gap-1.5">
+            <XCircle className="w-3 h-3 shrink-0" />
+            <span className="flex-1">{watchError}</span>
+            <span className="text-rose-300/70">Đang hiển thị trạng thái đọc được lần gần nhất.</span>
+          </div>
+        )}
+
+        {/* Controls */}
+        <div className="px-3 py-2.5 flex flex-wrap items-center gap-2">
+          <button
+            id={`btn-toggle-watch-${key}`}
+            disabled={pending}
+            onClick={() => updateWatcher(gateConfig.gateType, { enabled: !configured.enabled })}
+            className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-[11px] font-semibold transition-all cursor-pointer disabled:opacity-50 ${
+              configured.enabled
+                ? "bg-emerald-600 hover:bg-emerald-500 text-white shadow-xs"
+                : "bg-slate-800 hover:bg-slate-700 text-slate-400 border border-slate-700"
+            }`}
+            title="Bật/Tắt watcher quét lặp lại trên máy chủ cho cổng này"
+          >
+            <Zap className={`w-3.5 h-3.5 ${configured.enabled ? "text-white" : "text-slate-500"}`} />
+            {configured.enabled ? "Watcher: BẬT" : "Watcher: TẮT"}
+          </button>
+
+          {/* Rest AFTER a scan finishes - deliberately not a period (1-300 s) */}
+          <label className="inline-flex items-center gap-1.5 text-[11px] text-slate-400">
+            <span>Nghỉ sau mỗi lần quét</span>
+            <input
+              id={`input-watch-interval-${key}`}
+              type="number"
+              min={1}
+              max={300}
+              step={1}
+              disabled={pending}
+              value={intervalValue}
+              placeholder="giây nghỉ"
+              onChange={(e) => setIntervalDraft((p) => ({ ...p, [key]: e.target.value }))}
+              onBlur={() => commitIntervalDraft(gateConfig.gateType, configured.intervalSeconds)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") (e.target as HTMLInputElement).blur();
+                if (e.key === "Escape") setIntervalDraft((p) => ({ ...p, [key]: null }));
+              }}
+              className="w-16 bg-slate-900 text-slate-200 border border-slate-700 rounded-lg px-2 py-1.5 text-[11px] font-mono focus:outline-hidden focus:border-indigo-500 disabled:opacity-50"
+              title="Số giây NGHỈ tính từ lúc một lần quét kết thúc đến lúc lần quét sau bắt đầu (1-300 giây). Đây không phải khoảng lặp cố định: thời lượng của chính lần quét được cộng thêm vào."
+            />
+            <span>giây</span>
+          </label>
+
+          {/* Frames per stream per watcher scan (1-5) */}
+          <label className="inline-flex items-center gap-1.5 text-[11px] text-slate-400">
+            <span>Số khung</span>
+            <select
+              id={`select-watch-frames-${key}`}
+              disabled={pending}
+              value={configured.frames}
+              onChange={(e) =>
+                updateWatcher(gateConfig.gateType, { frames: clampFrames(e.target.value) })
+              }
+              className="bg-slate-900 text-slate-200 border border-slate-700 rounded-lg px-2 py-1.5 text-[11px] font-mono focus:outline-hidden focus:border-indigo-500 disabled:opacity-50"
+              title="Số khung hình chụp trên mỗi luồng cho mỗi lượt quét nền (1-5)"
+            >
+              {[1, 2, 3, 4, 5].map((n) => (
+                <option key={n} value={n}>
+                  {n} khung/luồng
+                </option>
+              ))}
+            </select>
+          </label>
+
+          {nextIn !== null && configured.enabled && (
+            <span className="inline-flex items-center gap-1 px-2 py-1 rounded-md bg-slate-950 border border-slate-700 text-[10px] font-mono text-sky-300">
+              <Timer className="w-3 h-3" />
+              {runtime?.running ? "đang quét" : nextIn <= 0 ? "sắp quét" : `hết nghỉ sau ${nextIn}s`}
+            </span>
+          )}
+        </div>
+
+        {fieldError && (
+          <div className="px-3 pb-2 -mt-1 text-[10px] text-rose-300 flex items-center gap-1.5">
+            <XCircle className="w-3 h-3 shrink-0" />
+            {fieldError}
+          </div>
+        )}
+
+        {/* The honest cost of the chosen rest time, right next to the control */}
+        <div className="px-3 pb-2.5 text-[10px] leading-relaxed text-slate-500 space-y-1">
+          <div className={tooShort ? "text-amber-300" : "text-slate-300"}>
+            <b className="font-mono">
+              Nghỉ {configured.intervalSeconds}s (bạn đặt) +{" "}
+              {measuredSec !== null
+                ? `lần quét gần nhất ${fmtSeconds(scanSec)}s (đo được)`
+                : `lần quét ~${fmtSeconds(scanSec)}s (ước tính)`}{" "}
+              ≈ một lượt quét mỗi ~{fmtSeconds(cycleSec)}s
+            </b>{" "}
+            <span className="text-slate-500">
+              {measuredSec !== null
+                ? "- thời lượng lấy từ lượt quét thật gần nhất của watcher."
+                : "- watcher chưa chạy lượt nào nên thời lượng là ước tính theo số đo tham chiếu bên dưới."}
+            </span>
+          </div>
+          <div>
+            Lần quét sau chỉ bắt đầu khi lần quét trước đã chạy xong, rồi mới cộng thêm thời gian
+            nghỉ này. Vì vậy hai lần quét không bao giờ chồng lên nhau, không lượt nào bị âm thầm bỏ
+            qua, và thời lượng của chính lần quét luôn được cộng vào khoảng cách giữa hai lượt.
+          </div>
+          <div>
+            Số đo tham chiếu trên engine ONNX với một cổng {MEASURED_STREAM_COUNT} luồng: 1 khung mất{" "}
+            {fmtSeconds(MEASURED_SCAN_SECONDS[1])} giây, 2 khung mất {fmtSeconds(MEASURED_SCAN_SECONDS[2])} giây.
+            {enabledStreamCount !== MEASURED_STREAM_COUNT
+              ? ` Cổng này đang bật ${enabledStreamCount} luồng nên số thực tế có thể lệch.`
+              : ""}{" "}
+            Muốn mỗi lần quét nhanh hơn, bạn có thể tự tắt bớt luồng của cổng trong trang Cấu Hình
+            Luồng Camera - hệ thống không tự bỏ luồng nào.
+          </div>
+          {tooShort && (
+            <div className="text-amber-300">
+              Thời gian nghỉ {configured.intervalSeconds} giây còn ngắn hơn thời lượng một lần quét (
+              {fmtSeconds(scanSec)} giây): cổng gần như bị quét liên tục và camera cùng cụm worker
+              chịu tải cao nhất. Thực tế vẫn là một lượt mỗi ~{fmtSeconds(cycleSec)} giây, không phải
+              mỗi {configured.intervalSeconds} giây.
+            </div>
+          )}
+        </div>
+
+        {/* Live status of the watcher */}
+        <div className="px-3 pb-3 grid grid-cols-2 sm:grid-cols-4 gap-2">
+          <div className="p-2 rounded-lg bg-slate-950 border border-slate-800">
+            <div className="text-[9px] uppercase tracking-wide text-slate-500">Lượt gần nhất</div>
+            <div className="font-mono text-[11px] font-bold text-white truncate">
+              {relativeTime(runtime?.lastRunAt, nowMs)}
+            </div>
+          </div>
+          <div className="p-2 rounded-lg bg-slate-950 border border-slate-800">
+            <div className="text-[9px] uppercase tracking-wide text-slate-500">Thời lượng</div>
+            <div className="font-mono text-[11px] font-bold text-white">
+              {typeof runtime?.lastDurationMs === "number" ? `${runtime.lastDurationMs} ms` : "—"}
+            </div>
+          </div>
+          <div className="p-2 rounded-lg bg-slate-950 border border-slate-800">
+            <div className="text-[9px] uppercase tracking-wide text-slate-500">Tổng lượt</div>
+            <div className="font-mono text-[11px] font-bold text-white">{runtime?.totalRuns ?? 0}</div>
+          </div>
+          <div
+            className={`p-2 rounded-lg border ${
+              errors > 0 ? "bg-rose-950/60 border-rose-700/70" : "bg-slate-950 border-slate-800"
+            }`}
+          >
+            <div className={`text-[9px] uppercase tracking-wide ${errors > 0 ? "text-rose-300" : "text-slate-500"}`}>
+              Lỗi liên tiếp
+            </div>
+            <div className={`font-mono text-[11px] font-bold ${errors > 0 ? "text-rose-200" : "text-white"}`}>
+              {errors}
+            </div>
+          </div>
+        </div>
+
+        {/* Last outcome / last error reported by the watcher */}
+        {errors === 0 && runtime?.lastError ? (
+          <div className="mx-3 mb-3 px-2.5 py-2 rounded-lg bg-slate-950 border border-slate-800 text-[10px] text-slate-400 flex items-start gap-1.5">
+            <Info className="w-3 h-3 shrink-0 mt-0.5 text-slate-500" />
+            <span className="break-words">
+              <b>Watcher đang chờ:</b> {runtime.lastError}
+            </span>
+          </div>
+        ) : errors > 0 && runtime?.lastError ? (
+          <div className="mx-3 mb-3 px-2.5 py-2 rounded-lg bg-rose-950/60 border border-rose-700/70 text-[10px] text-rose-200 flex items-start gap-1.5">
+            <AlertTriangle className="w-3 h-3 shrink-0 mt-0.5" />
+            <span className="break-words">
+              <b>Lỗi mới nhất của watcher:</b> {runtime.lastError}
+            </span>
+          </div>
+        ) : runtime?.lastRunAt ? (
+          <div className="mx-3 mb-3 px-2.5 py-1.5 rounded-lg bg-slate-950 border border-slate-800 text-[10px] text-slate-400 flex flex-wrap items-center gap-x-2 gap-y-0.5">
+            <span className={runtime.lastRecognized ? "text-emerald-300 font-semibold" : "text-slate-300"}>
+              {runtime.lastRecognized
+                ? `Nhận diện: ${runtime.lastEmployeeName || "nhân viên hợp lệ"}`
+                : "Chưa khớp hồ sơ nào"}
+            </span>
+            {runtime.lastBasis && <span className="font-mono text-slate-500">cơ sở: {runtime.lastBasis}</span>}
+          </div>
+        ) : null}
       </div>
     );
   };
@@ -1447,6 +2194,9 @@ export const CameraDashboard: React.FC<CameraDashboardProps> = ({
           </div>
         )}
 
+        {/* Backend watcher: control surface + live status for this gate */}
+        {renderWatchPanel(gateConfig, enabledStreams.length)}
+
         {/* Notices */}
         {scanState.retryNotice && (
           <div className="mx-3.5 mt-3 p-2.5 rounded-lg bg-amber-950/60 border border-amber-700/60 text-amber-200 text-xs flex items-center gap-2">
@@ -1503,7 +2253,27 @@ export const CameraDashboard: React.FC<CameraDashboardProps> = ({
                   {lastResult.recognized
                     ? `Bộ phận: ${lastResult.employee?.department || "Nhân sự"} • Cửa đã mở tự động`
                     : lastResult.message || "Luồng camera đang giám sát..."}
-                  {scanState.lastScanTime ? ` • ${scanState.lastScanTime}` : ""}
+                </div>
+                {/* Where this result came from, and when. */}
+                <div className="mt-0.5 flex items-center gap-1.5 flex-wrap">
+                  <span
+                    className={`inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[9px] font-bold border ${
+                      scanState.resultOrigin === "WATCHER"
+                        ? "bg-indigo-950/80 text-indigo-300 border-indigo-700/70"
+                        : "bg-slate-800 text-slate-300 border-slate-600"
+                    }`}
+                  >
+                    {scanState.resultOrigin === "WATCHER" ? (
+                      <Server className="w-2.5 h-2.5" />
+                    ) : (
+                      <Hand className="w-2.5 h-2.5" />
+                    )}
+                    {scanState.resultOrigin === "WATCHER" ? "Watcher máy chủ" : "Quét thủ công"}
+                  </span>
+                  <span className="text-[10px] font-mono text-slate-400">
+                    {scanState.lastScanTime || "—"}
+                    {scanState.resultAt ? ` • ${relativeTime(scanState.resultAt, nowMs)}` : ""}
+                  </span>
                 </div>
               </div>
             </div>
@@ -1530,46 +2300,14 @@ export const CameraDashboard: React.FC<CameraDashboardProps> = ({
         {/* Controls Bar for this Gate */}
         <div className="p-3.5 bg-slate-950 flex flex-wrap items-center justify-between gap-3 text-xs">
           <div className="flex items-center gap-2">
-            {/* Auto-Scan Toggle Switch */}
-            <button
-              id={`btn-toggle-autoscan-${gateConfig.gateType.toLowerCase()}`}
-              onClick={() =>
-                setScanState((prev) => ({
-                  ...prev,
-                  autoScanEnabled: !prev.autoScanEnabled,
-                }))
-              }
-              className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg font-semibold transition-all cursor-pointer ${
-                scanState.autoScanEnabled
-                  ? "bg-emerald-600 hover:bg-emerald-500 text-white shadow-xs"
-                  : "bg-slate-800 hover:bg-slate-700 text-slate-400 border border-slate-700"
-              }`}
-              title="Bật/Tắt chế độ tự động nhận diện AI định kỳ trên toàn bộ luồng của cổng"
-            >
-              <Zap className={`w-3.5 h-3.5 ${scanState.autoScanEnabled ? "text-white" : "text-slate-500"}`} />
-              <span>{scanState.autoScanEnabled ? "Tự Động Quét AI: BẬT" : "Tự Động Quét: TẮT"}</span>
-            </button>
+            {/* Manual scan only. The repeating cycle lives in the backend watcher
+                panel above; this browser never schedules a scan. */}
+            <span className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg bg-slate-900 border border-slate-700 text-slate-400 font-semibold">
+              <Hand className="w-3.5 h-3.5 text-slate-500" />
+              Quét thủ công
+            </span>
 
-            {/* Scan Frequency Dropdown */}
-            {scanState.autoScanEnabled && (
-              <select
-                value={scanState.scanIntervalSeconds}
-                onChange={(e) =>
-                  setScanState((prev) => ({
-                    ...prev,
-                    scanIntervalSeconds: Number(e.target.value),
-                  }))
-                }
-                className="bg-slate-900 text-slate-300 border border-slate-700 rounded-lg px-2 py-1.5 text-xs font-mono focus:outline-hidden focus:border-indigo-500"
-                title="Chu kỳ quét AI"
-              >
-                <option value={1.5}>1.5 giây (Nhanh)</option>
-                <option value={3}>3.0 giây (Tiêu chuẩn)</option>
-                <option value={5}>5.0 giây (Tiết kiệm)</option>
-              </select>
-            )}
-
-            {/* Frames per stream per scan -> more fusion evidence, more latency */}
+            {/* Frames per stream for a MANUAL scan -> more fusion evidence, more latency */}
             <label className="inline-flex items-center gap-1.5 text-slate-400">
               <span className="hidden sm:inline">Số khung hình</span>
               <select
@@ -1620,30 +2358,25 @@ export const CameraDashboard: React.FC<CameraDashboardProps> = ({
             </button>
           </div>
 
-          {/* Honest cost of the frame count */}
+          {/* Honest cost of the frame count (manual scans only) */}
           <div className="w-full text-[10px] text-slate-500 leading-relaxed">
+            Số khung này chỉ áp dụng cho lệnh quét thủ công ở trên; watcher trên máy chủ có tham số
+            số khung riêng trong bảng “Quét nền trên máy chủ”.{" "}
             {scanState.scanFrames === 1 ? (
               <>
-                1 khung/luồng: nhanh nhất, nhưng chỉ chấp nhận được khi có một góc nhìn thật rõ.
+                1 khung/luồng: nhanh nhất (~{fmtSeconds(estimateScanSeconds(1))} giây cho một cổng{" "}
+                {MEASURED_STREAM_COUNT} luồng), nhưng chỉ chấp nhận được khi có một góc nhìn thật rõ.
                 Chọn từ 2 khung trở lên để bộ quyết định có thể dựa vào nhiều quan sát đồng thuận.
               </>
             ) : (
               <>
                 {scanState.scanFrames} khung/luồng trên {enabledStreams.length} luồng: mỗi khung thêm
-                tốn khoảng {FRAME_LATENCY_COST_MS / 1000} giây cho mỗi luồng, tức chậm hơn khoảng{" "}
-                {((scanState.scanFrames - 1) * FRAME_LATENCY_COST_MS) / 1000} giây so với 1 khung.
-                Đổi lại có thêm bằng chứng cho quyết định đồng thuận.
+                tốn khoảng {fmtSeconds(EXTRA_FRAME_SECONDS)} giây cho cả cổng, tức một lượt quét mất
+                khoảng {fmtSeconds(estimateScanSeconds(scanState.scanFrames))} giây thay vì{" "}
+                {fmtSeconds(estimateScanSeconds(1))} giây. Đổi lại có thêm bằng chứng cho quyết định
+                đồng thuận.
               </>
             )}
-            {scanState.autoScanEnabled &&
-              scanState.scanIntervalSeconds <
-                ((scanState.scanFrames - 1) * FRAME_LATENCY_COST_MS) / 1000 + 1 && (
-                <span className="text-amber-400">
-                  {" "}
-                  Chu kỳ tự động {scanState.scanIntervalSeconds} giây ngắn hơn thời gian một lần quét -
-                  các lượt trùng nhau sẽ bị bỏ qua.
-                </span>
-              )}
           </div>
         </div>
 
@@ -1670,6 +2403,23 @@ export const CameraDashboard: React.FC<CameraDashboardProps> = ({
                 <p className="text-xs text-slate-500 mt-0.5">
                   Tự động hiển thị toàn bộ luồng camera đang hoạt động của từng cổng (Cổng Vào &amp; Cổng Ra), nhận diện khuôn mặt nhân viên AI thời gian thực và điều khiển mở khóa tự động.
                 </p>
+
+                {/* The behaviour changed: say so loudly instead of letting the
+                    operator assume the old browser-timer model. */}
+                <div className="mt-2.5 flex items-start gap-2 rounded-xl border border-indigo-200 bg-indigo-50 px-3 py-2 text-[11px] text-indigo-900 max-w-3xl">
+                  <Server className="w-4 h-4 text-indigo-600 shrink-0 mt-0.5" />
+                  <p className="leading-relaxed">
+                    <b>Việc quét lặp lại đã chuyển hẳn sang máy chủ.</b> Trình duyệt không còn hẹn giờ
+                    quét nữa: watcher chạy trên máy chủ và <b>vẫn tiếp tục khi bạn đóng trang này</b>;
+                    mở thêm tab cũng không làm camera bị quét thêm lượt nào. Trang này chỉ bật/tắt, đặt
+                    tham số và hiển thị kết quả — nút “Quét Ngay” vẫn là lệnh quét thủ công tức thì.
+                    {watchSupported === false && (
+                      <span className="block mt-1 text-amber-800">
+                        Máy chủ hiện tại chưa hỗ trợ watcher — chỉ còn quét thủ công.
+                      </span>
+                    )}
+                  </p>
+                </div>
               </div>
             </div>
           </div>
@@ -1685,6 +2435,31 @@ export const CameraDashboard: React.FC<CameraDashboardProps> = ({
                   : activeGates.length > 0
                   ? `Đang chạy ${totalEnabledStreams} luồng camera trên ${activeGates.length} cổng`
                   : "Không có luồng camera active"}
+              </span>
+            </div>
+
+            {/* Backend watcher summary */}
+            <div
+              className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-semibold border ${
+                watchSupported === false
+                  ? "bg-amber-50 border-amber-200 text-amber-800"
+                  : watchSupported === null
+                  ? "bg-slate-50 border-slate-200 text-slate-500"
+                  : activeWatcherCount > 0
+                  ? "bg-emerald-50 border-emerald-200 text-emerald-800"
+                  : "bg-slate-50 border-slate-200 text-slate-600"
+              }`}
+              title="Trạng thái watcher quét nền trên máy chủ"
+            >
+              <Server className="w-3.5 h-3.5 shrink-0" />
+              <span>
+                {watchSupported === false
+                  ? "Máy chủ chưa hỗ trợ quét nền"
+                  : watchSupported === null
+                  ? "Đang đọc trạng thái quét nền..."
+                  : activeWatcherCount > 0
+                  ? `Watcher máy chủ: ${activeWatcherCount}/${activeGates.length || 2} cổng đang bật`
+                  : "Watcher máy chủ: chưa bật cổng nào"}
               </span>
             </div>
 
