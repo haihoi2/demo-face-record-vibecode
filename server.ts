@@ -21,6 +21,7 @@ import {
   AI_ENGINE_MODES,
   DEFAULT_STRANGER_WEBHOOK_CONFIG,
   FaceTemplateRecord,
+  StrangerResolutionRecord,
 } from "./src/server/db";
 import { STRANGER_DEEP_LINK_HASH } from "./src/types";
 import type {
@@ -229,6 +230,9 @@ export interface AccessLogRecord {
   lockAction: string;
   doorName: string;
   reason?: string;
+  faceEmbedding?: number[];
+  faceEmbeddingModelTag?: string;
+  faceEmbeddingQuality?: number;
 }
 
 export interface MobileNotificationRecord {
@@ -3110,6 +3114,8 @@ interface RecognitionOutcomeInput {
    * a watcher SSE payload.
    */
   sseSnapshot?: string;
+  /** Highest-quality real ArcFace observation for a DENIED event; never serialized. */
+  strangerObservation?: FaceObservation;
 }
 
 /** JSON-safe outcome report: ids, flags and counters - never image bytes. */
@@ -3386,6 +3392,9 @@ async function applyRecognitionOutcome(input: RecognitionOutcomeInput): Promise<
     reason:
       (detectedFaces[0]?.message || "Không có khuôn mặt nào khớp với cơ sở dữ liệu nhân viên") +
       recognitionSourceSuffix(input),
+    faceEmbedding: input.strangerObservation?.embedding,
+    faceEmbeddingModelTag: input.strangerObservation ? faceModelTag() : undefined,
+    faceEmbeddingQuality: input.strangerObservation?.quality,
   };
   accessLogs.unshift(accessLog);
   db.saveAccessLog(accessLog);
@@ -3765,6 +3774,7 @@ async function performGateScan(input: GateScanRequest): Promise<GateScanResult> 
   let snapshotStreamId: string | undefined;
   let snapshotStreamLabel: string | undefined;
   let snapshotFaces: Array<DetectedFaceItem & { streamId: string; streamLabel: string }> = [];
+  let snapshotObservation: FaceObservation | undefined;
 
   if (faceEngine === "onnx" && allObserved.length > 0) {
     let pick = -1;
@@ -3779,6 +3789,7 @@ async function performGateScan(input: GateScanRequest): Promise<GateScanResult> 
       }
     }
     const chosen = allObserved[pick];
+    snapshotObservation = chosen.observation;
     const owner = outcomes.find((o) => o.stream.id === chosen.streamId);
     const jpeg = owner?.frameJpegs.get(chosen.frameIndex);
     if (jpeg) {
@@ -3818,6 +3829,7 @@ async function performGateScan(input: GateScanRequest): Promise<GateScanResult> 
     processingTimeMs,
     cooldowns: true,
     denyWithoutFace: false,
+    strangerObservation: snapshotObservation,
   });
 
   return { status: 200, body: {
@@ -4635,10 +4647,14 @@ app.post(EMPLOYEE_ROUTES, async (req, res) => {
 
   res.json({
     success: true,
-    message: "Đăng ký khuôn mặt nhân viên thành công",
+    message: enrolled.saved
+      ? "Đăng ký nhân viên và mẫu khuôn mặt thành công"
+      : "Đã tạo hồ sơ nhân viên nhưng chưa tạo được mẫu khuôn mặt; quyền nhận diện vẫn fail-closed",
     employee: newEmployee,
     faceTemplate: enrolled.saved || null,
     faceTemplateRejected: enrolled.rejected || null,
+    recognitionReady: Boolean(enrolled.saved),
+    partialFailure: !enrolled.saved,
     faceEngine: activeFaceEngine(),
   });
 });
@@ -5077,8 +5093,61 @@ const LOG_ROUTES = [
   "/api/access-logs/",
 ];
 
-app.get(LOG_ROUTES, (_req, res) => {
-  res.json(accessLogs);
+const boundedInt = (value: unknown, fallback: number, min: number, max: number) => {
+  const parsed = Number.parseInt(String(value ?? ""), 10);
+  return Number.isInteger(parsed) ? Math.min(max, Math.max(min, parsed)) : fallback;
+};
+
+const logImageUrl = (id: string) => `/api/logs/${encodeURIComponent(id)}/image`;
+const publicAccessLog = (log: AccessLogRecord) => {
+  const { photoSnapshot: _image, faceEmbedding: _embedding, faceEmbeddingModelTag: _model,
+    faceEmbeddingQuality: _quality, ...metadata } = log;
+  const imageUrl = logImageUrl(log.id);
+  return { ...metadata, photoSnapshot: imageUrl, imageUrl, hasImage: Boolean(log.photoSnapshot) };
+};
+
+app.get(LOG_ROUTES, (req, res) => {
+  const page = boundedInt(req.query.page, 1, 1, 1_000_000);
+  const limit = boundedInt(req.query.limit, 50, 1, 100);
+  const total = accessLogs.length;
+  const logs = accessLogs.slice((page - 1) * limit, page * limit).map(publicAccessLog);
+  res.setHeader("X-Total-Count", String(total));
+  res.setHeader("X-Page", String(page));
+  res.setHeader("X-Page-Limit", String(limit));
+  if (String(req.query.format || "").toLowerCase() === "page") {
+    res.json({ success: true, logs, page, limit, total, hasMore: page * limit < total });
+    return;
+  }
+  res.json(logs);
+});
+
+app.get("/api/logs/:id/image", (req, res) => {
+  const id = String(req.params.id || "");
+  if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(id)) {
+    res.status(400).json({ success: false, error: "Invalid log id" });
+    return;
+  }
+  const log = accessLogs.find((item) => item.id === id);
+  if (!log?.photoSnapshot) {
+    res.status(404).json({ success: false, error: "Image not found" });
+    return;
+  }
+  const match = /^data:(image\/(?:jpeg|png|webp));base64,([A-Za-z0-9+/=\s]+)$/i.exec(log.photoSnapshot);
+  if (!match) {
+    res.status(415).json({ success: false, error: "Stored image format is not supported" });
+    return;
+  }
+  const image = Buffer.from(match[2].replace(/\s/g, ""), "base64");
+  if (image.length === 0 || image.length > 25 * 1024 * 1024) {
+    res.status(415).json({ success: false, error: "Stored image is invalid" });
+    return;
+  }
+  res.setHeader("Content-Type", match[1].toLowerCase());
+  res.setHeader("Content-Length", String(image.length));
+  res.setHeader("X-Content-Type-Options", "nosniff");
+  res.setHeader("Content-Security-Policy", "default-src 'none'; sandbox");
+  res.setHeader("Cache-Control", "private, max-age=300, no-transform");
+  res.send(image);
 });
 
 app.post(["/api/logs/clear", "/logs/clear"], (_req, res) => {
@@ -5115,9 +5184,15 @@ app.post(["/api/notifications/mark-read", "/notifications/mark-read"], (_req, re
 });
 
 // --- Stranger Face Alerts & Clustered Face Quick Registration ---
-app.get(["/api/strangers/clusters", "/api/strangers", "/api/strangers/"], (_req, res) => {
+app.get(["/api/strangers/clusters", "/api/strangers", "/api/strangers/"], (req, res) => {
   try {
-    const clusters = clusterStrangerFaces(accessLogs, db.getResolvedStrangerClusters());
+    const page = boundedInt(req.query.page, 1, 1, 1_000_000);
+    const limit = boundedInt(req.query.limit, 20, 1, 50);
+    const demoSeedsEnabled = process.env.NODE_ENV !== "production" && process.env.ENABLE_DEMO_STRANGER_SEEDS === "true";
+    const allClusters = clusterStrangerFaces(accessLogs, db.getResolvedStrangerClusters(), {
+      includeDemoSeeds: demoSeedsEnabled,
+    });
+    const clusters = allClusters.slice((page - 1) * limit, page * limit);
     const deniedLogsCount = accessLogs.filter(
       (l) => l.status === "DENIED" || !l.employeeId || l.employeeName === "Không xác định"
     ).length;
@@ -5126,13 +5201,41 @@ app.get(["/api/strangers/clusters", "/api/strangers", "/api/strangers/"], (_req,
       success: true,
       clusters,
       totalUnregisteredLogs: deniedLogsCount,
-      totalClusters: clusters.length,
+      totalClusters: allClusters.length,
+      page,
+      limit,
+      hasMore: page * limit < allClusters.length,
+      demoSeedsEnabled,
     });
   } catch (err: any) {
     console.error("[Strangers] Lỗi gom cụm ảnh khuôn mặt người lạ:", err);
     res.status(500).json({ success: false, error: err?.message || "Lỗi xử lý phân cụm ảnh người lạ" });
   }
 });
+
+function validatedStrangerCluster(clusterId: unknown, requestedIds: unknown): {
+  clusterId: string;
+  logIds: string[];
+  logs: AccessLogRecord[];
+} | { error: string } {
+  const id = String(clusterId || "").trim();
+  const ids = Array.isArray(requestedIds) ? [...new Set(requestedIds.map(String))].sort() : [];
+  if (!id || ids.length === 0) return { error: "Cần clusterId và danh sách log của cụm" };
+  const cluster = clusterStrangerFaces(accessLogs, db.getResolvedStrangerClusters()).find((item) => item.clusterId === id);
+  if (!cluster) return { error: "Cụm người lạ không tồn tại hoặc đã được xử lý" };
+  const actual = cluster.photos.map((photo) => photo.logId).sort();
+  if (actual.length !== ids.length || actual.some((value, index) => value !== ids[index])) {
+    return { error: "Danh sách log không khớp thành viên cụm trên máy chủ" };
+  }
+  const logs = ids.map((logId) => accessLogs.find((log) => log.id === logId));
+  if (logs.some((log) => !log || log.status !== "DENIED")) {
+    return { error: "Cụm chứa log không hợp lệ hoặc không còn là sự kiện DENIED" };
+  }
+  return { clusterId: id, logIds: ids, logs: logs as AccessLogRecord[] };
+}
+
+const resolutionId = (clusterId: string) =>
+  `RES-${Buffer.from(clusterId).toString("base64url").slice(0, 80)}`;
 
 app.post(["/api/strangers/quick-register", "/api/strangers/register"], async (req, res) => {
   try {
@@ -5145,7 +5248,7 @@ app.post(["/api/strangers/quick-register", "/api/strangers/register"], async (re
       photoUrl,
       clusterId,
       clusterLogIds = [],
-      retroUpdateLogs = true,
+      sourceLogId,
     } = req.body;
 
     if (!name || !name.trim()) {
@@ -5153,84 +5256,85 @@ app.post(["/api/strangers/quick-register", "/api/strangers/register"], async (re
       return;
     }
 
+    const existingResolution = db.getStrangerResolution(String(clusterId || ""));
+    if (existingResolution) {
+      const employee = employees.find((item) => item.id === existingResolution.employeeId);
+      if (existingResolution.action !== "QUICK_REGISTER" || !employee) {
+        res.status(409).json({ success: false, error: "Cụm đã được xử lý theo cách khác" });
+        return;
+      }
+      res.json({ success: true, employee, updatedLogsCount: 0,
+        adjudicatedLogsCount: existingResolution.logIds.length, resolution: existingResolution,
+        idempotentReplay: true, recognitionReady: db.getFaceTemplatesForEmployee(employee.id).length > 0 });
+      return;
+    }
+
+    const validated = validatedStrangerCluster(clusterId, clusterLogIds);
+    if ("error" in validated) {
+      res.status(409).json({ success: false, error: validated.error });
+      return;
+    }
+
     const newEmpId = "EMP-" + Math.floor(1000 + Math.random() * 9000);
     const autoCode = employeeCode?.trim() || `NV-${Math.floor(1000 + Math.random() * 9000)}`;
-
     const newEmployee: EmployeeRecord = {
       id: newEmpId,
       name: name.trim(),
       employeeCode: autoCode,
       department: department?.trim() || "Phòng Kỹ Thuật AI",
       position: position?.trim() || "Nhân viên mới",
-      photoUrl: photoUrl || "https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=400",
+      photoUrl: photoUrl || logImageUrl(validated.logIds[0]),
       registeredAt: new Date().toISOString(),
       accessLevel,
     };
-
     employees.unshift(newEmployee);
     db.saveEmployee(newEmployee);
 
-    let updatedLogsCount = 0;
-    if (retroUpdateLogs && Array.isArray(clusterLogIds) && clusterLogIds.length > 0) {
-      for (const logId of clusterLogIds) {
-        const log = accessLogs.find((l) => l.id === logId);
-        if (log) {
-          log.status = "GRANTED";
-          log.employeeId = newEmployee.id;
-          log.employeeName = newEmployee.name;
-          log.employeeCode = newEmployee.employeeCode;
-          log.department = newEmployee.department;
-          log.reason = `Đã khai báo nhanh từ cụm ảnh người lạ (Xác thực hợp lệ)`;
-          log.lockAction = "Mở chốt tự động qua API";
-          log.confidence = 96;
-          db.saveAccessLog(log);
-          updatedLogsCount++;
-        }
-      }
-    }
+    const requestedSource = String(sourceLogId || "");
+    const sightingLog = validated.logs.find((log) => log.id === requestedSource) ||
+      validated.logs.find((log) => Boolean(log.photoSnapshot));
+    const enrolled = sightingLog && isEnrollableImage(sightingLog.photoSnapshot)
+      ? await enrollTemplateFromImage(newEmployee.id, sightingLog.photoSnapshot, {
+          source: "enrollment", sourceLogId: sightingLog.id,
+        })
+      : { rejected: "unsupported-image" as const };
+    const resolution = await db.saveStrangerResolution({
+      id: resolutionId(validated.clusterId), clusterId: validated.clusterId, action: "QUICK_REGISTER",
+      employeeId: newEmployee.id, actor: "operator", resolvedAt: new Date().toISOString(),
+      logIds: validated.logIds, sourceLogId: sightingLog?.id,
+      metadata: { recognitionReady: Boolean(enrolled.saved), enrollmentRejected: enrolled.rejected || null },
+    });
 
     const notif: MobileNotificationRecord = {
       id: "NOTIF-" + Date.now(),
-      title: "Khai báo nhân viên thành công",
-      body: `Đã chuyển đổi cụm ảnh người lạ thành nhân viên: ${newEmployee.name} (${newEmployee.employeeCode}). Khóa cửa giờ đây sẽ nhận diện mở tự động.`,
-      timestamp: new Date().toISOString(),
-      type: "SUCCESS",
-      read: false,
-      employeeId: newEmployee.id,
-      employeeName: newEmployee.name,
+      title: enrolled.saved ? "Khai báo nhân viên thành công" : "Khai báo nhân viên chưa hoàn tất mẫu khuôn mặt",
+      body: enrolled.saved
+        ? `Đã khai báo ${newEmployee.name} (${newEmployee.employeeCode}) và tạo mẫu nhận diện.`
+        : `Đã tạo hồ sơ ${newEmployee.name}, nhưng chưa tạo được mẫu nhận diện; hệ thống vẫn từ chối cho đến khi enrollment thành công.`,
+      timestamp: new Date().toISOString(), type: enrolled.saved ? "SUCCESS" : "WARNING", read: false,
+      employeeId: newEmployee.id, employeeName: newEmployee.name,
     };
     mobileNotifications.unshift(notif);
     db.saveNotification(notif);
-
-    // Retire the cluster so it stops being offered once it has an owner.
-    if (clusterId) db.markStrangerClusterResolved(String(clusterId));
-
-    // Enrol from the supplied photo exactly as POST /api/employees does, so a
-    // quick-registered person is actually recognisable afterwards. Best-effort.
-    const enrolled = isEnrollableImage(photoUrl)
-      ? await enrollTemplateFromImage(newEmployee.id, photoUrl, { source: "enrollment" })
-      : { rejected: "unsupported-image" as const };
-
     broadcastSSE("employee_added", newEmployee);
     broadcastSSE("notification", notif);
-    broadcastSSE("stranger_registered", {
-      employee: newEmployee,
-      updatedLogsCount,
-      clusterId,
-      clusterLogIds,
-    });
-
-    console.log(`[Strangers] Đã thêm nhanh nhân viên ${newEmployee.name} (${newEmployee.employeeCode}) từ cụm ảnh, cập nhật ${updatedLogsCount} nhật ký cũ.`);
+    broadcastSSE("stranger_registered", { employee: newEmployee, updatedLogsCount: 0,
+      clusterId: validated.clusterId, clusterLogIds: validated.logIds });
 
     res.json({
       success: true,
-      message: `Đã khai báo thành công nhân viên ${newEmployee.name}`,
+      message: `Đã khai báo nhân viên ${newEmployee.name}`,
       employee: newEmployee,
-      updatedLogsCount,
-      clusterId: clusterId || null,
-      clusterResolved: Boolean(clusterId),
+      updatedLogsCount: 0,
+      adjudicatedLogsCount: validated.logIds.length,
+      clusterId: validated.clusterId,
+      clusterResolved: true,
       faceTemplate: enrolled.saved || null,
       faceTemplateRejected: enrolled.rejected || null,
+      recognitionReady: Boolean(enrolled.saved),
+      partialFailure: !enrolled.saved,
+      resolution,
+      idempotentReplay: false,
       faceEngine: activeFaceEngine(),
     });
   } catch (err: any) {
@@ -5328,131 +5432,94 @@ app.post(["/api/strangers/merge", "/api/strangers/assign"], async (req, res) => 
       employeeCode,
       clusterId,
       clusterLogIds = [],
-      retroUpdateLogs = true,
       adoptPhoto = false,
-      photoUrl,
+      sourceLogId,
     } = req.body || {};
 
     if (!employeeId && !employeeCode) {
       res.status(400).json({ success: false, error: "Vui lòng chọn nhân viên cần gộp cụm ảnh" });
       return;
     }
-
-    const target = employees.find(
-      (e) =>
-        (employeeId && e.id === employeeId) ||
-        (employeeCode && e.employeeCode.toUpperCase() === String(employeeCode).toUpperCase())
-    );
-
+    const target = employees.find((e) =>
+      (employeeId && e.id === employeeId) ||
+      (employeeCode && e.employeeCode.toUpperCase() === String(employeeCode).toUpperCase()));
     if (!target) {
-      res.status(404).json({
-        success: false,
-        error: `Không tìm thấy nhân viên tương ứng (${employeeId || employeeCode})`,
-      });
+      res.status(404).json({ success: false, error: `Không tìm thấy nhân viên tương ứng (${employeeId || employeeCode})` });
       return;
     }
 
-    if (!Array.isArray(clusterLogIds) || clusterLogIds.length === 0) {
-      res.status(400).json({ success: false, error: "Cụm ảnh không có nhật ký nào để gộp" });
+    const existingResolution = db.getStrangerResolution(String(clusterId || ""));
+    if (existingResolution) {
+      if (existingResolution.action !== "MERGE" || existingResolution.employeeId !== target.id) {
+        res.status(409).json({ success: false, error: "Cụm đã được xử lý theo cách khác" });
+        return;
+      }
+      res.json({ success: true, employee: target, updatedLogsCount: 0,
+        adjudicatedLogsCount: existingResolution.logIds.length, resolution: existingResolution,
+        idempotentReplay: true, recognitionReady: db.getFaceTemplatesForEmployee(target.id).length > 0 });
       return;
     }
 
-    // Adopting the captured frame as the avatar only changes how this person is
-    // displayed and enrolled; it does not by itself make the matcher recognise them.
+    const validated = validatedStrangerCluster(clusterId, clusterLogIds);
+    if ("error" in validated) {
+      res.status(409).json({ success: false, error: validated.error });
+      return;
+    }
+    const requestedSource = String(sourceLogId || "");
+    const sightingLog = validated.logs.find((log) => log.id === requestedSource) ||
+      validated.logs.find((log) => Boolean(log.photoSnapshot));
+
     let photoUpdated = false;
-    const newPhoto = String(photoUrl || "").trim();
-    if (adoptPhoto && newPhoto) {
-      target.photoUrl = newPhoto;
+    if (adoptPhoto && sightingLog) {
+      target.photoUrl = logImageUrl(sightingLog.id);
       db.saveEmployee(target);
       photoUpdated = true;
     }
 
-    let updatedLogsCount = 0;
-    const skippedLogIds: string[] = [];
-
-    if (retroUpdateLogs) {
-      for (const logId of clusterLogIds) {
-        const log = accessLogs.find((l) => l.id === logId);
-        if (!log) {
-          skippedLogIds.push(logId);
-          continue;
-        }
-        log.status = "GRANTED";
-        log.employeeId = target.id;
-        log.employeeName = target.name;
-        log.employeeCode = target.employeeCode;
-        log.department = target.department;
-        log.reason = `Đã gộp thủ công vào nhân viên có sẵn ${target.name} (${target.employeeCode}) do AI không nhận diện được`;
-        log.lockAction = log.lockAction || "Xác thực thủ công bởi quản trị viên";
-        db.saveAccessLog(log);
-        updatedLogsCount++;
-      }
-    }
+    const enrolled = sightingLog && isEnrollableImage(sightingLog.photoSnapshot)
+      ? await enrollTemplateFromImage(target.id, sightingLog.photoSnapshot, {
+          source: "merge", sourceLogId: sightingLog.id,
+        })
+      : { rejected: "unsupported-image" as const };
+    const resolution = await db.saveStrangerResolution({
+      id: resolutionId(validated.clusterId), clusterId: validated.clusterId, action: "MERGE",
+      employeeId: target.id, actor: "operator", resolvedAt: new Date().toISOString(),
+      logIds: validated.logIds, sourceLogId: sightingLog?.id,
+      metadata: { recognitionReady: Boolean(enrolled.saved), enrollmentRejected: enrolled.rejected || null },
+    });
 
     const notif: MobileNotificationRecord = {
       id: "NOTIF-" + Date.now(),
-      title: "Đã gộp cụm ảnh người lạ",
-      body: `Đã gán ${updatedLogsCount} ảnh/nhật ký người lạ cho nhân viên có sẵn: ${target.name} (${target.employeeCode}).`,
-      timestamp: new Date().toISOString(),
-      type: "SUCCESS",
-      read: false,
-      employeeId: target.id,
-      employeeName: target.name,
+      title: enrolled.saved ? "Đã gộp cụm ảnh người lạ" : "Đã adjudicate nhưng chưa tạo được mẫu khuôn mặt",
+      body: enrolled.saved
+        ? `Đã xác định ${validated.logIds.length} lượt DENIED là ${target.name} (${target.employeeCode}) và tạo mẫu nhận diện.`
+        : `Đã xác định lịch sử thuộc ${target.name}, nhưng enrollment thất bại; lịch sử DENIED và trạng thái khóa được giữ nguyên.`,
+      timestamp: new Date().toISOString(), type: enrolled.saved ? "SUCCESS" : "WARNING", read: false,
+      employeeId: target.id, employeeName: target.name,
     };
     mobileNotifications.unshift(notif);
     db.saveNotification(notif);
-
-    // Retire the cluster so it stops being offered once it has an owner.
-    if (clusterId) db.markStrangerClusterResolved(String(clusterId));
-
-    // An operator confirming "this captured face IS this employee" is a
-    // labelled sample - the most valuable kind, because it comes from the gate
-    // camera under real lighting. Enrol it (source "merge", carrying the
-    // sighting's log id and stream) so the next pass recognises them without
-    // help. Best-effort: never fails the merge.
-    const sightingLog = clusterLogIds
-      .map((logId: string) => accessLogs.find((l) => l.id === logId))
-      .find((l: AccessLogRecord | undefined) => Boolean(l && l.photoSnapshot));
-    const sampleImage = newPhoto || sightingLog?.photoSnapshot || "";
-    const enrolled = isEnrollableImage(sampleImage)
-      ? await enrollTemplateFromImage(target.id, sampleImage, {
-          source: "merge",
-          sourceLogId: sightingLog?.id || (clusterLogIds.length === 1 ? String(clusterLogIds[0]) : undefined),
-        })
-      : { rejected: "unsupported-image" as const };
-    if (enrolled.saved) {
-      console.log(
-        `[FaceEngine] Đã tạo mẫu khuôn mặt (merge) cho ${target.name} từ ảnh người lạ ${enrolled.saved.sourceLogId || ""} (chất lượng ${enrolled.saved.quality}).`
-      );
-    }
-
     broadcastSSE("notification", notif);
-    broadcastSSE("stranger_merged", {
-      employee: target,
-      updatedLogsCount,
-      clusterId,
-      clusterLogIds,
-      photoUpdated,
-    });
-    if (photoUpdated) {
-      broadcastSSE("employee_updated", target);
-    }
-
-    console.log(
-      `[Strangers] Đã gộp ${updatedLogsCount}/${clusterLogIds.length} nhật ký người lạ vào nhân viên ${target.name} (${target.employeeCode}).`
-    );
+    broadcastSSE("stranger_merged", { employee: target, updatedLogsCount: 0,
+      clusterId: validated.clusterId, clusterLogIds: validated.logIds, photoUpdated });
+    if (photoUpdated) broadcastSSE("employee_updated", target);
 
     res.json({
       success: true,
-      message: `Đã gộp cụm ảnh vào nhân viên ${target.name}`,
+      message: `Đã adjudicate cụm ảnh cho nhân viên ${target.name}`,
       employee: target,
-      updatedLogsCount,
-      skippedLogIds,
+      updatedLogsCount: 0,
+      adjudicatedLogsCount: validated.logIds.length,
+      skippedLogIds: [],
       photoUpdated,
-      clusterId: clusterId || null,
-      clusterResolved: Boolean(clusterId),
+      clusterId: validated.clusterId,
+      clusterResolved: true,
       faceTemplate: enrolled.saved || null,
       faceTemplateRejected: enrolled.rejected || null,
+      recognitionReady: Boolean(enrolled.saved),
+      partialFailure: !enrolled.saved,
+      resolution,
+      idempotentReplay: false,
       faceEngine: activeFaceEngine(),
     });
   } catch (err: any) {
@@ -5565,6 +5632,8 @@ interface RecognizeFrameResult {
   fusion?: FusionDecision;
   /** Which engine actually decided this frame. */
   faceEngine: ActiveFaceEngine;
+  /** Internal only; route responses never expose embeddings. */
+  strangerObservation?: FaceObservation;
 }
 
 /**
@@ -5631,6 +5700,7 @@ async function recognizeFrame({
   // -----------------------------------------------------------------------
   const faceEngine = activeFaceEngine();
   let fusion: FusionDecision | undefined;
+  let strangerObservation: FaceObservation | undefined;
 
   if (faceEngine === "onnx" && detectedFaces.length === 0 && rawImage) {
     const engineInfo = getFaceEngineInfo();
@@ -5648,6 +5718,9 @@ async function recognizeFrame({
     multiThreadInfo = { threadLatencyMs: Date.now() - tEngine };
 
     if (observed.length > 0) {
+      strangerObservation = observed
+        .map((item) => item.observation)
+        .sort((a, b) => b.quality - a.quality)[0];
       detectedFaces = facesFromDecision(observed, fusion, employees);
       const winner = fusion.recognized
         ? employees.find((e) => e.id === fusion!.employeeId)
@@ -5957,6 +6030,7 @@ Yêu cầu phân tích:
     multiThreadInfo,
     fusion,
     faceEngine,
+    strangerObservation,
   };
 }
 
@@ -6263,6 +6337,7 @@ app.post(RECOGNIZE_FACE_ROUTES, async (req, res) => {
       cooldowns: false,
       denyWithoutFace: true,
       sseSnapshot: imageBase64,
+      strangerObservation: recognition.strangerObservation,
     });
     const recognizedEmployees = outcome.recognizedEmployees;
     const generatedLogs = outcome.logs;

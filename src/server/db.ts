@@ -53,6 +53,12 @@ export interface AccessLogRecord {
   lockAction: string;
   doorName: string;
   reason?: string;
+  /** L2-normalised stranger observation captured by the real ArcFace engine. */
+  faceEmbedding?: number[];
+  /** Model identity for faceEmbedding. Embeddings with different tags are never compared. */
+  faceEmbeddingModelTag?: string;
+  /** Capture quality (0..1) of the persisted stranger observation. */
+  faceEmbeddingQuality?: number;
 }
 
 export interface SmartLockStateRecord {
@@ -312,6 +318,20 @@ export interface FaceTemplateRecord {
   streamId?: string;
 }
 
+export type StrangerResolutionAction = "QUICK_REGISTER" | "MERGE" | "DISMISS";
+
+export interface StrangerResolutionRecord {
+  id: string;
+  clusterId: string;
+  action: StrangerResolutionAction;
+  employeeId?: string;
+  actor: string;
+  resolvedAt: string;
+  logIds: string[];
+  sourceLogId?: string;
+  metadata?: Record<string, unknown>;
+}
+
 // float32 little-endian <-> number[] for BYTEA/BLOB storage of embeddings
 function embeddingToBuffer(e: number[]): Buffer {
   return Buffer.from(new Float32Array(e).buffer);
@@ -335,6 +355,36 @@ function rowToFaceTemplate(r: any): FaceTemplateRecord {
     capturedAt: r.capturedAt,
     sourceLogId: r.sourceLogId || undefined,
     streamId: r.streamId || undefined,
+  };
+}
+
+function rowToAccessLog(r: any): AccessLogRecord {
+  return {
+    ...r,
+    confidence: Number(r.confidence) || 0,
+    livenessScore: r.livenessScore == null ? undefined : Number(r.livenessScore),
+    faceEmbedding: bufferToEmbedding(r.faceEmbedding, r.faceEmbeddingDims),
+    faceEmbeddingModelTag: r.faceEmbeddingModelTag || undefined,
+    faceEmbeddingQuality: r.faceEmbeddingQuality == null ? undefined : Number(r.faceEmbeddingQuality),
+  } as AccessLogRecord;
+}
+
+function rowToStrangerResolution(r: any): StrangerResolutionRecord {
+  const parse = (value: unknown, fallback: unknown) => {
+    if (value == null) return fallback;
+    if (typeof value === "object") return value;
+    try { return JSON.parse(String(value)); } catch { return fallback; }
+  };
+  return {
+    id: String(r.id),
+    clusterId: String(r.clusterId),
+    action: r.action,
+    employeeId: r.employeeId || undefined,
+    actor: r.actor || "operator",
+    resolvedAt: r.resolvedAt,
+    logIds: parse(r.logIds, []) as string[],
+    sourceLogId: r.sourceLogId || undefined,
+    metadata: parse(r.metadata, {}) as Record<string, unknown>,
   };
 }
 
@@ -604,21 +654,25 @@ class SQLiteStorage {
           await this.pgPool.query(`
             INSERT INTO access_logs (
               id, timestamp, type, status, "employeeId", "employeeName", "employeeCode",
-              department, "photoSnapshot", confidence, "livenessScore", "lockAction", "doorName", reason
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+              department, "photoSnapshot", confidence, "livenessScore", "lockAction", "doorName", reason,
+              "faceEmbedding", "faceEmbeddingDims", "faceEmbeddingModelTag", "faceEmbeddingQuality"
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
             ON CONFLICT (id) DO NOTHING
           `, [
             log.id, log.timestamp, log.type, log.status,
             log.employeeId || null, log.employeeName || null, log.employeeCode || null,
             log.department || null, log.photoSnapshot, log.confidence,
-            log.livenessScore || null, log.lockAction, log.doorName, log.reason || null
+            log.livenessScore ?? null, log.lockAction, log.doorName, log.reason || null,
+            log.faceEmbedding?.length ? embeddingToBuffer(log.faceEmbedding) : null,
+            log.faceEmbedding?.length || null, log.faceEmbeddingModelTag || null, log.faceEmbeddingQuality ?? null
           ]);
         }
         console.log(`[PostgreSQL] Đã khởi tạo và đồng bộ ${existingLogs.length} bản ghi truy cập vào PostgreSQL!`);
       } else {
         const pgLogs = await this.pgPool.query(`
           SELECT id, timestamp, type, status, "employeeId", "employeeName", "employeeCode",
-                 department, "photoSnapshot", confidence, "livenessScore", "lockAction", "doorName", reason
+                 department, "photoSnapshot", confidence, "livenessScore", "lockAction", "doorName", reason,
+                 "faceEmbedding", "faceEmbeddingDims", "faceEmbeddingModelTag", "faceEmbeddingQuality"
           FROM access_logs ORDER BY timestamp DESC LIMIT 100
         `);
         for (const r of pgLogs.rows) {
@@ -627,15 +681,18 @@ class SQLiteStorage {
               const stmt = this.db.prepare(`
                 INSERT INTO access_logs (
                   id, timestamp, type, status, employeeId, employeeName, employeeCode,
-                  department, photoSnapshot, confidence, livenessScore, lockAction, doorName, reason
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                  department, photoSnapshot, confidence, livenessScore, lockAction, doorName, reason,
+                  faceEmbedding, faceEmbeddingDims, faceEmbeddingModelTag, faceEmbeddingQuality
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(id) DO NOTHING
               `);
               stmt.run(
                 r.id, r.timestamp, r.type, r.status,
                 r.employeeId || null, r.employeeName || null, r.employeeCode || null,
                 r.department || null, r.photoSnapshot, r.confidence,
-                r.livenessScore || null, r.lockAction, r.doorName, r.reason || null
+                r.livenessScore ?? null, r.lockAction, r.doorName, r.reason || null,
+                r.faceEmbedding || null, r.faceEmbeddingDims || null,
+                r.faceEmbeddingModelTag || null, r.faceEmbeddingQuality ?? null
               );
             } catch {}
           }
@@ -819,7 +876,11 @@ class SQLiteStorage {
           "livenessScore" NUMERIC(5, 2),
           "lockAction" TEXT,
           "doorName" VARCHAR(255),
-          reason TEXT
+          reason TEXT,
+          "faceEmbedding" BYTEA,
+          "faceEmbeddingDims" INTEGER,
+          "faceEmbeddingModelTag" VARCHAR(128),
+          "faceEmbeddingQuality" REAL
         );
 
         CREATE TABLE IF NOT EXISTS smart_lock_state (
@@ -878,6 +939,18 @@ class SQLiteStorage {
           "resolvedBy" VARCHAR(255)
         );
 
+        CREATE TABLE IF NOT EXISTS stranger_resolutions (
+          id VARCHAR(128) PRIMARY KEY,
+          "clusterId" VARCHAR(128) UNIQUE NOT NULL,
+          action VARCHAR(32) NOT NULL,
+          "employeeId" VARCHAR(64),
+          actor VARCHAR(255) NOT NULL,
+          "resolvedAt" VARCHAR(64) NOT NULL,
+          "logIds" JSONB NOT NULL,
+          "sourceLogId" VARCHAR(64),
+          metadata JSONB NOT NULL DEFAULT '{}'::jsonb
+        );
+
         CREATE TABLE IF NOT EXISTS face_templates (
           id VARCHAR(64) PRIMARY KEY,
           "employeeId" VARCHAR(64) NOT NULL,
@@ -900,8 +973,13 @@ class SQLiteStorage {
 
         -- Migration: stranger-alert settings for databases created before they existed
         ALTER TABLE webhook_config ADD COLUMN IF NOT EXISTS "strangerConfig" TEXT;
+        ALTER TABLE access_logs ADD COLUMN IF NOT EXISTS "faceEmbedding" BYTEA;
+        ALTER TABLE access_logs ADD COLUMN IF NOT EXISTS "faceEmbeddingDims" INTEGER;
+        ALTER TABLE access_logs ADD COLUMN IF NOT EXISTS "faceEmbeddingModelTag" VARCHAR(128);
+        ALTER TABLE access_logs ADD COLUMN IF NOT EXISTS "faceEmbeddingQuality" REAL;
       `);
       await this.loadResolvedStrangerClusters();
+      await this.loadStrangerResolutions();
       await this.loadAiRecognitionConfig();
       await this.loadFaceTemplates();
       console.log("[PostgreSQL] Các bảng dữ liệu đã sẵn sàng trên PostgreSQL!");
@@ -956,7 +1034,11 @@ class SQLiteStorage {
         livenessScore REAL,
         lockAction TEXT,
         doorName TEXT,
-        reason TEXT
+        reason TEXT,
+        faceEmbedding BLOB,
+        faceEmbeddingDims INTEGER,
+        faceEmbeddingModelTag TEXT,
+        faceEmbeddingQuality REAL
       );
 
       CREATE TABLE IF NOT EXISTS smart_lock_state (
@@ -1052,6 +1134,24 @@ class SQLiteStorage {
         config_json TEXT NOT NULL,
         updatedAt TEXT
       );
+
+      CREATE TABLE IF NOT EXISTS resolved_stranger_clusters (
+        clusterId TEXT PRIMARY KEY,
+        resolvedAt TEXT,
+        resolvedBy TEXT
+      );
+
+      CREATE TABLE IF NOT EXISTS stranger_resolutions (
+        id TEXT PRIMARY KEY,
+        clusterId TEXT UNIQUE NOT NULL,
+        action TEXT NOT NULL,
+        employeeId TEXT,
+        actor TEXT NOT NULL,
+        resolvedAt TEXT NOT NULL,
+        logIds TEXT NOT NULL,
+        sourceLogId TEXT,
+        metadata TEXT NOT NULL
+      );
     `);
 
     // Migration: databases created before the stranger alert existed have no
@@ -1061,6 +1161,14 @@ class SQLiteStorage {
       this.db.exec(`ALTER TABLE webhook_config ADD COLUMN strangerConfig TEXT`);
     } catch {
       // column already present
+    }
+    for (const migration of [
+      "ALTER TABLE access_logs ADD COLUMN faceEmbedding BLOB",
+      "ALTER TABLE access_logs ADD COLUMN faceEmbeddingDims INTEGER",
+      "ALTER TABLE access_logs ADD COLUMN faceEmbeddingModelTag TEXT",
+      "ALTER TABLE access_logs ADD COLUMN faceEmbeddingQuality REAL",
+    ]) {
+      try { this.db.exec(migration); } catch { /* column already present */ }
     }
   }
 
@@ -1076,6 +1184,7 @@ class SQLiteStorage {
     door_api_logs: DoorApiLogRecord[];
     camera_streams_config?: CameraStreamsConfigRecord;
     resolved_stranger_clusters?: string[];
+    stranger_resolutions?: StrangerResolutionRecord[];
     face_templates?: FaceTemplateRecord[];
     ai_recognition_config?: AiRecognitionConfigRecord;
   } = {
@@ -1085,6 +1194,7 @@ class SQLiteStorage {
     mobile_notifications: [],
     door_api_logs: [],
     resolved_stranger_clusters: [],
+    stranger_resolutions: [],
   };
 
   private fallbackFile = path.join(DATA_DIR, "smartface_data.json");
@@ -1251,7 +1361,7 @@ class SQLiteStorage {
       try {
         const rows = this.db.prepare("SELECT * FROM access_logs ORDER BY timestamp DESC LIMIT 100").all();
         if (rows && rows.length > 0) {
-          return rows as AccessLogRecord[];
+          return rows.map(rowToAccessLog);
         }
         for (const log of defaults) {
           this.saveAccessLog(log);
@@ -1268,48 +1378,35 @@ class SQLiteStorage {
     return this.fallbackData.access_logs;
   }
 
+  /** Insert an immutable physical access event. Replays with the same id are no-ops. */
   saveAccessLog(log: AccessLogRecord) {
+    const embedding = log.faceEmbedding?.length ? embeddingToBuffer(log.faceEmbedding) : null;
+    const embeddingDims = log.faceEmbedding?.length || null;
     if (this.pgPool && this.isPostgres) {
       this.pgPool.query(`
         INSERT INTO access_logs (
           id, timestamp, type, status, "employeeId", "employeeName", "employeeCode",
-          department, "photoSnapshot", confidence, "livenessScore", "lockAction", "doorName", reason
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
-        ON CONFLICT (id) DO UPDATE SET
-          status = EXCLUDED.status,
-          confidence = EXCLUDED.confidence,
-          "employeeId" = EXCLUDED."employeeId",
-          "employeeName" = EXCLUDED."employeeName",
-          "employeeCode" = EXCLUDED."employeeCode",
-          department = EXCLUDED.department,
-          reason = EXCLUDED.reason,
-          "lockAction" = EXCLUDED."lockAction",
-          "photoSnapshot" = EXCLUDED."photoSnapshot"
+          department, "photoSnapshot", confidence, "livenessScore", "lockAction", "doorName", reason,
+          "faceEmbedding", "faceEmbeddingDims", "faceEmbeddingModelTag", "faceEmbeddingQuality"
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
+        ON CONFLICT (id) DO NOTHING
       `, [
         log.id, log.timestamp, log.type, log.status,
         log.employeeId || null, log.employeeName || null, log.employeeCode || null,
         log.department || null, log.photoSnapshot, log.confidence,
-        log.livenessScore || null, log.lockAction, log.doorName, log.reason || null
+        log.livenessScore ?? null, log.lockAction, log.doorName, log.reason || null,
+        embedding, embeddingDims, log.faceEmbeddingModelTag || null, log.faceEmbeddingQuality ?? null,
       ]).catch((e) => console.error("[PostgreSQL] Lỗi saveAccessLog:", e.message));
     }
 
     if (this.isNativeSqlite && this.db) {
       try {
         const stmt = this.db.prepare(`
-          INSERT INTO access_logs (
+          INSERT OR IGNORE INTO access_logs (
             id, timestamp, type, status, employeeId, employeeName, employeeCode,
-            department, photoSnapshot, confidence, livenessScore, lockAction, doorName, reason
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-          ON CONFLICT(id) DO UPDATE SET
-            status = excluded.status,
-            confidence = excluded.confidence,
-            employeeId = excluded.employeeId,
-            employeeName = excluded.employeeName,
-            employeeCode = excluded.employeeCode,
-            department = excluded.department,
-            reason = excluded.reason,
-            lockAction = excluded.lockAction,
-            photoSnapshot = excluded.photoSnapshot
+            department, photoSnapshot, confidence, livenessScore, lockAction, doorName, reason,
+            faceEmbedding, faceEmbeddingDims, faceEmbeddingModelTag, faceEmbeddingQuality
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         `);
         stmt.run(
           log.id,
@@ -1322,21 +1419,27 @@ class SQLiteStorage {
           log.department || null,
           log.photoSnapshot,
           log.confidence,
-          log.livenessScore || null,
+          log.livenessScore ?? null,
           log.lockAction,
           log.doorName,
-          log.reason || null
+          log.reason || null,
+          embedding,
+          embeddingDims,
+          log.faceEmbeddingModelTag || null,
+          log.faceEmbeddingQuality ?? null,
         );
         return;
       } catch (err) {
         console.error("[SQLite] Lỗi saveAccessLog:", err);
       }
     }
-    this.fallbackData.access_logs.unshift(log);
-    if (this.fallbackData.access_logs.length > 150) {
-      this.fallbackData.access_logs = this.fallbackData.access_logs.slice(0, 150);
+    if (!this.fallbackData.access_logs.some((existing) => existing.id === log.id)) {
+      this.fallbackData.access_logs.unshift({ ...log });
+      if (this.fallbackData.access_logs.length > 150) {
+        this.fallbackData.access_logs = this.fallbackData.access_logs.slice(0, 150);
+      }
+      this.saveFallback();
     }
-    this.saveFallback();
   }
 
   clearAccessLogs() {
@@ -2116,6 +2219,81 @@ class SQLiteStorage {
       this.fallbackData.resolved_stranger_clusters = [...current, clusterId];
       this.saveFallback();
     }
+  }
+
+  private strangerResolutionsCache: StrangerResolutionRecord[] = [];
+  private strangerResolutionsHydrated = false;
+
+  private async loadStrangerResolutions(): Promise<void> {
+    if (!this.pgPool) return;
+    try {
+      const result = await this.pgPool.query(
+        'SELECT id, "clusterId", action, "employeeId", actor, "resolvedAt", "logIds", "sourceLogId", metadata FROM stranger_resolutions'
+      );
+      this.strangerResolutionsCache = result.rows.map(rowToStrangerResolution);
+      this.strangerResolutionsHydrated = true;
+    } catch (err) {
+      console.error("[PostgreSQL] Lỗi nạp adjudication người lạ:", err);
+    }
+  }
+
+  getStrangerResolutions(): StrangerResolutionRecord[] {
+    if (this.strangerResolutionsHydrated || this.strangerResolutionsCache.length > 0) {
+      return this.strangerResolutionsCache.map((record) => ({ ...record, logIds: [...record.logIds] }));
+    }
+    if (this.isNativeSqlite && this.db) {
+      try {
+        const rows = this.db.prepare("SELECT * FROM stranger_resolutions").all() as any[];
+        this.strangerResolutionsCache = rows.map(rowToStrangerResolution);
+        this.strangerResolutionsHydrated = true;
+        return this.getStrangerResolutions();
+      } catch {}
+    }
+    this.strangerResolutionsCache = [...(this.fallbackData.stranger_resolutions || [])];
+    this.strangerResolutionsHydrated = true;
+    return this.getStrangerResolutions();
+  }
+
+  getStrangerResolution(clusterId: string): StrangerResolutionRecord | undefined {
+    return this.getStrangerResolutions().find((record) => record.clusterId === clusterId);
+  }
+
+  /** Append one idempotent adjudication without mutating the physical access event. */
+  async saveStrangerResolution(record: StrangerResolutionRecord): Promise<StrangerResolutionRecord> {
+    const existing = this.getStrangerResolution(record.clusterId);
+    if (existing) return existing;
+    const snapshot: StrangerResolutionRecord = {
+      ...record,
+      logIds: [...record.logIds].sort(),
+      metadata: { ...(record.metadata || {}) },
+    };
+    if (this.pgPool && this.isPostgres) {
+      await this.pgPool.query(
+        `INSERT INTO stranger_resolutions
+          (id, "clusterId", action, "employeeId", actor, "resolvedAt", "logIds", "sourceLogId", metadata)
+         VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb,$8,$9::jsonb)
+         ON CONFLICT ("clusterId") DO NOTHING`,
+        [snapshot.id, snapshot.clusterId, snapshot.action, snapshot.employeeId || null, snapshot.actor,
+          snapshot.resolvedAt, JSON.stringify(snapshot.logIds), snapshot.sourceLogId || null,
+          JSON.stringify(snapshot.metadata || {})]
+      );
+    }
+    if (this.isNativeSqlite && this.db) {
+      this.db.prepare(
+        `INSERT OR IGNORE INTO stranger_resolutions
+          (id, clusterId, action, employeeId, actor, resolvedAt, logIds, sourceLogId, metadata)
+         VALUES (?,?,?,?,?,?,?,?,?)`
+      ).run(snapshot.id, snapshot.clusterId, snapshot.action, snapshot.employeeId || null, snapshot.actor,
+        snapshot.resolvedAt, JSON.stringify(snapshot.logIds), snapshot.sourceLogId || null,
+        JSON.stringify(snapshot.metadata || {}));
+    }
+    this.strangerResolutionsCache.push(snapshot);
+    const fallback = this.fallbackData.stranger_resolutions || [];
+    if (!fallback.some((item) => item.clusterId === snapshot.clusterId)) fallback.push(snapshot);
+    this.fallbackData.stranger_resolutions = fallback;
+    this.saveFallback();
+    this.markStrangerClusterResolved(snapshot.clusterId, snapshot.actor);
+    return snapshot;
   }
 
   // ================= FACE TEMPLATES (real engine gallery) =================

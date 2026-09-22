@@ -20,7 +20,10 @@ export interface AccessLog {
   employeeName?: string;
   employeeCode?: string;
   department?: string;
+  /** Validated server image endpoint; list responses never contain raw image bytes. */
   photoSnapshot: string;
+  imageUrl?: string;
+  hasImage?: boolean;
   confidence: number;
   livenessScore?: number;
   lockAction: string;
@@ -30,12 +33,14 @@ export interface AccessLog {
 
 export interface StrangerPhoto {
   logId: string;
+  /** Validated server image endpoint; retained under the legacy key for compatibility. */
   photoSnapshot: string;
+  imageUrl?: string;
+  hasImage?: boolean;
   timestamp: string;
   confidence: number;
   doorName: string;
   reason?: string;
-  faceEmbeddingHash?: string;
 }
 
 export interface StrangerCluster {
@@ -47,7 +52,7 @@ export interface StrangerCluster {
   totalSightings: number;
   primaryPhoto: string;
   estimatedGender?: string;
-  similarityScore: number;
+  similarityScore: number | null;
   suggestedName?: string;
   notes?: string;
 }
@@ -58,7 +63,7 @@ export interface QuickRegisterStrangerPayload {
   department: string;
   position: string;
   accessLevel: 'ALL_ACCESS' | 'OFFICE_HOURS' | 'RESTRICTED';
-  photoUrl: string;
+  sourceLogId: string;
   clusterLogIds: string[];
   retroUpdateLogs?: boolean;
 }

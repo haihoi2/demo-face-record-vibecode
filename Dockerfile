@@ -44,8 +44,8 @@ WORKDIR /app
 # Copy package files
 COPY package*.json ./
 
-# Install dependencies (npm ci when a lockfile is committed, npm install otherwise)
-RUN if [ -f package-lock.json ]; then npm ci; else npm install --no-audit --no-fund; fi
+# Deterministic dependency install; package-lock.json is authoritative.
+RUN npm ci --no-audit --no-fund
 
 # Copy source files
 COPY . .
@@ -124,7 +124,7 @@ COPY --chown=node:node package*.json ./
 #      ever load. `node -p process.platform/process.arch` names it in exactly the
 #      layout onnxruntime-node uses (linux/x64, linux/arm64, ...), so this stays
 #      correct on an arm64 build instead of hard-coding x64.
-RUN if [ -f package-lock.json ]; then npm ci --omit=dev; else npm install --omit=dev --no-audit --no-fund; fi \
+RUN npm ci --omit=dev --no-audit --no-fund \
     && npm cache clean --force \
     && if [ -d node_modules/onnxruntime-node ]; then \
          find node_modules/onnxruntime-node \( -name 'libonnxruntime_providers_cuda*' \

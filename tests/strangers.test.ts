@@ -1,16 +1,12 @@
 /**
- * Unit tests for stranger face signature hashing and clustering
- * (src/server/strangers.ts).
+ * Regression tests for server-side stranger clustering.
  */
 
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 
-import { generateFaceSignature, clusterStrangerFaces } from "../src/server/strangers";
+import { clusterStrangerFaces } from "../src/server/strangers";
 import { AccessLogRecord } from "../src/server/db";
-
-const KNOWN_VISITOR_01 = "https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=450";
-const KNOWN_VISITOR_02 = "https://images.unsplash.com/photo-1507003211169-0a1dd7228f2d?w=450";
 
 function makeLog(overrides: Partial<AccessLogRecord> = {}): AccessLogRecord {
   return {
@@ -20,175 +16,100 @@ function makeLog(overrides: Partial<AccessLogRecord> = {}): AccessLogRecord {
     status: "DENIED",
     photoSnapshot: "data:image/jpeg;base64,AAAABBBBCCCCDDDD",
     confidence: 31.4,
-    lockAction: "NONE",
+    lockAction: "Khóa giữ nguyên trạng thái LOCKED",
     doorName: "Cửa Chính Trụ Sở",
     ...overrides,
   };
 }
 
-describe("generateFaceSignature", () => {
-  it("returns a sentinel for an empty image", () => {
-    assert.equal(generateFaceSignature(""), "unknown-hash");
-  });
-
-  it("maps the seeded visitor-01 photos onto one shared signature", () => {
-    assert.equal(generateFaceSignature(KNOWN_VISITOR_01), "face-hash-visitor-01");
-    assert.equal(
-      generateFaceSignature("https://images.unsplash.com/photo-1517841905240-472988babdf9?w=450"),
-      "face-hash-visitor-01"
-    );
-  });
-
-  it("maps the seeded visitor-02 photos onto their own signature", () => {
-    assert.equal(generateFaceSignature(KNOWN_VISITOR_02), "face-hash-visitor-02");
-  });
-
-  it("derives a stable hash-N signature for unseen images", () => {
-    const signature = generateFaceSignature("data:image/jpeg;base64,ZZZZYYYYXXXX");
-    assert.match(signature, /^hash-\d{1,4}$/);
-    assert.equal(signature, generateFaceSignature("data:image/jpeg;base64,ZZZZYYYYXXXX"));
-  });
-
-  it("separates clearly different images", () => {
-    assert.notEqual(
-      generateFaceSignature("data:image/jpeg;base64,AAAAAAAAAAAA"),
-      generateFaceSignature("data:image/jpeg;base64,ZZZZZZZZZZZZ")
-    );
-  });
-});
-
 describe("clusterStrangerFaces", () => {
-  it("returns the seeded clusters when there are no logs", () => {
-    const clusters = clusterStrangerFaces([]);
-
-    assert.ok(clusters.length >= 1);
-    assert.ok(clusters.some((c) => c.clusterId === "cluster-visitor-01"));
-    for (const cluster of clusters) {
-      assert.ok(cluster.photos.length > 0);
-      assert.equal(cluster.totalSightings, cluster.photos.length);
-      assert.equal(cluster.primaryPhoto, cluster.photos[0].photoSnapshot);
-    }
+  it("does not inject demo clusters unless explicitly enabled", () => {
+    assert.deepEqual(clusterStrangerFaces([]), []);
+    assert.ok(
+      clusterStrangerFaces([], [], { includeDemoSeeds: true }).some(
+        (cluster) => cluster.clusterId === "cluster-visitor-01",
+      ),
+    );
   });
 
-  it("folds a denied log with a known face into the matching seeded cluster", () => {
-    const before = clusterStrangerFaces([]);
-    const seeded = before.find((c) => c.clusterId === "cluster-visitor-01");
-    assert.ok(seeded);
-
-    const after = clusterStrangerFaces([
-      makeLog({ id: "LOG-NEW-1", photoSnapshot: KNOWN_VISITOR_01 }),
-    ]);
-    const grown = after.find((c) => c.clusterId === "cluster-visitor-01");
-
-    assert.ok(grown);
-    assert.equal(grown.photos.length, seeded.photos.length + 1);
-    assert.ok(grown.photos.some((p) => p.logId === "LOG-NEW-1"));
-  });
-
-  it("opens a new cluster for a face that matches nothing seeded", () => {
-    const before = clusterStrangerFaces([]).length;
-    const after = clusterStrangerFaces([
-      makeLog({ id: "LOG-NOVEL-1", photoSnapshot: "data:image/jpeg;base64,NOVELFACE0001" }),
-    ]);
-
-    assert.equal(after.length, before + 1);
-    const created = after.find((c) => c.photos.some((p) => p.logId === "LOG-NOVEL-1"));
-    assert.ok(created);
-    assert.equal(created.totalSightings, 1);
-  });
-
-  it("groups two sightings of the same novel face into a single cluster", () => {
-    const snapshot = "data:image/jpeg;base64,REPEATEDFACE99";
+  it("groups compatible ArcFace embeddings by deterministic cosine similarity", () => {
     const clusters = clusterStrangerFaces([
-      makeLog({ id: "LOG-R1", photoSnapshot: snapshot, timestamp: "2026-09-16T08:00:00.000Z" }),
-      makeLog({ id: "LOG-R2", photoSnapshot: snapshot, timestamp: "2026-09-16T09:00:00.000Z" }),
-    ]);
-
-    const matched = clusters.filter((c) => c.photos.some((p) => p.photoSnapshot === snapshot));
-    assert.equal(matched.length, 1);
-    assert.equal(matched[0].totalSightings, 2);
-  });
-
-  it("skips denied logs that carry no photo snapshot", () => {
-    const before = clusterStrangerFaces([]).length;
-    const after = clusterStrangerFaces([makeLog({ id: "LOG-NOPHOTO", photoSnapshot: "" })]);
-
-    assert.equal(after.length, before);
-  });
-
-  it("ignores granted logs that belong to a known employee", () => {
-    const before = clusterStrangerFaces([]).length;
-    const after = clusterStrangerFaces([
       makeLog({
-        id: "LOG-GRANTED",
-        status: "GRANTED",
-        employeeId: "EMP-0001",
-        employeeName: "Nguyễn Văn A",
-        photoSnapshot: "data:image/jpeg;base64,EMPLOYEEFACE01",
+        id: "LOG-A",
+        timestamp: "2026-09-16T08:00:00.000Z",
+        faceEmbedding: [1, 0, 0],
+        faceEmbeddingModelTag: "arcface_w600k_r50",
+      }),
+      makeLog({
+        id: "LOG-B",
+        timestamp: "2026-09-16T09:00:00.000Z",
+        faceEmbedding: [0.99, 0.01, 0],
+        faceEmbeddingModelTag: "arcface_w600k_r50",
       }),
     ]);
 
-    assert.equal(after.length, before);
+    assert.equal(clusters.length, 1);
+    assert.deepEqual(clusters[0].photos.map((photo) => photo.logId), ["LOG-B", "LOG-A"]);
+    assert.ok(clusters[0].similarityScore > 99);
   });
 
-  it("treats a granted log with no employeeId as a stranger", () => {
-    const before = clusterStrangerFaces([]).length;
-    const after = clusterStrangerFaces([
+  it("never compares embeddings from different model tags", () => {
+    const clusters = clusterStrangerFaces([
       makeLog({
-        id: "LOG-ORPHAN",
-        status: "GRANTED",
-        photoSnapshot: "data:image/jpeg;base64,ORPHANFACE001",
+        id: "LOG-A",
+        faceEmbedding: [1, 0, 0],
+        faceEmbeddingModelTag: "arcface_w600k_r50",
+      }),
+      makeLog({
+        id: "LOG-B",
+        faceEmbedding: [1, 0, 0],
+        faceEmbeddingModelTag: "arcface_other",
       }),
     ]);
 
-    assert.equal(after.length, before + 1);
+    assert.equal(clusters.length, 2);
+    assert.ok(clusters.every((cluster) => cluster.totalSightings === 1));
   });
 
-  it("orders photos newest-first and derives firstSeen/lastSeen from them", () => {
-    const snapshot = "data:image/jpeg;base64,ORDEREDFACE01";
+  it("keeps missing embeddings as singletons even when JPEG bytes are identical", () => {
+    const snapshot = "data:image/jpeg;base64,SAMEJPEG";
+    const clusters = clusterStrangerFaces([
+      makeLog({ id: "LOG-A", photoSnapshot: snapshot }),
+      makeLog({ id: "LOG-B", photoSnapshot: snapshot }),
+    ]);
+
+    assert.equal(clusters.length, 2);
+    assert.ok(clusters.every((cluster) => cluster.totalSightings === 1));
+  });
+
+  it("returns image endpoint metadata and never raw images or embeddings", () => {
     const [cluster] = clusterStrangerFaces([
-      makeLog({ id: "LOG-O1", photoSnapshot: snapshot, timestamp: "2026-09-16T08:00:00.000Z" }),
-      makeLog({ id: "LOG-O2", photoSnapshot: snapshot, timestamp: "2026-09-16T10:00:00.000Z" }),
-    ]).filter((c) => c.photos.some((p) => p.photoSnapshot === snapshot));
-
-    assert.ok(cluster);
-    assert.equal(cluster.photos[0].logId, "LOG-O2");
-    assert.equal(cluster.lastSeen, "2026-09-16T10:00:00.000Z");
-    assert.equal(cluster.firstSeen, "2026-09-16T08:00:00.000Z");
-  });
-
-  it("sorts clusters by sighting count, densest first", () => {
-    const clusters = clusterStrangerFaces([
-      makeLog({ id: "LOG-S1", photoSnapshot: "data:image/jpeg;base64,SINGLEFACE001" }),
-    ]);
-
-    for (let i = 1; i < clusters.length; i++) {
-      assert.ok(
-        clusters[i - 1].photos.length >= clusters[i].photos.length,
-        "clusters must be ordered by descending photo count"
-      );
-    }
-  });
-
-  it("falls back to sensible defaults on generated clusters", () => {
-    const clusters = clusterStrangerFaces([
       makeLog({
-        id: "LOG-DEFAULTS",
-        photoSnapshot: "data:image/jpeg;base64,DEFAULTSFACE1",
-        confidence: 0,
-        doorName: "",
-        reason: undefined,
+        id: "LOG-IMAGE",
+        photoSnapshot: "data:image/jpeg;base64,VERY-LARGE-SECRET-IMAGE",
+        faceEmbedding: [1, 0, 0],
+        faceEmbeddingModelTag: "arcface_w600k_r50",
       }),
     ]);
 
-    const created = clusters.find((c) => c.photos.some((p) => p.logId === "LOG-DEFAULTS"));
-    assert.ok(created);
+    const serialized = JSON.stringify(cluster);
+    assert.equal(cluster.primaryPhoto, "/api/logs/LOG-IMAGE/image");
+    assert.equal(cluster.photos[0].photoSnapshot, "/api/logs/LOG-IMAGE/image");
+    assert.doesNotMatch(serialized, /VERY-LARGE-SECRET-IMAGE/);
+    assert.doesNotMatch(serialized, /faceEmbedding/);
+    assert.doesNotMatch(serialized, /\[1,0,0\]/);
+  });
 
-    const photo = created.photos.find((p) => p.logId === "LOG-DEFAULTS");
-    assert.ok(photo);
-    assert.equal(photo.confidence, 30);
-    assert.equal(photo.doorName, "Cổng Quét Cửa");
-    assert.equal(photo.reason, "Cảnh báo người lạ chụp hình");
-    assert.equal(photo.faceEmbeddingHash, generateFaceSignature(photo.photoSnapshot));
+  it("filters resolved clusters and individually dismissed logs", () => {
+    const logs = [
+      makeLog({ id: "LOG-A", faceEmbedding: [1, 0], faceEmbeddingModelTag: "arcface" }),
+      makeLog({ id: "LOG-B", faceEmbedding: [0, 1], faceEmbeddingModelTag: "arcface" }),
+    ];
+    const initial = clusterStrangerFaces(logs);
+    const resolvedCluster = initial.find((cluster) => cluster.photos[0].logId === "LOG-A");
+    assert.ok(resolvedCluster);
+
+    const remaining = clusterStrangerFaces(logs, [resolvedCluster.clusterId, "log:LOG-B"]);
+    assert.deepEqual(remaining, []);
   });
 });

@@ -15,9 +15,10 @@
     "build:worker": "esbuild src/server/faceWorker.ts --bundle --platform=node --format=cjs --packages=external --sourcemap --outfile=dist/faceWorker.cjs",
     "start": "node dist/server.cjs",
     "clean": "rm -rf dist server.js",
+    "typecheck": "tsc --noEmit",
     "lint": "tsc --noEmit",
     "test": "node --import tsx --test tests/*.test.ts",
-    "test:integration": "node --import tsx --test tests/integration/*.test.ts"
+    "test:integration": "node --import tsx --test --test-concurrency=1 tests/integration/*.test.ts"
   },
   "dependencies": {
     "@google/genai": "^2.4.0",

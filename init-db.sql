@@ -26,7 +26,11 @@ CREATE TABLE IF NOT EXISTS access_logs (
   "livenessScore" NUMERIC(5, 2),
   "lockAction" TEXT,
   "doorName" VARCHAR(255),
-  reason TEXT
+  reason TEXT,
+  "faceEmbedding" BYTEA,
+  "faceEmbeddingDims" INTEGER,
+  "faceEmbeddingModelTag" VARCHAR(128),
+  "faceEmbeddingQuality" REAL
 );
 
 CREATE TABLE IF NOT EXISTS smart_lock_state (
@@ -95,6 +99,18 @@ CREATE TABLE IF NOT EXISTS resolved_stranger_clusters (
   "clusterId" VARCHAR(128) PRIMARY KEY,
   "resolvedAt" VARCHAR(64),
   "resolvedBy" VARCHAR(255)
+);
+
+CREATE TABLE IF NOT EXISTS stranger_resolutions (
+  id VARCHAR(128) PRIMARY KEY,
+  "clusterId" VARCHAR(128) UNIQUE NOT NULL,
+  action VARCHAR(32) NOT NULL,
+  "employeeId" VARCHAR(64),
+  actor VARCHAR(255) NOT NULL,
+  "resolvedAt" VARCHAR(64) NOT NULL,
+  "logIds" JSONB NOT NULL,
+  "sourceLogId" VARCHAR(64),
+  metadata JSONB NOT NULL DEFAULT '{}'::jsonb
 );
 
 -- AI recognition engine settings (engine mode, Gemini model, thresholds).

@@ -1,0 +1,104 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  quality:
+    name: Typecheck, unit tests, and production build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Set up Node 22
+        uses: actions/setup-node@2028fbc5c25fe9cf00d9f06a71cc4710d4507903 # v6.0.0
+        with:
+          node-version: 22.19.0
+          cache: npm
+      - name: Install locked dependencies
+        run: npm ci --no-audit --no-fund
+      - name: Typecheck
+        run: npm run typecheck
+      - name: Unit tests
+        run: npm test
+      - name: Production build
+        run: npm run build
+
+  integration:
+    name: Isolated serial integration tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Build authoritative Docker test image
+        run: docker compose --profile test build tests
+      - name: Start isolated gateway
+        run: |
+          docker compose --profile test run --rm -d --name smartface-ci-itest \
+            -e NODE_ENV=production \
+            -e DATABASE_URL= \
+            -e DATA_DIR=/tmp/smartface-ci-data \
+            -e ALLOW_SIMULATED_RECOGNITION=false \
+            -e ENABLE_DEMO_STRANGER_SEEDS=false \
+            -e CORS_ALLOWED_ORIGINS=http://allowed.test \
+            -p 3100:3000 \
+            --entrypoint sh tests -c 'npx tsx server.ts'
+          for _ in $(seq 1 60); do
+            if node -e "fetch('http://127.0.0.1:3100/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"; then
+              exit 0
+            fi
+            sleep 1
+          done
+          docker logs smartface-ci-itest
+          exit 1
+      - name: Run integration tests serially
+        run: |
+          docker compose --profile test run --rm \
+            -e APP_URL=http://smartface-ci-itest:3000 \
+            -e CORS_TEST_ALLOWED_ORIGIN=http://allowed.test \
+            --entrypoint sh tests -c 'npm run test:integration'
+      - name: Gateway logs on failure
+        if: failure()
+        run: docker logs smartface-ci-itest || true
+      - name: Stop isolated gateway
+        if: always()
+        run: docker rm -f smartface-ci-itest || true
+
+  dependency-audit:
+    name: npm audit
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Set up Node 22
+        uses: actions/setup-node@2028fbc5c25fe9cf00d9f06a71cc4710d4507903 # v6.0.0
+        with:
+          node-version: 22.19.0
+          cache: npm
+      - name: Audit locked production dependencies
+        run: npm audit --omit=dev --audit-level=high
+
+  secret-scan:
+    name: Secret scanning
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Checkout full history
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+      - name: Gitleaks
+        uses: gitleaks/gitleaks-action@e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e # v3.0.0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

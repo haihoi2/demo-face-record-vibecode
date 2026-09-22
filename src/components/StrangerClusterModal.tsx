@@ -27,12 +27,6 @@ import {
 import { StrangerCluster, StrangerPhoto, Employee, AccessLog } from "../types";
 import { safeJsonFetch } from "../utils/api";
 import { soundEffects } from "../utils/audio";
-import {
-  getStoredLogs,
-  saveStoredLogs,
-  getStoredEmployees,
-  saveStoredEmployees,
-} from "../utils/offlineEngine";
 
 interface StrangerClusterModalProps {
   isOpen: boolean;
@@ -134,132 +128,27 @@ export const StrangerClusterModal: React.FC<StrangerClusterModalProps> = ({
     );
   };
 
-  // Fetch clusters from API (or generate from local logs fallback)
+  // Fetch authoritative clusters. HTTP errors remain errors; the browser never
+  // fabricates biometric clusters or converts a refused mutation into success.
   const loadClusters = async () => {
     setLoading(true);
     setError(null);
     setPreselectMissNotice(null);
     try {
       const res = await safeJsonFetch<{ success: boolean; clusters: StrangerCluster[] }>(
-        "/api/strangers/clusters"
+        "/api/strangers/clusters?limit=50"
       );
-      if (res.ok && res.data && Array.isArray(res.data.clusters)) {
-        setClusters(res.data.clusters);
-        applyPreselection(res.data.clusters);
-      } else {
-        // Fallback using local logs
-        applyPreselection(buildFallbackClusters());
+      if (!res.ok || !res.data?.success || !Array.isArray(res.data.clusters)) {
+        throw new Error((res.data as any)?.error || `HTTP ${res.status}`);
       }
-    } catch {
-      applyPreselection(buildFallbackClusters());
+      setClusters(res.data.clusters);
+      applyPreselection(res.data.clusters);
+    } catch (err: any) {
+      setClusters([]);
+      setError(err?.message || "Không thể tải cụm người lạ từ máy chủ");
     } finally {
       setLoading(false);
     }
-  };
-
-  const buildFallbackClusters = (): StrangerCluster[] => {
-    const localLogs = getStoredLogs();
-    const denied = localLogs.filter((l) => l.status === "DENIED" || !l.employeeId);
-
-    // Mock realistic clusters if few denied logs exist
-    const defaultClusters: StrangerCluster[] = [
-      {
-        clusterId: "cluster-visitor-01",
-        label: "Người lạ #1 (Khách nữ - 3 ảnh tương đồng)",
-        similarityScore: 98.4,
-        estimatedGender: "Nữ",
-        suggestedName: "Lê Mỹ Dung (Khách đối tác)",
-        notes: "Xuất hiện 3 lần tại Cửa Chính Trụ Sở - Cổng A. Các góc mặt đồng nhất 98.4%.",
-        firstSeen: new Date(Date.now() - 45 * 60 * 1000).toISOString(),
-        lastSeen: new Date(Date.now() - 12 * 60 * 1000).toISOString(),
-        totalSightings: 3,
-        primaryPhoto: "https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=450&auto=format&fit=crop&q=80",
-        photos: [
-          {
-            logId: "LOG-STRANGER-A1",
-            photoSnapshot: "https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=450&auto=format&fit=crop&q=80",
-            timestamp: new Date(Date.now() - 45 * 60 * 1000).toISOString(),
-            confidence: 32.5,
-            doorName: "Cửa Chính Trụ Sở - Cổng A",
-            reason: "Cảnh báo: Khuôn mặt lạ chưa đăng ký thẻ/nhận diện",
-          },
-          {
-            logId: "LOG-STRANGER-A2",
-            photoSnapshot: "https://images.unsplash.com/photo-1517841905240-472988babdf9?w=450&auto=format&fit=crop&q=80",
-            timestamp: new Date(Date.now() - 28 * 60 * 1000).toISOString(),
-            confidence: 34.1,
-            doorName: "Cửa Chính Trụ Sở - Cổng A",
-            reason: "Cảnh báo: Người lạ thử quét lần 2",
-          },
-          {
-            logId: "LOG-STRANGER-A3",
-            photoSnapshot: "https://images.unsplash.com/photo-1544005313-94ddf0286df2?w=450&auto=format&fit=crop&q=80",
-            timestamp: new Date(Date.now() - 12 * 60 * 1000).toISOString(),
-            confidence: 36.8,
-            doorName: "Cửa Chính Trụ Sở - Cổng A",
-            reason: "Cảnh báo: Người lạ chụp hình tại cổng",
-          },
-        ],
-      },
-      {
-        clusterId: "cluster-visitor-02",
-        label: "Người lạ #2 (Khách nam - 2 ảnh tương đồng)",
-        similarityScore: 97.2,
-        estimatedGender: "Nam",
-        suggestedName: "Vũ Đình Trọng (Ứng viên phỏng vấn)",
-        notes: "Xuất hiện 2 lần tại Cổng B - Tầng 2. Đặc điểm khuôn mặt tương đồng 97.2%.",
-        firstSeen: new Date(Date.now() - 65 * 60 * 1000).toISOString(),
-        lastSeen: new Date(Date.now() - 18 * 60 * 1000).toISOString(),
-        totalSightings: 2,
-        primaryPhoto: "https://images.unsplash.com/photo-1507003211169-0a1dd7228f2d?w=450&auto=format&fit=crop&q=80",
-        photos: [
-          {
-            logId: "LOG-STRANGER-B1",
-            photoSnapshot: "https://images.unsplash.com/photo-1507003211169-0a1dd7228f2d?w=450&auto=format&fit=crop&q=80",
-            timestamp: new Date(Date.now() - 65 * 60 * 1000).toISOString(),
-            confidence: 29.4,
-            doorName: "Cổng B - Tầng 2",
-            reason: "Cảnh báo: Khuôn mặt nam không nằm trong danh mục nhân viên",
-          },
-          {
-            logId: "LOG-STRANGER-B2",
-            photoSnapshot: "https://images.unsplash.com/photo-1500648767791-00dcc994a43e?w=450&auto=format&fit=crop&q=80",
-            timestamp: new Date(Date.now() - 18 * 60 * 1000).toISOString(),
-            confidence: 33.1,
-            doorName: "Cổng B - Tầng 2",
-            reason: "Cảnh báo: Người lạ quét lại cùng vị trí",
-          },
-        ],
-      },
-    ];
-
-    // Append newly captured denied logs if any
-    if (denied.length > 0) {
-      const extraPhotos: StrangerPhoto[] = denied.map((d) => ({
-        logId: d.id,
-        photoSnapshot: d.photoSnapshot,
-        timestamp: d.timestamp,
-        confidence: d.confidence || 30,
-        doorName: d.doorName || "Cổng Quét Cửa",
-        reason: d.reason,
-      }));
-
-      defaultClusters.push({
-        clusterId: "cluster-visitor-live",
-        label: `Người lạ vừa phát hiện (${extraPhotos.length} ảnh quét)`,
-        similarityScore: 96.0,
-        suggestedName: "Khách vừa quét camera",
-        notes: `Đã phát hiện ${extraPhotos.length} lần quét ảnh trực tiếp qua camera an ninh.`,
-        firstSeen: extraPhotos[extraPhotos.length - 1].timestamp,
-        lastSeen: extraPhotos[0].timestamp,
-        totalSightings: extraPhotos.length,
-        primaryPhoto: extraPhotos[0].photoSnapshot,
-        photos: extraPhotos,
-      });
-    }
-
-    setClusters(defaultClusters);
-    return defaultClusters;
   };
 
   // Reload (and re-apply the preselection) when opened, or when a new deep link
@@ -274,8 +163,7 @@ export const StrangerClusterModal: React.FC<StrangerClusterModalProps> = ({
     setSelectedCluster(cluster);
     setActivePhotoUrl(defaultPhoto || cluster.primaryPhoto || cluster.photos[0]?.photoSnapshot || "");
     // Auto-suggest next employee code
-    const existing = getStoredEmployees();
-    const nextNum = Math.floor(4000 + existing.length * 10 + Math.random() * 90);
+    const nextNum = Math.floor(4000 + Math.random() * 900);
     setEmployeeCode(`NV-${nextNum}`);
     setName(cluster.suggestedName ? cluster.suggestedName.split("(")[0].trim() : "");
     setPosition("Chuyên viên");
@@ -289,31 +177,21 @@ export const StrangerClusterModal: React.FC<StrangerClusterModalProps> = ({
     setRetroUpdateLogs(true);
   };
 
-  // Search the roster. Falls back to filtering the offline cache when the API is unreachable.
+  // Search the authoritative server roster; failures stay failures rather than local success.
   const searchEmployees = async (q: string) => {
     setSearchingEmployees(true);
     try {
-      const res = await safeJsonFetch<{ success: boolean; employees: Employee[] }>(
+      const res = await safeJsonFetch<{ success: boolean; employees: Employee[]; error?: string }>(
         `/api/strangers/search-employees?q=${encodeURIComponent(q)}`
       );
       if (res.ok && res.data?.employees) {
         setEmployeeResults(res.data.employees);
       } else {
-        throw new Error("fallback");
+        throw new Error(res.data?.error || "Không thể tải danh sách nhân viên");
       }
-    } catch {
-      const term = q.trim().toLowerCase();
-      const local = getStoredEmployees();
-      setEmployeeResults(
-        (term
-          ? local.filter((e) =>
-              [e.name, e.employeeCode, e.department, e.position]
-                .filter(Boolean)
-                .some((f) => String(f).toLowerCase().includes(term))
-            )
-          : local
-        ).slice(0, 20)
-      );
+    } catch (err: any) {
+      setEmployeeResults([]);
+      setError(err?.message || "Không thể tải danh sách nhân viên");
     } finally {
       setSearchingEmployees(false);
     }
@@ -345,6 +223,7 @@ export const StrangerClusterModal: React.FC<StrangerClusterModalProps> = ({
         retroUpdateLogs,
         adoptPhoto,
         photoUrl: activePhotoUrl || selectedCluster.primaryPhoto,
+        sourceLogId: selectedCluster.photos.find((photo: StrangerPhoto) => photo.photoSnapshot === activePhotoUrl)?.logId,
       };
 
       const res = await safeJsonFetch<{
@@ -357,43 +236,11 @@ export const StrangerClusterModal: React.FC<StrangerClusterModalProps> = ({
         body: JSON.stringify(payload),
       });
 
-      let merged: Employee = mergeTarget;
-      let mergedCount = 0;
-
-      if (res.ok && res.data?.employee) {
-        merged = res.data.employee;
-        mergedCount = res.data.updatedLogsCount || 0;
-      } else {
-        // Offline fallback: reattribute the cached logs locally.
-        merged = adoptPhoto
-          ? { ...mergeTarget, photoUrl: payload.photoUrl }
-          : mergeTarget;
-
-        if (adoptPhoto) {
-          const allEmps = getStoredEmployees();
-          saveStoredEmployees(allEmps.map((e) => (e.id === merged.id ? merged : e)));
-        }
-
-        if (retroUpdateLogs) {
-          const targetIds = new Set(clusterLogIds);
-          const logs = getStoredLogs();
-          const updated = logs.map((l) => {
-            if (!targetIds.has(l.id)) return l;
-            mergedCount++;
-            return {
-              ...l,
-              status: "GRANTED" as const,
-              employeeId: merged.id,
-              employeeName: merged.name,
-              employeeCode: merged.employeeCode,
-              department: merged.department,
-              reason: `Đã gộp thủ công vào nhân viên có sẵn ${merged.name} (${merged.employeeCode})`,
-              lockAction: l.lockAction || "Xác thực thủ công bởi quản trị viên",
-            };
-          });
-          saveStoredLogs(updated);
-        }
+      if (!res.ok || !res.data?.success || !res.data.employee) {
+        throw new Error((res.data as any)?.error || `HTTP ${res.status}`);
       }
+      const merged: Employee = res.data.employee;
+      const mergedCount = res.data.updatedLogsCount || 0;
 
       soundEffects.playSuccess();
       onEmployeeAdded(merged);
@@ -432,7 +279,7 @@ export const StrangerClusterModal: React.FC<StrangerClusterModalProps> = ({
     if (!ok) return;
     setDismissingId(cluster.clusterId);
     try {
-      await safeJsonFetch<{ success: boolean }>("/api/strangers/dismiss", {
+      const res = await safeJsonFetch<{ success: boolean; error?: string }>("/api/strangers/dismiss", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -441,14 +288,16 @@ export const StrangerClusterModal: React.FC<StrangerClusterModalProps> = ({
           reason: "Từ chối thủ công từ bảng người lạ",
         }),
       });
-    } catch {
-      // offline: hide locally only
-    } finally {
+      if (!res.ok || !res.data?.success) throw new Error(res.data?.error || `HTTP ${res.status}`);
       setClusters((prev) => prev.filter((c) => c.clusterId !== cluster.clusterId));
       if (selectedCluster?.clusterId === cluster.clusterId) setSelectedCluster(null);
       setDismissingId(null);
       setSuccessToast(`Đã từ chối và ẩn cụm ảnh "${cluster.label}"`);
       setTimeout(() => setSuccessToast(null), 3500);
+    } catch (err: any) {
+      alert(`Từ chối cụm ảnh thất bại: ${err?.message || "Lỗi máy chủ"}`);
+    } finally {
+      setDismissingId(null);
     }
   };
 
@@ -472,6 +321,7 @@ export const StrangerClusterModal: React.FC<StrangerClusterModalProps> = ({
         clusterId: selectedCluster.clusterId,
         clusterLogIds: selectedCluster.photos.map((p) => p.logId),
         retroUpdateLogs,
+        sourceLogId: selectedCluster.photos.find((photo: StrangerPhoto) => photo.photoSnapshot === activePhotoUrl)?.logId,
       };
 
       const res = await safeJsonFetch<{ success: boolean; employee: Employee; updatedLogsCount: number }>(
@@ -483,45 +333,10 @@ export const StrangerClusterModal: React.FC<StrangerClusterModalProps> = ({
         }
       );
 
-      let createdEmployee: Employee;
-      if (res.ok && res.data && res.data.employee) {
-        createdEmployee = res.data.employee;
-      } else {
-        // Fallback local save
-        createdEmployee = {
-          id: `EMP-${Date.now()}`,
-          name: payload.name,
-          employeeCode: payload.employeeCode,
-          department: payload.department,
-          position: payload.position,
-          accessLevel: payload.accessLevel,
-          photoUrl: payload.photoUrl,
-          registeredAt: new Date().toISOString(),
-        };
-        const allEmps = getStoredEmployees();
-        saveStoredEmployees([createdEmployee, ...allEmps]);
-
-        if (retroUpdateLogs) {
-          const logs = getStoredLogs();
-          const targetIds = new Set(selectedCluster.photos.map((p) => p.logId));
-          const updatedLogs = logs.map((l) => {
-            if (targetIds.has(l.id)) {
-              return {
-                ...l,
-                status: "GRANTED" as const,
-                employeeId: createdEmployee.id,
-                employeeName: createdEmployee.name,
-                employeeCode: createdEmployee.employeeCode,
-                department: createdEmployee.department,
-                reason: "Đã khai báo nhanh từ cụm ảnh người lạ",
-                lockAction: "Mở chốt tự động qua API",
-              };
-            }
-            return l;
-          });
-          saveStoredLogs(updatedLogs);
-        }
+      if (!res.ok || !res.data?.success || !res.data.employee) {
+        throw new Error((res.data as any)?.error || `HTTP ${res.status}`);
       }
+      const createdEmployee: Employee = res.data.employee;
 
       soundEffects.playSuccess();
       onEmployeeAdded(createdEmployee);
@@ -630,7 +445,17 @@ export const StrangerClusterModal: React.FC<StrangerClusterModalProps> = ({
             </div>
           </div>
 
-          {loading ? (
+          {error ? (
+            <div className="py-12 text-center bg-rose-50 rounded-3xl border border-rose-200">
+              <AlertTriangle className="w-8 h-8 text-rose-600 mx-auto mb-3" />
+              <p className="text-sm font-semibold text-rose-900">Không tải được dữ liệu người lạ</p>
+              <p className="text-xs text-rose-700 mt-1">{error}</p>
+              <button type="button" onClick={loadClusters}
+                className="mt-4 px-4 py-2 rounded-xl bg-white border border-rose-200 text-xs font-semibold text-rose-700">
+                Thử lại
+              </button>
+            </div>
+          ) : loading ? (
             <div className="py-16 text-center">
               <RefreshCw className="w-8 h-8 text-amber-600 animate-spin mx-auto mb-3" />
               <p className="text-sm font-medium text-slate-600">Đang phân tích các cụm ảnh người lạ...</p>
@@ -642,14 +467,7 @@ export const StrangerClusterModal: React.FC<StrangerClusterModalProps> = ({
               <p className="text-xs text-slate-500 max-w-md mx-auto mt-1">
                 Tất cả các lượt quét gần đây đều là nhân viên hợp lệ hoặc toàn bộ ảnh người lạ đã được đăng ký.
               </p>
-              <button
-                id="btn-seed-sample-strangers"
-                onClick={buildFallbackClusters}
-                className="mt-4 inline-flex items-center gap-2 px-4 py-2 bg-white border border-slate-200 hover:bg-slate-50 text-slate-700 text-xs font-semibold rounded-xl shadow-2xs transition-colors"
-              >
-                <Sparkles className="w-3.5 h-3.5 text-amber-600" />
-                Nạp lại 2 cụm người lạ mẫu để thử nghiệm
-              </button>
+
             </div>
           ) : (
             <div className="space-y-4">
@@ -945,8 +763,7 @@ export const StrangerClusterModal: React.FC<StrangerClusterModalProps> = ({
                                   htmlFor={`check-merge-retro-${cluster.clusterId}`}
                                   className="text-xs text-slate-700 font-medium cursor-pointer"
                                 >
-                                  Cập nhật {cluster.photos.length} nhật ký quét cũ thành “Đã xác thực” cho
-                                  nhân viên này
+                                  Ghi nhận adjudication cho {cluster.photos.length} lượt quét, giữ nguyên sự kiện DENIED và trạng thái khóa vật lý
                                 </label>
                               </div>
                               <div className="flex items-start gap-2">
@@ -1113,7 +930,7 @@ export const StrangerClusterModal: React.FC<StrangerClusterModalProps> = ({
                               htmlFor="check-retro-update-logs"
                               className="text-xs text-slate-700 font-medium cursor-pointer"
                             >
-                              Đồng bộ cập nhật toàn bộ {cluster.photos.length} lịch sử quét trước đây của người lạ này thành nhân viên mới (Đã xác thực)
+                              Ghi nhận adjudication cho {cluster.photos.length} lượt quét, giữ nguyên lịch sử DENIED và trạng thái khóa vật lý
                             </label>
                           </div>
                         </div>
