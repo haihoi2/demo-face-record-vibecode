@@ -45,7 +45,7 @@ services:
       # Cổng truy cập Web App trên máy host (mặc định 8080).
       # Container luôn lắng nghe cổng 3000 bên trong; cổng 80 do k3d chiếm giữ,
       # nginx reverse proxy sẽ trỏ về cổng này.
-      - "${APP_PORT:-8080}:3000"
+      - "${LAN_BIND_IP:-192.168.6.52}:${APP_PORT:-8080}:3000"
     environment:
       - NODE_ENV=production
       - PORT=3000
@@ -141,7 +141,7 @@ services:
       TZ: ${TZ:-Asia/Ho_Chi_Minh}
     ports:
       # Cổng PostgreSQL máy host (có thể đổi thành 5433 nếu máy host đã có Postgres 18 chạy cổng 5432)
-      - "${POSTGRES_PORT:-5432}:5432"
+      - "${LAN_BIND_IP:-192.168.6.52}:${POSTGRES_PORT:-5432}:5432"
     volumes:
       # Volume lưu trữ dữ liệu PostgreSQL 18
       - postgres18_data:/var/lib/postgresql/data
