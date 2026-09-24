@@ -1329,7 +1329,7 @@ export const CameraStreamConfigPage: React.FC = () => {
             <div>
               <span className="font-semibold text-slate-900">Cấu hình trên giao diện Web camera Hikvision (http://192.168.60.2):</span>
               <ul className="list-disc pl-4 text-[11px] text-slate-600 space-y-0.5 mt-0.5">
-                <li>Vào <b>Configuration &rarr; Network &rarr; Advanced Settings &rarr; Integration Protocol</b> &rarr; Bật <b>Enable Open Network Video Interface (ONVIF)</b> và thêm user <code className="text-indigo-700 font-bold">viewCam</code>.</li>
+                <li>Vào <b>Configuration &rarr; Network &rarr; Advanced Settings &rarr; Integration Protocol</b> &rarr; Bật <b>Enable Open Network Video Interface (ONVIF)</b> và thêm một user chỉ có quyền xem luồng.</li>
                 <li>Vào <b>Configuration &rarr; System &rarr; Security &rarr; Authentication</b> &rarr; Mục <i>RTSP Authentication</i> chọn <b>digest/basic</b>.</li>
               </ul>
             </div>
