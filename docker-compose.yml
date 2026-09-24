@@ -62,6 +62,8 @@ services:
       - GOOGLE_GEMINI_MODEL=${GOOGLE_GEMINI_MODEL:-gemini-3.8-flash}
 
       # Camera credentials belong in the uncommitted environment, never source.
+      # Storage-only floor for stranger snapshots; never affects access decisions.
+      - FACE_STRANGER_MIN_QUALITY=${FACE_STRANGER_MIN_QUALITY:-}
       - CAMERA_ENTRY_RTSP_URL=${CAMERA_ENTRY_RTSP_URL:-}
       - CAMERA_EXIT_RTSP_URL=${CAMERA_EXIT_RTSP_URL:-}
 

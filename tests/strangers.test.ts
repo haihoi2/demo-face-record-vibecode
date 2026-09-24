@@ -2,6 +2,7 @@
  * Regression tests for server-side stranger clustering.
  */
 
+import { readFileSync } from "node:fs";
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 
@@ -155,5 +156,18 @@ describe("clusterStrangerFaces", () => {
     const clusters = clusterStrangerFaces(logs);
     assert.equal(clusters.length, 5_001);
     assert.ok(clusters.some((cluster) => cluster.photos[0].logId === "LOG-05000"));
+  });
+});
+
+describe("stranger capture quality floor", () => {
+  it("is a storage gate only - the constant never appears in a recognition decision", () => {
+    const server = readFileSync(new URL("../server.ts", import.meta.url), "utf8");
+    // The floor must not leak into matching, fusion or the unlock path: a poor
+    // capture is still allowed to be recognised, it is just not stored.
+    const uses = server.match(/FACE_STRANGER_MIN_QUALITY/g) || [];
+    assert.ok(uses.length >= 2, "expected the floor to be declared and applied");
+    assert.doesNotMatch(server, /recognizeObservations\([^)]*FACE_STRANGER_MIN_QUALITY/);
+    assert.doesNotMatch(server, /FACE_STRANGER_MIN_QUALITY[^\n]*unlockDoor/);
+    assert.match(server, /summary\.suppressed = "stranger-quality"/);
   });
 });
