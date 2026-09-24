@@ -53,7 +53,7 @@ const DEFAULT_STREAMS_CONFIG: CameraStreamsConfig = {
     name: "Camera Cổng Vào (Main Entry Gate)",
     enabled: true,
     sourceType: "RTSP",
-    rtspUrl: "rtsp://viewCam:1234abcd@192.168.60.2:554/Streaming/Channels/101",
+    rtspUrl: "",
     rtspTransport: "TCP",
     httpUrl: "http://192.168.60.2/stream",
     uvcDeviceId: "default",
@@ -69,7 +69,7 @@ const DEFAULT_STREAMS_CONFIG: CameraStreamsConfig = {
     name: "Camera Cổng Ra (Exit Gate B2)",
     enabled: true,
     sourceType: "RTSP",
-    rtspUrl: "rtsp://viewCam:1234abcd@192.168.60.2:554/Streaming/Channels/102",
+    rtspUrl: "",
     rtspTransport: "TCP",
     httpUrl: "http://192.168.60.2/substream",
     uvcDeviceId: "default",
@@ -140,7 +140,7 @@ const deriveGateStreams = (gate: GateStreamConfig | undefined, key: GateKey): Ga
 const getPrimaryStream = (streams: GateStreamSource[]): GateStreamSource | null =>
   streams.find((s) => s.enabled) || streams[0] || null;
 
-/** rtsp://user:secret@host/... -> rtsp://user:•••@host/... */
+/** Mask credentials embedded in an RTSP URL before rendering it. */
 const maskRtspCredentials = (url?: string): string => {
   if (!url) return "";
   return url.replace(/^([a-z]+:\/\/)([^:@/]+)(?::[^@/]*)?@/i, (_m, proto, user) => `${proto}${user}:•••@`);
@@ -939,15 +939,15 @@ export const CameraStreamConfigPage: React.FC = () => {
   ) => {
     let presetUrl = "";
     if (type === "HIKVISION_LOCAL_101") {
-      presetUrl = "rtsp://viewCam:1234abcd@192.168.60.2:554/Streaming/Channels/101";
+      presetUrl = "rtsp://camera.example.invalid:554/Streaming/Channels/101";
     } else if (type === "HIKVISION_LOCAL_102") {
-      presetUrl = "rtsp://viewCam:1234abcd@192.168.60.2:554/Streaming/Channels/102";
+      presetUrl = "rtsp://camera.example.invalid:554/Streaming/Channels/102";
     } else if (type === "HIKVISION") {
-      presetUrl = "rtsp://admin:Password123@192.168.1.64:554/Streaming/Channels/101";
+      presetUrl = "rtsp://camera.example.invalid:554/Streaming/Channels/101";
     } else if (type === "DAHUA") {
-      presetUrl = "rtsp://admin:admin123@192.168.1.108:554/cam/realmonitor?channel=1&subtype=0";
+      presetUrl = "rtsp://camera.example.invalid:554/cam/realmonitor?channel=1&subtype=0";
     } else if (type === "EZVIZ") {
-      presetUrl = "rtsp://admin:VERIFICATION_CODE@192.168.1.50:554/h264/ch1/main/av_stream";
+      presetUrl = "rtsp://camera.example.invalid:554/h264/ch1/main/av_stream";
     } else {
       presetUrl = "rtsp://192.168.1.100:554/live/ch0";
     }
@@ -1055,7 +1055,7 @@ export const CameraStreamConfigPage: React.FC = () => {
                   type="button"
                   onClick={() => applyPreset(setValues, "HIKVISION_LOCAL_101")}
                   className="px-2.5 py-1 rounded-md text-xs bg-indigo-600 text-white hover:bg-indigo-700 font-semibold shadow-xs flex items-center gap-1"
-                  title="rtsp://viewCam:1234abcd@192.168.60.2:554/Streaming/Channels/101"
+                  title="RTSP example (add credentials before use)"
                 >
                   <Zap className="w-3 h-3" />
                   192.168.60.2 (Kênh 101 Main)
@@ -1064,7 +1064,7 @@ export const CameraStreamConfigPage: React.FC = () => {
                   type="button"
                   onClick={() => applyPreset(setValues, "HIKVISION_LOCAL_102")}
                   className="px-2.5 py-1 rounded-md text-xs bg-indigo-100 text-indigo-800 hover:bg-indigo-200 font-semibold border border-indigo-200"
-                  title="rtsp://viewCam:1234abcd@192.168.60.2:554/Streaming/Channels/102"
+                  title="RTSP example (add credentials before use)"
                 >
                   192.168.60.2 (Kênh 102 Sub)
                 </button>
@@ -1089,7 +1089,7 @@ export const CameraStreamConfigPage: React.FC = () => {
                 value={values.rtspUrl}
                 onChange={(e) => set("rtspUrl", e.target.value)}
                 className="w-full px-3.5 py-2.5 rounded-lg border border-slate-300 text-sm font-mono text-slate-800 bg-white focus:ring-2 focus:ring-indigo-500 outline-none"
-                placeholder="rtsp://viewCam:1234abcd@192.168.60.2:554/Streaming/Channels/101"
+                placeholder="rtsp://camera.example.invalid:554/Streaming/Channels/101"
               />
               <div className="flex flex-wrap items-center justify-between text-xs text-slate-700 mt-1.5 gap-2">
                 <span>
@@ -1285,7 +1285,7 @@ export const CameraStreamConfigPage: React.FC = () => {
       <div className="flex items-center justify-between border-b border-indigo-100 pb-2">
         <div className="flex items-center gap-2 font-bold text-indigo-950 text-sm">
           <Info className="w-4 h-4 text-indigo-600" />
-          Hướng Dẫn Cấu Hình Luồng RTSP Cục Bộ: <code className="font-mono text-indigo-700 bg-white px-1.5 py-0.5 rounded border border-indigo-200">rtsp://viewCam:1234abcd@192.168.60.2:554/Streaming/Channels/101</code>
+          Hướng Dẫn Cấu Hình Luồng RTSP Cục Bộ: <code className="font-mono text-indigo-700 bg-white px-1.5 py-0.5 rounded border border-indigo-200">rtsp://camera.example.invalid:554/Streaming/Channels/101</code>
         </div>
       </div>
 
@@ -1297,8 +1297,8 @@ export const CameraStreamConfigPage: React.FC = () => {
         </div>
         <div className="bg-white p-2.5 rounded-lg border border-indigo-100">
           <div className="text-slate-500 font-semibold text-[11px]">TÀI KHOẢN & MẬT KHẨU</div>
-          <div className="font-mono font-bold text-slate-900 mt-0.5">viewCam / 1234abcd</div>
-          <div className="text-[11px] text-slate-500 mt-0.5">Xác thực Digest/Basic quyền xem luồng</div>
+          <div className="font-mono font-bold text-slate-900 mt-0.5">Cấu hình ngoài mã nguồn</div>
+          <div className="text-[11px] text-slate-500 mt-0.5">Nhập tài khoản camera khi triển khai; không lưu bí mật trong Git</div>
         </div>
         <div className="bg-white p-2.5 rounded-lg border border-indigo-100">
           <div className="text-slate-500 font-semibold text-[11px]">KÊNH 101 VS KÊNH 102</div>

@@ -54,8 +54,8 @@ COPY . .
 RUN npm run build
 
 # ----------------- Test Stage -----------------
-# Unit tests reuse the builder stage, which already has devDependencies (tsx)
-# installed, so no separate install is needed. This stage deliberately sits
+# Unit tests reuse the builder's npm-ci dependency tree, including
+# devDependencies (tsx), so no second install is needed. This stage deliberately sits
 # BEFORE the runner stage so that a plain `docker build` still targets runner.
 #   docker compose --profile test run --rm tests
 #   docker build --target tester -t smartface-tests . && docker run --rm smartface-tests

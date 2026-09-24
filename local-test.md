@@ -301,15 +301,15 @@ Entry gate is configured for the Hikvision camera on the LAN:
 
 | Gate | Channel | URL |
 | :--- | :--- | :--- |
-| Entry (Cổng Vào) | 101 (main, 1920x1080 HEVC) | `rtsp://<user>:<pass>@192.168.60.2:554/Streaming/Channels/101` |
-| Exit (Cổng Ra) | 102 (substream) | `rtsp://<user>:<pass>@192.168.60.2:554/Streaming/Channels/102` |
+| Entry (Cổng Vào) | 101 (main, 1920x1080 HEVC) | `rtsp://camera.example.invalid:554/Streaming/Channels/101` |
+| Exit (Cổng Ra) | 102 (substream) | `rtsp://camera.example.invalid:554/Streaming/Channels/102` |
 
 Set or change a gate through the API:
 
 ```bash
 curl -X POST http://localhost:8080/api/camera-streams/config \
   -H 'Content-Type: application/json' \
-  -d '{"entryGate":{"sourceType":"RTSP","rtspUrl":"rtsp://user:pass@192.168.60.2:554/Streaming/Channels/101","rtspTransport":"TCP","enabled":true,"autoStart":true}}'
+  -d '{"entryGate":{"sourceType":"RTSP","rtspUrl":"rtsp://camera.example.invalid:554/Streaming/Channels/101","rtspTransport":"TCP","enabled":true,"autoStart":true}}'
 ```
 
 Verify the stream:
@@ -318,7 +318,7 @@ Verify the stream:
 # TCP reachability probe
 curl -X POST http://localhost:8080/api/camera-streams/test-stream \
   -H 'Content-Type: application/json' \
-  -d '{"url":"rtsp://user:pass@192.168.60.2:554/Streaming/Channels/101","sourceType":"RTSP","transport":"TCP"}'
+  -d '{"url":"rtsp://camera.example.invalid:554/Streaming/Channels/101","sourceType":"RTSP","transport":"TCP"}'
 
 # Single frame (real JPEG when the camera is reachable)
 curl -o frame.jpg 'http://localhost:8080/api/camera-streams/snapshot?gate=entry'
@@ -355,7 +355,7 @@ Example — the exit gate watched by two NVR channels:
 ```bash
 curl -X POST http://localhost:8080/api/camera-streams/exit/streams \
   -H 'Content-Type: application/json' \
-  -d '{"label":"OB-LoiDiVaoKho","sourceType":"RTSP","rtspUrl":"rtsp://user:pass@192.168.60.1:554/Streaming/Channels/2401","rtspTransport":"TCP","enabled":true,"priority":20}'
+  -d '{"label":"OB-LoiDiVaoKho","sourceType":"RTSP","rtspUrl":"rtsp://camera.example.invalid:554/Streaming/Channels/2401","rtspTransport":"TCP","enabled":true,"priority":20}'
 
 curl -X POST http://localhost:8080/api/camera-streams/scan-rtsp \
   -H 'Content-Type: application/json' -d '{"gate":"exit"}'

@@ -215,7 +215,7 @@ describe("camera streams: multi-stream gate config", () => {
       const res = await postJson("/api/camera-streams/exit/streams", {
         label: "ITEST derived id",
         sourceType: "RTSP",
-        rtspUrl: `rtsp://user:pw@127.0.0.1:1/Streaming/Channels/${channel}`,
+        rtspUrl: `rtsp://127.0.0.1:1/Streaming/Channels/${channel}`,
       });
       assert.equal(res.status, 201, res.text.slice(0, 300));
       assert.equal(res.body.stream.id, `exit-${channel}`);
@@ -326,7 +326,7 @@ describe("camera streams: multi-stream gate config", () => {
       const cfg = await getConfig();
       const primary = primaryOf(cfg.entryGate);
       assert.ok(cfg.entryGate.streams.length >= 2, "precondition: entry gate has 2 streams");
-      const newUrl = `rtsp://legacy:client@127.0.0.1:1/legacy/${Date.now().toString(36)}`;
+      const newUrl = `rtsp://127.0.0.1:1/legacy/${Date.now().toString(36)}`;
       const res = await postJson("/api/camera-streams/config", {
         entryGate: {
           name: cfg.entryGate.name,
@@ -350,7 +350,7 @@ describe("camera streams: multi-stream gate config", () => {
 
     it("an old dashboard echoing streams[] while editing legacy fields still updates the primary", async () => {
       const cfg = await getConfig();
-      const echoedUrl = `rtsp://echo:client@127.0.0.1:1/echo/${Date.now().toString(36)}`;
+      const echoedUrl = `rtsp://127.0.0.1:1/echo/${Date.now().toString(36)}`;
       const res = await postJson("/api/camera-streams/config", {
         ...cfg,
         entryGate: { ...cfg.entryGate, rtspUrl: echoedUrl },
@@ -542,10 +542,19 @@ describe("camera streams: multi-stream gate config", () => {
      * cameras are not reachable from the test network the case is skipped.
      */
     it("positive multi-stream scan against the site NVR (skipped when unreachable)", async (t) => {
-      const nvr = [
-        { id: "exit-itest-nvr-501", label: "NVR 501", rtspUrl: "rtsp://viewCam:1234abcd@192.168.60.1:554/Streaming/Channels/501" },
-        { id: "exit-itest-nvr-2401", label: "NVR 2401", rtspUrl: "rtsp://viewCam:1234abcd@192.168.60.1:554/Streaming/Channels/2401" },
-      ];
+      const urls = (process.env.INTEGRATION_NVR_RTSP_URLS || "")
+        .split(",")
+        .map((url) => url.trim())
+        .filter(Boolean);
+      if (urls.length < 2) {
+        t.skip("set INTEGRATION_NVR_RTSP_URLS to two comma-separated RTSP URLs");
+        return;
+      }
+      const nvr = urls.slice(0, 2).map((rtspUrl, index) => ({
+        id: `exit-itest-nvr-${index + 1}`,
+        label: `NVR integration stream ${index + 1}`,
+        rtspUrl,
+      }));
       const probe = await postJson("/api/camera-streams/test-stream", { url: nvr[0].rtspUrl });
       if (probe.status !== 200 || probe.body?.success !== true || probe.body?.reachable === false) {
         t.skip(`NVR not reachable from the gateway (${probe.status}: ${probe.text.slice(0, 120)})`);

@@ -433,6 +433,9 @@ export interface CameraStreamsConfigRecord {
   backendCaptureFps: number;
 }
 
+const DEFAULT_ENTRY_RTSP_URL = process.env.CAMERA_ENTRY_RTSP_URL?.trim() || "";
+const DEFAULT_EXIT_RTSP_URL = process.env.CAMERA_EXIT_RTSP_URL?.trim() || "";
+
 export const DEFAULT_CAMERA_STREAMS_CONFIG: CameraStreamsConfigRecord = {
   entryGate: {
     gateType: "ENTRY",
@@ -446,7 +449,7 @@ export const DEFAULT_CAMERA_STREAMS_CONFIG: CameraStreamsConfigRecord = {
         id: "entry-101",
         label: "Camera Cổng Vào (Main Entry Gate)",
         sourceType: "RTSP",
-        rtspUrl: "rtsp://viewCam:1234abcd@192.168.60.2:554/Streaming/Channels/101",
+        rtspUrl: DEFAULT_ENTRY_RTSP_URL,
         rtspTransport: "TCP",
         httpUrl: "http://192.168.60.2/stream",
         uvcDeviceId: "default",
@@ -459,7 +462,7 @@ export const DEFAULT_CAMERA_STREAMS_CONFIG: CameraStreamsConfigRecord = {
       },
     ],
     sourceType: "RTSP",
-    rtspUrl: "rtsp://viewCam:1234abcd@192.168.60.2:554/Streaming/Channels/101",
+    rtspUrl: DEFAULT_ENTRY_RTSP_URL,
     rtspTransport: "TCP",
     httpUrl: "http://192.168.60.2/stream",
     uvcDeviceId: "default",
@@ -480,7 +483,7 @@ export const DEFAULT_CAMERA_STREAMS_CONFIG: CameraStreamsConfigRecord = {
         id: "exit-102",
         label: "Camera Cổng Ra (Exit Gate B2)",
         sourceType: "RTSP",
-        rtspUrl: "rtsp://viewCam:1234abcd@192.168.60.2:554/Streaming/Channels/102",
+        rtspUrl: DEFAULT_EXIT_RTSP_URL,
         rtspTransport: "TCP",
         httpUrl: "http://192.168.60.2/substream",
         uvcDeviceId: "default",
@@ -493,7 +496,7 @@ export const DEFAULT_CAMERA_STREAMS_CONFIG: CameraStreamsConfigRecord = {
       },
     ],
     sourceType: "RTSP",
-    rtspUrl: "rtsp://viewCam:1234abcd@192.168.60.2:554/Streaming/Channels/102",
+    rtspUrl: DEFAULT_EXIT_RTSP_URL,
     rtspTransport: "TCP",
     httpUrl: "http://192.168.60.2/substream",
     uvcDeviceId: "default",

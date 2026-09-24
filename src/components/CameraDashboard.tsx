@@ -61,7 +61,7 @@ const DEFAULT_STREAMS_CONFIG: CameraStreamsConfig = {
     name: "Camera Cổng Vào (Main Entry Gate)",
     enabled: true,
     sourceType: "RTSP",
-    rtspUrl: "rtsp://viewCam:1234abcd@192.168.60.2:554/Streaming/Channels/101",
+    rtspUrl: "",
     rtspTransport: "TCP",
     httpUrl: "http://192.168.60.2/stream",
     uvcDeviceId: "default",
@@ -77,7 +77,7 @@ const DEFAULT_STREAMS_CONFIG: CameraStreamsConfig = {
     name: "Camera Cổng Ra (Exit Gate B2)",
     enabled: true,
     sourceType: "RTSP",
-    rtspUrl: "rtsp://viewCam:1234abcd@192.168.60.2:554/Streaming/Channels/102",
+    rtspUrl: "",
     rtspTransport: "TCP",
     httpUrl: "http://192.168.60.2/substream",
     uvcDeviceId: "default",
@@ -138,7 +138,7 @@ const deriveGateStreams = (gate: GateStreamConfig | undefined, key: GateKey): Ga
 const getPrimaryStream = (streams: GateStreamSource[]): GateStreamSource | null =>
   streams.find((s) => s.enabled) || streams[0] || null;
 
-/** rtsp://user:secret@host/... -> rtsp://user:•••@host/... */
+/** Mask credentials embedded in an RTSP URL before rendering it. */
 const maskRtspCredentials = (url?: string): string => {
   if (!url) return "";
   return url.replace(/^([a-z]+:\/\/)([^:@/]+)(?::[^@/]*)?@/i, (_m, proto, user) => `${proto}${user}:•••@`);

@@ -61,6 +61,10 @@ services:
       - GEMINI_API_KEY=${GEMINI_API_KEY:-}
       - GOOGLE_GEMINI_MODEL=${GOOGLE_GEMINI_MODEL:-gemini-3.8-flash}
 
+      # Camera credentials belong in the uncommitted environment, never source.
+      - CAMERA_ENTRY_RTSP_URL=${CAMERA_ENTRY_RTSP_URL:-}
+      - CAMERA_EXIT_RTSP_URL=${CAMERA_EXIT_RTSP_URL:-}
+
       # Eton Webhook thông báo kết quả chấm công
       - ETON_WEBHOOK_URL=${ETON_WEBHOOK_URL:-https://chat-room.eton.vn/hooks/YOUR_WEBHOOK_TOKEN}
 
