@@ -29,13 +29,13 @@
 - **API/event contracts added or changed:** none.
 - **Schema/migration changed:** none.
 - **Environment/configuration changed:** `CAMERA_ENTRY_RTSP_URL`, `CAMERA_EXIT_RTSP_URL` (documented in `.env.example`, wired in `docker-compose.yml`), `INTEGRATION_NVR_RTSP_URLS` (test-only, documented in `local-test.md`).
-- **Security/privacy impact:** the Hikvision viewer account `viewCam` / `1234abcd` was committed in six places across components, defaults, docs and tests. It is now absent from tracked source. **The account itself still needs rotating on the camera — removing it from Git does not un-disclose it, and it remains in this repository's history.**
+- **Security/privacy impact:** the Hikvision viewer account and its password were committed in six places across components, defaults, docs and tests. It is now absent from tracked source. **The account itself still needs rotating on the camera — removing it from Git does not un-disclose it, and it remains in this repository's history.**
 
 ## Verification
 
 ```text
-command: git grep -nE 'viewCam|1234abcd' -- .
-result:  no matches
+command: git grep for the committed camera account name and password
+result:  no matches in tracked source
 
 command: docker compose --profile test build tests
 result:  exit 0
