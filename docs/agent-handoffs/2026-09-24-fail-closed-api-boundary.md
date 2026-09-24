@@ -78,8 +78,8 @@ result:  exit 0 — dist/server.cjs 381.2kb, dist/faceWorker.cjs 7.8kb
   3. Threshold calibration is still based on one subject and one impostor; unchanged by this work.
   4. Stranger-capture quality floor still absent — 57% of stored captures are below usable quality.
 - **Unresolved questions:** who holds the operator token in day-to-day use, and whether the viewer principal is wanted at all on this site.
-- **Dependencies on other agents/commits:** `agent/build/ci-baseline` still holds `package-lock.json`, the unconditional `npm ci`, `--test-concurrency=1`, and the removal of hardcoded camera credentials from `src/server/db.ts` defaults. That branch overlaps `src/server/db.ts` and `docker-compose.yml` with `f95caf2` and will need a rebase.
-- **Requested integration action/order:** integrate this branch first, then rebase `agent/build/ci-baseline` on top and re-run the gates from the merged branch before any deploy.
+- **Dependencies on other agents/commits:** resolved. `agent/build/ci-baseline` has been rebased onto `c5310e5` and now sits at `aefb264`; see the companion handoff `2026-09-24-camera-credentials-rebase.md`.
+- **Requested integration action/order:** merge `agent/build/ci-baseline` (which contains this branch as its ancestry) into `main` as one unit, then deploy only after the five operator/device/internal variables and the two camera URL variables are present in the host `.env`.
 
 ## Environment note
 
