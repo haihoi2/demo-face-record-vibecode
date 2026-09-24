@@ -304,6 +304,11 @@ Entry gate is configured for the Hikvision camera on the LAN:
 | Entry (Cổng Vào) | 101 (main, 1920x1080 HEVC) | `rtsp://camera.example.invalid:554/Streaming/Channels/101` |
 | Exit (Cổng Ra) | 102 (substream) | `rtsp://camera.example.invalid:554/Streaming/Channels/102` |
 
+Gate defaults are empty until `CAMERA_ENTRY_RTSP_URL` / `CAMERA_EXIT_RTSP_URL`
+are set in `.env`; the credential-bearing URL is never committed. The positive
+multi-stream NVR integration case reads `INTEGRATION_NVR_RTSP_URLS` (two
+comma-separated URLs) and skips itself when that is unset.
+
 Set or change a gate through the API:
 
 ```bash
