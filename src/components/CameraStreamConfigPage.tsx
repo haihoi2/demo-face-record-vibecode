@@ -45,6 +45,7 @@ import {
   CameraSourceType,
   ThreadPoolTelemetry,
 } from "../types";
+import { apiFetch, operatorJsonFetch } from "../utils/api";
 
 const DEFAULT_STREAMS_CONFIG: CameraStreamsConfig = {
   entryGate: {
@@ -320,9 +321,9 @@ export const CameraStreamConfigPage: React.FC = () => {
   const fetchConfig = async () => {
     try {
       setLoading(true);
-      const res = await fetch("/api/camera-streams/config");
+      const res = await operatorJsonFetch<any>("/api/camera-streams/config");
       if (res.ok) {
-        const data = await res.json();
+        const data = res.data;
         if (data.config) {
           setConfig(data.config);
         }
@@ -340,9 +341,9 @@ export const CameraStreamConfigPage: React.FC = () => {
   // 2. Refresh Telemetry periodically
   const fetchTelemetry = async () => {
     try {
-      const res = await fetch("/api/camera-streams/threads");
+      const res = await operatorJsonFetch<any>("/api/camera-streams/threads");
       if (res.ok) {
-        const data = await res.json();
+        const data = res.data;
         if (data.telemetry) {
           setTelemetry(data.telemetry);
         }
@@ -403,17 +404,17 @@ export const CameraStreamConfigPage: React.FC = () => {
         exitGate: withStreams(config.exitGate, deriveGateStreams(config.exitGate, "exit")),
       };
 
-      const res = await fetch("/api/camera-streams/config", {
+      const res = await operatorJsonFetch<any>("/api/camera-streams/config", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(payload),
       });
 
       if (!res.ok) {
-        throw new Error(`Lưu thất bại (HTTP ${res.status})`);
+        throw new Error(res.error || `Lưu thất bại (HTTP ${res.status})`);
       }
 
-      const data = await res.json();
+      const data = res.data;
       if (data.config) {
         setConfig(data.config);
       }
@@ -438,7 +439,7 @@ export const CameraStreamConfigPage: React.FC = () => {
     const updatedCount = Math.max(1, Math.min(8, newCount));
     setConfig((prev) => ({ ...prev, workerThreadsCount: updatedCount }));
     try {
-      const res = await fetch("/api/camera-streams/threads/scale", {
+      const res = await apiFetch("/api/camera-streams/threads/scale", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ count: updatedCount }),
@@ -457,7 +458,7 @@ export const CameraStreamConfigPage: React.FC = () => {
     try {
       setBenchmarking(true);
       setBenchmarkResults(null);
-      const res = await fetch("/api/camera-streams/benchmark", {
+      const res = await apiFetch("/api/camera-streams/benchmark", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ taskCount: 8 }),
@@ -511,7 +512,7 @@ export const CameraStreamConfigPage: React.FC = () => {
   const replaceGateStreamsViaConfig = async (key: GateKey, streams: GateStreamSource[]): Promise<GateStreamSource[]> => {
     const field = gateFieldOf(key);
     const gatePayload = withStreams(config[field], streams);
-    const res = await fetch("/api/camera-streams/config", {
+    const res = await apiFetch("/api/camera-streams/config", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ [field]: gatePayload }),
@@ -706,7 +707,7 @@ export const CameraStreamConfigPage: React.FC = () => {
     if (!targetUrl) return;
     setRowTests((prev) => ({ ...prev, [s.id]: { loading: true, data: null, message: null } }));
     try {
-      const res = await fetch("/api/camera-streams/test-stream", {
+      const res = await apiFetch("/api/camera-streams/test-stream", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -746,7 +747,7 @@ export const CameraStreamConfigPage: React.FC = () => {
     try {
       setIsScanningRtsp(true);
       setRtspScanResult(null);
-      const res = await fetch("/api/camera-streams/scan-rtsp", {
+      const res = await apiFetch("/api/camera-streams/scan-rtsp", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({

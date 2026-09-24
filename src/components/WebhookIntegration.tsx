@@ -35,7 +35,7 @@ import {
   MobileNotification,
   STRANGER_DEEP_LINK_HASH,
 } from "../types";
-import { safeJsonFetch } from "../utils/api";
+import { buildEventSourceUrl, safeJsonFetch } from "../utils/api";
 import { soundEffects } from "../utils/audio";
 import {
   getStoredWebhookConfig,
@@ -243,7 +243,7 @@ export const WebhookIntegration: React.FC<WebhookIntegrationProps> = ({
     // 1. Subscribe to SSE events from Server for real-time updates
     let es: EventSource | null = null;
     try {
-      es = new EventSource("/api/events");
+      es = new EventSource(buildEventSourceUrl("/api/events"), { withCredentials: true });
       es.addEventListener("webhook_log", (event: MessageEvent) => {
         try {
           const newLog: WebhookLog = JSON.parse(event.data);

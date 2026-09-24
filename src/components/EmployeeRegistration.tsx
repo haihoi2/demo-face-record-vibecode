@@ -496,40 +496,16 @@ export const EmployeeRegistration: React.FC<EmployeeRegistrationProps> = ({
         }),
       });
 
-      let emp: Employee;
-
-      if (response.ok && response.data?.employee) {
-        emp = response.data.employee;
-        setSuccessMsg(
-          `Đã tạo hồ sơ nhân viên: ${emp.name} (${emp.employeeCode}). Bước tiếp theo: đăng ký khuôn mặt từ camera cổng ở khung bên dưới.`
-        );
-      } else {
-        // Fallback: if server responds with error or 404, create local record so user is never blocked
-        console.warn("[EmployeeRegistration] Server returned error or 404, saving locally:", response.error);
-        emp = {
-          id: "EMP-" + String(Date.now()).slice(-4),
-          name: name.trim(),
-          employeeCode: codeClean,
-          department: department ? department.trim() : "Phòng Hành chính - Nhân sự",
-          position: position ? position.trim() : "Nhân viên",
-          photoUrl: photoBase64,
-          registeredAt: new Date().toISOString(),
-          accessLevel,
-        };
-        setSuccessMsg(
-          `Đã tạo hồ sơ nhân viên: ${emp.name} (${emp.employeeCode}). Bước tiếp theo: đăng ký khuôn mặt từ camera cổng ở khung bên dưới.`
-        );
+      // The server is the only source of an employee identity. A rejection stays a
+      // rejection: fabricating a local record here would enrol a face the backend
+      // never accepted, and the offline matcher would then treat it as enrolled.
+      if (!response.ok || !response.data?.employee) {
+        throw new Error(response.data?.error || response.error || `Đăng ký nhân viên thất bại (HTTP ${response.status})`);
       }
-
-      // Persist to local storage for offline resilience
-      try {
-        const storedRaw = localStorage.getItem("smartlock_offline_employees");
-        const storedList: Employee[] = storedRaw ? JSON.parse(storedRaw) : [];
-        const updated = [emp, ...storedList.filter((x) => x.id !== emp.id && x.employeeCode !== emp.employeeCode)];
-        localStorage.setItem("smartlock_offline_employees", JSON.stringify(updated));
-      } catch (e) {
-        console.warn("Could not save to localStorage:", e);
-      }
+      const emp: Employee = response.data.employee;
+      setSuccessMsg(
+        `Đã tạo hồ sơ nhân viên: ${emp.name} (${emp.employeeCode}). Bước tiếp theo: đăng ký khuôn mặt từ camera cổng ở khung bên dưới.`
+      );
 
       onEmployeeAdded(emp);
       // Send the operator straight on to per-camera enrolment for this person.
@@ -541,25 +517,7 @@ export const EmployeeRegistration: React.FC<EmployeeRegistrationProps> = ({
       setPhotoBase64("");
     } catch (err: any) {
       console.error("Registration error:", err);
-      // Even in catch block, never leave user stranded
-      const fallbackEmp: Employee = {
-        id: "EMP-" + String(Date.now()).slice(-4),
-        name: name.trim(),
-        employeeCode: codeClean,
-        department: department ? department.trim() : "Phòng Hành chính - Nhân sự",
-        position: position ? position.trim() : "Nhân viên",
-        photoUrl: photoBase64,
-        registeredAt: new Date().toISOString(),
-        accessLevel,
-      };
-      onEmployeeAdded(fallbackEmp);
-      setEnrollEmployeeId(fallbackEmp.id);
-      setSuccessMsg(
-        `Đã tạo hồ sơ nhân viên: ${fallbackEmp.name} (${fallbackEmp.employeeCode}). Bước tiếp theo: đăng ký khuôn mặt từ camera cổng ở khung bên dưới.`
-      );
-      setName("");
-      setEmployeeCode("");
-      setPhotoBase64("");
+      setErrorMsg(err?.message || "Không thể đăng ký nhân viên");
     } finally {
       setIsSubmitting(false);
     }

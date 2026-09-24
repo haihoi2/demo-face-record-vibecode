@@ -24,15 +24,12 @@ import {
   Code2,
 } from "lucide-react";
 import { DoorControllerConfig, DoorApiLog, DoorAuthHeaderType, SmartLockState } from "../types";
-import { safeJsonFetch } from "../utils/api";
+import { operatorJsonFetch } from "../utils/api";
 import { soundEffects } from "../utils/audio";
 import {
-  getStoredDoorConfig,
-  saveStoredDoorConfig,
   getStoredDoorLogs,
   saveStoredDoorLogs,
   clearStoredDoorLogs,
-  dispatchDirectDoorControllerCommand,
   clientEventBus,
   DEFAULT_OFFLINE_DOOR_CONFIG,
 } from "../utils/offlineEngine";
@@ -69,15 +66,14 @@ export const DoorConfigPage: React.FC<DoorConfigPageProps> = ({
   const fetchConfigAndLogs = useCallback(async () => {
     setLoading(true);
     try {
-      const configRes = await safeJsonFetch<DoorControllerConfig>("/api/door-controller/config");
+      const configRes = await operatorJsonFetch<DoorControllerConfig>("/api/door-controller/config");
       if (configRes.ok && configRes.data && configRes.data.apiUrl) {
         setConfig(configRes.data);
-        saveStoredDoorConfig(configRes.data);
       } else {
-        setConfig(getStoredDoorConfig());
+        setConfig(DEFAULT_OFFLINE_DOOR_CONFIG);
       }
 
-      const logsRes = await safeJsonFetch<DoorApiLog[]>("/api/door-controller/logs");
+      const logsRes = await operatorJsonFetch<DoorApiLog[]>("/api/door-controller/logs");
       if (logsRes.ok && Array.isArray(logsRes.data)) {
         setLogs(logsRes.data);
         saveStoredDoorLogs(logsRes.data);
@@ -85,7 +81,7 @@ export const DoorConfigPage: React.FC<DoorConfigPageProps> = ({
         setLogs(getStoredDoorLogs());
       }
     } catch {
-      setConfig(getStoredDoorConfig());
+      setConfig(DEFAULT_OFFLINE_DOOR_CONFIG);
       setLogs(getStoredDoorLogs());
     } finally {
       setLoading(false);
@@ -121,23 +117,20 @@ export const DoorConfigPage: React.FC<DoorConfigPageProps> = ({
     setSaveSuccess(false);
 
     try {
-      saveStoredDoorConfig(config);
-      clientEventBus.emit("door_config_updated", config);
-
-      await safeJsonFetch("/api/door-controller/config", {
+      const result = await operatorJsonFetch("/api/door-controller/config", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(config),
       });
+      if (!result.ok) throw new Error(result.error || `Lưu cấu hình thất bại (HTTP ${result.status})`);
 
+      clientEventBus.emit("door_config_updated", config);
       setSaveSuccess(true);
       soundEffects.playGranted();
       setTimeout(() => setSaveSuccess(false), 3500);
     } catch (err) {
       console.warn("Lỗi lưu cấu hình API cửa:", err);
-      // Fallback local save is already done
-      setSaveSuccess(true);
-      setTimeout(() => setSaveSuccess(false), 3500);
+      setSaveSuccess(false);
     } finally {
       setSaving(false);
     }
@@ -150,7 +143,7 @@ export const DoorConfigPage: React.FC<DoorConfigPageProps> = ({
     const startTime = Date.now();
     try {
       // First attempt server-side test endpoint
-      const res = await safeJsonFetch<{ success: boolean; log: DoorApiLog; error?: string }>(
+      const res = await operatorJsonFetch<{ success: boolean; log: DoorApiLog; error?: string }>(
         "/api/door-controller/test",
         {
           method: "POST",
@@ -164,39 +157,31 @@ export const DoorConfigPage: React.FC<DoorConfigPageProps> = ({
         }
       );
 
-      if (res.ok && res.data && res.data.log) {
-        const testData = res.data;
+      // A rejected or malformed server response is the result - it is never
+      // retried locally and never reported as a successful door command.
+      if (!res.ok || !res.data?.log) {
         setTestResult({
-          success: testData.success,
-          statusCode: testData.log.statusCode,
-          durationMs: testData.log.durationMs,
-          responseBody: testData.log.responseBody,
-          error: testData.log.error || testData.error,
+          success: false,
+          durationMs: Date.now() - startTime,
+          error: res.data?.error || res.error || `Kiểm tra thất bại (HTTP ${res.status})`,
         });
-        setLogs((prev) => [testData.log, ...prev.filter((l) => l.id !== testData.log.id)].slice(0, 60));
-        if (testData.success) {
-          soundEffects.playGranted();
-        } else {
-          soundEffects.playDenied();
-        }
+        soundEffects.playDenied();
+        return;
+      }
+
+      const testData = res.data;
+      setTestResult({
+        success: testData.success,
+        statusCode: testData.log.statusCode,
+        durationMs: testData.log.durationMs,
+        responseBody: testData.log.responseBody,
+        error: testData.log.error || testData.error,
+      });
+      setLogs((prev) => [testData.log, ...prev.filter((l) => l.id !== testData.log.id)].slice(0, 60));
+      if (testData.success) {
+        soundEffects.playGranted();
       } else {
-        // Direct browser dispatch fallback (if server offline or running static host)
-        const directLog = await dispatchDirectDoorControllerCommand(testAction, testSource);
-        if (directLog) {
-          setTestResult({
-            success: directLog.success,
-            statusCode: directLog.statusCode,
-            durationMs: directLog.durationMs,
-            responseBody: directLog.responseBody,
-            error: directLog.error,
-          });
-          setLogs((prev) => [directLog, ...prev.filter((l) => l.id !== directLog.id)].slice(0, 60));
-          if (directLog.success) {
-            soundEffects.playGranted();
-          } else {
-            soundEffects.playDenied();
-          }
-        }
+        soundEffects.playDenied();
       }
 
       if (onRefreshLockState && updateUIAfterTest) {
@@ -218,13 +203,15 @@ export const DoorConfigPage: React.FC<DoorConfigPageProps> = ({
     if (!window.confirm("Bạn có chắc chắn muốn xóa toàn bộ nhật ký gọi API mở cửa không?")) {
       return;
     }
-    setLogs([]);
-    clearStoredDoorLogs();
-    clientEventBus.emit("door_api_logs_cleared", { success: true });
-
     try {
-      await safeJsonFetch("/api/door-controller/logs", { method: "DELETE" });
-    } catch {}
+      const result = await operatorJsonFetch("/api/door-controller/logs", { method: "DELETE" });
+      if (!result.ok) throw new Error(result.error || `Xóa nhật ký thất bại (HTTP ${result.status})`);
+      setLogs([]);
+      clearStoredDoorLogs();
+      clientEventBus.emit("door_api_logs_cleared", { success: true });
+    } catch (err) {
+      console.warn("Lỗi xóa nhật ký API cửa:", err);
+    }
   };
 
   const handleApplyPreset = (preset: "GENERIC_RELAY" | "HOME_ASSISTANT" | "SHELLY" | "ESP32") => {
