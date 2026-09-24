@@ -22,6 +22,7 @@ import {
 import { Bell, CheckCircle2, AlertTriangle, Sparkles, X, Code2, Copy, Check, Camera, ScanFace } from "lucide-react";
 import { soundEffects } from "./utils/audio";
 import { safeJsonFetch, operatorJsonFetch, normalizeApiUrl, getApiBaseUrl, getCustomBackendUrl, setCustomBackendUrl } from "./utils/api";
+import { OperatorSessionBar } from "./components/OperatorSessionBar";
 import {
   isNetlifyOrStaticHost,
   getStoredEmployees,
@@ -562,6 +563,10 @@ export default function App() {
 
   return (
     <div className="min-h-screen bg-slate-50 text-slate-900 flex flex-col antialiased">
+      {/* Operator session: sign-in, role, sign-out. Also answers a 401 raised
+          anywhere in the app so the failed request can be retried. */}
+      <OperatorSessionBar />
+
       {/* Top Navbar */}
       <Navbar
         activeTab={activeTab}

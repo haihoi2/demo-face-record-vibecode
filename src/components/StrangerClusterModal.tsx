@@ -749,7 +749,7 @@ export const StrangerClusterModal: React.FC<StrangerClusterModalProps> = ({
                                         picked ? "bg-emerald-50" : "hover:bg-slate-50"
                                       }`}
                                     >
-                                      <img
+                                      <ProtectedImage
                                         src={emp.photoUrl}
                                         alt={emp.name}
                                         className="w-9 h-9 rounded-lg object-cover bg-slate-200 shrink-0"
@@ -782,7 +782,7 @@ export const StrangerClusterModal: React.FC<StrangerClusterModalProps> = ({
                                   className="w-10 h-10 rounded-lg object-cover bg-slate-200"
                                 />
                                 <ArrowRight className="w-4 h-4 text-emerald-600 shrink-0" />
-                                <img
+                                <ProtectedImage
                                   src={mergeTarget.photoUrl}
                                   alt={mergeTarget.name}
                                   className="w-10 h-10 rounded-lg object-cover bg-slate-200"

@@ -28,6 +28,7 @@ import {
   GateStreamSource,
 } from "../types";
 import { safeJsonFetch, compressImage } from "../utils/api";
+import { ProtectedImage } from "./ProtectedImage";
 
 /** One enrolled template as returned by GET /api/employees/:id/templates.
  *  Raw embeddings are never sent to the browser, so every field is optional. */
@@ -1331,7 +1332,7 @@ export const EmployeeRegistration: React.FC<EmployeeRegistrationProps> = ({
               className="p-4 rounded-xl border border-slate-200 hover:border-indigo-300 transition-all bg-slate-50/50 hover:bg-white hover:shadow-sm group flex flex-col justify-between"
             >
               <div className="flex items-start gap-3.5">
-                <img
+                <ProtectedImage
                   src={emp.photoUrl}
                   alt={emp.name}
                   className="w-14 h-14 rounded-xl object-cover border border-slate-200 shadow-xs shrink-0"

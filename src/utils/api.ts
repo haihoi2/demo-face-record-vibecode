@@ -205,23 +205,60 @@ export async function safeJsonFetch<T = any>(
   }
 }
 
+export interface OperatorSessionInfo {
+  actor: string;
+  role: "viewer" | "operator";
+  expiresAt: string;
+}
+
+/**
+ * How a 401 asks for credentials. The UI registers a modal here; without one
+ * (tests, non-browser callers) the request simply stays rejected rather than
+ * blocking on a dialog.
+ */
+type OperatorTokenResolver = () => Promise<string | null>;
+let operatorTokenResolver: OperatorTokenResolver | null = null;
+export function setOperatorTokenResolver(resolver: OperatorTokenResolver | null): void {
+  operatorTokenResolver = resolver;
+}
+
+/** Exchange a bootstrap token for the HttpOnly session cookie. */
+export async function openOperatorSession(token: string): Promise<OperatorSessionInfo> {
+  const res = await safeJsonFetch<OperatorSessionInfo & { success: boolean; error?: string; csrfToken?: string }>(
+    "/api/operator/session",
+    { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ token }) },
+  );
+  if (!res.ok || !res.data?.success) throw new Error(res.data?.error || "Xác thực vận hành thất bại");
+  return { actor: res.data.actor, role: res.data.role, expiresAt: res.data.expiresAt };
+}
+
+/** Current session, or null when unauthenticated. Never throws. */
+export async function readOperatorSession(): Promise<OperatorSessionInfo | null> {
+  const res = await safeJsonFetch<OperatorSessionInfo & { success: boolean }>("/api/operator/session");
+  if (!res.ok || !res.data?.success) return null;
+  return { actor: res.data.actor, role: res.data.role, expiresAt: res.data.expiresAt };
+}
+
+/** Clear the server session cookie. Requires the session CSRF token. */
+export async function closeOperatorSession(): Promise<void> {
+  await safeJsonFetch("/api/operator/session", {
+    method: "DELETE",
+    headers: { "Content-Type": "application/json" },
+  });
+  clearSessionCsrfToken();
+}
+
 export async function operatorJsonFetch<T = any>(
   url: string,
   options?: RequestInit,
   fallback?: T,
 ): Promise<{ ok: boolean; status: number; data: T; error?: string }> {
-  let response = await safeJsonFetch<T>(url, options, fallback);
-  if (response.status !== 401 || typeof window === "undefined") return response;
-  const token = window.prompt("Nhập mã phiên vận hành để truy cập dữ liệu được bảo vệ:");
+  const response = await safeJsonFetch<T>(url, options, fallback);
+  if (response.status !== 401 || !operatorTokenResolver) return response;
+  const token = await operatorTokenResolver();
   if (!token) return response;
-  const login = await safeJsonFetch<{ success: boolean; error?: string; csrfToken?: string }>("/api/operator/session", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ token }),
-  });
-  if (!login.ok || !login.data?.success) throw new Error(login.data?.error || "Xác thực vận hành thất bại");
-  response = await safeJsonFetch<T>(url, options, fallback);
-  return response;
+  await openOperatorSession(token);
+  return safeJsonFetch<T>(url, options, fallback);
 }
 
 /**

@@ -15,6 +15,15 @@ export const ProtectedImage: React.FC<ProtectedImageProps> = ({ src, alt = "", .
     setBlobUrl("");
     if (!src) return () => { active = false; };
 
+    // An inline data:/blob: source is already the bytes - fetching it would add a
+    // round trip and a failure mode for no gain. Only a server path needs the
+    // operator cookie, and employee photoUrl is either shape depending on whether
+    // the record was registered from an upload or adopted from a stranger sighting.
+    if (/^(?:data|blob):/i.test(src)) {
+      setBlobUrl(src);
+      return () => { active = false; };
+    }
+
     const load = async () => {
       try {
         const response = await apiFetch(src, { method: "GET" });

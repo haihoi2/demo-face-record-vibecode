@@ -36,6 +36,7 @@ import {
   getStoredAiConfig,
   isNetlifyOrStaticHost,
 } from "../utils/offlineEngine";
+import { ProtectedImage } from "./ProtectedImage";
 
 interface FaceScannerProps {
   employees: Employee[];
@@ -904,7 +905,7 @@ export const FaceScanner: React.FC<FaceScannerProps> = ({
                 onClick={() => handleScan(employees[0].photoUrl, employees[0].id)}
                 className="flex items-center gap-2.5 p-2.5 rounded-xl border border-slate-200 hover:border-indigo-400 hover:bg-slate-50 transition text-left group cursor-pointer"
               >
-                <img
+                <ProtectedImage
                   src={employees[0].photoUrl}
                   alt={employees[0].name}
                   className="w-10 h-10 rounded-lg object-cover border border-slate-200 shrink-0"

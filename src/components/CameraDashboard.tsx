@@ -54,6 +54,7 @@ import {
   getStoredAiConfig,
   demoOfflinePersistenceEnabled,
 } from "../utils/offlineEngine";
+import { ProtectedImage } from "./ProtectedImage";
 
 const DEFAULT_STREAMS_CONFIG: CameraStreamsConfig = {
   entryGate: {
@@ -2243,7 +2244,7 @@ export const CameraDashboard: React.FC<CameraDashboardProps> = ({
           >
             <div className="flex items-center gap-2.5 min-w-0">
               {lastResult.recognized && lastResult.employee?.photoUrl ? (
-                <img
+                <ProtectedImage
                   src={lastResult.employee.photoUrl}
                   alt={lastResult.employee.name}
                   className="w-8 h-8 rounded-lg object-cover border border-emerald-400/80 shrink-0"
@@ -2594,7 +2595,7 @@ export const CameraDashboard: React.FC<CameraDashboardProps> = ({
                   <div key={log.id} className="py-3 flex items-center justify-between gap-3 text-xs">
                     <div className="flex items-center gap-3 min-w-0">
                       {log.photoSnapshot ? (
-                        <img
+                        <ProtectedImage
                           src={log.photoSnapshot}
                           alt={log.employeeName || "User"}
                           className="w-10 h-10 rounded-xl object-cover border border-slate-200 shrink-0"
