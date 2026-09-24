@@ -1,8 +1,9 @@
-import express, { Request, Response } from "express";
+import express, { NextFunction, Request, RequestHandler, Response } from "express";
 import path from "path";
 import dns from "dns";
 import https from "https";
 import net from "net";
+import { createHash, createHmac, randomUUID, timingSafeEqual } from "crypto";
 import { spawn } from "child_process";
 import { createServer as createViteServer } from "vite";
 import { GoogleGenAI, Type } from "@google/genai";
@@ -22,6 +23,7 @@ import {
   DEFAULT_STRANGER_WEBHOOK_CONFIG,
   FaceTemplateRecord,
   StrangerResolutionRecord,
+  sameResolutionIntent,
 } from "./src/server/db";
 import { STRANGER_DEEP_LINK_HASH } from "./src/types";
 import type {
@@ -149,6 +151,320 @@ app.options("*", (_req, res) => {
 app.use(express.json({ limit: "50mb" }));
 app.use(express.urlencoded({ extended: true, limit: "50mb" }));
 app.use(express.text({ limit: "50mb", type: ["text/*", "application/octet-stream"] }));
+
+// Short-lived, HttpOnly operator sessions protect biometric reads and stranger
+// adjudication. The bootstrap token is entered once and is never persisted by
+// browser JavaScript. Production fails closed when no operator identity/token is configured.
+type OperatorRole = "viewer" | "operator";
+interface OperatorSession { actor: string; role: OperatorRole; expiresAt: number; csrfToken: string }
+const OPERATOR_COOKIE = "smartface_operator_session";
+const OPERATOR_SESSION_TTL_MS = 8 * 60 * 60 * 1000;
+
+const authPrincipals = () => [
+  { actor: String(process.env.OPERATOR_ID || "").trim(), token: String(process.env.OPERATOR_TOKEN || ""), role: "operator" as const },
+  { actor: String(process.env.VIEWER_ID || "").trim(), token: String(process.env.VIEWER_TOKEN || ""), role: "viewer" as const },
+].filter((principal) => principal.actor && principal.token);
+
+const authConfigured = () => authPrincipals().some((principal) => principal.role === "operator");
+const sessionSecret = () => String(process.env.OPERATOR_SESSION_SECRET || process.env.OPERATOR_TOKEN || "");
+const constantTimeEqual = (left: string, right: string) => {
+  const a = Buffer.from(left);
+  const b = Buffer.from(right);
+  return a.length === b.length && timingSafeEqual(a, b);
+};
+const signOperatorSession = (session: OperatorSession) => {
+  const payload = Buffer.from(JSON.stringify(session)).toString("base64url");
+  const signature = createHmac("sha256", sessionSecret()).update(payload).digest("base64url");
+  return `${payload}.${signature}`;
+};
+const readOperatorSession = (req: Request): OperatorSession | null => {
+  if (!authConfigured() || !sessionSecret()) return null;
+  const cookieHeader = String(req.headers.cookie || "");
+  const encoded = cookieHeader.split(";").map((part) => part.trim()).find((part) => part.startsWith(`${OPERATOR_COOKIE}=`))?.slice(OPERATOR_COOKIE.length + 1);
+  if (!encoded) return null;
+  const [payload, signature, extra] = encoded.split(".");
+  if (!payload || !signature || extra) return null;
+  const expected = createHmac("sha256", sessionSecret()).update(payload).digest("base64url");
+  if (!constantTimeEqual(signature, expected)) return null;
+  try {
+    const session = JSON.parse(Buffer.from(payload, "base64url").toString("utf8")) as OperatorSession;
+    if (!session.actor || !session.csrfToken || !["viewer", "operator"].includes(session.role) || session.expiresAt <= Date.now()) return null;
+    return session;
+  } catch {
+    return null;
+  }
+};
+const requireOperatorRole = (role: OperatorRole): RequestHandler => (req: Request, res: Response, next: NextFunction) => {
+  if (!authConfigured()) {
+    res.status(503).json({ success: false, code: "AUTH_NOT_CONFIGURED", error: "Operator authentication is not configured" });
+    return;
+  }
+  const session = readOperatorSession(req);
+  if (!session) {
+    res.status(401).json({ success: false, code: "AUTH_REQUIRED", error: "Operator authentication required" });
+    return;
+  }
+  if (role === "operator" && session.role !== "operator") {
+    res.status(403).json({ success: false, code: "ROLE_REQUIRED", error: "Operator role required" });
+    return;
+  }
+  (req as any).operatorSession = session;
+  next();
+};
+const operatorActor = (req: Request) => String((req as any).operatorSession?.actor || "");
+
+const requestOrigin = (req: Request) => {
+  const protocol = String(req.headers["x-forwarded-proto"] || req.protocol || "http").split(",")[0].trim();
+  return `${protocol}://${req.get("host")}`.toLowerCase();
+};
+const requireCsrf: RequestHandler = (req: Request, res: Response, next: NextFunction) => {
+  const session = (req as any).operatorSession as OperatorSession | undefined;
+  if (!session) {
+    res.status(401).json({ success: false, code: "AUTH_REQUIRED", error: "Operator authentication required" });
+    return;
+  }
+  const origin = String(req.headers.origin || "").trim().replace(/\/+$/, "").toLowerCase();
+  if (origin && origin !== requestOrigin(req) && (!CORS_ALLOWED_ORIGINS.length || !isOriginAllowed(origin))) {
+    res.status(403).json({ success: false, code: "ORIGIN_FORBIDDEN", error: "Request origin is not allowed" });
+    return;
+  }
+  if (!String(req.headers["content-type"] || "").toLowerCase().startsWith("application/json")) {
+    res.status(415).json({ success: false, code: "JSON_REQUIRED", error: "Protected mutations require application/json" });
+    return;
+  }
+  const supplied = String(req.headers["x-csrf-token"] || "");
+  if (!supplied || !constantTimeEqual(supplied, session.csrfToken)) {
+    res.status(403).json({ success: false, code: "CSRF_REQUIRED", error: "Valid CSRF token required" });
+    return;
+  }
+  next();
+};
+
+const requireRecognitionCsrf: RequestHandler = (req: Request, res: Response, next: NextFunction) => {
+  const session = (req as any).operatorSession as OperatorSession | undefined;
+  if (!session) {
+    res.status(401).json({ success: false, code: "AUTH_REQUIRED", error: "Operator authentication required" });
+    return;
+  }
+  const origin = String(req.headers.origin || "").trim().replace(/\/+$/, "").toLowerCase();
+  if (origin && origin !== requestOrigin(req) && (!CORS_ALLOWED_ORIGINS.length || !isOriginAllowed(origin))) {
+    res.status(403).json({ success: false, code: "ORIGIN_FORBIDDEN", error: "Request origin is not allowed" });
+    return;
+  }
+  const supplied = String(req.headers["x-csrf-token"] || "");
+  if (!supplied || !constantTimeEqual(supplied, session.csrfToken)) {
+    res.status(403).json({ success: false, code: "CSRF_REQUIRED", error: "Valid CSRF token required" });
+    return;
+  }
+  next();
+};
+
+const requireAllowedReadOrigin: RequestHandler = (req: Request, res: Response, next: NextFunction) => {
+  const origin = String(req.headers.origin || "").trim().replace(/\/+$/, "").toLowerCase();
+  if (origin && origin !== requestOrigin(req) && (!CORS_ALLOWED_ORIGINS.length || !isOriginAllowed(origin))) {
+    res.status(403).json({ success: false, code: "ORIGIN_FORBIDDEN", error: "Request origin is not allowed" });
+    return;
+  }
+  next();
+};
+
+const operatorCookieAttributes = () => {
+  const secure = process.env.NODE_ENV === "production";
+  const crossSite = String(process.env.OPERATOR_COOKIE_CROSS_SITE || "").toLowerCase() === "true";
+  if (crossSite && !secure) return null;
+  return `Path=/; HttpOnly; SameSite=${crossSite ? "None" : "Lax"}; Max-Age=${Math.floor(OPERATOR_SESSION_TTL_MS / 1000)}${secure ? "; Secure" : ""}`;
+};
+
+app.post("/api/operator/session", (req, res) => {
+  if (!authConfigured()) {
+    res.status(503).json({ success: false, error: "Operator authentication is not configured" });
+    return;
+  }
+  const supplied = String((req.body as any)?.token || "");
+  const principal = authPrincipals().find((candidate) => constantTimeEqual(supplied, candidate.token));
+  if (!principal) {
+    res.status(401).json({ success: false, error: "Invalid operator credentials" });
+    return;
+  }
+  const cookieAttributes = operatorCookieAttributes();
+  if (!cookieAttributes) {
+    res.status(503).json({ success: false, error: "Cross-site operator cookies require production HTTPS" });
+    return;
+  }
+  const origin = String(req.headers.origin || "").trim().replace(/\/+$/, "").toLowerCase();
+  if (origin && origin !== requestOrigin(req) && (!CORS_ALLOWED_ORIGINS.length || !isOriginAllowed(origin))) {
+    res.status(403).json({ success: false, error: "Request origin is not allowed" });
+    return;
+  }
+  const session: OperatorSession = {
+    actor: principal.actor,
+    role: principal.role,
+    expiresAt: Date.now() + OPERATOR_SESSION_TTL_MS,
+    csrfToken: randomUUID(),
+  };
+  res.setHeader("Set-Cookie", `${OPERATOR_COOKIE}=${signOperatorSession(session)}; ${cookieAttributes}`);
+  res.json({ success: true, actor: session.actor, role: session.role,
+    expiresAt: new Date(session.expiresAt).toISOString(), csrfToken: session.csrfToken });
+});
+
+app.delete("/api/operator/session", requireOperatorRole("viewer"), requireCsrf, (_req: Request, res: Response) => {
+  const attributes = operatorCookieAttributes() || "Path=/; HttpOnly; SameSite=Lax; Max-Age=0";
+  res.setHeader("Set-Cookie", `${OPERATOR_COOKIE}=; ${attributes.replace(/Max-Age=\d+/, "Max-Age=0")}`);
+  res.json({ success: true });
+});
+
+app.get(
+  "/api/operator/session",
+  requireOperatorRole("viewer"),
+  requireAllowedReadOrigin,
+  (req: Request, res: Response) => {
+    const session = (req as any).operatorSession as OperatorSession;
+    res.setHeader("Cache-Control", "private, no-store");
+    res.json({ success: true, actor: session.actor, role: session.role,
+      expiresAt: new Date(session.expiresAt).toISOString(), csrfToken: session.csrfToken });
+  },
+);
+
+const configuredBearer = (name: "DEVICE_INGEST_TOKEN" | "INTERNAL_API_TOKEN") =>
+  String(process.env[name] || "").trim();
+const bearerFromRequest = (req: Request) => {
+  const match = /^Bearer\s+(.+)$/i.exec(String(req.headers.authorization || ""));
+  return match?.[1] || "";
+};
+const requireInternalToken: RequestHandler = (req: Request, res: Response, next: NextFunction) => {
+  const configured = configuredBearer("INTERNAL_API_TOKEN");
+  if (!configured) {
+    res.status(process.env.NODE_ENV === "production" ? 503 : 401).json({
+      success: false, code: "INTERNAL_AUTH_NOT_CONFIGURED", error: "Internal API authentication is not configured",
+    });
+    return;
+  }
+  const supplied = bearerFromRequest(req);
+  if (!supplied || !constantTimeEqual(supplied, configured)) {
+    res.status(401).json({ success: false, code: "INTERNAL_AUTH_REQUIRED", error: "Internal API token required" });
+    return;
+  }
+  next();
+};
+const requireRecognitionIngest: RequestHandler = (req: Request, res: Response, next: NextFunction) => {
+  const session = readOperatorSession(req);
+  if (session) {
+    if (session.role !== "operator") {
+      res.status(403).json({ success: false, code: "ROLE_REQUIRED", error: "Operator role required" });
+      return;
+    }
+    (req as any).operatorSession = session;
+    requireRecognitionCsrf(req, res, next);
+    return;
+  }
+  if (String(req.headers.origin || "").trim()) {
+    res.status(403).json({ success: false, code: "DEVICE_ORIGIN_FORBIDDEN", error: "Device ingestion must not send Origin" });
+    return;
+  }
+  const configured = configuredBearer("DEVICE_INGEST_TOKEN");
+  if (!configured) {
+    res.status(process.env.NODE_ENV === "production" ? 503 : 401).json({
+      success: false, code: "DEVICE_AUTH_NOT_CONFIGURED", error: "Device ingestion authentication is not configured",
+    });
+    return;
+  }
+  const supplied = bearerFromRequest(req);
+  if (!supplied || !constantTimeEqual(supplied, configured)) {
+    res.status(401).json({ success: false, code: "DEVICE_AUTH_REQUIRED", error: "Device ingestion token required" });
+    return;
+  }
+  next();
+};
+const recognitionPath = (pathName: string) => [
+  "/api/recognize-face", "/recognize-face", "/api/face/recognize",
+  "/api/face-recognize", "/api/face-recognition", "/api/recognize",
+].includes(pathName.replace(/\/+$/, ""));
+const legacySensitivePath = (pathName: string) =>
+  /^(?:\/(?:events|lock|status|employees?|logs|notifications|webhook))(?:\/|$)/.test(pathName);
+
+function redactedUrl(value: string): string {
+  try {
+    const url = new URL(value);
+    url.username = "";
+    url.password = "";
+    for (const key of [...url.searchParams.keys()]) {
+      if (/token|key|secret|password|auth/i.test(key)) url.searchParams.set(key, "***");
+    }
+    if (/\/hooks?\//i.test(url.pathname)) {
+      const parts = url.pathname.split("/");
+      if (parts.length > 2) parts[parts.length - 1] = "***";
+      url.pathname = parts.join("/");
+    }
+    return url.toString();
+  } catch {
+    return value ? "configured" : "";
+  }
+}
+
+function publicEmployee(employee: EmployeeRecord) {
+  return {
+    id: employee.id,
+    name: employee.name,
+    employeeCode: employee.employeeCode,
+    department: employee.department,
+    position: employee.position,
+    registeredAt: employee.registeredAt,
+    accessLevel: employee.accessLevel,
+  };
+}
+
+function sanitizePublicJson(value: any): any {
+  if (Array.isArray(value)) return value.map(sanitizePublicJson);
+  if (!value || typeof value !== "object") return value;
+  if (typeof value.id === "string" && value.status && value.lockAction && value.timestamp) {
+    const imageUrl = `/api/logs/${encodeURIComponent(value.id)}/image`;
+    return {
+      id: value.id, timestamp: value.timestamp, type: value.type, status: value.status,
+      employeeId: value.employeeId, employeeName: value.employeeName, employeeCode: value.employeeCode,
+      department: value.department, confidence: value.confidence, livenessScore: value.livenessScore,
+      lockAction: value.lockAction, doorName: value.doorName, reason: value.reason,
+      photoSnapshot: imageUrl, imageUrl, hasImage: Boolean(value.photoSnapshot),
+    };
+  }
+  if (typeof value.id === "string" && value.employeeCode && value.accessLevel) {
+    return publicEmployee(value as EmployeeRecord);
+  }
+  const result: Record<string, unknown> = {};
+  for (const [key, item] of Object.entries(value)) {
+    if (/^(?:faceEmbedding(?:Dims|ModelTag|Quality)?|imageBase64|snapshot|photoUrl)$/i.test(key)) continue;
+    if (/token|password|secret/i.test(key) && key !== "csrfToken") {
+      result[`${key}Configured`] = Boolean(item);
+      continue;
+    }
+    if (/^(?:url|apiUrl|rtspUrl|httpUrl)$/i.test(key) && typeof item === "string") {
+      result[key] = redactedUrl(item);
+      continue;
+    }
+    result[key] = sanitizePublicJson(item);
+  }
+  return result;
+}
+
+app.use((_req: Request, res: Response, next: NextFunction) => {
+  const json = res.json.bind(res);
+  res.json = ((body: any) => json(sanitizePublicJson(body))) as Response["json"];
+  next();
+});
+
+// One fail-closed boundary covers the API surface and every legacy alias.
+app.use((req: Request, res: Response, next: NextFunction) => {
+  const pathName = req.path;
+  if (pathName === "/api/health" || pathName === "/api/operator/session") return next();
+  if (pathName === "/api/system/db-info") return requireInternalToken(req, res, next);
+  if (recognitionPath(pathName) && req.method === "POST") return requireRecognitionIngest(req, res, next);
+  const sensitive = pathName.startsWith("/api/") || legacySensitivePath(pathName) || recognitionPath(pathName);
+  if (!sensitive) return next();
+  const role: OperatorRole = req.method === "GET" || req.method === "HEAD" ? "viewer" : "operator";
+  requireOperatorRole(role)(req, res, () => {
+    if (role === "viewer") requireAllowedReadOrigin(req, res, next);
+    else requireCsrf(req, res, next);
+  });
+});
 app.use(express.raw({ limit: "50mb", type: "image/*" }));
 
 // Incoming request logger for transparency and debugging
@@ -231,6 +547,7 @@ export interface AccessLogRecord {
   doorName: string;
   reason?: string;
   faceEmbedding?: number[];
+  faceEmbeddingDims?: number;
   faceEmbeddingModelTag?: string;
   faceEmbeddingQuality?: number;
 }
@@ -247,6 +564,7 @@ export interface MobileNotificationRecord {
 }
 
 // Pre-seeded employees with SVG portraits
+const DEMO_DATA_ENABLED = process.env.NODE_ENV !== "production" && process.env.ENABLE_DEMO_DATA === "true";
 const DEFAULT_EMPLOYEES: EmployeeRecord[] = [
   {
     id: "EMP-001",
@@ -397,8 +715,8 @@ export interface WebhookLogRecord {
 }
 
 const DEFAULT_WEBHOOK_CONFIG = {
-  enabled: true,
-  url: "https://chat-room.eton.vn/hooks/6aa4dfb6928518a18ba27a13/mguNArZoWHY7AegnWFw7d7TwyfnoT4JZWpmwvxtLmfi7iGuY",
+  enabled: false,
+  url: "",
   gateInTitle: "[[CỔNG VÀO]]",
   gateOutTitle: "[[CỔNG RA]]",
   includeEmployeeCode: true,
@@ -411,9 +729,9 @@ const DEFAULT_WEBHOOK_CONFIG = {
 };
 
 // Persistent instances loaded from database (PostgreSQL / SQLite)
-let employees: EmployeeRecord[] = db.getEmployees(DEFAULT_EMPLOYEES);
-let accessLogs: AccessLogRecord[] = db.getAccessLogs(DEFAULT_ACCESS_LOGS);
-let mobileNotifications: MobileNotificationRecord[] = db.getNotifications(DEFAULT_NOTIFICATIONS);
+let employees: EmployeeRecord[] = db.getEmployees(DEMO_DATA_ENABLED ? DEFAULT_EMPLOYEES : []);
+let accessLogs: AccessLogRecord[] = db.getAccessLogs(DEMO_DATA_ENABLED ? DEFAULT_ACCESS_LOGS : []);
+let mobileNotifications: MobileNotificationRecord[] = db.getNotifications(DEMO_DATA_ENABLED ? DEFAULT_NOTIFICATIONS : []);
 let smartLockState = db.getSmartLockState(DEFAULT_SMART_LOCK_STATE);
 let webhookConfig = db.getWebhookConfig(DEFAULT_WEBHOOK_CONFIG);
 let webhookLogs: WebhookLogRecord[] = db.getWebhookLogs();
@@ -735,9 +1053,9 @@ db.onAiRecognitionConfigLoaded(() => {
 // Listen to Postgres sync events to refresh memory models
 db.onSync(() => {
   aiRecognitionConfig = db.getAiRecognitionConfig(DEFAULT_AI_RECOGNITION_CONFIG);
-  employees = db.getEmployees(DEFAULT_EMPLOYEES);
-  accessLogs = db.getAccessLogs(DEFAULT_ACCESS_LOGS);
-  mobileNotifications = db.getNotifications(DEFAULT_NOTIFICATIONS);
+  employees = db.getEmployees(DEMO_DATA_ENABLED ? DEFAULT_EMPLOYEES : []);
+  accessLogs = db.getAccessLogs(DEMO_DATA_ENABLED ? DEFAULT_ACCESS_LOGS : []);
+  mobileNotifications = db.getNotifications(DEMO_DATA_ENABLED ? DEFAULT_NOTIFICATIONS : []);
   smartLockState = db.getSmartLockState(DEFAULT_SMART_LOCK_STATE);
   webhookConfig = db.getWebhookConfig(DEFAULT_WEBHOOK_CONFIG);
   webhookLogs = db.getWebhookLogs();
@@ -1089,6 +1407,11 @@ function enforceTemplateCap(employeeId: string, keepRoom = 0): string[] {
     .slice(0, existing.length - limit);
   for (const t of evicted) db.deleteFaceTemplate(t.id);
   return evicted.map((t) => t.id);
+}
+
+function recognitionReadyForEmployee(employeeId: string): boolean {
+  const currentModelTag = faceModelTag();
+  return db.getFaceTemplatesForEmployee(employeeId).some((template) => template.modelTag === currentModelTag);
 }
 
 interface EnrollOutcome {
@@ -1501,14 +1824,30 @@ async function sendStrangerWebhook({
 let autoRelockTimer: NodeJS.Timeout | null = null;
 let countdownInterval: NodeJS.Timeout | null = null;
 
-// SSE Client list
-let sseClients: Response[] = [];
+// SSE Client list. Each connection keeps its own API origin so protected image
+// links remain credentialed and usable when the dashboard and API are split.
+let sseClients: Array<{ res: Response; origin: string }> = [];
+
+function publicSseAccessLog(log: AccessLogRecord, origin: string) {
+  const { photoSnapshot: _image, faceEmbedding: _embedding, faceEmbeddingDims: _dims,
+    faceEmbeddingModelTag: _model, faceEmbeddingQuality: _quality, ...metadata } = log;
+  const imageUrl = new URL(`/api/logs/${encodeURIComponent(log.id)}/image`, origin).toString();
+  return { ...metadata, photoSnapshot: imageUrl, imageUrl, hasImage: Boolean(log.photoSnapshot) };
+}
+
+function publicSsePayload(eventType: string, data: any, origin: string) {
+  const sanitized = sanitizePublicJson(data);
+  if (["access_granted", "access_denied", "stranger_detected"].includes(eventType) && data?.log) {
+    sanitized.log = publicSseAccessLog(data.log, origin);
+  }
+  return sanitized;
+}
 
 function broadcastSSE(eventType: string, data: any) {
-  const payload = `event: ${eventType}\ndata: ${JSON.stringify(data)}\n\n`;
   sseClients.forEach((client) => {
     try {
-      client.write(payload);
+      const payload = publicSsePayload(eventType, data, client.origin);
+      client.res.write(`event: ${eventType}\ndata: ${JSON.stringify(payload)}\n\n`);
     } catch {
       // client disconnected
     }
@@ -1727,13 +2066,18 @@ app.get("/api/health", (_req, res) => {
 });
 
 // SSE endpoint for real-time mobile notifications and lock status
-app.get(["/api/events", "/api/events/", "/events", "/events/"], (req, res) => {
+app.get(
+  ["/api/events", "/api/events/", "/events", "/events/"],
+  requireOperatorRole("viewer"),
+  requireAllowedReadOrigin,
+  (req: Request, res: Response) => {
   res.setHeader("Content-Type", "text/event-stream");
   res.setHeader("Cache-Control", "no-cache");
   res.setHeader("Connection", "keep-alive");
   res.flushHeaders?.();
 
-  sseClients.push(res);
+  const origin = requestOrigin(req);
+  sseClients.push({ res, origin });
 
   // Send initial state
   res.write(`event: connected\ndata: {"status":"connected"}\n\n`);
@@ -1751,7 +2095,7 @@ app.get(["/api/events", "/api/events/", "/events", "/events/"], (req, res) => {
 
   req.on("close", () => {
     clearInterval(keepAlive);
-    sseClients = sseClients.filter((c) => c !== res);
+    sseClients = sseClients.filter((client) => client.res !== res);
   });
 });
 
@@ -1852,10 +2196,6 @@ const WEBHOOK_CLIENT_LOG_ROUTES = [
 
 app.get(WEBHOOK_CONFIG_ROUTES, (_req, res) => {
   webhookConfig = db.getWebhookConfig(DEFAULT_WEBHOOK_CONFIG);
-  if (!webhookConfig.url || webhookConfig.url.includes("...") || webhookConfig.url.endsWith("/hooks/") || webhookConfig.url.endsWith("/hooks")) {
-    webhookConfig.url = DEFAULT_WEBHOOK_CONFIG.url;
-    db.saveWebhookConfig(webhookConfig);
-  }
   res.json(webhookConfig);
 });
 
@@ -1863,9 +2203,9 @@ app.post(WEBHOOK_CONFIG_ROUTES, (req, res) => {
   const body = req.body || {};
   const { enabled, url, gateInTitle, gateOutTitle, includeEmployeeCode } = body;
   if (typeof enabled === "boolean") webhookConfig.enabled = enabled;
-  if (url && typeof url === "string") {
+  if (typeof url === "string") {
     let cleanUrl = url.trim();
-    if (cleanUrl.includes("...") || cleanUrl.endsWith("/hooks/") || cleanUrl.endsWith("/hooks")) {
+    if (cleanUrl && (cleanUrl.includes("...") || cleanUrl.endsWith("/hooks/") || cleanUrl.endsWith("/hooks"))) {
       cleanUrl = DEFAULT_WEBHOOK_CONFIG.url;
     }
     webhookConfig.url = cleanUrl;
@@ -4578,6 +4918,22 @@ const EMPLOYEE_ROUTES = [
   "/api/employee",
   "/api/employee/",
 ];
+const ACCESS_LEVELS = ["ALL_ACCESS", "OFFICE_HOURS", "RESTRICTED"] as const;
+const isAccessLevel = (value: unknown): value is EmployeeRecord["accessLevel"] =>
+  ACCESS_LEVELS.includes(value as EmployeeRecord["accessLevel"]);
+const normalizedField = (value: unknown, max: number): string | null => {
+  if (typeof value !== "string") return null;
+  const normalized = value.trim();
+  return normalized && normalized.length <= max ? normalized : null;
+};
+const normalizedOptionalField = (value: unknown, max: number): string | null => {
+  if (value === undefined || value === null || value === "") return "";
+  return normalizedField(value, max);
+};
+const requestedLogIds = (value: unknown): string[] =>
+  Array.isArray(value)
+    ? [...new Set(value.filter((item): item is string => typeof item === "string").map((item) => item.trim()).filter(Boolean))].sort()
+    : [];
 
 app.get(EMPLOYEE_ROUTES, (_req, res) => {
   res.json(employees);
@@ -4592,6 +4948,10 @@ app.post(EMPLOYEE_ROUTES, async (req, res) => {
     res.status(400).json({ error: "Vui lòng cung cấp họ tên, mã số và ảnh khuôn mặt" });
     return;
   }
+  if (!isAccessLevel(accessLevel || "ALL_ACCESS")) {
+    res.status(400).json({ error: "Quyền truy cập không hợp lệ" });
+    return;
+  }
 
   // Check duplicate employeeCode
   const existing = employees.find(
@@ -4603,7 +4963,7 @@ app.post(EMPLOYEE_ROUTES, async (req, res) => {
   }
 
   const newEmployee: EmployeeRecord = {
-    id: "EMP-" + String(Date.now()).slice(-4),
+    id: `EMP-${randomUUID()}`,
     name: name.trim(),
     employeeCode: employeeCode.trim().toUpperCase(),
     department: department ? department.trim() : "Phòng Hành chính - Nhân sự",
@@ -4677,6 +5037,54 @@ const EMPLOYEE_TEMPLATE_ITEM_ROUTES = [
   "/employees/:id/templates/:templateId",
 ];
 
+async function prepareTemplateFromImage(
+  employeeId: string,
+  image: string | Buffer,
+  opts: { source: "enrollment" | "merge"; sourceLogId?: string },
+): Promise<EnrollOutcome & { record?: FaceTemplateRecord }> {
+  if (!faceEngineActive()) {
+    return { rejected: activeFaceEngine() === "unavailable" ? "engine-unavailable" : "engine-disabled" };
+  }
+  if (db.getFaceTemplatesForEmployee(employeeId).length >= FACE_TEMPLATE_MAX) {
+    return { rejected: "template-cap" };
+  }
+  try {
+    const faces = await extractFaces(image);
+    if (faces.length === 0) return { rejected: "no-face", detectedFaces: 0 };
+    const best = faces.reduce((a, b) => (b.quality > a.quality ? b : a));
+    if (best.quality < FACE_ENROLL_MIN_QUALITY) {
+      return { rejected: "low-quality", quality: Math.round(best.quality * 1000) / 1000, detectedFaces: faces.length };
+    }
+    const record: FaceTemplateRecord = {
+      id: `FT-${randomUUID()}`,
+      employeeId,
+      embedding: Array.from(best.embedding),
+      dims: best.embedding.length,
+      modelTag: faceModelTag(),
+      source: opts.source,
+      quality: Math.round(best.quality * 1000) / 1000,
+      capturedAt: new Date().toISOString(),
+      sourceLogId: opts.sourceLogId,
+    };
+    return {
+      record,
+      saved: {
+        id: record.id,
+        quality: record.quality,
+        source: record.source,
+        capturedAt: record.capturedAt,
+        sourceLogId: record.sourceLogId,
+        dims: record.dims,
+        modelTag: record.modelTag,
+      },
+      detectedFaces: faces.length,
+    };
+  } catch (err: any) {
+    console.warn(`[FaceEngine] Không chuẩn bị được mẫu khuôn mặt cho ${employeeId}:`, err?.message || err);
+    return { rejected: "engine-error" };
+  }
+}
+
 function publicTemplate(t: FaceTemplateRecord) {
   return {
     id: t.id,
@@ -4690,7 +5098,7 @@ function publicTemplate(t: FaceTemplateRecord) {
   };
 }
 
-app.get(EMPLOYEE_TEMPLATE_ROUTES, (req, res) => {
+app.get(EMPLOYEE_TEMPLATE_ROUTES, requireOperatorRole("viewer"), (req, res) => {
   const employee = employees.find((e) => e.id === req.params.id);
   if (!employee) {
     res.status(404).json({ success: false, error: `Không tìm thấy nhân viên ${req.params.id}` });
@@ -4729,7 +5137,7 @@ app.get(EMPLOYEE_TEMPLATE_ROUTES, (req, res) => {
  * name the camera the still came from, because templates are matched
  * per-camera and the gallery is only as good as that label.
  */
-app.post(EMPLOYEE_TEMPLATE_ROUTES, async (req, res) => {
+app.post(EMPLOYEE_TEMPLATE_ROUTES, requireOperatorRole("operator"), requireCsrf, async (req, res) => {
   const employee = employees.find((e) => e.id === req.params.id);
   if (!employee) {
     res.status(404).json({ success: false, error: `Không tìm thấy nhân viên ${req.params.id}` });
@@ -4818,7 +5226,7 @@ app.post(EMPLOYEE_TEMPLATE_ROUTES, async (req, res) => {
  * is below FACE_ENROLL_MIN_QUALITY (default 0.25) are reported as rejected with
  * the reason, never silently enrolled: a blurred or tiny face poisons a gallery.
  */
-app.post(EMPLOYEE_TEMPLATE_CAPTURE_ROUTES, async (req, res) => {
+app.post(EMPLOYEE_TEMPLATE_CAPTURE_ROUTES, requireOperatorRole("operator"), requireCsrf, async (req, res) => {
   const employee = employees.find((e) => e.id === req.params.id);
   if (!employee) {
     res.status(404).json({ success: false, error: `Không tìm thấy nhân viên ${req.params.id}` });
@@ -4948,7 +5356,7 @@ app.post(EMPLOYEE_TEMPLATE_CAPTURE_ROUTES, async (req, res) => {
   });
 });
 
-app.delete(EMPLOYEE_TEMPLATE_ITEM_ROUTES, (req, res) => {
+app.delete(EMPLOYEE_TEMPLATE_ITEM_ROUTES, requireOperatorRole("operator"), requireCsrf, (req, res) => {
   const { id, templateId } = req.params;
   const employee = employees.find((e) => e.id === id);
   if (!employee) {
@@ -5100,34 +5508,45 @@ const boundedInt = (value: unknown, fallback: number, min: number, max: number) 
 
 const logImageUrl = (id: string) => `/api/logs/${encodeURIComponent(id)}/image`;
 const publicAccessLog = (log: AccessLogRecord) => {
-  const { photoSnapshot: _image, faceEmbedding: _embedding, faceEmbeddingModelTag: _model,
-    faceEmbeddingQuality: _quality, ...metadata } = log;
+  const { photoSnapshot: _image, faceEmbedding: _embedding, faceEmbeddingDims: _dims,
+    faceEmbeddingModelTag: _model, faceEmbeddingQuality: _quality, ...metadata } = log;
   const imageUrl = logImageUrl(log.id);
   return { ...metadata, photoSnapshot: imageUrl, imageUrl, hasImage: Boolean(log.photoSnapshot) };
 };
 
-app.get(LOG_ROUTES, (req, res) => {
+app.get(LOG_ROUTES, requireOperatorRole("viewer"), async (req, res) => {
   const page = boundedInt(req.query.page, 1, 1, 1_000_000);
   const limit = boundedInt(req.query.limit, 50, 1, 100);
-  const total = accessLogs.length;
-  const logs = accessLogs.slice((page - 1) * limit, page * limit).map(publicAccessLog);
+  const result = await db.getAccessLogsPage(page, limit);
+  const total = result.total;
+  const logs = result.logs.map(publicAccessLog);
   res.setHeader("X-Total-Count", String(total));
   res.setHeader("X-Page", String(page));
   res.setHeader("X-Page-Limit", String(limit));
-  if (String(req.query.format || "").toLowerCase() === "page") {
-    res.json({ success: true, logs, page, limit, total, hasMore: page * limit < total });
-    return;
-  }
-  res.json(logs);
+  res.json({ success: true, version: 1, logs, page, limit, total, hasMore: page * limit < total });
 });
 
-app.get("/api/logs/:id/image", (req, res) => {
+app.get("/api/logs/:id/image", requireOperatorRole("viewer"), async (req, res) => {
+  const fetchSite = String(req.headers["sec-fetch-site"] || "").toLowerCase();
+  const origin = String(req.headers.origin || "").trim().replace(/\/+$/, "").toLowerCase();
+  let refererOrigin = "";
+  try { refererOrigin = req.headers.referer ? new URL(String(req.headers.referer)).origin.toLowerCase() : ""; } catch {}
+  const browserOrigin = origin || refererOrigin;
+  const trustedBrowserOrigin = Boolean(browserOrigin) && (browserOrigin === requestOrigin(req) || isOriginAllowed(browserOrigin));
+  res.setHeader("Vary", "Origin, Referer, Sec-Fetch-Site");
+  res.setHeader("Cache-Control", "private, no-store");
+  res.setHeader("X-Content-Type-Options", "nosniff");
+  if ((browserOrigin && !trustedBrowserOrigin) || (fetchSite === "cross-site" && !trustedBrowserOrigin)) {
+    res.status(403).json({ success: false, code: "IMAGE_CROSS_SITE_FORBIDDEN", error: "Cross-site image request is not allowed" });
+    return;
+  }
+  res.setHeader("Cross-Origin-Resource-Policy", fetchSite === "cross-site" && trustedBrowserOrigin ? "cross-origin" : "same-site");
   const id = String(req.params.id || "");
   if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(id)) {
     res.status(400).json({ success: false, error: "Invalid log id" });
     return;
   }
-  const log = accessLogs.find((item) => item.id === id);
+  const log = await db.getAccessLogById(id);
   if (!log?.photoSnapshot) {
     res.status(404).json({ success: false, error: "Image not found" });
     return;
@@ -5144,13 +5563,11 @@ app.get("/api/logs/:id/image", (req, res) => {
   }
   res.setHeader("Content-Type", match[1].toLowerCase());
   res.setHeader("Content-Length", String(image.length));
-  res.setHeader("X-Content-Type-Options", "nosniff");
   res.setHeader("Content-Security-Policy", "default-src 'none'; sandbox");
-  res.setHeader("Cache-Control", "private, max-age=300, no-transform");
   res.send(image);
 });
 
-app.post(["/api/logs/clear", "/logs/clear"], (_req, res) => {
+app.post(["/api/logs/clear", "/logs/clear"], requireOperatorRole("operator"), requireCsrf, (_req, res) => {
   accessLogs = [];
   db.clearAccessLogs();
   broadcastSSE("logs_cleared", {});
@@ -5183,29 +5600,68 @@ app.post(["/api/notifications/mark-read", "/notifications/mark-read"], (_req, re
   res.json({ success: true });
 });
 
-// --- Stranger Face Alerts & Clustered Face Quick Registration ---
-app.get(["/api/strangers/clusters", "/api/strangers", "/api/strangers/"], (req, res) => {
+const encodeStrangerCursor = (log: AccessLogRecord) =>
+  Buffer.from(JSON.stringify({ timestamp: log.timestamp, id: log.id }), "utf8").toString("base64url");
+const decodeStrangerCursor = (value: unknown): { timestamp: string; id: string } | null => {
+  if (!value) return null;
   try {
-    const page = boundedInt(req.query.page, 1, 1, 1_000_000);
+    const parsed = JSON.parse(Buffer.from(String(value), "base64url").toString("utf8"));
+    if (typeof parsed?.timestamp !== "string" || typeof parsed?.id !== "string") return null;
+    if (!Number.isFinite(Date.parse(parsed.timestamp)) || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(parsed.id)) return null;
+    return { timestamp: parsed.timestamp, id: parsed.id };
+  } catch {
+    return null;
+  }
+};
+const strangerClusterRegistry = new Map<string, { cluster: any; logs: AccessLogRecord[]; version: number }>();
+const registerStrangerClusters = (clusters: any[], logs: AccessLogRecord[]) => {
+  for (const cluster of clusters) {
+    const memberIds = new Set(cluster.photos.map((photo: any) => photo.logId));
+    const members = logs.filter((log) => memberIds.has(log.id));
+    const version = Number.parseInt(createHash("sha256").update(cluster.clusterId).digest("hex").slice(0, 8), 16);
+    cluster.clusterVersion = version;
+    cluster.status = "OPEN";
+    cluster.observationCount = cluster.photos.length;
+    strangerClusterRegistry.delete(cluster.clusterId);
+    strangerClusterRegistry.set(cluster.clusterId, { cluster, logs: members, version });
+  }
+  while (strangerClusterRegistry.size > 1000) {
+    const oldest = strangerClusterRegistry.keys().next().value;
+    if (!oldest) break;
+    strangerClusterRegistry.delete(oldest);
+  }
+};
+
+// --- Stranger Face Alerts & Clustered Face Quick Registration ---
+app.get(["/api/strangers/clusters", "/api/strangers", "/api/strangers/"], requireOperatorRole("viewer"), async (req, res) => {
+  try {
     const limit = boundedInt(req.query.limit, 20, 1, 50);
-    const demoSeedsEnabled = process.env.NODE_ENV !== "production" && process.env.ENABLE_DEMO_STRANGER_SEEDS === "true";
-    const allClusters = clusterStrangerFaces(accessLogs, db.getResolvedStrangerClusters(), {
-      includeDemoSeeds: demoSeedsEnabled,
+    const cursor = decodeStrangerCursor(req.query.cursor);
+    if (req.query.cursor && !cursor) {
+      res.status(400).json({ success: false, error: "Cursor không hợp lệ" });
+      return;
+    }
+    const demoSeedsEnabled = DEMO_DATA_ENABLED;
+    const candidatePage = await db.getStrangerCandidateLogsPage(cursor, limit);
+    const clusters = clusterStrangerFaces(candidatePage.logs, db.getRetiredStrangerObservationIds(), {
+      includeDemoSeeds: demoSeedsEnabled && !cursor,
     });
-    const clusters = allClusters.slice((page - 1) * limit, page * limit);
-    const deniedLogsCount = accessLogs.filter(
-      (l) => l.status === "DENIED" || !l.employeeId || l.employeeName === "Không xác định"
-    ).length;
+    registerStrangerClusters(clusters, candidatePage.logs);
+    const last = candidatePage.logs[candidatePage.logs.length - 1];
+    const nextCursor = candidatePage.hasMore && last ? encodeStrangerCursor(last) : null;
 
     res.json({
       success: true,
       clusters,
-      totalUnregisteredLogs: deniedLogsCount,
-      totalClusters: allClusters.length,
-      page,
+      totalUnregisteredLogs: null,
+      totalClusters: clusters.length,
+      page: 1,
       limit,
-      hasMore: page * limit < allClusters.length,
+      cursor: req.query.cursor || null,
+      nextCursor,
+      hasMore: Boolean(nextCursor),
       demoSeedsEnabled,
+      workBound: limit,
     });
   } catch (err: any) {
     console.error("[Strangers] Lỗi gom cụm ảnh khuôn mặt người lạ:", err);
@@ -5213,31 +5669,69 @@ app.get(["/api/strangers/clusters", "/api/strangers", "/api/strangers/"], (req, 
   }
 });
 
-function validatedStrangerCluster(clusterId: unknown, requestedIds: unknown): {
+app.get("/api/strangers/lookup", requireOperatorRole("viewer"), async (req, res) => {
+  const logId = String(req.query.logId || "").trim();
+  if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(logId)) {
+    res.status(400).json({ success: false, error: "logId không hợp lệ" });
+    return;
+  }
+  if (db.getRetiredStrangerObservationIds().includes(`log:${logId}`)) {
+    res.status(410).json({ success: false, status: "RESOLVED", error: "Lượt quét đã được xử lý" });
+    return;
+  }
+  const log = await db.getStrangerCandidateLogById(logId);
+  if (!log) {
+    res.status(404).json({ success: false, status: "MISSING", error: "Không tìm thấy lượt quét người lạ" });
+    return;
+  }
+  const [cluster] = clusterStrangerFaces([log], db.getRetiredStrangerObservationIds());
+  if (!cluster) {
+    res.status(404).json({ success: false, status: "MISSING", error: "Không tìm thấy cụm người lạ" });
+    return;
+  }
+  registerStrangerClusters([cluster], [log]);
+  res.json({ success: true, cluster });
+});
+
+app.get("/api/strangers/clusters/:clusterId", requireOperatorRole("viewer"), (req, res) => {
+  const entry = strangerClusterRegistry.get(String(req.params.clusterId || ""));
+  if (!entry) {
+    res.status(404).json({ success: false, error: "Cụm không còn trong cửa sổ tra cứu; hãy tra cứu lại bằng logId" });
+    return;
+  }
+  const limit = boundedInt(req.query.limit, 20, 1, 50);
+  res.json({ success: true, cluster: entry.cluster, observations: entry.cluster.photos.slice(0, limit),
+    totalObservations: entry.cluster.photos.length, hasMore: entry.cluster.photos.length > limit });
+});
+
+async function validatedStrangerCluster(clusterId: unknown, requestedIds: unknown, requestedVersion?: unknown): Promise<{
   clusterId: string;
   logIds: string[];
   logs: AccessLogRecord[];
-} | { error: string } {
+} | { error: string }> {
   const id = String(clusterId || "").trim();
-  const ids = Array.isArray(requestedIds) ? [...new Set(requestedIds.map(String))].sort() : [];
-  if (!id || ids.length === 0) return { error: "Cần clusterId và danh sách log của cụm" };
-  const cluster = clusterStrangerFaces(accessLogs, db.getResolvedStrangerClusters()).find((item) => item.clusterId === id);
-  if (!cluster) return { error: "Cụm người lạ không tồn tại hoặc đã được xử lý" };
-  const actual = cluster.photos.map((photo) => photo.logId).sort();
-  if (actual.length !== ids.length || actual.some((value, index) => value !== ids[index])) {
+  let ids = Array.isArray(requestedIds) ? [...new Set(requestedIds.map(String))].sort() : [];
+  const registered = strangerClusterRegistry.get(id);
+  if (registered && ids.length === 0 && Number(requestedVersion) === registered.version) {
+    ids = registered.cluster.photos.map((photo: any) => photo.logId).sort();
+  }
+  if (!id || ids.length === 0) return { error: "Cần clusterId và danh sách log hoặc clusterVersion của cụm" };
+  if (!registered) return { error: "Cụm người lạ không tồn tại hoặc đã hết phiên tra cứu" };
+  if (requestedVersion != null && Number(requestedVersion) !== registered.version) return { error: "Phiên bản cụm đã thay đổi" };
+  const actual = registered.cluster.photos.map((photo: any) => photo.logId).sort();
+  if (actual.length !== ids.length || actual.some((value: string, index: number) => value !== ids[index])) {
     return { error: "Danh sách log không khớp thành viên cụm trên máy chủ" };
   }
-  const logs = ids.map((logId) => accessLogs.find((log) => log.id === logId));
-  if (logs.some((log) => !log || log.status !== "DENIED")) {
+  if (registered.logs.some((log) => log.status !== "DENIED")) {
     return { error: "Cụm chứa log không hợp lệ hoặc không còn là sự kiện DENIED" };
   }
-  return { clusterId: id, logIds: ids, logs: logs as AccessLogRecord[] };
+  return { clusterId: id, logIds: ids, logs: registered.logs };
 }
 
 const resolutionId = (clusterId: string) =>
   `RES-${Buffer.from(clusterId).toString("base64url").slice(0, 80)}`;
 
-app.post(["/api/strangers/quick-register", "/api/strangers/register"], async (req, res) => {
+app.post(["/api/strangers/quick-register", "/api/strangers/register"], requireOperatorRole("operator"), requireCsrf, async (req, res) => {
   try {
     const {
       name,
@@ -5247,63 +5741,112 @@ app.post(["/api/strangers/quick-register", "/api/strangers/register"], async (re
       accessLevel = "ALL_ACCESS",
       photoUrl,
       clusterId,
+      clusterVersion,
       clusterLogIds = [],
       sourceLogId,
     } = req.body;
 
-    if (!name || !name.trim()) {
-      res.status(400).json({ success: false, error: "Họ và tên nhân viên không được để trống" });
+    const normalizedName = normalizedField(name, 120);
+    const normalizedEmployeeCode = normalizedField(employeeCode, 32)?.toUpperCase() || "";
+    const normalizedDepartment = normalizedOptionalField(department, 120);
+    const normalizedPosition = normalizedOptionalField(position, 120);
+    const normalizedPhotoUrl = normalizedOptionalField(photoUrl, 2048);
+    const normalizedLogIds = requestedLogIds(clusterLogIds);
+    const normalizedSourceLogId = normalizedField(sourceLogId, 128) || normalizedLogIds[0] || null;
+    if (!normalizedName || !normalizedEmployeeCode || normalizedDepartment === null || normalizedPosition === null || normalizedPhotoUrl === null) {
+      res.status(400).json({ success: false, error: "Thông tin nhân viên không đúng kiểu hoặc vượt quá độ dài cho phép" });
       return;
     }
+    if (!/^[A-Z0-9][A-Z0-9._-]{0,31}$/.test(normalizedEmployeeCode)) {
+      res.status(400).json({ success: false, error: "Mã nhân viên không đúng định dạng" });
+      return;
+    }
+    if (!isAccessLevel(accessLevel)) {
+      res.status(400).json({ success: false, error: "Quyền truy cập không hợp lệ" });
+      return;
+    }
+    if (!normalizedSourceLogId || !normalizedLogIds.includes(normalizedSourceLogId)) {
+      res.status(400).json({ success: false, error: "sourceLogId phải là một thành viên của cụm" });
+      return;
+    }
+    const intent = { name: normalizedName, employeeCode: normalizedEmployeeCode,
+      department: normalizedDepartment, position: normalizedPosition, accessLevel, photoUrl: normalizedPhotoUrl };
 
     const existingResolution = db.getStrangerResolution(String(clusterId || ""));
     if (existingResolution) {
       const employee = employees.find((item) => item.id === existingResolution.employeeId);
-      if (existingResolution.action !== "QUICK_REGISTER" || !employee) {
+      if (!employee || !sameResolutionIntent(existingResolution, {
+        ...existingResolution, action: "QUICK_REGISTER", employeeId: employee.id,
+        logIds: normalizedLogIds, sourceLogId: normalizedSourceLogId, metadata: { intent },
+      })) {
         res.status(409).json({ success: false, error: "Cụm đã được xử lý theo cách khác" });
         return;
       }
       res.json({ success: true, employee, updatedLogsCount: 0,
         adjudicatedLogsCount: existingResolution.logIds.length, resolution: existingResolution,
-        idempotentReplay: true, recognitionReady: db.getFaceTemplatesForEmployee(employee.id).length > 0 });
+        idempotentReplay: true,
+        recognitionReady: recognitionReadyForEmployee(employee.id) });
       return;
     }
 
-    const validated = validatedStrangerCluster(clusterId, clusterLogIds);
+    if (employees.some((item) => item.employeeCode.toUpperCase() === normalizedEmployeeCode)) {
+      res.status(409).json({ success: false, error: `Mã nhân viên ${normalizedEmployeeCode} đã tồn tại` });
+      return;
+    }
+
+    const validated = await validatedStrangerCluster(clusterId, normalizedLogIds, clusterVersion);
     if ("error" in validated) {
       res.status(409).json({ success: false, error: validated.error });
       return;
     }
 
-    const newEmpId = "EMP-" + Math.floor(1000 + Math.random() * 9000);
-    const autoCode = employeeCode?.trim() || `NV-${Math.floor(1000 + Math.random() * 9000)}`;
+    const newEmpId = `EMP-${randomUUID()}`;
     const newEmployee: EmployeeRecord = {
       id: newEmpId,
-      name: name.trim(),
-      employeeCode: autoCode,
-      department: department?.trim() || "Phòng Kỹ Thuật AI",
-      position: position?.trim() || "Nhân viên mới",
-      photoUrl: photoUrl || logImageUrl(validated.logIds[0]),
+      name: normalizedName,
+      employeeCode: normalizedEmployeeCode,
+      department: normalizedDepartment || "Phòng Kỹ Thuật AI",
+      position: normalizedPosition || "Nhân viên mới",
+      photoUrl: normalizedPhotoUrl || logImageUrl(validated.logIds[0]),
       registeredAt: new Date().toISOString(),
       accessLevel,
     };
-    employees.unshift(newEmployee);
-    db.saveEmployee(newEmployee);
-
-    const requestedSource = String(sourceLogId || "");
+    const requestedSource = normalizedSourceLogId;
     const sightingLog = validated.logs.find((log) => log.id === requestedSource) ||
       validated.logs.find((log) => Boolean(log.photoSnapshot));
-    const enrolled = sightingLog && isEnrollableImage(sightingLog.photoSnapshot)
-      ? await enrollTemplateFromImage(newEmployee.id, sightingLog.photoSnapshot, {
-          source: "enrollment", sourceLogId: sightingLog.id,
+    const sourceLog = sightingLog ? await db.getAccessLogById(sightingLog.id) : undefined;
+    const enrolled = sourceLog && isEnrollableImage(sourceLog.photoSnapshot)
+      ? await prepareTemplateFromImage(newEmployee.id, sourceLog.photoSnapshot, {
+          source: "enrollment", sourceLogId: sourceLog.id,
         })
       : { rejected: "unsupported-image" as const };
-    const resolution = await db.saveStrangerResolution({
-      id: resolutionId(validated.clusterId), clusterId: validated.clusterId, action: "QUICK_REGISTER",
-      employeeId: newEmployee.id, actor: "operator", resolvedAt: new Date().toISOString(),
-      logIds: validated.logIds, sourceLogId: sightingLog?.id,
-      metadata: { recognitionReady: Boolean(enrolled.saved), enrollmentRejected: enrolled.rejected || null },
+    const commit = await db.commitStrangerResolution({
+      employee: newEmployee,
+      faceTemplate: enrolled.record,
+      resolution: {
+        id: resolutionId(validated.clusterId), clusterId: validated.clusterId, action: "QUICK_REGISTER",
+        employeeId: newEmployee.id, actor: operatorActor(req), resolvedAt: new Date().toISOString(),
+        logIds: validated.logIds, sourceLogId: sightingLog?.id,
+        metadata: { intent, recognitionReady: Boolean(enrolled.saved), enrollmentRejected: enrolled.rejected || null },
+      },
     });
+    if (commit.status === "conflict") {
+      res.status(409).json({ success: false, error: "Cụm đã được xử lý theo cách khác" });
+      return;
+    }
+    if (commit.status === "replay") {
+      const employee = commit.resolution.employeeId ? await db.getEmployeeById(commit.resolution.employeeId) : undefined;
+      if (!employee) {
+        res.status(409).json({ success: false, error: "Adjudication đã tồn tại nhưng hồ sơ nhân viên không hợp lệ" });
+        return;
+      }
+      res.json({ success: true, employee, updatedLogsCount: 0,
+        adjudicatedLogsCount: commit.resolution.logIds.length, resolution: commit.resolution,
+        idempotentReplay: true, recognitionReady: recognitionReadyForEmployee(employee.id) });
+      return;
+    }
+    const resolution = commit.resolution;
+    employees.unshift(newEmployee);
 
     const notif: MobileNotificationRecord = {
       id: "NOTIF-" + Date.now(),
@@ -5331,8 +5874,8 @@ app.post(["/api/strangers/quick-register", "/api/strangers/register"], async (re
       clusterResolved: true,
       faceTemplate: enrolled.saved || null,
       faceTemplateRejected: enrolled.rejected || null,
-      recognitionReady: Boolean(enrolled.saved),
-      partialFailure: !enrolled.saved,
+      recognitionReady: recognitionReadyForEmployee(newEmployee.id),
+      partialFailure: !recognitionReadyForEmployee(newEmployee.id),
       resolution,
       idempotentReplay: false,
       faceEngine: activeFaceEngine(),
@@ -5348,55 +5891,100 @@ app.post(["/api/strangers/quick-register", "/api/strangers/register"], async (re
 // log ids is retired as "log:<id>" so those sightings stop feeding the
 // clustering. Logs themselves are kept - the access history is not rewritten,
 // only the panel stops offering them. Reversible via /api/strangers/restore.
-app.post(["/api/strangers/dismiss", "/api/strangers/reject"], (req, res) => {
+app.post(["/api/strangers/dismiss", "/api/strangers/reject"], requireOperatorRole("operator"), requireCsrf, async (req, res) => {
   try {
-    const { clusterId, clusterLogIds = [], reason } = req.body || {};
-    const logIds: string[] = Array.isArray(clusterLogIds) ? clusterLogIds.map(String) : [];
-    if (!clusterId && logIds.length === 0) {
-      res.status(400).json({ success: false, error: "Cần clusterId hoặc danh sách clusterLogIds để từ chối" });
+    const { clusterId, clusterVersion, clusterLogIds = [], reason } = req.body || {};
+    const normalizedLogIds = requestedLogIds(clusterLogIds);
+    const normalizedReason = typeof reason === "string" ? reason.trim().slice(0, 120) : "";
+    const existing = db.getStrangerResolution(String(clusterId || ""));
+    if (existing) {
+      if (!sameResolutionIntent(existing, {
+        ...existing, action: "DISMISS", employeeId: undefined, sourceLogId: undefined,
+        logIds: normalizedLogIds, metadata: { intent: { reason: normalizedReason } },
+      })) {
+        res.status(409).json({ success: false, error: "Cụm đã được xử lý theo cách khác" });
+        return;
+      }
+      res.json({ success: true, resolution: existing, idempotentReplay: true });
       return;
     }
-    const retired: string[] = [];
-    if (clusterId) { db.markStrangerClusterResolved(String(clusterId), "dismissed"); retired.push(String(clusterId)); }
-    for (const logId of logIds) {
-      const key = `log:${logId}`;
-      db.markStrangerClusterResolved(key, "dismissed");
-      retired.push(key);
-      const log = accessLogs.find((l) => l.id === logId);
-      if (log) {
-        log.reason = `${log.reason ? log.reason + " | " : ""}Đã từ chối ảnh người lạ${reason ? ": " + String(reason).slice(0, 120) : ""}`;
-        db.saveAccessLog(log);
-      }
+    const validated = await validatedStrangerCluster(clusterId, normalizedLogIds, clusterVersion);
+    if ("error" in validated) {
+      res.status(409).json({ success: false, error: validated.error });
+      return;
     }
-    broadcastSSE("stranger_dismissed", { clusterId: clusterId || null, clusterLogIds: logIds, reason: reason || null });
-    console.log(`[Strangers] Đã từ chối cụm ảnh người lạ ${clusterId || "(logs)"}: ${logIds.length} ảnh.`);
-    res.json({ success: true, message: "Đã từ chối và ẩn cụm ảnh người lạ", clusterId: clusterId || null, retired });
+    const commit = await db.commitStrangerResolution({
+      resolution: {
+        id: resolutionId(validated.clusterId),
+        clusterId: validated.clusterId,
+        action: "DISMISS",
+        actor: operatorActor(req),
+        resolvedAt: new Date().toISOString(),
+        logIds: validated.logIds,
+        metadata: { intent: { reason: normalizedReason }, reason: normalizedReason || null },
+      },
+    });
+    if (commit.status === "conflict") {
+      res.status(409).json({ success: false, error: "Cụm đã được xử lý theo cách khác" });
+      return;
+    }
+    const resolution = commit.resolution;
+    broadcastSSE("stranger_dismissed", { clusterId: validated.clusterId, clusterLogIds: validated.logIds });
+    res.json({ success: true, message: "Đã từ chối và ẩn cụm ảnh người lạ", resolution, idempotentReplay: commit.status === "replay" });
   } catch (err: any) {
     console.error("[Strangers] Lỗi từ chối cụm ảnh người lạ:", err);
     res.status(500).json({ success: false, error: err?.message || "Lỗi xử lý từ chối ảnh người lạ" });
   }
 });
 
-app.post("/api/strangers/restore", (req, res) => {
+app.post("/api/strangers/restore", requireOperatorRole("operator"), requireCsrf, async (req, res) => {
   try {
-    const { clusterId, clusterLogIds = [] } = req.body || {};
-    const logIds: string[] = Array.isArray(clusterLogIds) ? clusterLogIds.map(String) : [];
-    if (!clusterId && logIds.length === 0) {
-      res.status(400).json({ success: false, error: "Cần clusterId hoặc clusterLogIds để khôi phục" });
+    const clusterId = String(req.body?.clusterId || "").trim();
+    const requested = Array.isArray(req.body?.clusterLogIds)
+      ? [...new Set(req.body.clusterLogIds.map(String))].sort()
+      : [];
+    const resolution = db.getStrangerResolution(clusterId);
+    if (!resolution || resolution.action !== "DISMISS") {
+      res.status(409).json({ success: false, error: "Không tìm thấy adjudication DISMISS có thể khôi phục" });
       return;
     }
-    if (clusterId) db.unmarkStrangerClusterResolved(String(clusterId));
-    for (const logId of logIds) db.unmarkStrangerClusterResolved(`log:${logId}`);
-    broadcastSSE("stranger_restored", { clusterId: clusterId || null, clusterLogIds: logIds });
-    res.json({ success: true, message: "Đã khôi phục cụm ảnh người lạ" });
+    const actual = [...resolution.logIds].sort();
+    if (requested.length !== actual.length || actual.some((value, index) => value !== requested[index])) {
+      res.status(409).json({ success: false, error: "Danh sách log không khớp adjudication đã lưu" });
+      return;
+    }
+    const restored = await db.restoreStrangerResolution({
+      id: `${resolutionId(clusterId)}-restore-${randomUUID()}`,
+      clusterId,
+      action: "RESTORE",
+      actor: operatorActor(req),
+      resolvedAt: new Date().toISOString(),
+      logIds: actual,
+      metadata: { restoredResolutionId: resolution.id },
+    });
+    broadcastSSE("stranger_restored", { clusterId, clusterLogIds: actual, actor: operatorActor(req) });
+    res.json({ success: true, message: "Đã khôi phục cụm ảnh người lạ", resolution: restored });
   } catch (err: any) {
+    if (err?.message === "restore-conflict") {
+      res.status(409).json({ success: false, error: "Adjudication đã thay đổi; không thể khôi phục" });
+      return;
+    }
     res.status(500).json({ success: false, error: err?.message || "Lỗi khôi phục" });
   }
 });
 
+app.get("/api/strangers/resolutions/:clusterId", requireOperatorRole("viewer"), (req: Request, res: Response) => {
+  const clusterId = String(req.params.clusterId || "").trim();
+  if (!clusterId || clusterId.length > 128) {
+    res.status(400).json({ success: false, error: "clusterId không hợp lệ" });
+    return;
+  }
+  res.json({ success: true, clusterId, resolutions: db.getStrangerResolutionEvents(clusterId) });
+});
+
 // Search the existing roster so an unrecognized stranger cluster can be merged
 // into the employee it actually belongs to, instead of creating a duplicate.
-app.get(["/api/strangers/search-employees", "/api/strangers/employees"], (req, res) => {
+app.get(["/api/strangers/search-employees", "/api/strangers/employees"], requireOperatorRole("viewer"), (req, res) => {
   try {
     const q = String(req.query.q || "").trim().toLowerCase();
     const limit = Math.min(50, Math.max(1, parseInt(String(req.query.limit || "20"), 10) || 20));
@@ -5425,12 +6013,13 @@ app.get(["/api/strangers/search-employees", "/api/strangers/employees"], (req, r
 // Merge a stranger cluster into an EXISTING employee. Used when the recognition
 // engine failed to match a person who is in fact already enrolled: the operator
 // picks the right employee and the cluster's history is reattributed to them.
-app.post(["/api/strangers/merge", "/api/strangers/assign"], async (req, res) => {
+app.post(["/api/strangers/merge", "/api/strangers/assign"], requireOperatorRole("operator"), requireCsrf, async (req, res) => {
   try {
     const {
       employeeId,
       employeeCode,
       clusterId,
+      clusterVersion,
       clusterLogIds = [],
       adoptPhoto = false,
       sourceLogId,
@@ -5448,45 +6037,68 @@ app.post(["/api/strangers/merge", "/api/strangers/assign"], async (req, res) => 
       return;
     }
 
+    const normalizedLogIds = requestedLogIds(clusterLogIds);
+    const normalizedSourceLogId = normalizedField(sourceLogId, 128) || normalizedLogIds[0] || null;
+    if (!normalizedSourceLogId || !normalizedLogIds.includes(normalizedSourceLogId)) {
+      res.status(400).json({ success: false, error: "sourceLogId phải là một thành viên của cụm" });
+      return;
+    }
     const existingResolution = db.getStrangerResolution(String(clusterId || ""));
     if (existingResolution) {
-      if (existingResolution.action !== "MERGE" || existingResolution.employeeId !== target.id) {
+      if (!sameResolutionIntent(existingResolution, {
+        ...existingResolution, action: "MERGE", employeeId: target.id,
+        logIds: normalizedLogIds, sourceLogId: normalizedSourceLogId,
+        metadata: { intent: { adoptPhoto: Boolean(adoptPhoto) } },
+      })) {
         res.status(409).json({ success: false, error: "Cụm đã được xử lý theo cách khác" });
         return;
       }
       res.json({ success: true, employee: target, updatedLogsCount: 0,
         adjudicatedLogsCount: existingResolution.logIds.length, resolution: existingResolution,
-        idempotentReplay: true, recognitionReady: db.getFaceTemplatesForEmployee(target.id).length > 0 });
+        idempotentReplay: true,
+        recognitionReady: recognitionReadyForEmployee(target.id) });
       return;
     }
 
-    const validated = validatedStrangerCluster(clusterId, clusterLogIds);
+    const validated = await validatedStrangerCluster(clusterId, normalizedLogIds, clusterVersion);
     if ("error" in validated) {
       res.status(409).json({ success: false, error: validated.error });
       return;
     }
-    const requestedSource = String(sourceLogId || "");
+    const requestedSource = normalizedSourceLogId;
     const sightingLog = validated.logs.find((log) => log.id === requestedSource) ||
       validated.logs.find((log) => Boolean(log.photoSnapshot));
 
-    let photoUpdated = false;
-    if (adoptPhoto && sightingLog) {
-      target.photoUrl = logImageUrl(sightingLog.id);
-      db.saveEmployee(target);
-      photoUpdated = true;
-    }
-
-    const enrolled = sightingLog && isEnrollableImage(sightingLog.photoSnapshot)
-      ? await enrollTemplateFromImage(target.id, sightingLog.photoSnapshot, {
-          source: "merge", sourceLogId: sightingLog.id,
+    const nextPhotoUrl = adoptPhoto && sightingLog ? logImageUrl(sightingLog.id) : null;
+    const photoUpdated = Boolean(nextPhotoUrl && nextPhotoUrl !== target.photoUrl);
+    const sourceLog = sightingLog ? await db.getAccessLogById(sightingLog.id) : undefined;
+    const enrolled = sourceLog && isEnrollableImage(sourceLog.photoSnapshot)
+      ? await prepareTemplateFromImage(target.id, sourceLog.photoSnapshot, {
+          source: "merge", sourceLogId: sourceLog.id,
         })
       : { rejected: "unsupported-image" as const };
-    const resolution = await db.saveStrangerResolution({
-      id: resolutionId(validated.clusterId), clusterId: validated.clusterId, action: "MERGE",
-      employeeId: target.id, actor: "operator", resolvedAt: new Date().toISOString(),
-      logIds: validated.logIds, sourceLogId: sightingLog?.id,
-      metadata: { recognitionReady: Boolean(enrolled.saved), enrollmentRejected: enrolled.rejected || null },
+    const commit = await db.commitStrangerResolution({
+      employeePhotoUpdate: nextPhotoUrl ? { employeeId: target.id, photoUrl: nextPhotoUrl } : undefined,
+      faceTemplate: enrolled.record,
+      resolution: {
+        id: resolutionId(validated.clusterId), clusterId: validated.clusterId, action: "MERGE",
+        employeeId: target.id, actor: operatorActor(req), resolvedAt: new Date().toISOString(),
+        logIds: validated.logIds, sourceLogId: sightingLog?.id,
+        metadata: { intent: { adoptPhoto: Boolean(adoptPhoto) }, recognitionReady: Boolean(enrolled.saved), enrollmentRejected: enrolled.rejected || null },
+      },
     });
+    if (commit.status === "conflict") {
+      res.status(409).json({ success: false, error: "Cụm đã được xử lý theo cách khác" });
+      return;
+    }
+    if (commit.status === "replay") {
+      res.json({ success: true, employee: target, updatedLogsCount: 0,
+        adjudicatedLogsCount: commit.resolution.logIds.length, resolution: commit.resolution,
+        idempotentReplay: true, recognitionReady: recognitionReadyForEmployee(target.id) });
+      return;
+    }
+    const resolution = commit.resolution;
+    if (nextPhotoUrl) target.photoUrl = nextPhotoUrl;
 
     const notif: MobileNotificationRecord = {
       id: "NOTIF-" + Date.now(),
@@ -5516,8 +6128,8 @@ app.post(["/api/strangers/merge", "/api/strangers/assign"], async (req, res) => 
       clusterResolved: true,
       faceTemplate: enrolled.saved || null,
       faceTemplateRejected: enrolled.rejected || null,
-      recognitionReady: Boolean(enrolled.saved),
-      partialFailure: !enrolled.saved,
+      recognitionReady: recognitionReadyForEmployee(target.id),
+      partialFailure: !recognitionReadyForEmployee(target.id),
       resolution,
       idempotentReplay: false,
       faceEngine: activeFaceEngine(),
@@ -6129,33 +6741,6 @@ app.post(RECOGNIZE_FACE_ROUTES, async (req, res) => {
     }
 
     const testEmployeeId: string | undefined = simulationAllowed ? requestedTestId : undefined;
-    const clientEmployees = body.clientEmployees;
-
-    // Sync any employees sent from client that server doesn't have yet
-    if (Array.isArray(clientEmployees) && clientEmployees.length > 0) {
-      for (const ce of clientEmployees) {
-        if (
-          ce &&
-          ce.employeeCode &&
-          !employees.some(
-            (e) => e.employeeCode.toUpperCase() === ce.employeeCode.toUpperCase()
-          )
-        ) {
-          const newEmp: EmployeeRecord = {
-            id: ce.id || "EMP-" + String(Date.now()).slice(-4),
-            name: ce.name,
-            employeeCode: ce.employeeCode.toUpperCase(),
-            department: ce.department || "Phòng Hành chính - Nhân sự",
-            position: ce.position || "Nhân viên",
-            photoUrl: ce.photoUrl || "",
-            registeredAt: ce.registeredAt || new Date().toISOString(),
-            accessLevel: ce.accessLevel || "ALL_ACCESS",
-          };
-          employees.unshift(newEmp);
-          db.saveEmployee(newEmp);
-        }
-      }
-    }
 
     if (!imageBase64 && !testEmployeeId) {
       res.status(400).json({
@@ -6163,7 +6748,7 @@ app.post(RECOGNIZE_FACE_ROUTES, async (req, res) => {
         error: "Không nhận được hình ảnh từ camera hoặc mã kiểm thử",
         message:
           "Endpoint /api/recognize-face hoạt động bình thường. Vui lòng gửi trường 'imageBase64' (Data URL hoặc base64) hoặc 'testEmployeeId'.",
-        supportedFields: ["imageBase64", "scanType", "testEmployeeId", "clientEmployees"],
+        supportedFields: ["imageBase64", "scanType", "testEmployeeId"],
       });
       return;
     }

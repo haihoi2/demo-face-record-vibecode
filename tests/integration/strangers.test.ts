@@ -7,10 +7,13 @@ import assert from "node:assert/strict";
 
 import {
   api,
+  authenticateAs,
+  csrfTokenForCookie,
   createTempEmployee,
   deleteEmployee,
   noFaceJpegDataUrl,
   postJson,
+  rawApi,
   recognize,
   type Employee,
 } from "./helpers";
@@ -23,6 +26,7 @@ interface AccessLog {
   imageUrl?: string;
   hasImage?: boolean;
   faceEmbedding?: number[];
+  reason?: string;
 }
 
 async function makeDeniedLog(seed: number): Promise<AccessLog> {
@@ -31,6 +35,9 @@ async function makeDeniedLog(seed: number): Promise<AccessLog> {
   const body = res.body as any;
   assert.equal(body.recognized, false);
   assert.ok(body.log?.id);
+  assert.doesNotMatch(res.text, /data:image\//);
+  assert.doesNotMatch(res.text, /faceEmbedding/);
+  assert.match(body.log.photoSnapshot, /^\/api\/logs\//);
   return body.log as AccessLog;
 }
 
@@ -42,6 +49,89 @@ async function clusterFor(logId: string) {
   );
 }
 
+describe("operator authorization", () => {
+  it("rejects unauthenticated stranger, access-log, and image reads", async () => {
+    assert.equal((await rawApi("/api/strangers/clusters")).status, 401);
+    assert.equal((await rawApi("/api/logs")).status, 401);
+    assert.equal((await rawApi("/api/logs/LOG-DOES-NOT-EXIST/image")).status, 401);
+  });
+
+  it("allows viewer reads but forbids viewer mutations", async () => {
+    const viewerCookie = await authenticateAs(process.env.VIEWER_TOKEN || "integration-viewer-token");
+    const listing = await rawApi("/api/strangers/clusters", { headers: { Cookie: viewerCookie } });
+    assert.equal(listing.status, 200, listing.text.slice(0, 200));
+    const mutation = await rawApi("/api/strangers/dismiss", {
+      method: "POST",
+      headers: { Cookie: viewerCookie, "Content-Type": "application/json" },
+      body: JSON.stringify({ clusterId: "cluster-any", clusterLogIds: ["LOG-any"] }),
+    });
+    assert.equal(mutation.status, 403, mutation.text.slice(0, 200));
+  });
+
+  it("protects every SSE alias with viewer authentication", async () => {
+    for (const path of ["/api/events", "/api/events/", "/events", "/events/"]) {
+      const res = await rawApi(path);
+      assert.equal(res.status, 401, `${path}: ${res.text.slice(0, 200)}`);
+    }
+  });
+
+  it("redacts biometric bytes and embeddings from authenticated SSE access events", async () => {
+    const cookie = await authenticateAs(process.env.VIEWER_TOKEN || "integration-viewer-token");
+    const controller = new AbortController();
+    const stream = await fetch(`${process.env.APP_URL || "http://127.0.0.1:3100"}/api/events`, {
+      headers: { Cookie: cookie },
+      signal: controller.signal,
+    });
+    assert.equal(stream.status, 200);
+    assert.match(stream.headers.get("content-type") || "", /text\/event-stream/);
+    const reader = stream.body!.getReader();
+    const deniedPromise = makeDeniedLog(91000);
+    const decoder = new TextDecoder();
+    let text = "";
+    try {
+      const deadline = Date.now() + 10_000;
+      while (Date.now() < deadline && !text.includes("event: access_denied")) {
+        const chunk = await reader.read();
+        if (chunk.done) break;
+        text += decoder.decode(chunk.value, { stream: true });
+      }
+    } finally {
+      controller.abort();
+      await deniedPromise;
+    }
+    const event = text.split("\n\n").find((part) => part.includes("event: access_denied")) || "";
+    assert.ok(event, text.slice(0, 1000));
+    assert.doesNotMatch(event, /data:image\//);
+    assert.doesNotMatch(event, /faceEmbedding/);
+    const dataLine = event.split("\n").find((line) => line.startsWith("data: "))!;
+    const payload = JSON.parse(dataLine.slice(6));
+    assert.match(payload.log.photoSnapshot, /^https?:\/\//);
+    assert.equal(payload.log.imageUrl, payload.log.photoSnapshot);
+  });
+
+  it("enforces session-bound CSRF, JSON content, and mutation origins", async () => {
+    const cookie = await authenticateAs(process.env.OPERATOR_TOKEN || "integration-operator-token");
+    const csrf = csrfTokenForCookie(cookie);
+    const body = JSON.stringify({ clusterId: "cluster-any", clusterLogIds: ["LOG-any"] });
+    assert.equal((await rawApi("/api/strangers/dismiss", {
+      method: "POST", headers: { Cookie: cookie, "Content-Type": "application/json" }, body,
+    })).status, 403);
+    assert.equal((await rawApi("/api/strangers/dismiss", {
+      method: "POST", headers: { Cookie: cookie, "Content-Type": "application/json", "X-CSRF-Token": "invalid" }, body,
+    })).status, 403);
+    assert.equal((await rawApi("/api/strangers/dismiss", {
+      method: "POST", headers: { Cookie: cookie, "Content-Type": "application/x-www-form-urlencoded", "X-CSRF-Token": csrf }, body: "clusterId=x",
+    })).status, 415);
+    assert.equal((await rawApi("/api/strangers/dismiss", {
+      method: "POST", headers: { Cookie: cookie, Origin: "http://evil.test", "Content-Type": "application/json", "X-CSRF-Token": csrf }, body,
+    })).status, 403);
+    const valid = await rawApi("/api/strangers/dismiss", {
+      method: "POST", headers: { Cookie: cookie, Origin: "http://allowed.test", "Content-Type": "application/json", "X-CSRF-Token": csrf }, body,
+    });
+    assert.equal(valid.status, 409, valid.text.slice(0, 200));
+  });
+});
+
 describe("bounded image-free list APIs", () => {
   let denied: AccessLog;
 
@@ -49,15 +139,16 @@ describe("bounded image-free list APIs", () => {
     denied = await makeDeniedLog(91001);
   });
 
-  it("GET /api/logs is bounded and never embeds full image data or embeddings", async () => {
-    const res = await api<AccessLog[]>("/api/logs");
+  it("GET /api/logs returns a bounded versioned metadata page without image data or embeddings", async () => {
+    const res = await api<{ version: number; logs: AccessLog[]; total: number; limit: number }>("/api/logs");
     assert.equal(res.status, 200, res.text.slice(0, 300));
-    assert.ok(Array.isArray(res.body));
-    assert.ok(res.body.length <= 50);
-    assert.equal(typeof res.headers.get("x-total-count"), "string");
+    assert.equal(res.body.version, 1);
+    assert.ok(Array.isArray(res.body.logs));
+    assert.ok(res.body.logs.length <= res.body.limit);
+    assert.equal(res.body.total, Number(res.headers.get("x-total-count")));
     assert.doesNotMatch(res.text, /data:image\//);
     assert.doesNotMatch(res.text, /faceEmbedding/);
-    for (const log of res.body) {
+    for (const log of res.body.logs) {
       assert.equal(log.photoSnapshot, `/api/logs/${encodeURIComponent(log.id)}/image`);
       assert.equal(log.imageUrl, log.photoSnapshot);
     }
@@ -76,7 +167,11 @@ describe("bounded image-free list APIs", () => {
   });
 
   it("GET /api/logs/:id/image returns original bytes with safe headers", async () => {
-    const res = await fetch(`${process.env.APP_URL || "http://127.0.0.1:3100"}/api/logs/${encodeURIComponent(denied.id)}/image`);
+    const cookie = await authenticateAs(process.env.OPERATOR_TOKEN || "integration-operator-token");
+    const res = await fetch(
+      `${process.env.APP_URL || "http://127.0.0.1:3100"}/api/logs/${encodeURIComponent(denied.id)}/image`,
+      { headers: { Cookie: cookie } },
+    );
     assert.equal(res.status, 200);
     assert.equal(res.headers.get("content-type"), "image/jpeg");
     assert.equal(res.headers.get("x-content-type-options"), "nosniff");
@@ -85,6 +180,20 @@ describe("bounded image-free list APIs", () => {
     assert.ok(bytes.length > 20);
     assert.equal(bytes[0], 0xff);
     assert.equal(bytes[1], 0xd8);
+  });
+
+  it("blocks hostile cross-site image embedding but permits configured split-origin fetches", async () => {
+    const cookie = await authenticateAs(process.env.OPERATOR_TOKEN || "integration-operator-token");
+    const url = `${process.env.APP_URL || "http://127.0.0.1:3100"}/api/logs/${encodeURIComponent(denied.id)}/image`;
+    const hostile = await fetch(url, { headers: {
+      Cookie: cookie, Origin: "http://evil.test", Referer: "http://evil.test/page", "Sec-Fetch-Site": "cross-site",
+    } });
+    assert.equal(hostile.status, 403);
+    const trusted = await fetch(url, { headers: {
+      Cookie: cookie, Origin: "http://allowed.test", Referer: "http://allowed.test/page", "Sec-Fetch-Site": "cross-site",
+    } });
+    assert.equal(trusted.status, 200);
+    assert.equal(trusted.headers.get("cross-origin-resource-policy"), "cross-origin");
   });
 
   it("rejects malformed and unknown image ids", async () => {
@@ -103,6 +212,53 @@ describe("bounded image-free list APIs", () => {
     assert.equal(typeof res.body.page, "number");
     assert.equal(typeof res.body.limit, "number");
     assert.equal(typeof res.body.totalClusters, "number");
+  });
+});
+
+describe("persisted stranger cluster cursors and versions", () => {
+  it("paginates authoritative candidates with a bounded cursor and reaches later observations", async () => {
+    const older = await makeDeniedLog(91989);
+    await makeDeniedLog(91990);
+    const first = await api<any>("/api/strangers/clusters?limit=1");
+    assert.equal(first.status, 200, first.text);
+    assert.ok(first.body.clusters.length <= 1);
+    assert.equal(first.body.workBound, 1);
+    assert.equal(first.body.totalClusters, first.body.clusters.length);
+    assert.equal(first.body.totalUnregisteredLogs, null);
+    assert.equal(typeof first.body.nextCursor, "string");
+    const second = await api<any>(`/api/strangers/clusters?limit=1&cursor=${encodeURIComponent(first.body.nextCursor)}`);
+    assert.equal(second.status, 200, second.text);
+    assert.ok(second.body.clusters.length <= 1);
+    const lookup = await api<any>(`/api/strangers/lookup?logId=${encodeURIComponent(older.id)}`);
+    assert.equal(lookup.status, 200, lookup.text);
+    assert.ok(lookup.body.cluster.observationCount >= 1);
+  });
+
+  it("looks up a log beyond list pagination and resolves by server-owned versioned membership", async () => {
+    const denied = await makeDeniedLog(91991);
+    const lookup = await api<any>(`/api/strangers/lookup?logId=${encodeURIComponent(denied.id)}`);
+    assert.equal(lookup.status, 200, lookup.text.slice(0, 300));
+    assert.equal(lookup.body.cluster.status, "OPEN");
+    assert.equal(typeof lookup.body.cluster.clusterVersion, "number");
+
+    const detail = await api<any>(`/api/strangers/clusters/${encodeURIComponent(lookup.body.cluster.clusterId)}?limit=1`);
+    assert.equal(detail.status, 200, detail.text.slice(0, 300));
+    assert.equal(detail.body.cluster.clusterVersion, lookup.body.cluster.clusterVersion);
+    assert.ok(detail.body.observations.some((item: any) => item.logId === denied.id));
+
+    const dismissed = await postJson<any>("/api/strangers/dismiss", {
+      clusterId: lookup.body.cluster.clusterId,
+      clusterVersion: lookup.body.cluster.clusterVersion,
+      reason: "versioned persisted cluster test",
+    });
+    assert.equal(dismissed.status, 200, dismissed.text.slice(0, 300));
+
+    const stale = await postJson("/api/strangers/dismiss", {
+      clusterId: lookup.body.cluster.clusterId,
+      clusterVersion: lookup.body.cluster.clusterVersion,
+      reason: "stale replay with different intent",
+    });
+    assert.equal(stale.status, 409, stale.text.slice(0, 300));
   });
 });
 
@@ -157,11 +313,141 @@ describe("immutable DENIED history and durable idempotent resolutions", () => {
     assert.equal(second.body.idempotentReplay, true);
     assert.equal(second.body.resolution.id, first.body.resolution.id);
 
-    const logs = await api<AccessLog[]>("/api/logs");
-    const stored = logs.body.find((log) => log.id === denied.id);
+    const forgedReplay = await postJson("/api/strangers/merge", { ...payload, adoptPhoto: false });
+    assert.equal(forgedReplay.status, 409, forgedReplay.text.slice(0, 300));
+
+    const logs = await api<{ logs: AccessLog[] }>("/api/logs?limit=100");
+    const stored = logs.body.logs.find((log) => log.id === denied.id);
     assert.ok(stored);
     assert.equal(stored.status, "DENIED");
     assert.equal(stored.lockAction, denied.lockAction);
+  });
+
+  it("allows only one conflicting concurrent resolution", async () => {
+    const denied = await makeDeniedLog(92006);
+    const cluster = await clusterFor(denied.id);
+    assert.ok(cluster);
+    const logIds = cluster.photos.map((photo: any) => photo.logId);
+
+    const [merge, dismiss] = await Promise.all([
+      postJson("/api/strangers/merge", { employeeId: mergeTarget.id, clusterId: cluster.clusterId, clusterLogIds: logIds }),
+      postJson("/api/strangers/dismiss", { clusterId: cluster.clusterId, clusterLogIds: logIds, reason: "race" }),
+    ]);
+    assert.deepEqual([merge.status, dismiss.status].sort(), [200, 409]);
+  });
+
+  it("dismiss records immutable adjudication and rejects forged membership", async () => {
+    const denied = await makeDeniedLog(92004);
+    const cluster = await clusterFor(denied.id);
+    assert.ok(cluster);
+
+    const forged = await postJson("/api/strangers/dismiss", {
+      clusterId: cluster.clusterId,
+      clusterLogIds: [...cluster.photos.map((photo: any) => photo.logId), "LOG-FORGED"],
+      reason: "test",
+    });
+    assert.equal(forged.status, 409, forged.text.slice(0, 300));
+
+    const dismissed = await postJson<any>("/api/strangers/dismiss", {
+      clusterId: cluster.clusterId,
+      clusterLogIds: cluster.photos.map((photo: any) => photo.logId),
+      reason: "test",
+    });
+    assert.equal(dismissed.status, 200, dismissed.text.slice(0, 300));
+    assert.equal(dismissed.body.resolution.action, "DISMISS");
+    assert.equal(dismissed.body.resolution.actor, "itest-operator");
+
+    const forgedReplay = await postJson("/api/strangers/dismiss", {
+      clusterId: cluster.clusterId,
+      clusterLogIds: cluster.photos.map((photo: any) => photo.logId),
+      reason: "different replay intent",
+    });
+    assert.equal(forgedReplay.status, 409, forgedReplay.text.slice(0, 300));
+
+    const logs = await api<{ logs: AccessLog[] }>("/api/logs?limit=100");
+    const stored = logs.body.logs.find((log) => log.id === denied.id);
+    assert.ok(stored);
+    assert.equal((stored as AccessLog).status, "DENIED");
+    assert.equal((stored as AccessLog).reason, (denied as any).reason);
+  });
+
+  it("restore appends an immutable adjudication event and validates stored membership", async () => {
+    const denied = await makeDeniedLog(92007);
+    const cluster = await clusterFor(denied.id);
+    assert.ok(cluster);
+    const logIds = cluster.photos.map((photo: any) => photo.logId);
+
+    const dismissed = await postJson("/api/strangers/dismiss", {
+      clusterId: cluster.clusterId,
+      clusterLogIds: logIds,
+      reason: "restore audit",
+    });
+    assert.equal(dismissed.status, 200, dismissed.text.slice(0, 300));
+
+    const forged = await postJson("/api/strangers/restore", {
+      clusterId: cluster.clusterId,
+      clusterLogIds: [...logIds, "LOG-FORGED"],
+    });
+    assert.equal(forged.status, 409, forged.text.slice(0, 300));
+
+    const restored = await postJson("/api/strangers/restore", {
+      clusterId: cluster.clusterId,
+      clusterLogIds: logIds,
+    });
+    assert.equal(restored.status, 200, restored.text.slice(0, 300));
+    assert.equal(restored.body.resolution.action, "RESTORE");
+    assert.equal(restored.body.resolution.actor, "itest-operator");
+
+    const audit = await api<any>(`/api/strangers/resolutions/${encodeURIComponent(cluster.clusterId)}`);
+    assert.equal(audit.status, 200, audit.text.slice(0, 300));
+    assert.deepEqual(audit.body.resolutions.map((item: any) => item.action), ["DISMISS", "RESTORE"]);
+    assert.equal(audit.body.resolutions[0].actor, "itest-operator");
+    assert.equal(audit.body.resolutions[1].actor, "itest-operator");
+
+    const logs = await api<{ logs: AccessLog[] }>("/api/logs?limit=100");
+    const stored = logs.body.logs.find((log) => log.id === denied.id);
+    assert.ok(stored);
+    assert.equal(stored!.status, "DENIED");
+    assert.equal(stored!.reason, denied.reason);
+  });
+
+  it("rejects duplicate employee codes and invalid access levels before quick-register mutation", async () => {
+    const denied = await makeDeniedLog(92005);
+    const cluster = await clusterFor(denied.id);
+    assert.ok(cluster);
+
+    const duplicate = await postJson("/api/strangers/quick-register", {
+      name: "Duplicate Code",
+      employeeCode: mergeTarget.employeeCode.toLowerCase(),
+      department: "Integration Test Dept",
+      position: "Fixture",
+      accessLevel: "ALL_ACCESS",
+      clusterId: cluster.clusterId,
+      clusterLogIds: cluster.photos.map((photo: any) => photo.logId),
+    });
+    assert.equal(duplicate.status, 409, duplicate.text.slice(0, 300));
+
+    const invalid = await postJson("/api/strangers/quick-register", {
+      name: "Invalid Access",
+      employeeCode: `BAD-${Date.now()}`,
+      department: "Integration Test Dept",
+      position: "Fixture",
+      accessLevel: "SUPER_ADMIN",
+      clusterId: cluster.clusterId,
+      clusterLogIds: cluster.photos.map((photo: any) => photo.logId),
+    });
+    assert.equal(invalid.status, 400, invalid.text.slice(0, 300));
+
+    const invalidType = await postJson("/api/strangers/quick-register", {
+      name: { not: "a string" },
+      employeeCode: `TYPE-${Date.now()}`,
+      department: "Integration Test Dept",
+      position: "Fixture",
+      clusterId: cluster.clusterId,
+      clusterLogIds: cluster.photos.map((photo: any) => photo.logId),
+    });
+    assert.equal(invalidType.status, 400, invalidType.text.slice(0, 300));
+    assert.ok(await clusterFor(denied.id), "rejected validation must not resolve the cluster");
   });
 
   it("quick-register is idempotent and preserves the original denial", async () => {
@@ -192,8 +478,11 @@ describe("immutable DENIED history and durable idempotent resolutions", () => {
     assert.equal(second.body.idempotentReplay, true);
     assert.equal(second.body.employee.id, first.body.employee.id);
 
-    const logs = await api<AccessLog[]>("/api/logs");
-    const stored = logs.body.find((log) => log.id === denied.id);
+    const forgedReplay = await postJson("/api/strangers/quick-register", { ...payload, name: `${payload.name} forged` });
+    assert.equal(forgedReplay.status, 409, forgedReplay.text.slice(0, 300));
+
+    const logs = await api<{ logs: AccessLog[] }>("/api/logs?limit=100");
+    const stored = logs.body.logs.find((log) => log.id === denied.id);
     assert.ok(stored);
     assert.equal(stored.status, "DENIED");
     assert.equal(stored.lockAction, denied.lockAction);

@@ -15,6 +15,8 @@ import {
   getApiBaseUrl,
   getCustomBackendUrl,
   STORAGE_KEY_CUSTOM_BACKEND,
+  clearSessionCsrfToken,
+  operatorJsonFetch,
 } from "../src/utils/api";
 
 describe("getCustomBackendUrl", () => {
@@ -69,5 +71,63 @@ describe("buildEventSourceUrl", () => {
   it("normalizes the SSE endpoint the same way as a regular API call", () => {
     assert.equal(buildEventSourceUrl("api/events"), "/api/events");
     assert.equal(buildEventSourceUrl("/api/events"), normalizeApiUrl("/api/events"));
+  });
+});
+
+describe("operatorJsonFetch CSRF recovery", () => {
+  it("refreshes the authenticated session and retries a CSRF-specific 403 exactly once", async () => {
+    clearSessionCsrfToken();
+    const originalFetch = globalThis.fetch;
+    const calls: Array<{ url: string; csrf: string | null }> = [];
+    globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+      const url = String(input);
+      const csrf = new Headers(init?.headers).get("x-csrf-token");
+      calls.push({ url, csrf });
+      if (url === "/api/operator/session") {
+        return new Response(JSON.stringify({ success: true, csrfToken: "fresh-csrf" }), {
+          status: 200, headers: { "Content-Type": "application/json" },
+        });
+      }
+      if (calls.filter((call) => call.url === "/api/lock/lock").length === 1) {
+        return new Response(JSON.stringify({ success: false, code: "CSRF_REQUIRED" }), {
+          status: 403, headers: { "Content-Type": "application/json" },
+        });
+      }
+      return new Response(JSON.stringify({ success: true }), {
+        status: 200, headers: { "Content-Type": "application/json" },
+      });
+    }) as typeof fetch;
+    try {
+      const result = await operatorJsonFetch("/api/lock/lock", {
+        method: "POST", headers: { "Content-Type": "application/json" }, body: "{}",
+      });
+      assert.equal(result.status, 200);
+      assert.deepEqual(calls.map((call) => call.url), [
+        "/api/lock/lock", "/api/operator/session", "/api/lock/lock",
+      ]);
+      assert.equal(calls[2].csrf, "fresh-csrf");
+    } finally {
+      globalThis.fetch = originalFetch;
+      clearSessionCsrfToken();
+    }
+  });
+
+  it("does not retry an arbitrary 403", async () => {
+    clearSessionCsrfToken();
+    const originalFetch = globalThis.fetch;
+    let calls = 0;
+    globalThis.fetch = (async () => {
+      calls += 1;
+      return new Response(JSON.stringify({ success: false, code: "ROLE_REQUIRED" }), {
+        status: 403, headers: { "Content-Type": "application/json" },
+      });
+    }) as typeof fetch;
+    try {
+      const result = await operatorJsonFetch("/api/lock/lock", { method: "POST" });
+      assert.equal(result.status, 403);
+      assert.equal(calls, 1);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
   });
 });

@@ -1,6 +1,7 @@
 import fs from "fs";
 import path from "path";
 import { createRequire } from "module";
+import { randomUUID } from "crypto";
 import { Pool } from "pg";
 
 // Safe dynamic loader for Node 22 native sqlite DatabaseSync
@@ -55,6 +56,8 @@ export interface AccessLogRecord {
   reason?: string;
   /** L2-normalised stranger observation captured by the real ArcFace engine. */
   faceEmbedding?: number[];
+  /** Persisted vector length; internal only and stripped from API responses. */
+  faceEmbeddingDims?: number;
   /** Model identity for faceEmbedding. Embeddings with different tags are never compared. */
   faceEmbeddingModelTag?: string;
   /** Capture quality (0..1) of the persisted stranger observation. */
@@ -318,7 +321,7 @@ export interface FaceTemplateRecord {
   streamId?: string;
 }
 
-export type StrangerResolutionAction = "QUICK_REGISTER" | "MERGE" | "DISMISS";
+export type StrangerResolutionAction = "QUICK_REGISTER" | "MERGE" | "DISMISS" | "RESTORE";
 
 export interface StrangerResolutionRecord {
   id: string;
@@ -331,6 +334,18 @@ export interface StrangerResolutionRecord {
   sourceLogId?: string;
   metadata?: Record<string, unknown>;
 }
+
+export interface StrangerResolutionCommit {
+  resolution: StrangerResolutionRecord;
+  employee?: EmployeeRecord;
+  employeePhotoUpdate?: { employeeId: string; photoUrl: string };
+  faceTemplate?: FaceTemplateRecord;
+}
+
+export type StrangerResolutionCommitResult =
+  | { status: "created"; resolution: StrangerResolutionRecord }
+  | { status: "replay"; resolution: StrangerResolutionRecord }
+  | { status: "conflict"; resolution: StrangerResolutionRecord };
 
 // float32 little-endian <-> number[] for BYTEA/BLOB storage of embeddings
 function embeddingToBuffer(e: number[]): Buffer {
@@ -386,6 +401,26 @@ function rowToStrangerResolution(r: any): StrangerResolutionRecord {
     sourceLogId: r.sourceLogId || undefined,
     metadata: parse(r.metadata, {}) as Record<string, unknown>,
   };
+}
+
+function stableJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(stableJson).join(",")}]`;
+  if (value && typeof value === "object") {
+    return `{${Object.entries(value as Record<string, unknown>)
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([key, item]) => `${JSON.stringify(key)}:${stableJson(item)}`).join(",")}}`;
+  }
+  return JSON.stringify(value);
+}
+
+export function sameResolutionIntent(a: StrangerResolutionRecord, b: StrangerResolutionRecord): boolean {
+  const aIds = [...a.logIds].sort();
+  const bIds = [...b.logIds].sort();
+  return a.clusterId === b.clusterId && a.action === b.action &&
+    (a.employeeId || "") === (b.employeeId || "") &&
+    (a.sourceLogId || "") === (b.sourceLogId || "") &&
+    aIds.length === bIds.length && aIds.every((id, index) => id === bIds[index]) &&
+    stableJson(a.metadata?.intent ?? null) === stableJson(b.metadata?.intent ?? null);
 }
 
 export interface CameraStreamsConfigRecord {
@@ -951,6 +986,20 @@ class SQLiteStorage {
           metadata JSONB NOT NULL DEFAULT '{}'::jsonb
         );
 
+        CREATE TABLE IF NOT EXISTS stranger_resolution_events (
+          id VARCHAR(128) PRIMARY KEY,
+          "clusterId" VARCHAR(128) NOT NULL,
+          action VARCHAR(32) NOT NULL,
+          "employeeId" VARCHAR(64),
+          actor VARCHAR(255) NOT NULL,
+          "resolvedAt" VARCHAR(64) NOT NULL,
+          "logIds" JSONB NOT NULL,
+          "sourceLogId" VARCHAR(64),
+          metadata JSONB NOT NULL DEFAULT '{}'::jsonb
+        );
+        CREATE INDEX IF NOT EXISTS idx_stranger_resolution_events_cluster
+          ON stranger_resolution_events ("clusterId", "resolvedAt");
+
         CREATE TABLE IF NOT EXISTS face_templates (
           id VARCHAR(64) PRIMARY KEY,
           "employeeId" VARCHAR(64) NOT NULL,
@@ -980,6 +1029,7 @@ class SQLiteStorage {
       `);
       await this.loadResolvedStrangerClusters();
       await this.loadStrangerResolutions();
+      await this.loadStrangerResolutionEvents();
       await this.loadAiRecognitionConfig();
       await this.loadFaceTemplates();
       console.log("[PostgreSQL] Các bảng dữ liệu đã sẵn sàng trên PostgreSQL!");
@@ -1150,8 +1200,22 @@ class SQLiteStorage {
         resolvedAt TEXT NOT NULL,
         logIds TEXT NOT NULL,
         sourceLogId TEXT,
-        metadata TEXT NOT NULL
+        metadata TEXT NOT NULL DEFAULT '{}'
       );
+
+      CREATE TABLE IF NOT EXISTS stranger_resolution_events (
+        id TEXT PRIMARY KEY,
+        clusterId TEXT NOT NULL,
+        action TEXT NOT NULL,
+        employeeId TEXT,
+        actor TEXT NOT NULL,
+        resolvedAt TEXT NOT NULL,
+        logIds TEXT NOT NULL,
+        sourceLogId TEXT,
+        metadata TEXT NOT NULL DEFAULT '{}'
+      );
+      CREATE INDEX IF NOT EXISTS idx_stranger_resolution_events_cluster
+        ON stranger_resolution_events (clusterId, resolvedAt);
     `);
 
     // Migration: databases created before the stranger alert existed have no
@@ -1185,6 +1249,7 @@ class SQLiteStorage {
     camera_streams_config?: CameraStreamsConfigRecord;
     resolved_stranger_clusters?: string[];
     stranger_resolutions?: StrangerResolutionRecord[];
+    stranger_resolution_events?: StrangerResolutionRecord[];
     face_templates?: FaceTemplateRecord[];
     ai_recognition_config?: AiRecognitionConfigRecord;
   } = {
@@ -1198,6 +1263,27 @@ class SQLiteStorage {
   };
 
   private fallbackFile = path.join(DATA_DIR, "smartface_data.json");
+  private fallbackStrangerHead: { log: AccessLogRecord; next: any } | null = null;
+  private fallbackStrangerNodes = new Map<string, { log: AccessLogRecord; next: any }>();
+
+  private isFallbackStrangerCandidate(log: AccessLogRecord): boolean {
+    return Boolean(log.photoSnapshot) && (log.status === "DENIED" || !log.employeeId || log.employeeName === "Không xác định");
+  }
+
+  private prependFallbackStrangerCandidate(log: AccessLogRecord): void {
+    if (!this.isFallbackStrangerCandidate(log) || this.fallbackStrangerNodes.has(log.id)) return;
+    const node = { log, next: this.fallbackStrangerHead };
+    this.fallbackStrangerHead = node;
+    this.fallbackStrangerNodes.set(log.id, node);
+  }
+
+  private rebuildFallbackStrangerIndex(): void {
+    this.fallbackStrangerHead = null;
+    this.fallbackStrangerNodes.clear();
+    for (let index = this.fallbackData.access_logs.length - 1; index >= 0; index -= 1) {
+      this.prependFallbackStrangerCandidate(this.fallbackData.access_logs[index]);
+    }
+  }
 
   private initFallbackStorage() {
     if (fs.existsSync(this.fallbackFile)) {
@@ -1206,11 +1292,18 @@ class SQLiteStorage {
         this.fallbackData = JSON.parse(raw);
       } catch {}
     }
+    this.rebuildFallbackStrangerIndex();
+  }
+
+  private writeFallback(data = this.fallbackData) {
+    const tempFile = `${this.fallbackFile}.${process.pid}.${randomUUID()}.tmp`;
+    fs.writeFileSync(tempFile, JSON.stringify(data, null, 2), "utf-8");
+    fs.renameSync(tempFile, this.fallbackFile);
   }
 
   private saveFallback() {
     try {
-      fs.writeFileSync(this.fallbackFile, JSON.stringify(this.fallbackData, null, 2), "utf-8");
+      this.writeFallback();
     } catch {}
   }
 
@@ -1236,6 +1329,17 @@ class SQLiteStorage {
       this.saveFallback();
     }
     return this.fallbackData.employees;
+  }
+
+  async getEmployeeById(id: string): Promise<EmployeeRecord | undefined> {
+    if (this.pgPool && this.isPostgres) {
+      const result = await this.pgPool.query('SELECT id,name,"employeeCode",department,position,"photoUrl","registeredAt","accessLevel" FROM employees WHERE id=$1', [id]);
+      return result.rows[0] as EmployeeRecord | undefined;
+    }
+    if (this.isNativeSqlite && this.db) {
+      return this.db.prepare("SELECT * FROM employees WHERE id=?").get(id) as EmployeeRecord | undefined;
+    }
+    return this.fallbackData.employees.find((employee) => employee.id === id);
   }
 
   saveEmployee(emp: EmployeeRecord) {
@@ -1373,9 +1477,130 @@ class SQLiteStorage {
     }
     if (this.fallbackData.access_logs.length === 0) {
       this.fallbackData.access_logs = [...defaults];
+      this.rebuildFallbackStrangerIndex();
       this.saveFallback();
     }
     return this.fallbackData.access_logs;
+  }
+
+  /** Authoritative metadata page; unlike startup hydration this is not capped at 100 rows. */
+  async getAccessLogsPage(page: number, limit: number): Promise<{ logs: AccessLogRecord[]; total: number }> {
+    const offset = Math.max(0, (page - 1) * limit);
+    if (this.pgPool && this.isPostgres) {
+      const [rows, count] = await Promise.all([
+        this.pgPool.query(
+          `SELECT id, timestamp, type, status, "employeeId", "employeeName", "employeeCode", department,
+                  confidence, "livenessScore", "lockAction", "doorName", reason,
+                  CASE WHEN "photoSnapshot" IS NOT NULL AND "photoSnapshot" <> '' THEN 1 ELSE 0 END AS "hasImage"
+             FROM access_logs ORDER BY timestamp DESC, id DESC LIMIT $1 OFFSET $2`,
+          [limit, offset],
+        ),
+        this.pgPool.query("SELECT count(*)::int AS total FROM access_logs"),
+      ]);
+      return { logs: rows.rows.map((row: any) => ({ ...rowToAccessLog(row), photoSnapshot: row.hasImage ? "stored" : "" })), total: Number(count.rows[0]?.total || 0) };
+    }
+    if (this.isNativeSqlite && this.db) {
+      const rows = this.db.prepare(`SELECT id, timestamp, type, status, employeeId, employeeName, employeeCode,
+        department, confidence, livenessScore, lockAction, doorName, reason,
+        CASE WHEN photoSnapshot IS NOT NULL AND photoSnapshot <> '' THEN 1 ELSE 0 END AS hasImage
+        FROM access_logs ORDER BY timestamp DESC, id DESC LIMIT ? OFFSET ?`).all(limit, offset) as any[];
+      const count = this.db.prepare("SELECT count(*) AS total FROM access_logs").get() as any;
+      return { logs: rows.map((row) => ({ ...rowToAccessLog(row), photoSnapshot: row.hasImage ? "stored" : "" })), total: Number(count?.total || 0) };
+    }
+    const sorted = this.fallbackData.access_logs.slice().sort((a, b) => b.timestamp.localeCompare(a.timestamp) || b.id.localeCompare(a.id));
+    return { logs: sorted.slice(offset, offset + limit).map((log) => ({
+      ...log, photoSnapshot: log.photoSnapshot ? "stored" : "", faceEmbedding: undefined,
+      faceEmbeddingModelTag: undefined, faceEmbeddingQuality: undefined,
+    })), total: sorted.length };
+  }
+
+  async getAccessLogById(id: string): Promise<AccessLogRecord | undefined> {
+    if (this.pgPool && this.isPostgres) {
+      const result = await this.pgPool.query(
+        `SELECT id, "photoSnapshot" FROM access_logs WHERE id = $1`,
+        [id],
+      );
+      return result.rows[0] ? rowToAccessLog(result.rows[0]) : undefined;
+    }
+    if (this.isNativeSqlite && this.db) {
+      const row = this.db.prepare("SELECT * FROM access_logs WHERE id = ?").get(id) as any;
+      return row ? rowToAccessLog(row) : undefined;
+    }
+    const row = this.fallbackData.access_logs.find((log) => log.id === id);
+    return row ? { ...row, faceEmbedding: row.faceEmbedding ? [...row.faceEmbedding] : undefined } : undefined;
+  }
+
+  /**
+   * Bounded keyset page of authoritative stranger candidates. The cursor is the
+   * last `(timestamp,id)` pair returned by the previous page; no request loads
+   * or reclusters the complete access-log history.
+   */
+  async getStrangerCandidateLogsPage(
+    cursor: { timestamp: string; id: string } | null,
+    limit: number,
+  ): Promise<{ logs: AccessLogRecord[]; hasMore: boolean }> {
+    const boundedLimit = Math.min(100, Math.max(1, Math.trunc(limit)));
+    const fetchLimit = boundedLimit + 1;
+    if (this.pgPool && this.isPostgres) {
+      const params: unknown[] = [];
+      const cursorWhere = cursor
+        ? ` AND (timestamp, id) < ($1, $2)`
+        : "";
+      if (cursor) params.push(cursor.timestamp, cursor.id);
+      params.push(fetchLimit);
+      const limitParam = `$${params.length}`;
+      const result = await this.pgPool.query(
+          `SELECT id, timestamp, type, status, "employeeId", "employeeName", "employeeCode", department,
+                  CASE WHEN "photoSnapshot" IS NOT NULL AND "photoSnapshot" <> '' THEN 'stored' ELSE '' END AS "photoSnapshot",
+                  confidence, "livenessScore", "lockAction", "doorName", reason,
+                  "faceEmbedding", "faceEmbeddingDims", "faceEmbeddingModelTag", "faceEmbeddingQuality"
+             FROM access_logs
+            WHERE "photoSnapshot" IS NOT NULL AND "photoSnapshot" <> ''
+              AND (status = 'DENIED' OR "employeeId" IS NULL OR "employeeName" = 'Không xác định')${cursorWhere}
+            ORDER BY timestamp DESC, id DESC LIMIT ${limitParam}`,
+          params,
+        );
+      const rows = result.rows.map(rowToAccessLog);
+      return { logs: rows.slice(0, boundedLimit), hasMore: rows.length > boundedLimit };
+    }
+    if (this.isNativeSqlite && this.db) {
+      const cursorWhere = cursor ? " AND (timestamp < ? OR (timestamp = ? AND id < ?))" : "";
+      const params = cursor ? [cursor.timestamp, cursor.timestamp, cursor.id, fetchLimit] : [fetchLimit];
+      const rows = this.db.prepare(
+        `SELECT id, timestamp, type, status, employeeId, employeeName, employeeCode, department,
+                CASE WHEN photoSnapshot IS NOT NULL AND photoSnapshot <> '' THEN 'stored' ELSE '' END AS photoSnapshot,
+                confidence, livenessScore, lockAction, doorName, reason,
+                faceEmbedding, faceEmbeddingDims, faceEmbeddingModelTag, faceEmbeddingQuality FROM access_logs
+          WHERE photoSnapshot IS NOT NULL AND photoSnapshot <> ''
+            AND (status = 'DENIED' OR employeeId IS NULL OR employeeName = 'Không xác định')${cursorWhere}
+          ORDER BY timestamp DESC, id DESC LIMIT ?`,
+      ).all(...params) as any[];
+      return { logs: rows.slice(0, boundedLimit).map(rowToAccessLog), hasMore: rows.length > boundedLimit };
+    }
+    let node = cursor ? this.fallbackStrangerNodes.get(cursor.id)?.next || null : this.fallbackStrangerHead;
+    const rows: AccessLogRecord[] = [];
+    while (node && rows.length < fetchLimit) {
+      rows.push(node.log);
+      node = node.next;
+    }
+    return {
+      logs: rows.slice(0, boundedLimit).map((log) => ({ ...log, photoSnapshot: "stored", faceEmbedding: log.faceEmbedding ? [...log.faceEmbedding] : undefined })),
+      hasMore: rows.length > boundedLimit,
+    };
+  }
+
+  async getStrangerCandidateLogById(id: string): Promise<AccessLogRecord | undefined> {
+    if (!this.pgPool && !this.isNativeSqlite) {
+      const log = this.fallbackStrangerNodes.get(id)?.log;
+      return log ? { ...log, photoSnapshot: "stored", faceEmbedding: log.faceEmbedding ? [...log.faceEmbedding] : undefined } : undefined;
+    }
+    const log = await this.getAccessLogById(id);
+    if (!log?.photoSnapshot || !(log.status === "DENIED" || !log.employeeId || log.employeeName === "Không xác định")) return undefined;
+    return { ...log, photoSnapshot: "stored", faceEmbedding: log.faceEmbedding ? [...log.faceEmbedding] : undefined };
+  }
+
+  getRetiredStrangerObservationIds(): string[] {
+    return this.getStrangerResolutions().flatMap((resolution) => resolution.logIds.map((id) => `log:${id}`));
   }
 
   /** Insert an immutable physical access event. Replays with the same id are no-ops. */
@@ -1434,10 +1659,9 @@ class SQLiteStorage {
       }
     }
     if (!this.fallbackData.access_logs.some((existing) => existing.id === log.id)) {
-      this.fallbackData.access_logs.unshift({ ...log });
-      if (this.fallbackData.access_logs.length > 150) {
-        this.fallbackData.access_logs = this.fallbackData.access_logs.slice(0, 150);
-      }
+      const stored = { ...log };
+      this.fallbackData.access_logs.unshift(stored);
+      this.prependFallbackStrangerCandidate(stored);
       this.saveFallback();
     }
   }
@@ -1457,6 +1681,7 @@ class SQLiteStorage {
       }
     }
     this.fallbackData.access_logs = [];
+    this.rebuildFallbackStrangerIndex();
     this.saveFallback();
   }
 
@@ -2223,6 +2448,40 @@ class SQLiteStorage {
 
   private strangerResolutionsCache: StrangerResolutionRecord[] = [];
   private strangerResolutionsHydrated = false;
+  private strangerResolutionEventsCache: StrangerResolutionRecord[] = [];
+  private strangerResolutionEventsHydrated = false;
+
+  private async loadStrangerResolutionEvents(): Promise<void> {
+    if (!this.pgPool) return;
+    try {
+      const result = await this.pgPool.query(
+        'SELECT id, "clusterId", action, "employeeId", actor, "resolvedAt", "logIds", "sourceLogId", metadata FROM stranger_resolution_events ORDER BY "resolvedAt", id'
+      );
+      this.strangerResolutionEventsCache = result.rows.map(rowToStrangerResolution);
+      this.strangerResolutionEventsHydrated = true;
+    } catch (err) {
+      console.error("[PostgreSQL] Lỗi nạp lịch sử adjudication người lạ:", err);
+    }
+  }
+
+  getStrangerResolutionEvents(clusterId?: string): StrangerResolutionRecord[] {
+    if (!this.strangerResolutionEventsHydrated) {
+      if (this.isNativeSqlite && this.db) {
+        try {
+          const rows = this.db.prepare("SELECT * FROM stranger_resolution_events ORDER BY resolvedAt, id").all() as any[];
+          this.strangerResolutionEventsCache = rows.map(rowToStrangerResolution);
+        } catch {
+          this.strangerResolutionEventsCache = [];
+        }
+      } else {
+        this.strangerResolutionEventsCache = [...(this.fallbackData.stranger_resolution_events || [])];
+      }
+      this.strangerResolutionEventsHydrated = true;
+    }
+    return this.strangerResolutionEventsCache
+      .filter((record) => !clusterId || record.clusterId === clusterId)
+      .map((record) => ({ ...record, logIds: [...record.logIds], metadata: { ...(record.metadata || {}) } }));
+  }
 
   private async loadStrangerResolutions(): Promise<void> {
     if (!this.pgPool) return;
@@ -2256,6 +2515,148 @@ class SQLiteStorage {
 
   getStrangerResolution(clusterId: string): StrangerResolutionRecord | undefined {
     return this.getStrangerResolutions().find((record) => record.clusterId === clusterId);
+  }
+
+  async commitStrangerResolution(input: StrangerResolutionCommit): Promise<StrangerResolutionCommitResult> {
+    const resolution: StrangerResolutionRecord = {
+      ...input.resolution,
+      logIds: [...input.resolution.logIds].sort(),
+      metadata: { ...(input.resolution.metadata || {}) },
+    };
+    const classify = (existing: StrangerResolutionRecord): StrangerResolutionCommitResult => ({
+      status: sameResolutionIntent(existing, resolution) ? "replay" : "conflict",
+      resolution: existing,
+    });
+
+    if (this.pgPool && this.isPostgres) {
+      const client = await this.pgPool.connect();
+      try {
+        await client.query("BEGIN");
+        const found = await client.query(
+          'SELECT id, "clusterId", action, "employeeId", actor, "resolvedAt", "logIds", "sourceLogId", metadata FROM stranger_resolutions WHERE "clusterId"=$1 FOR UPDATE',
+          [resolution.clusterId],
+        );
+        if (found.rows[0]) {
+          await client.query("ROLLBACK");
+          return classify(rowToStrangerResolution(found.rows[0]));
+        }
+        if (input.employee) {
+          const e = input.employee;
+          await client.query(
+            'INSERT INTO employees (id,name,"employeeCode",department,position,"photoUrl","registeredAt","accessLevel") VALUES ($1,$2,$3,$4,$5,$6,$7,$8)',
+            [e.id, e.name, e.employeeCode, e.department, e.position, e.photoUrl, e.registeredAt, e.accessLevel],
+          );
+        }
+        if (input.employeePhotoUpdate) {
+          await client.query('UPDATE employees SET "photoUrl"=$1 WHERE id=$2', [input.employeePhotoUpdate.photoUrl, input.employeePhotoUpdate.employeeId]);
+        }
+        if (input.faceTemplate) {
+          const t = input.faceTemplate;
+          await client.query(
+            'INSERT INTO face_templates (id,"employeeId",embedding,dims,"modelTag",source,quality,"capturedAt","sourceLogId","streamId") VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)',
+            [t.id, t.employeeId, embeddingToBuffer(t.embedding), t.dims, t.modelTag, t.source, t.quality, t.capturedAt, t.sourceLogId || null, t.streamId || null],
+          );
+        }
+        await client.query(
+          'INSERT INTO stranger_resolutions (id,"clusterId",action,"employeeId",actor,"resolvedAt","logIds","sourceLogId",metadata) VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb,$8,$9::jsonb)',
+          [resolution.id, resolution.clusterId, resolution.action, resolution.employeeId || null, resolution.actor,
+            resolution.resolvedAt, JSON.stringify(resolution.logIds), resolution.sourceLogId || null, JSON.stringify(resolution.metadata || {})],
+        );
+        await client.query(
+          'INSERT INTO stranger_resolution_events (id,"clusterId",action,"employeeId",actor,"resolvedAt","logIds","sourceLogId",metadata) VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb,$8,$9::jsonb)',
+          [resolution.id, resolution.clusterId, resolution.action, resolution.employeeId || null, resolution.actor,
+            resolution.resolvedAt, JSON.stringify(resolution.logIds), resolution.sourceLogId || null, JSON.stringify(resolution.metadata || {})],
+        );
+        await client.query(
+          'INSERT INTO resolved_stranger_clusters ("clusterId","resolvedAt","resolvedBy") VALUES ($1,$2,$3)',
+          [resolution.clusterId, resolution.resolvedAt, resolution.actor],
+        );
+        await client.query("COMMIT");
+      } catch (error: any) {
+        await client.query("ROLLBACK");
+        if (error?.code === "23505") {
+          const found = await this.pgPool.query(
+            'SELECT id, "clusterId", action, "employeeId", actor, "resolvedAt", "logIds", "sourceLogId", metadata FROM stranger_resolutions WHERE "clusterId"=$1',
+            [resolution.clusterId],
+          );
+          if (found.rows[0]) return classify(rowToStrangerResolution(found.rows[0]));
+        }
+        throw error;
+      } finally {
+        client.release();
+      }
+    } else if (this.isNativeSqlite && this.db) {
+      this.db.exec("BEGIN IMMEDIATE");
+      try {
+        const found = this.db.prepare("SELECT * FROM stranger_resolutions WHERE clusterId=?").get(resolution.clusterId) as any;
+        if (found) {
+          this.db.exec("ROLLBACK");
+          return classify(rowToStrangerResolution(found));
+        }
+        if (input.employee) {
+          const e = input.employee;
+          this.db.prepare("INSERT INTO employees (id,name,employeeCode,department,position,photoUrl,registeredAt,accessLevel) VALUES (?,?,?,?,?,?,?,?)")
+            .run(e.id, e.name, e.employeeCode, e.department, e.position, e.photoUrl, e.registeredAt, e.accessLevel);
+        }
+        if (input.employeePhotoUpdate) {
+          this.db.prepare("UPDATE employees SET photoUrl=? WHERE id=?").run(input.employeePhotoUpdate.photoUrl, input.employeePhotoUpdate.employeeId);
+        }
+        if (input.faceTemplate) {
+          const t = input.faceTemplate;
+          this.ensureSqliteFaceTemplates();
+          this.db.prepare("INSERT INTO face_templates (id,employeeId,embedding,dims,modelTag,source,quality,capturedAt,sourceLogId,streamId) VALUES (?,?,?,?,?,?,?,?,?,?)")
+            .run(t.id, t.employeeId, embeddingToBuffer(t.embedding), t.dims, t.modelTag, t.source, t.quality, t.capturedAt, t.sourceLogId || null, t.streamId || null);
+        }
+        this.db.prepare("INSERT INTO stranger_resolutions (id,clusterId,action,employeeId,actor,resolvedAt,logIds,sourceLogId,metadata) VALUES (?,?,?,?,?,?,?,?,?)")
+          .run(resolution.id, resolution.clusterId, resolution.action, resolution.employeeId || null, resolution.actor,
+            resolution.resolvedAt, JSON.stringify(resolution.logIds), resolution.sourceLogId || null, JSON.stringify(resolution.metadata || {}));
+        this.db.prepare("INSERT INTO stranger_resolution_events (id,clusterId,action,employeeId,actor,resolvedAt,logIds,sourceLogId,metadata) VALUES (?,?,?,?,?,?,?,?,?)")
+          .run(resolution.id, resolution.clusterId, resolution.action, resolution.employeeId || null, resolution.actor,
+            resolution.resolvedAt, JSON.stringify(resolution.logIds), resolution.sourceLogId || null, JSON.stringify(resolution.metadata || {}));
+        this.db.prepare("INSERT INTO resolved_stranger_clusters (clusterId,resolvedAt,resolvedBy) VALUES (?,?,?)")
+          .run(resolution.clusterId, resolution.resolvedAt, resolution.actor);
+        this.db.exec("COMMIT");
+      } catch (error) {
+        try { this.db.exec("ROLLBACK"); } catch {}
+        const found = this.db.prepare("SELECT * FROM stranger_resolutions WHERE clusterId=?").get(resolution.clusterId) as any;
+        if (found) return classify(rowToStrangerResolution(found));
+        throw error;
+      }
+    } else {
+      const found = (this.fallbackData.stranger_resolutions || []).find((item) => item.clusterId === resolution.clusterId);
+      if (found) return classify(found);
+      const staged = JSON.parse(JSON.stringify(this.fallbackData)) as typeof this.fallbackData;
+      if (input.employee) {
+        if (staged.employees.some((item) => item.id === input.employee!.id || item.employeeCode.toUpperCase() === input.employee!.employeeCode.toUpperCase())) {
+          throw new Error("employee-conflict");
+        }
+        staged.employees.unshift(input.employee);
+      }
+      if (input.employeePhotoUpdate) {
+        const employee = staged.employees.find((item) => item.id === input.employeePhotoUpdate!.employeeId);
+        if (!employee) throw new Error("employee-not-found");
+        employee.photoUrl = input.employeePhotoUpdate.photoUrl;
+      }
+      if (input.faceTemplate) (staged.face_templates ||= []).push(input.faceTemplate);
+      (staged.stranger_resolutions ||= []).push(resolution);
+      (staged.stranger_resolution_events ||= []).push(resolution);
+      (staged.resolved_stranger_clusters ||= []).push(resolution.clusterId);
+      this.writeFallback(staged);
+      this.fallbackData = staged;
+    }
+
+    this.strangerResolutionsCache.push(resolution);
+    this.strangerResolutionsHydrated = true;
+    this.getStrangerResolutionEvents();
+    if (!this.strangerResolutionEventsCache.some((item) => item.id === resolution.id)) {
+      this.strangerResolutionEventsCache.push(resolution);
+    }
+    if (!this.resolvedClustersCache.includes(resolution.clusterId)) this.resolvedClustersCache.push(resolution.clusterId);
+    if (input.faceTemplate) {
+      this.getFaceTemplates();
+      this.faceTemplatesCache.push(input.faceTemplate);
+    }
+    return { status: "created", resolution };
   }
 
   /** Append one idempotent adjudication without mutating the physical access event. */
@@ -2294,6 +2695,86 @@ class SQLiteStorage {
     this.saveFallback();
     this.markStrangerClusterResolved(snapshot.clusterId, snapshot.actor);
     return snapshot;
+  }
+
+  async restoreStrangerResolution(record: StrangerResolutionRecord): Promise<StrangerResolutionRecord> {
+    const restore: StrangerResolutionRecord = {
+      ...record,
+      action: "RESTORE",
+      logIds: [...record.logIds].sort(),
+      metadata: { ...(record.metadata || {}) },
+    };
+    const existing = this.getStrangerResolution(restore.clusterId);
+    if (!existing || existing.action !== "DISMISS" || !sameResolutionIntent(
+      existing,
+      { ...existing, logIds: restore.logIds },
+    )) throw new Error("restore-conflict");
+
+    if (this.pgPool && this.isPostgres) {
+      const client = await this.pgPool.connect();
+      try {
+        await client.query("BEGIN");
+        const found = await client.query(
+          'SELECT id, "clusterId", action, "employeeId", actor, "resolvedAt", "logIds", "sourceLogId", metadata FROM stranger_resolutions WHERE "clusterId"=$1 FOR UPDATE',
+          [restore.clusterId],
+        );
+        const current = found.rows[0] ? rowToStrangerResolution(found.rows[0]) : undefined;
+        if (!current || current.action !== "DISMISS" || !sameResolutionIntent(current, { ...current, logIds: restore.logIds })) {
+          await client.query("ROLLBACK");
+          throw new Error("restore-conflict");
+        }
+        await client.query(
+          'INSERT INTO stranger_resolution_events (id,"clusterId",action,"employeeId",actor,"resolvedAt","logIds","sourceLogId",metadata) VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb,$8,$9::jsonb)',
+          [restore.id, restore.clusterId, restore.action, null, restore.actor, restore.resolvedAt,
+            JSON.stringify(restore.logIds), restore.sourceLogId || null, JSON.stringify(restore.metadata || {})],
+        );
+        await client.query('DELETE FROM stranger_resolutions WHERE "clusterId"=$1', [restore.clusterId]);
+        await client.query('DELETE FROM resolved_stranger_clusters WHERE "clusterId"=$1', [restore.clusterId]);
+        await client.query("COMMIT");
+      } catch (error) {
+        try { await client.query("ROLLBACK"); } catch {}
+        throw error;
+      } finally {
+        client.release();
+      }
+    } else if (this.isNativeSqlite && this.db) {
+      this.db.exec("BEGIN IMMEDIATE");
+      try {
+        const found = this.db.prepare("SELECT * FROM stranger_resolutions WHERE clusterId=?").get(restore.clusterId) as any;
+        const current = found ? rowToStrangerResolution(found) : undefined;
+        if (!current || current.action !== "DISMISS" || !sameResolutionIntent(current, { ...current, logIds: restore.logIds })) {
+          throw new Error("restore-conflict");
+        }
+        this.db.prepare("INSERT INTO stranger_resolution_events (id,clusterId,action,employeeId,actor,resolvedAt,logIds,sourceLogId,metadata) VALUES (?,?,?,?,?,?,?,?,?)")
+          .run(restore.id, restore.clusterId, restore.action, null, restore.actor, restore.resolvedAt,
+            JSON.stringify(restore.logIds), restore.sourceLogId || null, JSON.stringify(restore.metadata || {}));
+        this.db.prepare("DELETE FROM stranger_resolutions WHERE clusterId=?").run(restore.clusterId);
+        this.db.prepare("DELETE FROM resolved_stranger_clusters WHERE clusterId=?").run(restore.clusterId);
+        this.db.exec("COMMIT");
+      } catch (error) {
+        try { this.db.exec("ROLLBACK"); } catch {}
+        throw error;
+      }
+    } else {
+      const staged = JSON.parse(JSON.stringify(this.fallbackData)) as typeof this.fallbackData;
+      const current = (staged.stranger_resolutions || []).find((item) => item.clusterId === restore.clusterId);
+      if (!current || current.action !== "DISMISS" || !sameResolutionIntent(current, { ...current, logIds: restore.logIds })) {
+        throw new Error("restore-conflict");
+      }
+      (staged.stranger_resolution_events ||= []).push(restore);
+      staged.stranger_resolutions = (staged.stranger_resolutions || []).filter((item) => item.clusterId !== restore.clusterId);
+      staged.resolved_stranger_clusters = (staged.resolved_stranger_clusters || []).filter((id) => id !== restore.clusterId);
+      this.writeFallback(staged);
+      this.fallbackData = staged;
+    }
+
+    this.strangerResolutionsCache = this.strangerResolutionsCache.filter((item) => item.clusterId !== restore.clusterId);
+    this.getStrangerResolutionEvents();
+    if (!this.strangerResolutionEventsCache.some((item) => item.id === restore.id)) {
+      this.strangerResolutionEventsCache.push(restore);
+    }
+    this.resolvedClustersCache = this.resolvedClustersCache.filter((id) => id !== restore.clusterId);
+    return restore;
   }
 
   // ================= FACE TEMPLATES (real engine gallery) =================

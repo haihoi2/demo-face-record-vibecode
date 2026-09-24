@@ -1,3 +1,4 @@
+import { createHash } from "crypto";
 import { AccessLogRecord } from "./db";
 
 export interface StrangerPhoto {
@@ -76,8 +77,8 @@ function imageUrl(logId: string): string {
 }
 
 function clusterIdFor(logIds: string[]): string {
-  const stable = [...logIds].sort()[0] || "unknown";
-  return `cluster-${stable.replace(/[^a-zA-Z0-9]/g, "").slice(0, 32)}`;
+  const exactMembership = [...logIds].sort().map((id) => `${Buffer.byteLength(id, "utf8")}:${id}`).join("|");
+  return `cluster-${createHash("sha256").update(exactMembership).digest("hex")}`;
 }
 
 /**
@@ -109,40 +110,34 @@ export function clusterStrangerFaces(
     .slice()
     .sort((a, b) => a.id.localeCompare(b.id));
 
-  const parent = logs.map((_, index) => index);
-  const find = (start: number): number => {
-    let index = start;
-    while (parent[index] !== index) {
-      parent[index] = parent[parent[index]];
-      index = parent[index];
+  const groups: AccessLogRecord[][] = [];
+  for (const log of logs) {
+    if (!log.faceEmbedding?.length || !log.faceEmbeddingModelTag) {
+      groups.push([log]);
+      continue;
     }
-    return index;
-  };
-  const union = (a: number, b: number): void => {
-    const ra = find(a);
-    const rb = find(b);
-    if (ra !== rb) parent[Math.max(ra, rb)] = Math.min(ra, rb);
-  };
 
-  for (let i = 0; i < logs.length; i++) {
-    const a = logs[i];
-    if (!a.faceEmbedding?.length || !a.faceEmbeddingModelTag) continue;
-    for (let j = i + 1; j < logs.length; j++) {
-      const b = logs[j];
-      if (!b.faceEmbedding?.length || b.faceEmbeddingModelTag !== a.faceEmbeddingModelTag) continue;
-      if (cosineSimilarity(a.faceEmbedding, b.faceEmbedding) >= threshold) union(i, j);
+    let bestGroup = -1;
+    let bestMinimumSimilarity = -Infinity;
+    for (let groupIndex = 0; groupIndex < groups.length; groupIndex++) {
+      const group = groups[groupIndex];
+      if (group.some((member) =>
+        !member.faceEmbedding?.length || member.faceEmbeddingModelTag !== log.faceEmbeddingModelTag
+      )) continue;
+      const similarities = group.map((member) => cosineSimilarity(log.faceEmbedding!, member.faceEmbedding!));
+      const minimumSimilarity = Math.min(...similarities);
+      if (minimumSimilarity >= threshold && minimumSimilarity > bestMinimumSimilarity) {
+        bestGroup = groupIndex;
+        bestMinimumSimilarity = minimumSimilarity;
+      }
     }
+    if (bestGroup >= 0) groups[bestGroup].push(log);
+    else groups.push([log]);
   }
-
-  const grouped = new Map<number, AccessLogRecord[]>();
-  logs.forEach((log, index) => {
-    const root = find(index);
-    grouped.set(root, [...(grouped.get(root) || []), log]);
-  });
 
   const clusters: StrangerCluster[] = [];
   let index = 1;
-  for (const members of grouped.values()) {
+  for (const members of groups) {
     const clusterId = clusterIdFor(members.map((log) => log.id));
     if (resolved.has(clusterId)) continue;
 

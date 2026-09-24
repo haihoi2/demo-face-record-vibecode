@@ -21,19 +21,21 @@ import {
 } from "./types";
 import { Bell, CheckCircle2, AlertTriangle, Sparkles, X, Code2, Copy, Check, Camera, ScanFace } from "lucide-react";
 import { soundEffects } from "./utils/audio";
-import { safeJsonFetch, normalizeApiUrl, getApiBaseUrl, getCustomBackendUrl, setCustomBackendUrl } from "./utils/api";
+import { safeJsonFetch, operatorJsonFetch, normalizeApiUrl, getApiBaseUrl, getCustomBackendUrl, setCustomBackendUrl } from "./utils/api";
 import {
   isNetlifyOrStaticHost,
   getStoredEmployees,
   saveStoredEmployees,
   getStoredLogs,
   saveStoredLogs,
+  clearLegacyProtectedLogCache,
   getStoredLockState,
   saveStoredLockState,
   getStoredNotifications,
   saveStoredNotifications,
   clientDoorUnlock,
   clientEventBus,
+  demoOfflinePersistenceEnabled,
 } from "./utils/offlineEngine";
 
 /**
@@ -138,6 +140,7 @@ export default function App() {
   }, []);
 
   useEffect(() => {
+    clearLegacyProtectedLogCache();
     applyHashRoute();
     window.addEventListener("hashchange", applyHashRoute);
     return () => window.removeEventListener("hashchange", applyHashRoute);
@@ -213,7 +216,7 @@ export default function App() {
     try {
       const [empRes, logRes, lockRes, notifRes] = await Promise.all([
         safeJsonFetch<Employee[]>("/api/employees", undefined, []),
-        safeJsonFetch<AccessLog[]>("/api/logs", undefined, []),
+        operatorJsonFetch<{ logs: AccessLog[] }>("/api/logs?limit=100", undefined, { logs: [] }),
         safeJsonFetch<SmartLockState | null>("/api/lock/status", undefined, null),
         safeJsonFetch<MobileNotification[]>("/api/notifications", undefined, []),
       ]);
@@ -227,9 +230,9 @@ export default function App() {
       }
 
       // Access Logs
-      if (logRes.ok && Array.isArray(logRes.data) && logRes.data.length > 0) {
-        setAccessLogs(logRes.data);
-        saveStoredLogs(logRes.data);
+      if (logRes.ok && Array.isArray(logRes.data?.logs)) {
+        setAccessLogs(logRes.data.logs);
+        saveStoredLogs(logRes.data.logs);
       } else {
         setAccessLogs(getStoredLogs());
       }
@@ -305,7 +308,7 @@ export default function App() {
       if (!isMounted) return;
       try {
         const eventsUrl = normalizeApiUrl("/api/events");
-        eventSource = new EventSource(eventsUrl);
+        eventSource = new EventSource(eventsUrl, { withCredentials: true });
 
         eventSource.onopen = () => {
           if (isMounted) {
@@ -470,7 +473,7 @@ export default function App() {
   const handleManualUnlock = async () => {
     soundEffects.playLockClick();
     try {
-      const res = await fetch(normalizeApiUrl("/api/lock/unlock"), {
+      const res = await operatorJsonFetch("/api/lock/unlock", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -478,12 +481,10 @@ export default function App() {
           reason: "Kích hoạt trực tiếp từ trung tâm điều khiển",
         }),
       });
-      if (!res.ok) {
-        throw new Error(`Unlock request failed with status ${res.status}`);
-      }
+      if (!res.ok) throw new Error(res.error || `Unlock request failed with status ${res.status}`);
       soundEffects.playSuccess();
     } catch (err) {
-      if (isNetlifyOrStaticHost() && !getApiBaseUrl()) {
+      if (demoOfflinePersistenceEnabled()) {
         console.warn("Mở cửa qua Client Fallback:", err);
         clientDoorUnlock("Bảo Vệ Mở Cửa Khẩn Cấp (Client Fallback)");
         soundEffects.playSuccess();
@@ -501,9 +502,11 @@ export default function App() {
 
   const handleEmployeeDeleted = async (id: string) => {
     try {
-      await fetch(normalizeApiUrl(`/api/employees/${encodeURIComponent(id)}`), { method: "DELETE" });
+      const result = await operatorJsonFetch(`/api/employees/${encodeURIComponent(id)}`, { method: "DELETE" });
+      if (!result.ok) throw new Error(result.error || `Xóa nhân viên thất bại (HTTP ${result.status})`);
     } catch (err) {
-      console.warn("Xóa nhân viên trên máy chủ thất bại, cập nhật local:", err);
+      console.warn("Xóa nhân viên trên máy chủ thất bại:", err);
+      return;
     }
     setEmployees((prev) => {
       const updated = prev.filter((e) => e.id !== id);
@@ -514,9 +517,15 @@ export default function App() {
 
   const handleClearLogs = async () => {
     try {
-      await fetch(normalizeApiUrl("/api/logs/clear"), { method: "POST" });
+      const result = await operatorJsonFetch("/api/logs/clear", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: "{}",
+      });
+      if (!result.ok) throw new Error(result.error || `Xóa logs thất bại (HTTP ${result.status})`);
     } catch (err) {
-      console.warn("Xóa logs trên máy chủ thất bại, cập nhật local:", err);
+      console.warn("Xóa logs trên máy chủ thất bại:", err);
+      return;
     }
     setAccessLogs([]);
     saveStoredLogs([]);
@@ -524,9 +533,11 @@ export default function App() {
 
   const handleClearNotifications = async () => {
     try {
-      await fetch(normalizeApiUrl("/api/notifications/clear"), { method: "POST" });
+      const result = await operatorJsonFetch("/api/notifications/clear", { method: "POST" });
+      if (!result.ok) throw new Error(result.error || `Xóa thông báo thất bại (HTTP ${result.status})`);
     } catch (err) {
-      console.warn("Xóa thông báo trên máy chủ thất bại, cập nhật local:", err);
+      console.warn("Xóa thông báo trên máy chủ thất bại:", err);
+      return;
     }
     setNotifications([]);
     saveStoredNotifications([]);
@@ -534,9 +545,11 @@ export default function App() {
 
   const handleMarkNotificationsRead = async () => {
     try {
-      await fetch(normalizeApiUrl("/api/notifications/mark-read"), { method: "POST" });
+      const result = await operatorJsonFetch("/api/notifications/mark-read", { method: "POST" });
+      if (!result.ok) throw new Error(result.error || `Đánh dấu thông báo thất bại (HTTP ${result.status})`);
     } catch (err) {
-      console.warn("Đánh dấu đã đọc trên máy chủ thất bại, cập nhật local:", err);
+      console.warn("Đánh dấu đã đọc trên máy chủ thất bại:", err);
+      return;
     }
     setNotifications((prev) => {
       const updated = prev.map((n) => ({ ...n, read: true }));

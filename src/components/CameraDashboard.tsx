@@ -46,12 +46,13 @@ import {
   GateWatchRuntime,
 } from "../types";
 import { soundEffects } from "../utils/audio";
-import { safeJsonFetch, normalizeApiUrl, getApiBaseUrl, buildEventSourceUrl } from "../utils/api";
+import { safeJsonFetch, operatorJsonFetch, getApiBaseUrl, buildEventSourceUrl } from "../utils/api";
 import { runLocalFaceRecognition } from "../utils/localBiometrics";
 import {
   isNetlifyOrStaticHost,
   clientDoorUnlock,
   getStoredAiConfig,
+  demoOfflinePersistenceEnabled,
 } from "../utils/offlineEngine";
 
 const DEFAULT_STREAMS_CONFIG: CameraStreamsConfig = {
@@ -1123,10 +1124,9 @@ export const CameraDashboard: React.FC<CameraDashboardProps> = ({
         onRecognitionComplete(finalResult);
 
         if (finalResult.recognized) {
-          soundEffects.playSuccess();
           // Trigger smart lock unlock
           try {
-            await fetch(normalizeApiUrl("/api/lock/unlock"), {
+            const unlock = await operatorJsonFetch("/api/lock/unlock", {
               method: "POST",
               headers: { "Content-Type": "application/json" },
               body: JSON.stringify({
@@ -1134,8 +1134,16 @@ export const CameraDashboard: React.FC<CameraDashboardProps> = ({
                 reason: `Nhận diện khuôn mặt hợp lệ: ${finalResult.employee?.name || "Nhân viên"}`,
               }),
             });
-          } catch {
-            clientDoorUnlock(`${gateConfig.name} (Client Fallback)`);
+            if (!unlock.ok) throw new Error(unlock.error || `Unlock failed (HTTP ${unlock.status})`);
+            soundEffects.playSuccess();
+          } catch (err) {
+            if (demoOfflinePersistenceEnabled()) {
+              clientDoorUnlock(`${gateConfig.name} (Client Fallback)`, undefined, undefined, { simulated: true });
+              soundEffects.playSuccess();
+            } else {
+              console.warn("Không thể mở cửa sau nhận diện:", err);
+              soundEffects.playDenied();
+            }
           }
         } else if ((finalResult.totalFacesDetected ?? faces.length) > 0) {
           soundEffects.playStrangerAlert();
@@ -1189,7 +1197,7 @@ export const CameraDashboard: React.FC<CameraDashboardProps> = ({
   const handleGateUnlock = async (gateName: string) => {
     soundEffects.playLockClick();
     try {
-      await fetch(normalizeApiUrl("/api/lock/unlock"), {
+      const result = await operatorJsonFetch("/api/lock/unlock", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -1197,10 +1205,16 @@ export const CameraDashboard: React.FC<CameraDashboardProps> = ({
           reason: "Bảo vệ bấm nút mở cổng từ Dashboard Quét Cửa AI",
         }),
       });
+      if (!result.ok) throw new Error(result.error || `Unlock failed (HTTP ${result.status})`);
       soundEffects.playSuccess();
-    } catch {
-      clientDoorUnlock(`Điều khiển mở cửa (${gateName})`);
-      soundEffects.playSuccess();
+    } catch (err) {
+      if (demoOfflinePersistenceEnabled()) {
+        clientDoorUnlock(`Điều khiển mở cửa (${gateName})`, undefined, undefined, { simulated: true });
+        soundEffects.playSuccess();
+      } else {
+        console.warn("Mở cổng thất bại:", err);
+        soundEffects.playDenied();
+      }
     }
   };
 

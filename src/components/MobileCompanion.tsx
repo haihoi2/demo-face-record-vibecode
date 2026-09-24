@@ -18,8 +18,8 @@ import {
 } from "lucide-react";
 import { MobileNotification, SmartLockState } from "../types";
 import { soundEffects } from "../utils/audio";
-import { normalizeApiUrl, getApiBaseUrl } from "../utils/api";
-import { clientDoorUnlock, isNetlifyOrStaticHost } from "../utils/offlineEngine";
+import { operatorJsonFetch } from "../utils/api";
+import { clientDoorUnlock, demoOfflinePersistenceEnabled } from "../utils/offlineEngine";
 
 interface MobileCompanionProps {
   notifications: MobileNotification[];
@@ -38,7 +38,7 @@ export const MobileCompanion: React.FC<MobileCompanionProps> = ({
 }) => {
   const [filter, setFilter] = useState<"ALL" | "SUCCESS" | "WARNING">("ALL");
   const [isUnlocking, setIsUnlocking] = useState<boolean>(false);
-  const shouldUseClientFallback = isNetlifyOrStaticHost() && !getApiBaseUrl();
+  const shouldUseClientFallback = demoOfflinePersistenceEnabled();
 
   const filteredNotifications = notifications.filter((notif) => {
     if (filter === "SUCCESS") return notif.type === "SUCCESS";
@@ -50,7 +50,7 @@ export const MobileCompanion: React.FC<MobileCompanionProps> = ({
     setIsUnlocking(true);
     try {
       soundEffects.playLockClick();
-      const res = await fetch(normalizeApiUrl("/api/lock/unlock"), {
+      const res = await operatorJsonFetch("/api/lock/unlock", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -58,9 +58,7 @@ export const MobileCompanion: React.FC<MobileCompanionProps> = ({
           reason: "Người quản lý mở cửa từ xa qua điện thoại",
         }),
       });
-      if (!res.ok) {
-        throw new Error(`Unlock request failed with status ${res.status}`);
-      }
+      if (!res.ok) throw new Error(res.error || `Unlock request failed with status ${res.status}`);
       soundEffects.playSuccess();
     } catch (err) {
       if (shouldUseClientFallback) {

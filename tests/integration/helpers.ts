@@ -15,8 +15,8 @@ export interface ApiResponse<T = any> {
   text: string;
 }
 
-/** Fetch a path relative to BASE_URL and parse the JSON body when there is one. */
-export async function api<T = any>(path: string, init: RequestInit = {}): Promise<ApiResponse<T>> {
+/** Fetch without an operator session (used by authorization regressions). */
+export async function rawApi<T = any>(path: string, init: RequestInit = {}): Promise<ApiResponse<T>> {
   const res = await fetch(BASE_URL + path, init);
   const text = await res.text();
   let body: any = undefined;
@@ -28,6 +28,49 @@ export async function api<T = any>(path: string, init: RequestInit = {}): Promis
     }
   }
   return { status: res.status, headers: res.headers, body, text };
+}
+
+let operatorCookiePromise: Promise<string> | null = null;
+const csrfByCookie = new Map<string, string>();
+
+export async function authenticateAs(token: string): Promise<string> {
+  const res = await rawApi<{ success?: boolean; csrfToken?: string }>("/api/operator/session", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ token }),
+  });
+  if (res.status !== 200) {
+    throw new Error(`Operator login failed: HTTP ${res.status} ${res.text.slice(0, 200)}`);
+  }
+  const cookie = res.headers.get("set-cookie")?.split(";", 1)[0] || "";
+  if (!cookie) throw new Error("Operator login returned no session cookie");
+  if (!res.body?.csrfToken) throw new Error("Operator login returned no CSRF token");
+  csrfByCookie.set(cookie, res.body.csrfToken);
+  return cookie;
+}
+
+export function csrfTokenForCookie(cookie: string): string {
+  return csrfByCookie.get(cookie) || "";
+}
+
+async function operatorCookie(): Promise<string> {
+  if (!operatorCookiePromise) {
+    const token = process.env.OPERATOR_TOKEN || "integration-operator-token";
+    operatorCookiePromise = authenticateAs(token);
+  }
+  return operatorCookiePromise;
+}
+
+/** Fetch with the integration operator's short-lived HttpOnly session. */
+export async function api<T = any>(path: string, init: RequestInit = {}): Promise<ApiResponse<T>> {
+  const headers = new Headers(init.headers);
+  const cookie = await operatorCookie();
+  headers.set("Cookie", cookie);
+  if (!/^(GET|HEAD|OPTIONS)$/i.test(init.method || "GET")) {
+    headers.set("X-CSRF-Token", csrfByCookie.get(cookie) || "");
+    if (!headers.has("Content-Type")) headers.set("Content-Type", "application/json");
+  }
+  return rawApi<T>(path, { ...init, headers });
 }
 
 export function postJson<T = any>(path: string, payload: unknown, extraHeaders: Record<string, string> = {}) {

@@ -12,7 +12,7 @@ import {
   DoorControllerConfig,
   DoorApiLog,
 } from "../types";
-import { safeJsonFetch } from "./api";
+import { getApiBaseUrl, safeJsonFetch } from "./api";
 import { runLocalFaceRecognition } from "./localBiometrics";
 
 export const DEFAULT_OFFLINE_EMPLOYEES: Employee[] = [
@@ -153,51 +153,120 @@ export function isNetlifyOrStaticHost(): boolean {
   );
 }
 
-// Local Storage Keys
-const STORAGE_KEY_EMPLOYEES = "smartlock_offline_employees_v2";
-const STORAGE_KEY_LOGS = "smartlock_offline_logs_v2";
+// Local Storage Keys. Biometric employee/log caches are demo-only and disabled
+// unless all three conditions are true: explicit build flag, static demo host,
+// and no configured backend API.
+const LEGACY_SENSITIVE_STORAGE_KEYS = [
+  "smartlock_offline_logs_v2",
+  "smartlock_demo_only_logs_v3",
+  "smartlock_offline_employees",
+  "smartlock_offline_employees_v2",
+  "smartlock_offline_lock_v2",
+  "smartlock_offline_notifs_v2",
+  "smartlock_offline_webhook_config_v2",
+  "smartlock_offline_webhook_logs_v2",
+  "smartlock_door_controller_config_v1",
+  "smartlock_door_controller_logs_v1",
+  "smartface_camera_streams_config",
+] as const;
+const STORAGE_KEY_EMPLOYEES = "smartlock_demo_offline_employees_v3";
+const STORAGE_KEY_LOGS = "smartlock_demo_offline_logs_v4";
 const STORAGE_KEY_LOCK = "smartlock_offline_lock_v2";
 const STORAGE_KEY_NOTIFS = "smartlock_offline_notifs_v2";
 
-export function getStoredEmployees(): Employee[] {
+export function isDemoOfflinePersistenceAllowed(input: {
+  explicitlyEnabled: boolean;
+  staticHost: boolean;
+  apiBaseUrl: string;
+}): boolean {
+  return input.explicitlyEnabled && input.staticHost && !input.apiBaseUrl.trim();
+}
+
+export function demoOfflinePersistenceEnabled(): boolean {
+  const env = (import.meta as any).env || {};
+  return isDemoOfflinePersistenceAllowed({
+    explicitlyEnabled: String(env.VITE_ENABLE_DEMO_OFFLINE_PERSISTENCE || "").toLowerCase() === "true",
+    staticHost: isNetlifyOrStaticHost(),
+    apiBaseUrl: getApiBaseUrl(),
+  });
+}
+
+/** Remove historical browser caches and current demo caches whenever disabled. */
+export function clearLegacyProtectedLogCache(enabled = demoOfflinePersistenceEnabled()): void {
+  try {
+    for (const key of LEGACY_SENSITIVE_STORAGE_KEYS) localStorage.removeItem(key);
+    if (!enabled) {
+      localStorage.removeItem(STORAGE_KEY_LOGS);
+      localStorage.removeItem(STORAGE_KEY_EMPLOYEES);
+      localStorage.removeItem(STORAGE_KEY_LOCK);
+      localStorage.removeItem(STORAGE_KEY_NOTIFS);
+      localStorage.removeItem(STORAGE_KEY_WEBHOOK_CONFIG);
+      localStorage.removeItem(STORAGE_KEY_WEBHOOK_LOGS);
+      localStorage.removeItem(STORAGE_KEY_DOOR_CONFIG);
+      localStorage.removeItem(STORAGE_KEY_DOOR_LOGS);
+    }
+  } catch {}
+}
+
+export function getStoredEmployees(enabled = demoOfflinePersistenceEnabled()): Employee[] {
+  if (!enabled) {
+    clearLegacyProtectedLogCache(false);
+    return [];
+  }
   try {
     const raw = localStorage.getItem(STORAGE_KEY_EMPLOYEES);
     if (raw) {
       const parsed = JSON.parse(raw);
-      if (Array.isArray(parsed) && parsed.length > 0) return parsed;
+      if (Array.isArray(parsed)) return parsed;
     }
   } catch {}
   return DEFAULT_OFFLINE_EMPLOYEES;
 }
 
-export function saveStoredEmployees(employees: Employee[]): void {
+export function saveStoredEmployees(employees: Employee[], enabled = demoOfflinePersistenceEnabled()): void {
+  if (!enabled) {
+    clearLegacyProtectedLogCache(false);
+    return;
+  }
   try {
     localStorage.setItem(STORAGE_KEY_EMPLOYEES, JSON.stringify(employees));
   } catch (e) {
-    console.warn("Lỗi lưu employees vào localStorage:", e);
+    console.warn("Lỗi lưu employees demo vào localStorage:", e);
   }
 }
 
-export function getStoredLogs(): AccessLog[] {
+export function getStoredLogs(enabled = demoOfflinePersistenceEnabled()): AccessLog[] {
+  if (!enabled) {
+    clearLegacyProtectedLogCache(false);
+    return [];
+  }
   try {
     const raw = localStorage.getItem(STORAGE_KEY_LOGS);
     if (raw) {
       const parsed = JSON.parse(raw);
-      if (Array.isArray(parsed) && parsed.length > 0) return parsed;
+      if (Array.isArray(parsed)) return parsed;
     }
   } catch {}
   return DEFAULT_OFFLINE_LOGS;
 }
 
-export function saveStoredLogs(logs: AccessLog[]): void {
+export function saveStoredLogs(logs: AccessLog[], enabled = demoOfflinePersistenceEnabled()): void {
+  if (!enabled) {
+    clearLegacyProtectedLogCache(false);
+    return;
+  }
   try {
     localStorage.setItem(STORAGE_KEY_LOGS, JSON.stringify(logs.slice(0, 200)));
   } catch (e) {
-    console.warn("Lỗi lưu logs vào localStorage:", e);
+    console.warn("Lỗi lưu logs demo vào localStorage:", e);
   }
 }
 
-export function getStoredLockState(): SmartLockState {
+export function getStoredLockState(enabled = demoOfflinePersistenceEnabled()): SmartLockState {
+  if (!enabled) {
+    clearLegacyProtectedLogCache(false);
+    return DEFAULT_OFFLINE_LOCK;
+  }
   try {
     const raw = localStorage.getItem(STORAGE_KEY_LOCK);
     if (raw) return JSON.parse(raw);
@@ -205,7 +274,11 @@ export function getStoredLockState(): SmartLockState {
   return DEFAULT_OFFLINE_LOCK;
 }
 
-export function saveStoredLockState(state: SmartLockState): void {
+export function saveStoredLockState(state: SmartLockState, enabled = demoOfflinePersistenceEnabled()): void {
+  if (!enabled) {
+    clearLegacyProtectedLogCache(false);
+    return;
+  }
   try {
     localStorage.setItem(STORAGE_KEY_LOCK, JSON.stringify(state));
   } catch (e) {
@@ -213,7 +286,11 @@ export function saveStoredLockState(state: SmartLockState): void {
   }
 }
 
-export function getStoredNotifications(): MobileNotification[] {
+export function getStoredNotifications(enabled = demoOfflinePersistenceEnabled()): MobileNotification[] {
+  if (!enabled) {
+    clearLegacyProtectedLogCache(false);
+    return [];
+  }
   try {
     const raw = localStorage.getItem(STORAGE_KEY_NOTIFS);
     if (raw) {
@@ -224,7 +301,11 @@ export function getStoredNotifications(): MobileNotification[] {
   return DEFAULT_OFFLINE_NOTIFICATIONS;
 }
 
-export function saveStoredNotifications(notifs: MobileNotification[]): void {
+export function saveStoredNotifications(notifs: MobileNotification[], enabled = demoOfflinePersistenceEnabled()): void {
+  if (!enabled) {
+    clearLegacyProtectedLogCache(false);
+    return;
+  }
   try {
     localStorage.setItem(STORAGE_KEY_NOTIFS, JSON.stringify(notifs.slice(0, 100)));
   } catch (e) {
@@ -263,7 +344,11 @@ export const DEFAULT_OFFLINE_WEBHOOK_LOGS: WebhookLog[] = [
   },
 ];
 
-export function getStoredWebhookConfig(): WebhookConfig {
+export function getStoredWebhookConfig(enabled = demoOfflinePersistenceEnabled()): WebhookConfig {
+  if (!enabled) {
+    clearLegacyProtectedLogCache(false);
+    return DEFAULT_OFFLINE_WEBHOOK_CONFIG;
+  }
   try {
     const raw = localStorage.getItem(STORAGE_KEY_WEBHOOK_CONFIG);
     if (raw) {
@@ -280,7 +365,11 @@ export function getStoredWebhookConfig(): WebhookConfig {
   return DEFAULT_OFFLINE_WEBHOOK_CONFIG;
 }
 
-export function saveStoredWebhookConfig(config: WebhookConfig): void {
+export function saveStoredWebhookConfig(config: WebhookConfig, enabled = demoOfflinePersistenceEnabled()): void {
+  if (!enabled) {
+    clearLegacyProtectedLogCache(false);
+    return;
+  }
   try {
     if (!config.url || config.url.includes("...") || config.url.endsWith("/hooks/") || config.url.endsWith("/hooks")) {
       config.url = DEFAULT_OFFLINE_WEBHOOK_CONFIG.url;
@@ -291,7 +380,11 @@ export function saveStoredWebhookConfig(config: WebhookConfig): void {
   }
 }
 
-export function getStoredWebhookLogs(): WebhookLog[] {
+export function getStoredWebhookLogs(enabled = demoOfflinePersistenceEnabled()): WebhookLog[] {
+  if (!enabled) {
+    clearLegacyProtectedLogCache(false);
+    return [];
+  }
   try {
     const raw = localStorage.getItem(STORAGE_KEY_WEBHOOK_LOGS);
     if (raw) {
@@ -302,7 +395,11 @@ export function getStoredWebhookLogs(): WebhookLog[] {
   return DEFAULT_OFFLINE_WEBHOOK_LOGS;
 }
 
-export function saveStoredWebhookLogs(logs: WebhookLog[]): void {
+export function saveStoredWebhookLogs(logs: WebhookLog[], enabled = demoOfflinePersistenceEnabled()): void {
+  if (!enabled) {
+    clearLegacyProtectedLogCache(false);
+    return;
+  }
   try {
     localStorage.setItem(STORAGE_KEY_WEBHOOK_LOGS, JSON.stringify(logs.slice(0, 60)));
   } catch (e) {
@@ -384,7 +481,11 @@ export const DEFAULT_OFFLINE_DOOR_CONFIG: DoorControllerConfig = {
   triggerOnManualUnlock: true,
 };
 
-export function getStoredDoorConfig(): DoorControllerConfig {
+export function getStoredDoorConfig(enabled = demoOfflinePersistenceEnabled()): DoorControllerConfig {
+  if (!enabled) {
+    clearLegacyProtectedLogCache(false);
+    return DEFAULT_OFFLINE_DOOR_CONFIG;
+  }
   try {
     const raw = localStorage.getItem(STORAGE_KEY_DOOR_CONFIG);
     if (raw) {
@@ -400,7 +501,11 @@ export function getStoredDoorConfig(): DoorControllerConfig {
   return DEFAULT_OFFLINE_DOOR_CONFIG;
 }
 
-export function saveStoredDoorConfig(config: DoorControllerConfig): void {
+export function saveStoredDoorConfig(config: DoorControllerConfig, enabled = demoOfflinePersistenceEnabled()): void {
+  if (!enabled) {
+    clearLegacyProtectedLogCache(false);
+    return;
+  }
   try {
     localStorage.setItem(STORAGE_KEY_DOOR_CONFIG, JSON.stringify(config));
   } catch (e) {
@@ -408,7 +513,11 @@ export function saveStoredDoorConfig(config: DoorControllerConfig): void {
   }
 }
 
-export function getStoredDoorLogs(): DoorApiLog[] {
+export function getStoredDoorLogs(enabled = demoOfflinePersistenceEnabled()): DoorApiLog[] {
+  if (!enabled) {
+    clearLegacyProtectedLogCache(false);
+    return [];
+  }
   try {
     const raw = localStorage.getItem(STORAGE_KEY_DOOR_LOGS);
     if (raw) {
@@ -419,7 +528,11 @@ export function getStoredDoorLogs(): DoorApiLog[] {
   return [];
 }
 
-export function saveStoredDoorLogs(logs: DoorApiLog[]): void {
+export function saveStoredDoorLogs(logs: DoorApiLog[], enabled = demoOfflinePersistenceEnabled()): void {
+  if (!enabled) {
+    clearLegacyProtectedLogCache(false);
+    return;
+  }
   try {
     localStorage.setItem(STORAGE_KEY_DOOR_LOGS, JSON.stringify(logs.slice(0, 60)));
   } catch (e) {
@@ -427,7 +540,11 @@ export function saveStoredDoorLogs(logs: DoorApiLog[]): void {
   }
 }
 
-export function clearStoredDoorLogs(): void {
+export function clearStoredDoorLogs(enabled = demoOfflinePersistenceEnabled()): void {
+  if (!enabled) {
+    clearLegacyProtectedLogCache(false);
+    return;
+  }
   try {
     localStorage.removeItem(STORAGE_KEY_DOOR_LOGS);
   } catch {}
@@ -437,6 +554,7 @@ export async function dispatchDirectDoorControllerCommand(
   action: "OPEN" | "CLOSE",
   triggeredBy: string
 ): Promise<DoorApiLog | null> {
+  if (!demoOfflinePersistenceEnabled()) return null;
   const config = getStoredDoorConfig();
   if (!config.enabled || !config.apiUrl || !config.apiUrl.trim()) {
     return null;

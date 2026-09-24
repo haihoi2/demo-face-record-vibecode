@@ -63,6 +63,13 @@ const LEGACY_FIELDS = [
 
 const UNREACHABLE = (suffix: string) => `rtsp://127.0.0.1:1/${suffix}`;
 
+function publicUrl(value: string): string {
+  const parsed = new URL(value);
+  parsed.username = "";
+  parsed.password = "";
+  return parsed.toString();
+}
+
 async function getConfig(): Promise<CameraConfig> {
   const res = await api("/api/camera-streams/config");
   assert.equal(res.status, 200, res.text.slice(0, 300));
@@ -333,10 +340,10 @@ describe("camera streams: multi-stream gate config", () => {
       assert.equal(res.status, 200, res.text.slice(0, 300));
       const entry: GateConfig = res.body.config.entryGate;
       assert.deepEqual(entry.streams.map((s) => s.id), [primary.id, secondaryId], "stream list preserved");
-      assert.equal(entry.streams[0].rtspUrl, newUrl, "primary stream took the legacy rtspUrl");
+      assert.equal(entry.streams[0].rtspUrl, publicUrl(newUrl), "primary stream exposes the credential-redacted legacy rtspUrl");
       assert.equal(entry.streams[0].rtspTransport, "UDP");
       assert.equal(entry.streams[0].fps, 12);
-      assert.equal(entry.rtspUrl, newUrl, "legacy mirror follows");
+      assert.equal(entry.rtspUrl, publicUrl(newUrl), "legacy mirror follows with credentials redacted");
       assert.equal(entry.streams[1].rtspUrl, UNREACHABLE(secondaryId), "secondary stream untouched");
       assertLegacyMirrorsPrimary(entry, "entryGate after legacy write");
     });
@@ -350,8 +357,8 @@ describe("camera streams: multi-stream gate config", () => {
       });
       assert.equal(res.status, 200, res.text.slice(0, 300));
       const entry: GateConfig = res.body.config.entryGate;
-      assert.equal(entry.rtspUrl, echoedUrl);
-      assert.equal(primaryOf(entry).rtspUrl, echoedUrl, "the edited legacy field lands on the primary stream");
+      assert.equal(entry.rtspUrl, publicUrl(echoedUrl));
+      assert.equal(primaryOf(entry).rtspUrl, publicUrl(echoedUrl), "the edited legacy field lands on the primary stream without exposing credentials");
       assert.equal(entry.streams.length, cfg.entryGate.streams.length, "no stream lost");
     });
 

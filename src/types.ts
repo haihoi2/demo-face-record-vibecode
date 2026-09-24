@@ -55,6 +55,9 @@ export interface StrangerCluster {
   similarityScore: number | null;
   suggestedName?: string;
   notes?: string;
+  clusterVersion?: number;
+  status?: 'OPEN' | 'RESOLVED';
+  observationCount?: number;
 }
 
 export interface QuickRegisterStrangerPayload {

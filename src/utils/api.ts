@@ -58,6 +58,11 @@ export async function parseJsonResponse<T = any>(
 }
 
 export const STORAGE_KEY_CUSTOM_BACKEND = "smartlock_custom_backend_url";
+let sessionCsrfToken = "";
+
+export function clearSessionCsrfToken(): void {
+  sessionCsrfToken = "";
+}
 
 /**
  * Retrieves user-defined custom backend URL from localStorage (if configured in UI).
@@ -137,11 +142,42 @@ export function buildEventSourceUrl(rawUrl: string): string {
   return normalizeApiUrl(rawUrl);
 }
 
+export function normalizeApiAssetUrl(rawUrl: string): string {
+  return normalizeApiUrl(rawUrl);
+}
+
+function credentialedOptions(options: RequestInit = {}): RequestInit {
+  const method = String(options.method || "GET").toUpperCase();
+  const headers = new Headers(options.headers);
+  if (!["GET", "HEAD", "OPTIONS"].includes(method) && sessionCsrfToken) {
+    headers.set("X-CSRF-Token", sessionCsrfToken);
+  }
+  return { ...options, headers, credentials: options.credentials || "include" };
+}
+
 export async function apiFetch(
   url: string,
   options?: RequestInit
 ): Promise<Response> {
-  return fetch(normalizeApiUrl(url), options);
+  const normalizedUrl = normalizeApiUrl(url);
+  const first = await fetch(normalizedUrl, credentialedOptions(options));
+  if (first.status !== 403) return first;
+  let code = "";
+  try {
+    code = String((await first.clone().json())?.code || "");
+  } catch {}
+  if (code !== "CSRF_REQUIRED") return first;
+
+  const sessionResponse = await fetch(normalizeApiUrl("/api/operator/session"), credentialedOptions());
+  if (!sessionResponse.ok) return first;
+  try {
+    const session = await sessionResponse.json();
+    if (typeof session?.csrfToken !== "string" || !session.csrfToken) return first;
+    sessionCsrfToken = session.csrfToken;
+  } catch {
+    return first;
+  }
+  return fetch(normalizedUrl, credentialedOptions(options));
 }
 
 export async function safeJsonFetch<T = any>(
@@ -152,8 +188,12 @@ export async function safeJsonFetch<T = any>(
   const normalizedUrl = normalizeApiUrl(url);
 
   try {
-    const res = await fetch(normalizedUrl, options);
-    return await parseJsonResponse<T>(res, fallback);
+    const res = await apiFetch(normalizedUrl, options);
+    const parsed = await parseJsonResponse<T>(res, fallback);
+    const csrfToken = (parsed.data as any)?.csrfToken;
+    if (parsed.ok && typeof csrfToken === "string" && csrfToken) sessionCsrfToken = csrfToken;
+    if (res.status === 401) sessionCsrfToken = "";
+    return parsed;
   } catch (netErr: any) {
     console.warn(`[API Network Warning] ${normalizedUrl}:`, netErr?.message);
     return {
@@ -163,6 +203,25 @@ export async function safeJsonFetch<T = any>(
       error: netErr?.message || "Không thể kết nối đến máy chủ",
     };
   }
+}
+
+export async function operatorJsonFetch<T = any>(
+  url: string,
+  options?: RequestInit,
+  fallback?: T,
+): Promise<{ ok: boolean; status: number; data: T; error?: string }> {
+  let response = await safeJsonFetch<T>(url, options, fallback);
+  if (response.status !== 401 || typeof window === "undefined") return response;
+  const token = window.prompt("Nhập mã phiên vận hành để truy cập dữ liệu được bảo vệ:");
+  if (!token) return response;
+  const login = await safeJsonFetch<{ success: boolean; error?: string; csrfToken?: string }>("/api/operator/session", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ token }),
+  });
+  if (!login.ok || !login.data?.success) throw new Error(login.data?.error || "Xác thực vận hành thất bại");
+  response = await safeJsonFetch<T>(url, options, fallback);
+  return response;
 }
 
 /**

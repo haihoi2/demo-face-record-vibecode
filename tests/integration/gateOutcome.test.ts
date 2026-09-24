@@ -85,10 +85,10 @@ const SCAN_MARKER = "Quét RTSP thủ công";
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 async function getLogs(): Promise<AccessLog[]> {
-  const res = await api<AccessLog[]>("/api/logs");
+  const res = await api<{ logs: AccessLog[] }>("/api/logs?limit=100");
   assert.equal(res.status, 200, res.text.slice(0, 200));
-  assert.ok(Array.isArray(res.body), "GET /api/logs must return an array");
-  return res.body;
+  assert.ok(Array.isArray(res.body?.logs), "GET /api/logs must return a bounded page");
+  return res.body.logs;
 }
 
 /** Access logs written by a manual scan-rtsp call (ours; nothing else writes them). */

@@ -15,8 +15,8 @@ import {
 } from "lucide-react";
 import { SmartLockState } from "../types";
 import { soundEffects } from "../utils/audio";
-import { normalizeApiUrl, getApiBaseUrl } from "../utils/api";
-import { clientDoorUnlock, clientDoorLock, isNetlifyOrStaticHost } from "../utils/offlineEngine";
+import { operatorJsonFetch } from "../utils/api";
+import { clientDoorUnlock, clientDoorLock, demoOfflinePersistenceEnabled } from "../utils/offlineEngine";
 
 interface SmartLockCardProps {
   lockState: SmartLockState;
@@ -29,13 +29,13 @@ export const SmartLockCard: React.FC<SmartLockCardProps> = ({
 }) => {
   const [copiedIndex, setCopiedIndex] = useState<number | null>(null);
   const [isTriggering, setIsTriggering] = useState<boolean>(false);
-  const shouldUseClientFallback = isNetlifyOrStaticHost() && !getApiBaseUrl();
+  const shouldUseClientFallback = demoOfflinePersistenceEnabled();
 
   const handleManualUnlock = async () => {
     setIsTriggering(true);
     try {
       soundEffects.playLockClick();
-      const res = await fetch(normalizeApiUrl("/api/lock/unlock"), {
+      const res = await operatorJsonFetch("/api/lock/unlock", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -43,9 +43,7 @@ export const SmartLockCard: React.FC<SmartLockCardProps> = ({
           reason: "Kích hoạt thủ công từ Dashboard Quản trị",
         }),
       });
-      if (!res.ok) {
-        throw new Error(`Unlock request failed with status ${res.status}`);
-      }
+      if (!res.ok) throw new Error(res.error || `Unlock request failed with status ${res.status}`);
       soundEffects.playSuccess();
     } catch (err) {
       if (shouldUseClientFallback) {
@@ -65,16 +63,14 @@ export const SmartLockCard: React.FC<SmartLockCardProps> = ({
     setIsTriggering(true);
     try {
       soundEffects.playLockClick();
-      const res = await fetch(normalizeApiUrl("/api/lock/lock"), {
+      const res = await operatorJsonFetch("/api/lock/lock", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           source: "Bảng Điều Khiển Khóa Thông Minh",
         }),
       });
-      if (!res.ok) {
-        throw new Error(`Lock request failed with status ${res.status}`);
-      }
+      if (!res.ok) throw new Error(res.error || `Lock request failed with status ${res.status}`);
     } catch (err) {
       if (shouldUseClientFallback) {
         console.warn("Khóa cửa qua Client Fallback:", err);

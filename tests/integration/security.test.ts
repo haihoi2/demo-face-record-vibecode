@@ -26,6 +26,8 @@ import {
   lockDoor,
   noFaceJpegDataUrl,
   buildGreyJpeg,
+  createTempEmployee,
+  deleteEmployee,
   recognize,
   withAiConfig,
   type RecognizeResponse,
@@ -34,6 +36,15 @@ import {
 /** The fabricated-match fallback used exactly these numbers. */
 const LEGACY_FAKE_CONFIDENCE = 96.5;
 const LEGACY_FAKE_LIVENESS = 98.8;
+
+async function withTemporaryEmployee(run: (employee: Awaited<ReturnType<typeof createTempEmployee>>) => Promise<void>) {
+  const employee = await createTempEmployee({ name: "Security Regression Fixture" });
+  try {
+    await run(employee);
+  } finally {
+    await deleteEmployee(employee.id);
+  }
+}
 
 function assertDenied(res: { status: number; body: RecognizeResponse; text: string }, label: string) {
   assert.equal(res.status, 200, `${label}: expected HTTP 200 with a denial body, got ${res.status}: ${res.text.slice(0, 300)}`);
@@ -65,9 +76,9 @@ describe("gateway baseline", () => {
     assert.equal(res.body?.status, "ok");
   });
 
-  it("the roster is non-empty (the bypasses only mattered with enrolled employees)", async () => {
+  it("allows a production roster to start empty", async () => {
     const employees = await listEmployees();
-    assert.ok(employees.length > 0, "expected at least one enrolled employee");
+    assert.ok(Array.isArray(employees));
   });
 
   it("POST /api/lock/lock forces LOCKED and /api/lock/status reflects it", async () => {
@@ -101,19 +112,21 @@ describe("bypass 1: identity-only body without an image", () => {
   });
 
   it("a real enrolled employeeCode is refused just the same", async () => {
-    const [first] = await listEmployees();
-    const res = await recognize({ employeeCode: first.employeeCode });
-    assert.equal(res.status, 400, `unexpected status ${res.status}: ${res.text.slice(0, 300)}`);
-    assert.notEqual(res.body?.recognized, true);
-    await assertStillLocked("real employeeCode-only body");
+    await withTemporaryEmployee(async (employee) => {
+      const res = await recognize({ employeeCode: employee.employeeCode });
+      assert.equal(res.status, 400, `unexpected status ${res.status}: ${res.text.slice(0, 300)}`);
+      assert.notEqual(res.body?.recognized, true);
+      await assertStillLocked("real employeeCode-only body");
+    });
   });
 
   it("a real enrolled employeeId is refused just the same", async () => {
-    const [first] = await listEmployees();
-    const res = await recognize({ employeeId: first.id });
-    assert.equal(res.status, 400, `unexpected status ${res.status}: ${res.text.slice(0, 300)}`);
-    assert.notEqual(res.body?.recognized, true);
-    await assertStillLocked("real employeeId-only body");
+    await withTemporaryEmployee(async (employee) => {
+      const res = await recognize({ employeeId: employee.id });
+      assert.equal(res.status, 400, `unexpected status ${res.status}: ${res.text.slice(0, 300)}`);
+      assert.notEqual(res.body?.recognized, true);
+      await assertStillLocked("real employeeId-only body");
+    });
   });
 
   it("an empty JSON body is a 400, not an unlock", async () => {
@@ -152,11 +165,12 @@ describe("bypass 2: simulation shortcuts are disabled by default", () => {
   }
 
   it("a real enrolled code passed as testEmployeeId is refused too", async () => {
-    const [first] = await listEmployees();
-    const res = await recognize({ testEmployeeId: first.employeeCode });
-    assert.equal(res.status, 403);
-    assert.equal(res.body?.simulationDisabled, true);
-    await assertStillLocked("testEmployeeId=<real code>");
+    await withTemporaryEmployee(async (employee) => {
+      const res = await recognize({ testEmployeeId: employee.employeeCode });
+      assert.equal(res.status, 403);
+      assert.equal(res.body?.simulationDisabled, true);
+      await assertStillLocked("testEmployeeId=<real code>");
+    });
   });
 
   it("the testEmployee alias is refused as well", async () => {

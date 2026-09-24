@@ -22,6 +22,7 @@ import {
 } from "lucide-react";
 import { AccessLog } from "../types";
 import { EntryPatternAnalytics } from "./EntryPatternAnalytics";
+import { ProtectedImage } from "./ProtectedImage";
 
 interface AccessLogsProps {
   logs: AccessLog[];
@@ -327,7 +328,7 @@ export const AccessLogs: React.FC<AccessLogsProps> = ({
                     >
                       {/* Photo Thumbnail */}
                       <td className="py-3 px-4">
-                        <img
+                        <ProtectedImage
                           src={log.photoSnapshot}
                           alt="Face snapshot"
                           className="w-10 h-10 rounded-lg object-cover border border-slate-200 shadow-xs"

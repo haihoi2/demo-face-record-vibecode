@@ -25,7 +25,8 @@ import {
   UserSearch,
 } from "lucide-react";
 import { StrangerCluster, StrangerPhoto, Employee, AccessLog } from "../types";
-import { safeJsonFetch } from "../utils/api";
+import { operatorJsonFetch } from "../utils/api";
+import { ProtectedImage } from "./ProtectedImage";
 import { soundEffects } from "../utils/audio";
 
 interface StrangerClusterModalProps {
@@ -54,6 +55,9 @@ export const StrangerClusterModal: React.FC<StrangerClusterModalProps> = ({
   const [error, setError] = useState<string | null>(null);
   const [selectedCluster, setSelectedCluster] = useState<StrangerCluster | null>(null);
   const [activePhotoUrl, setActivePhotoUrl] = useState<string>("");
+  const [currentCursor, setCurrentCursor] = useState<string>("");
+  const [nextCursor, setNextCursor] = useState<string | null>(null);
+  const [cursorHistory, setCursorHistory] = useState<string[]>([]);
 
   // Registration form fields
   const [name, setName] = useState<string>("");
@@ -61,7 +65,6 @@ export const StrangerClusterModal: React.FC<StrangerClusterModalProps> = ({
   const [department, setDepartment] = useState<string>("Phòng Kỹ Thuật AI");
   const [position, setPosition] = useState<string>("Nhân viên mới");
   const [accessLevel, setAccessLevel] = useState<"ALL_ACCESS" | "OFFICE_HOURS" | "RESTRICTED">("ALL_ACCESS");
-  const [retroUpdateLogs, setRetroUpdateLogs] = useState<boolean>(true);
   const [submitting, setSubmitting] = useState<boolean>(false);
   const [successToast, setSuccessToast] = useState<string | null>(null);
   const [previewEnlargedPhoto, setPreviewEnlargedPhoto] = useState<string | null>(null);
@@ -128,21 +131,47 @@ export const StrangerClusterModal: React.FC<StrangerClusterModalProps> = ({
     );
   };
 
-  // Fetch authoritative clusters. HTTP errors remain errors; the browser never
-  // fabricates biometric clusters or converts a refused mutation into success.
-  const loadClusters = async () => {
+  // Fetch one bounded authoritative page. Deep links use the lookup endpoint so
+  // an observation outside the current page is never misreported as processed.
+  const loadClusters = async (cursor = "", history: string[] = []) => {
     setLoading(true);
     setError(null);
     setPreselectMissNotice(null);
     try {
-      const res = await safeJsonFetch<{ success: boolean; clusters: StrangerCluster[] }>(
-        "/api/strangers/clusters?limit=50"
-      );
+      const query = cursor ? `?limit=20&cursor=${encodeURIComponent(cursor)}` : "?limit=20";
+      const res = await operatorJsonFetch<{
+        success: boolean;
+        clusters: StrangerCluster[];
+        nextCursor?: string | null;
+      }>(`/api/strangers/clusters${query}`);
       if (!res.ok || !res.data?.success || !Array.isArray(res.data.clusters)) {
         throw new Error((res.data as any)?.error || `HTTP ${res.status}`);
       }
       setClusters(res.data.clusters);
-      applyPreselection(res.data.clusters);
+      setCurrentCursor(cursor);
+      setCursorHistory(history);
+      setNextCursor(res.data.nextCursor || null);
+
+      const targetLogId = (initialPreselectedLogId || "").trim();
+      const localMatch = targetLogId && res.data.clusters.some((cluster) =>
+        cluster.photos.some((photo) => photo.logId === targetLogId));
+      if (targetLogId && !localMatch) {
+        const lookup = await operatorJsonFetch<{ success: boolean; cluster?: StrangerCluster; status?: string; error?: string }>(
+          `/api/strangers/lookup?logId=${encodeURIComponent(targetLogId)}`,
+        );
+        if (lookup.ok && lookup.data?.cluster) {
+          const cluster = lookup.data.cluster;
+          setClusters((items: StrangerCluster[]) => items.some((item: StrangerCluster) => item.clusterId === cluster.clusterId) ? items : [cluster, ...items]);
+          setPreselectMissNotice(null);
+          handleOpenRegister(cluster, cluster.photos.find((photo) => photo.logId === targetLogId)?.photoSnapshot);
+        } else if (lookup.status === 404 || lookup.status === 410) {
+          setPreselectMissNotice(lookup.data?.error || `Không tìm thấy lượt quét ${targetLogId}.`);
+        } else {
+          throw new Error(lookup.data?.error || `HTTP ${lookup.status}`);
+        }
+      } else {
+        applyPreselection(res.data.clusters);
+      }
     } catch (err: any) {
       setClusters([]);
       setError(err?.message || "Không thể tải cụm người lạ từ máy chủ");
@@ -174,14 +203,13 @@ export const StrangerClusterModal: React.FC<StrangerClusterModalProps> = ({
     setEmployeeQuery("");
     setEmployeeResults([]);
     setAdoptPhoto(false);
-    setRetroUpdateLogs(true);
   };
 
   // Search the authoritative server roster; failures stay failures rather than local success.
   const searchEmployees = async (q: string) => {
     setSearchingEmployees(true);
     try {
-      const res = await safeJsonFetch<{ success: boolean; employees: Employee[]; error?: string }>(
+      const res = await operatorJsonFetch<{ success: boolean; employees: Employee[]; error?: string }>(
         `/api/strangers/search-employees?q=${encodeURIComponent(q)}`
       );
       if (res.ok && res.data?.employees) {
@@ -219,17 +247,21 @@ export const StrangerClusterModal: React.FC<StrangerClusterModalProps> = ({
         employeeId: mergeTarget.id,
         employeeCode: mergeTarget.employeeCode,
         clusterId: selectedCluster.clusterId,
+        clusterVersion: selectedCluster.clusterVersion,
         clusterLogIds,
-        retroUpdateLogs,
         adoptPhoto,
         photoUrl: activePhotoUrl || selectedCluster.primaryPhoto,
         sourceLogId: selectedCluster.photos.find((photo: StrangerPhoto) => photo.photoSnapshot === activePhotoUrl)?.logId,
       };
 
-      const res = await safeJsonFetch<{
+      const res = await operatorJsonFetch<{
         success: boolean;
         employee: Employee;
         updatedLogsCount: number;
+        adjudicatedLogsCount: number;
+        recognitionReady: boolean;
+        partialFailure: boolean;
+        faceTemplateRejected?: string | null;
       }>("/api/strangers/merge", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -240,9 +272,9 @@ export const StrangerClusterModal: React.FC<StrangerClusterModalProps> = ({
         throw new Error((res.data as any)?.error || `HTTP ${res.status}`);
       }
       const merged: Employee = res.data.employee;
-      const mergedCount = res.data.updatedLogsCount || 0;
+      const adjudicatedCount = res.data.adjudicatedLogsCount ?? 0;
 
-      soundEffects.playSuccess();
+      if (res.data.recognitionReady) soundEffects.playSuccess();
       onEmployeeAdded(merged);
       if (onLogsUpdated) onLogsUpdated();
 
@@ -251,7 +283,9 @@ export const StrangerClusterModal: React.FC<StrangerClusterModalProps> = ({
       setClusters((prev) => prev.filter((c) => c.clusterId !== resolvedId));
 
       setSuccessToast(
-        `Đã gộp ${mergedCount} ảnh/nhật ký vào nhân viên ${merged.name} (${merged.employeeCode})`
+        res.data.recognitionReady
+          ? `Đã adjudicate ${adjudicatedCount} lượt quét cho ${merged.name} và tạo mẫu nhận diện.`
+          : `Đã adjudicate ${adjudicatedCount} lượt quét cho ${merged.name}; chưa tạo được mẫu nhận diện nên quyền mở cửa chưa được kích hoạt.`
       );
       setSelectedCluster(null);
       setMergeTarget(null);
@@ -279,11 +313,12 @@ export const StrangerClusterModal: React.FC<StrangerClusterModalProps> = ({
     if (!ok) return;
     setDismissingId(cluster.clusterId);
     try {
-      const res = await safeJsonFetch<{ success: boolean; error?: string }>("/api/strangers/dismiss", {
+      const res = await operatorJsonFetch<{ success: boolean; error?: string }>("/api/strangers/dismiss", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           clusterId: cluster.clusterId,
+          clusterVersion: cluster.clusterVersion,
           clusterLogIds: cluster.photos.map((p) => p.logId),
           reason: "Từ chối thủ công từ bảng người lạ",
         }),
@@ -319,12 +354,20 @@ export const StrangerClusterModal: React.FC<StrangerClusterModalProps> = ({
         accessLevel,
         photoUrl: activePhotoUrl || selectedCluster.primaryPhoto,
         clusterId: selectedCluster.clusterId,
+        clusterVersion: selectedCluster.clusterVersion,
         clusterLogIds: selectedCluster.photos.map((p) => p.logId),
-        retroUpdateLogs,
         sourceLogId: selectedCluster.photos.find((photo: StrangerPhoto) => photo.photoSnapshot === activePhotoUrl)?.logId,
       };
 
-      const res = await safeJsonFetch<{ success: boolean; employee: Employee; updatedLogsCount: number }>(
+      const res = await operatorJsonFetch<{
+        success: boolean;
+        employee: Employee;
+        updatedLogsCount: number;
+        adjudicatedLogsCount: number;
+        recognitionReady: boolean;
+        partialFailure: boolean;
+        faceTemplateRejected?: string | null;
+      }>(
         "/api/strangers/quick-register",
         {
           method: "POST",
@@ -338,11 +381,15 @@ export const StrangerClusterModal: React.FC<StrangerClusterModalProps> = ({
       }
       const createdEmployee: Employee = res.data.employee;
 
-      soundEffects.playSuccess();
+      if (res.data.recognitionReady) soundEffects.playSuccess();
       onEmployeeAdded(createdEmployee);
       if (onLogsUpdated) onLogsUpdated();
 
-      setSuccessToast(`Đã thêm nhanh nhân viên: ${createdEmployee.name} (${createdEmployee.employeeCode})!`);
+      setSuccessToast(
+        res.data.recognitionReady
+          ? `Đã tạo ${createdEmployee.name} (${createdEmployee.employeeCode}) và mẫu nhận diện đã sẵn sàng.`
+          : `Đã tạo hồ sơ ${createdEmployee.name} (${createdEmployee.employeeCode}), nhưng chưa có mẫu nhận diện; quyền mở cửa chưa được kích hoạt.`
+      );
 
       // Remove this cluster from view
       setClusters((prev) => prev.filter((c) => c.clusterId !== selectedCluster.clusterId));
@@ -390,7 +437,7 @@ export const StrangerClusterModal: React.FC<StrangerClusterModalProps> = ({
           <div className="flex items-center gap-2">
             <button
               id="btn-refresh-stranger-clusters"
-              onClick={loadClusters}
+              onClick={() => loadClusters("", [])}
               disabled={loading}
               title="Làm mới danh sách"
               className="p-2 rounded-xl text-slate-500 hover:text-slate-800 hover:bg-slate-100 transition-colors"
@@ -441,7 +488,7 @@ export const StrangerClusterModal: React.FC<StrangerClusterModalProps> = ({
               <span className="font-semibold text-slate-900">Cơ chế bảo mật &amp; Thêm nhanh: </span>
               Mỗi khi camera an ninh phát hiện người lạ chưa phân quyền, hệ thống sẽ phát cảnh báo bảo mật,
               chụp lưu hình ảnh và tự động phân tích ngũ quan để nhóm các ảnh có độ tương đồng cao.
-              Nhấp <strong>"Khai Báo Nhanh"</strong> để cấp quyền mở khóa cửa tự động cho người này ngay lập tức!
+              Nhấp <strong>"Khai Báo Nhanh"</strong> để tạo hồ sơ và thử enrollment. Quyền nhận diện chỉ sẵn sàng khi máy chủ xác nhận đã tạo mẫu khuôn mặt.
             </div>
           </div>
 
@@ -450,7 +497,7 @@ export const StrangerClusterModal: React.FC<StrangerClusterModalProps> = ({
               <AlertTriangle className="w-8 h-8 text-rose-600 mx-auto mb-3" />
               <p className="text-sm font-semibold text-rose-900">Không tải được dữ liệu người lạ</p>
               <p className="text-xs text-rose-700 mt-1">{error}</p>
-              <button type="button" onClick={loadClusters}
+              <button type="button" onClick={() => loadClusters(currentCursor, cursorHistory)}
                 className="mt-4 px-4 py-2 rounded-xl bg-white border border-rose-200 text-xs font-semibold text-rose-700">
                 Thử lại
               </button>
@@ -493,10 +540,12 @@ export const StrangerClusterModal: React.FC<StrangerClusterModalProps> = ({
                         <div>
                           <div className="flex items-center gap-2 flex-wrap">
                             <h3 className="text-sm font-bold text-slate-900">{cluster.label}</h3>
-                            <span className="px-2 py-0.5 rounded-full text-[11px] font-semibold bg-emerald-50 text-emerald-700 border border-emerald-200 flex items-center gap-1">
-                              <Sparkles className="w-3 h-3" />
-                              {cluster.similarityScore}% trùng khớp
-                            </span>
+                            {cluster.similarityScore !== null && (
+                              <span className="px-2 py-0.5 rounded-full text-[11px] font-semibold bg-emerald-50 text-emerald-700 border border-emerald-200 flex items-center gap-1">
+                                <Sparkles className="w-3 h-3" />
+                                {cluster.similarityScore}% trùng khớp
+                              </span>
+                            )}
                             {cluster.estimatedGender && (
                               <span className="px-2 py-0.5 rounded-full text-[11px] font-medium bg-slate-100 text-slate-700">
                                 {cluster.estimatedGender}
@@ -569,7 +618,7 @@ export const StrangerClusterModal: React.FC<StrangerClusterModalProps> = ({
                                   : "border-slate-200 hover:border-slate-300 hover:shadow-xs"
                               }`}
                             >
-                              <img
+                              <ProtectedImage
                                 src={photo.photoSnapshot}
                                 alt={`Snapshot ${pIdx + 1}`}
                                 className="w-full h-28 object-cover group-hover:scale-105 transition-transform duration-200"
@@ -727,7 +776,7 @@ export const StrangerClusterModal: React.FC<StrangerClusterModalProps> = ({
                             {/* Selected target summary */}
                             {mergeTarget && (
                               <div className="flex items-center gap-3 p-3 rounded-xl bg-emerald-50 border border-emerald-200">
-                                <img
+                                <ProtectedImage
                                   src={activePhotoUrl || cluster.primaryPhoto}
                                   alt="Ảnh người lạ"
                                   className="w-10 h-10 rounded-lg object-cover bg-slate-200"
@@ -751,21 +800,9 @@ export const StrangerClusterModal: React.FC<StrangerClusterModalProps> = ({
 
                             {/* Options */}
                             <div className="space-y-2 pt-1">
-                              <div className="flex items-center gap-2">
-                                <input
-                                  id={`check-merge-retro-${cluster.clusterId}`}
-                                  type="checkbox"
-                                  checked={retroUpdateLogs}
-                                  onChange={(e) => setRetroUpdateLogs(e.target.checked)}
-                                  className="w-4 h-4 rounded-md text-emerald-600 border-slate-300 focus:ring-emerald-500"
-                                />
-                                <label
-                                  htmlFor={`check-merge-retro-${cluster.clusterId}`}
-                                  className="text-xs text-slate-700 font-medium cursor-pointer"
-                                >
-                                  Ghi nhận adjudication cho {cluster.photos.length} lượt quét, giữ nguyên sự kiện DENIED và trạng thái khóa vật lý
-                                </label>
-                              </div>
+                              <p className="text-xs text-slate-600">
+                                Adjudication luôn giữ nguyên sự kiện DENIED và trạng thái khóa vật lý.
+                              </p>
                               <div className="flex items-start gap-2">
                                 <input
                                   id={`check-merge-photo-${cluster.clusterId}`}
@@ -917,21 +954,8 @@ export const StrangerClusterModal: React.FC<StrangerClusterModalProps> = ({
                             </select>
                           </div>
 
-                          {/* Retroactive log conversion checkbox */}
-                          <div className="sm:col-span-2 md:col-span-3 flex items-center gap-2 pt-1">
-                            <input
-                              id="check-retro-update-logs"
-                              type="checkbox"
-                              checked={retroUpdateLogs}
-                              onChange={(e) => setRetroUpdateLogs(e.target.checked)}
-                              className="w-4 h-4 rounded-md text-indigo-600 border-slate-300 focus:ring-indigo-500"
-                            />
-                            <label
-                              htmlFor="check-retro-update-logs"
-                              className="text-xs text-slate-700 font-medium cursor-pointer"
-                            >
-                              Ghi nhận adjudication cho {cluster.photos.length} lượt quét, giữ nguyên lịch sử DENIED và trạng thái khóa vật lý
-                            </label>
+                          <div className="sm:col-span-2 md:col-span-3 text-xs text-slate-600">
+                            Adjudication luôn giữ nguyên lịch sử DENIED và trạng thái khóa vật lý.
                           </div>
                         </div>
 
@@ -958,7 +982,7 @@ export const StrangerClusterModal: React.FC<StrangerClusterModalProps> = ({
                             ) : (
                               <>
                                 <Check className="w-3.5 h-3.5" />
-                                <span>Lưu &amp; Kích Hoạt Quyền Mở Cửa Ngay</span>
+                                <span>Lưu hồ sơ &amp; Thử tạo mẫu nhận diện</span>
                               </>
                             )}
                           </button>
@@ -970,6 +994,29 @@ export const StrangerClusterModal: React.FC<StrangerClusterModalProps> = ({
                   </div>
                 );
               })}
+              <div className="flex items-center justify-between pt-2">
+                <button
+                  id="btn-prev-stranger-page"
+                  type="button"
+                  disabled={loading || cursorHistory.length === 0}
+                  onClick={() => {
+                    const history = cursorHistory.slice(0, -1);
+                    loadClusters(cursorHistory[cursorHistory.length - 1] || "", history);
+                  }}
+                  className="px-4 py-2 rounded-xl border border-slate-200 text-xs font-semibold disabled:opacity-40"
+                >
+                  Trang trước
+                </button>
+                <button
+                  id="btn-next-stranger-page"
+                  type="button"
+                  disabled={loading || !nextCursor}
+                  onClick={() => nextCursor && loadClusters(nextCursor, [...cursorHistory, currentCursor])}
+                  className="px-4 py-2 rounded-xl bg-slate-900 text-white text-xs font-semibold disabled:opacity-40"
+                >
+                  Trang sau
+                </button>
+              </div>
             </div>
           )}
         </div>
@@ -1004,7 +1051,7 @@ export const StrangerClusterModal: React.FC<StrangerClusterModalProps> = ({
             >
               <X className="w-4 h-4" />
             </button>
-            <img
+            <ProtectedImage
               src={previewEnlargedPhoto}
               alt="Enlarged snapshot"
               className="w-full h-auto rounded-xl object-contain max-h-[75vh]"

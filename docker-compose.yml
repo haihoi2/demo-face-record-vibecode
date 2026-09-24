@@ -55,6 +55,7 @@ services:
       # Cơ chế nhận diện khuôn mặt: "local" hoặc "google" (Gemini AI)
       # Demo-only unlock shortcuts. Never enable where a real lock is attached.
       - ALLOW_SIMULATED_RECOGNITION=${ALLOW_SIMULATED_RECOGNITION:-false}
+      - ENABLE_DEMO_DATA=${ENABLE_DEMO_DATA:-false}
       - FACE_RECOGNITION_PROVIDER=${FACE_RECOGNITION_PROVIDER:-local}
       - LOCAL_FACE_RECOGNITION_MODEL=${LOCAL_FACE_RECOGNITION_MODEL:-local-exact-match}
       - GEMINI_API_KEY=${GEMINI_API_KEY:-}
@@ -65,6 +66,17 @@ services:
 
       # Public URL of this app, used to build click-through links in webhook alerts
       - APP_URL=${APP_URL:-}
+
+      # Operator auth for biometric images and stranger adjudication. Leave no
+      # production deployment without an operator id/token: protected routes fail closed.
+      - OPERATOR_ID=${OPERATOR_ID:-}
+      - OPERATOR_TOKEN=${OPERATOR_TOKEN:-}
+      - OPERATOR_SESSION_SECRET=${OPERATOR_SESSION_SECRET:-}
+      - OPERATOR_COOKIE_CROSS_SITE=${OPERATOR_COOKIE_CROSS_SITE:-false}
+      - VIEWER_ID=${VIEWER_ID:-}
+      - VIEWER_TOKEN=${VIEWER_TOKEN:-}
+      - DEVICE_INGEST_TOKEN=${DEVICE_INGEST_TOKEN:-}
+      - INTERNAL_API_TOKEN=${INTERNAL_API_TOKEN:-}
 
       # -----------------------------------------------------------------------
       # Cấu hình chuỗi kết nối PostgreSQL 18:

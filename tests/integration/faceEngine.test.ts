@@ -22,12 +22,14 @@
  * found it.
  */
 
-import { describe, it, before } from "node:test";
+import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
 
 import {
   api,
+  authenticateAs,
   postJson,
+  rawApi,
   listEmployees,
   createTempEmployee,
   deleteEmployee,
@@ -80,8 +82,9 @@ interface TemplateList {
 const UNREACHABLE = (suffix: string) => `rtsp://127.0.0.1:1/${suffix}`;
 
 let status: EngineStatus;
-/** An employee that already exists on the roster; never created or deleted here. */
+/** An employee that already exists on the roster, or an isolated fixture when production starts empty. */
 let existing: Employee;
+let fixtureEmployeeId: string | null = null;
 
 function templatesOf(employeeId: string) {
   return api<TemplateList>(`/api/employees/${encodeURIComponent(employeeId)}/templates`);
@@ -93,9 +96,17 @@ before(async () => {
   const res = await api<EngineStatus>("/api/face-engine/status");
   assert.equal(res.status, 200, res.text.slice(0, 300));
   status = res.body;
-  const roster = await listEmployees();
-  assert.ok(roster.length > 0, "the gateway must have at least one employee to test against");
+  let roster = await listEmployees();
+  if (roster.length === 0) {
+    const fixture = await createTempEmployee({ name: "Face Engine Fixture" });
+    fixtureEmployeeId = fixture.id;
+    roster = [fixture];
+  }
   existing = roster[0];
+});
+
+after(async () => {
+  if (fixtureEmployeeId) await deleteEmployee(fixtureEmployeeId);
 });
 
 describe("GET /api/face-engine/status", () => {
@@ -152,6 +163,21 @@ describe("GET /api/face-engine/status", () => {
 });
 
 describe("face template gallery", () => {
+  it("requires viewer auth for reads and operator auth for enrollment mutations", async () => {
+    assert.equal((await rawApi(`/api/employees/${encodeURIComponent(existing.id)}/templates`)).status, 401);
+    const viewerCookie = await authenticateAs(process.env.VIEWER_TOKEN || "integration-viewer-token");
+    const list = await rawApi(`/api/employees/${encodeURIComponent(existing.id)}/templates`, {
+      headers: { Cookie: viewerCookie },
+    });
+    assert.equal(list.status, 200, list.text.slice(0, 200));
+    const enroll = await rawApi(`/api/employees/${encodeURIComponent(existing.id)}/templates`, {
+      method: "POST",
+      headers: { Cookie: viewerCookie, "Content-Type": "application/json" },
+      body: JSON.stringify({ image: noFaceJpegDataUrl(64, 17) }),
+    });
+    assert.equal(enroll.status, 403, enroll.text.slice(0, 200));
+  });
+
   it("lists an employee's templates without ever exposing raw embeddings", async () => {
     const res = await templatesOf(existing.id);
     assert.equal(res.status, 200, res.text.slice(0, 300));

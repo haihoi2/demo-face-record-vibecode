@@ -79,13 +79,13 @@ describe("CORS on actual requests", () => {
     assert.equal(res.headers.get("access-control-allow-credentials"), "true");
   });
 
-  it("a POST to /api/recognize-face from a disallowed Origin is still refused on its merits (400, no unlock)", async () => {
+  it("a POST to /api/recognize-face from a disallowed Origin is rejected before mutation", async () => {
     const res = await api("/api/recognize-face", {
       method: "POST",
       headers: { "Content-Type": "application/json", Origin: DISALLOWED_ORIGIN },
       body: JSON.stringify({ employeeCode: "NV-5588" }),
     });
-    assert.equal(res.status, 400);
+    assert.equal(res.status, 403);
     assert.equal(res.headers.get("access-control-allow-origin"), null);
   });
 });

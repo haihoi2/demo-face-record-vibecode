@@ -113,6 +113,20 @@ CREATE TABLE IF NOT EXISTS stranger_resolutions (
   metadata JSONB NOT NULL DEFAULT '{}'::jsonb
 );
 
+CREATE TABLE IF NOT EXISTS stranger_resolution_events (
+  id VARCHAR(128) PRIMARY KEY,
+  "clusterId" VARCHAR(128) NOT NULL,
+  action VARCHAR(32) NOT NULL,
+  "employeeId" VARCHAR(64),
+  actor VARCHAR(255) NOT NULL,
+  "resolvedAt" VARCHAR(64) NOT NULL,
+  "logIds" JSONB NOT NULL,
+  "sourceLogId" VARCHAR(64),
+  metadata JSONB NOT NULL DEFAULT '{}'::jsonb
+);
+CREATE INDEX IF NOT EXISTS idx_stranger_resolution_events_cluster
+  ON stranger_resolution_events ("clusterId", "resolvedAt");
+
 -- AI recognition engine settings (engine mode, Gemini model, thresholds).
 -- Single row id = 'default'; the server hydrates it into memory at startup.
 CREATE TABLE IF NOT EXISTS ai_recognition_config (
