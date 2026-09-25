@@ -1122,7 +1122,7 @@ export const WebhookIntegration: React.FC<WebhookIntegrationProps> = ({
                 <div>
                   <label htmlFor="input-stranger-cooldown" className="block font-semibold text-slate-700 mb-1 flex items-center gap-1">
                     <Timer className="w-3.5 h-3.5 text-amber-600" />
-                    Giãn cách giữa 2 cảnh báo (giây):
+                    Không báo lại cùng một người trong (giây):
                   </label>
                   <input
                     type="number"
@@ -1141,7 +1141,10 @@ export const WebhookIntegration: React.FC<WebhookIntegrationProps> = ({
                     }}
                     className="w-full px-3 py-2 rounded-xl border border-slate-200 font-mono text-xs bg-slate-50 text-slate-800 focus:bg-white focus:border-amber-500 focus:outline-hidden"
                   />
-                  <p className="mt-1 text-[11px] text-slate-500">0 = gửi mọi lần</p>
+                  <p className="mt-1 text-[11px] text-slate-500">
+                    Tính riêng cho từng người: người lạ khác vẫn được báo ngay. Khi quá nhiều người lạ
+                    cùng lúc, phần vượt giới hạn mỗi phút được gộp vào cảnh báo kế tiếp. 0 = gửi mọi lần.
+                  </p>
                 </div>
 
                 {/* Live link preview */}

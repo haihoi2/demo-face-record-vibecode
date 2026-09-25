@@ -10,6 +10,7 @@ import {
   clusterStrangerFaces,
   collectStrangerWindow,
   pageStrangerClusters,
+  strangerAlertFloodDecision,
   strangerCaptureDecision,
   STRANGER_SAME_PERSON_COSINE,
 } from "../src/server/strangers";
@@ -279,5 +280,27 @@ describe("grouping over a window, not page by page", () => {
     const gone = pageStrangerClusters(all, "resolved-meanwhile", 3);
     assert.equal(gone.restarted, true);
     assert.equal(gone.clusters[0].clusterId, "c0");
+  });
+});
+
+describe("stranger alert flood cap", () => {
+  it("sends up to the cap in a rolling minute, then holds back", () => {
+    let sentAt: number[] = [];
+    const outcomes: boolean[] = [];
+    for (let i = 0; i < 8; i++) {
+      const d = strangerAlertFloodDecision(sentAt, i * 1_000, 6);
+      sentAt = d.sentAt;
+      outcomes.push(d.send);
+    }
+    assert.deepEqual(outcomes, [true, true, true, true, true, true, false, false]);
+    assert.equal(sentAt.length, 6, "held-back alerts do not consume the budget");
+  });
+
+  it("frees a slot once the oldest send is a minute old", () => {
+    const sentAt = [0, 1_000, 2_000, 3_000, 4_000, 5_000];
+    assert.equal(strangerAlertFloodDecision(sentAt, 59_999, 6).send, false);
+    const later = strangerAlertFloodDecision(sentAt, 60_000, 6);
+    assert.equal(later.send, true);
+    assert.deepEqual(later.sentAt, [1_000, 2_000, 3_000, 4_000, 5_000, 60_000]);
   });
 });

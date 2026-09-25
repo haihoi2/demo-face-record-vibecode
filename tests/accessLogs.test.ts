@@ -1,7 +1,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 
-import { csvCell } from "../src/server/csv";
+import { accessLogExportName, csvCell } from "../src/server/csv";
 import { EMPTY_LOG_FILTERS, logFilterParams } from "../src/utils/accessLogs";
 
 describe("CSV export cells", () => {
@@ -40,5 +40,30 @@ describe("history filter parameters", () => {
     const earlier = new Date("2026-09-01T00:00:00").toISOString();
     assert.equal(logFilterParams(f, later).get("from"), later);
     assert.equal(logFilterParams(f, earlier).get("from"), new Date("2026-09-20T00:00:00").toISOString());
+  });
+});
+
+describe("CSV export file name", () => {
+  const TZ = "Asia/Ho_Chi_Minh";
+
+  it("names the days in the site's calendar, not UTC", () => {
+    // "Today" 2026-09-25 in Vietnam = [2026-09-24T17:00Z, 2026-09-25T17:00Z).
+    assert.equal(
+      accessLogExportName("2026-09-24T17:00:00.000Z", "2026-09-25T17:00:00.000Z", TZ),
+      "nhat_ky_vao_ra_tu_2026-09-25_den_2026-09-25.csv",
+    );
+  });
+
+  it("uses the last day included for the exclusive upper bound", () => {
+    assert.equal(
+      accessLogExportName("2026-09-19T17:00:00.000Z", "2026-09-25T17:00:00.000Z", TZ),
+      "nhat_ky_vao_ra_tu_2026-09-20_den_2026-09-25.csv",
+    );
+  });
+
+  it("leaves out an open or unreadable bound", () => {
+    assert.equal(accessLogExportName(undefined, undefined, TZ), "nhat_ky_vao_ra.csv");
+    assert.equal(accessLogExportName("2026-09-24T17:00:00.000Z", undefined, TZ), "nhat_ky_vao_ra_tu_2026-09-25.csv");
+    assert.equal(accessLogExportName("garbage", "", TZ), "nhat_ky_vao_ra.csv");
   });
 });

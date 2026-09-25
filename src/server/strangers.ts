@@ -288,3 +288,18 @@ export function pageStrangerClusters<T extends { clusterId: string }>(
   const clusters = all.slice(start, start + limit);
   return { clusters, hasMore: start + limit < all.length, restarted: Boolean(afterClusterId) && after < 0 };
 }
+
+/**
+ * Flood cap for stranger alerts: at most `maxPerMinute` sends in any rolling
+ * minute. `sentAt` is the caller's list of recent send times; the returned
+ * list replaces it (pruned, plus `nowMs` when the alert may go out).
+ */
+export function strangerAlertFloodDecision(
+  sentAt: number[],
+  nowMs: number,
+  maxPerMinute: number,
+): { send: boolean; sentAt: number[] } {
+  const recent = sentAt.filter((t) => nowMs - t < 60_000);
+  if (recent.length >= maxPerMinute) return { send: false, sentAt: recent };
+  return { send: true, sentAt: [...recent, nowMs] };
+}

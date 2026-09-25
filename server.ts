@@ -31,7 +31,7 @@ import {
 } from "./src/server/db";
 import { envNumber } from "./src/server/env";
 import { guardAsyncRoutes, jsonErrorHandler } from "./src/server/asyncRoutes";
-import { csvCell } from "./src/server/csv";
+import { accessLogExportName, csvCell } from "./src/server/csv";
 import {
   UserRole,
   isUserRole,
@@ -62,6 +62,7 @@ import {
   collectStrangerWindow,
   pageStrangerClusters,
   strangerCaptureDecision,
+  strangerAlertFloodDecision,
   RecentStranger,
 } from "./src/server/strangers";
 import { faceWorkerPool } from "./src/server/faceWorkerPool";
@@ -2057,6 +2058,13 @@ function buildStrangerDeepLink(baseUrl: string, logId?: string): string {
 
 /** Timestamp (ms) of the last stranger alert actually dispatched. */
 let lastStrangerWebhookAt = 0;
+/** Strangers alerted recently, for the per-person alert cooldown (all gates). */
+let recentAlertedStrangers: RecentStranger[] = [];
+/** Send times in the last minute, for the flood cap. */
+let strangerAlertTimes: number[] = [];
+/** Alerts held back by the flood cap since the last one sent; reported in the next. */
+let strangerAlertsHeldBack = 0;
+const STRANGER_ALERT_MAX_PER_MINUTE = envInt("STRANGER_ALERT_MAX_PER_MINUTE", 6, 1, 600);
 
 async function sendStrangerWebhook({
   log,
@@ -2065,8 +2073,11 @@ async function sendStrangerWebhook({
   baseUrl,
   timestamp,
   bypassCooldown,
+  embedding,
 }: {
   log: { id: string; type: "ENTRY" | "EXIT"; reason?: string };
+  /** The stranger's face embedding, for the per-person cooldown. */
+  embedding?: number[];
   doorName?: string;
   faceCount?: number;
   baseUrl?: string;
@@ -2090,19 +2101,47 @@ async function sendStrangerWebhook({
       ? webhookConfig.strangerCooldownSeconds
       : DEFAULT_WEBHOOK_CONFIG.strangerCooldownSeconds;
 
+  // The cooldown is per PERSON: a stranger already alerted within the window
+  // is not alerted again (and their window extends while they are still
+  // around), but a different stranger is always alerted. It used to be one
+  // global window across both gates, so a second person arriving within it
+  // produced no alert at all. Without an embedding (non-ONNX path) the old
+  // global behaviour applies.
+  const nowMs = Date.now();
   if (!bypassCooldown && cooldownSeconds > 0) {
-    const elapsedMs = Date.now() - lastStrangerWebhookAt;
-    if (lastStrangerWebhookAt > 0 && elapsedMs < cooldownSeconds * 1000) {
-      console.log(
-        `[Webhook] Bỏ qua cảnh báo người lạ (đang trong thời gian chờ ${cooldownSeconds}s, còn ${Math.ceil(
-          (cooldownSeconds * 1000 - elapsedMs) / 1000
-        )}s).`
-      );
-      return null;
+    if (embedding && embedding.length > 0) {
+      const decision = strangerCaptureDecision(recentAlertedStrangers, embedding, nowMs, cooldownSeconds * 1000);
+      recentAlertedStrangers = decision.recent;
+      if (!decision.capture) {
+        console.log(`[Webhook] Bỏ qua cảnh báo: người lạ này đã được báo trong ${cooldownSeconds}s gần đây.`);
+        return null;
+      }
+    } else {
+      const elapsedMs = nowMs - lastStrangerWebhookAt;
+      if (lastStrangerWebhookAt > 0 && elapsedMs < cooldownSeconds * 1000) {
+        console.log(
+          `[Webhook] Bỏ qua cảnh báo người lạ (đang trong thời gian chờ ${cooldownSeconds}s, còn ${Math.ceil(
+            (cooldownSeconds * 1000 - elapsedMs) / 1000
+          )}s).`
+        );
+        return null;
+      }
     }
   }
+  // Flood cap: a group walking past must not bury the chat room. Alerts over
+  // the cap are counted and reported in the next alert that goes out.
+  let heldBackReport = 0;
   if (!bypassCooldown) {
-    lastStrangerWebhookAt = Date.now();
+    const flood = strangerAlertFloodDecision(strangerAlertTimes, nowMs, STRANGER_ALERT_MAX_PER_MINUTE);
+    strangerAlertTimes = flood.sentAt;
+    if (!flood.send) {
+      strangerAlertsHeldBack += 1;
+      console.log(`[Webhook] Giữ lại cảnh báo người lạ: đã đạt ${STRANGER_ALERT_MAX_PER_MINUTE} cảnh báo/phút.`);
+      return null;
+    }
+    lastStrangerWebhookAt = nowMs;
+    heldBackReport = strangerAlertsHeldBack;
+    strangerAlertsHeldBack = 0;
   }
 
   const now = new Date();
@@ -2138,6 +2177,9 @@ async function sendStrangerWebhook({
   }
   detailLines.push(`Mã nhật ký: ${log.id}`);
   if (log.reason) detailLines.push(log.reason);
+  if (heldBackReport > 0) {
+    detailLines.push(`+${heldBackReport} cảnh báo người lạ khác được gộp lại (vượt ${STRANGER_ALERT_MAX_PER_MINUTE} cảnh báo/phút)`);
+  }
   detailLines.push("Cửa giữ trạng thái KHÓA. Không có quyền ra vào nào được cấp.");
 
   const attachment: { title: string; title_link?: string; text?: string } = {
@@ -4216,6 +4258,7 @@ async function applyRecognitionOutcome(input: RecognitionOutcomeInput): Promise<
     doorName: smartLockState.doorName,
     faceCount: detectedFaces.length,
     baseUrl: input.baseUrl,
+    embedding: input.strangerObservation?.embedding,
   })
     .then((sent) => {
       if (!sent) stats.strangerWebhooksNotSent += 1;
@@ -6264,8 +6307,7 @@ app.get("/api/logs/export.csv", requireOperatorRole("viewer"), async (req: Reque
       return;
     }
     const when = new Intl.DateTimeFormat("vi-VN", { timeZone: SITE_TIMEZONE, dateStyle: "short", timeStyle: "medium" });
-    const day = (iso?: string) => (iso ? iso.slice(0, 10) : "");
-    const name = `nhat_ky_vao_ra${parsed.query.from ? "_tu_" + day(parsed.query.from) : ""}${parsed.query.to ? "_den_" + day(parsed.query.to) : ""}.csv`;
+    const name = accessLogExportName(parsed.query.from, parsed.query.to, SITE_TIMEZONE);
     res.setHeader("Content-Type", "text/csv; charset=utf-8");
     res.setHeader("Content-Disposition", `attachment; filename="${name}"`);
     res.setHeader("Cache-Control", "private, no-store");
