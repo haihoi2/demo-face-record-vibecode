@@ -364,6 +364,89 @@ export interface OrgCatalogRecord {
   positions: OrgEntryRecord[];
 }
 
+/** Filters for the access history; every field optional, all combined with AND. */
+export interface AccessLogQuery {
+  /** Case-insensitive match on name, employee code, department or reason. */
+  q?: string;
+  status?: "GRANTED" | "DENIED";
+  type?: "ENTRY" | "EXIT";
+  /** ISO instant, inclusive. */
+  from?: string;
+  /** ISO instant, exclusive. */
+  to?: string;
+}
+
+export interface AccessLogHourBucket {
+  hour: number;
+  grantedEntries: number;
+  deniedEntries: number;
+  totalEntries: number;
+  exits: number;
+  totalScans: number;
+}
+
+export interface AccessLogStats {
+  total: number;
+  granted: number;
+  denied: number;
+  entries: number;
+  exits: number;
+  /** 24 buckets, hour of day in the site's time zone. */
+  byHour: AccessLogHourBucket[];
+  grantedEntriesByDepartment: Array<{ name: string; count: number }>;
+}
+
+const emptyHours = (): AccessLogHourBucket[] =>
+  Array.from({ length: 24 }, (_, hour) => ({ hour, grantedEntries: 0, deniedEntries: 0, totalEntries: 0, exits: 0, totalScans: 0 }));
+
+const escapeLike = (value: string) => value.replace(/[\\%_]/g, (c) => `\\${c}`);
+
+/** Hour of day of an ISO instant in `timeZone`, or -1 when unparseable. */
+function hourIn(iso: string, timeZone: string): number {
+  const t = Date.parse(iso);
+  if (!Number.isFinite(t)) return -1;
+  const h = Number(new Intl.DateTimeFormat("en-GB", { hour: "2-digit", hourCycle: "h23", timeZone }).format(t));
+  return Number.isInteger(h) && h >= 0 && h < 24 ? h : -1;
+}
+
+function matchesAccessLogQuery(log: AccessLogRecord, f: AccessLogQuery): boolean {
+  if (f.status && log.status !== f.status) return false;
+  if (f.type && log.type !== f.type) return false;
+  if (f.from && !(log.timestamp >= f.from)) return false;
+  if (f.to && !(log.timestamp < f.to)) return false;
+  if (f.q) {
+    const term = f.q.toLocaleLowerCase("vi");
+    const hay = [log.employeeName, log.employeeCode, log.department, log.reason].map((v) => String(v || "").toLocaleLowerCase("vi"));
+    if (!hay.some((v) => v.includes(term))) return false;
+  }
+  return true;
+}
+
+function accumulateStats(rows: Array<Pick<AccessLogRecord, "timestamp" | "type" | "status" | "department">>, timeZone: string): AccessLogStats {
+  const stats: AccessLogStats = { total: 0, granted: 0, denied: 0, entries: 0, exits: 0, byHour: emptyHours(), grantedEntriesByDepartment: [] };
+  const departments = new Map<string, number>();
+  for (const r of rows) {
+    stats.total += 1;
+    if (r.status === "GRANTED") stats.granted += 1; else if (r.status === "DENIED") stats.denied += 1;
+    if (r.type === "ENTRY") stats.entries += 1; else if (r.type === "EXIT") stats.exits += 1;
+    const h = hourIn(r.timestamp, timeZone);
+    if (h >= 0) {
+      const b = stats.byHour[h];
+      b.totalScans += 1;
+      if (r.type === "ENTRY") {
+        b.totalEntries += 1;
+        if (r.status === "GRANTED") b.grantedEntries += 1; else b.deniedEntries += 1;
+      } else if (r.type === "EXIT") b.exits += 1;
+    }
+    if (r.type === "ENTRY" && r.status === "GRANTED") {
+      const name = r.department || "Khác";
+      departments.set(name, (departments.get(name) || 0) + 1);
+    }
+  }
+  stats.grantedEntriesByDepartment = [...departments].map(([name, count]) => ({ name, count })).sort((a, b) => b.count - a.count);
+  return stats;
+}
+
 export type StrangerResolutionAction = "QUICK_REGISTER" | "MERGE" | "DISMISS" | "RESTORE";
 
 export interface StrangerResolutionRecord {
@@ -1117,6 +1200,9 @@ class SQLiteStorage {
         ALTER TABLE access_logs ADD COLUMN IF NOT EXISTS "faceEmbeddingDims" INTEGER;
         ALTER TABLE access_logs ADD COLUMN IF NOT EXISTS "faceEmbeddingModelTag" VARCHAR(128);
         ALTER TABLE access_logs ADD COLUMN IF NOT EXISTS "faceEmbeddingQuality" REAL;
+        -- Matches the history ordering (newest first, id as tie-break) so a page
+        -- is an index range scan instead of a sort of the whole table.
+        CREATE INDEX IF NOT EXISTS idx_access_logs_ts_id ON access_logs ("timestamp" DESC, id DESC);
       `);
       await this.loadResolvedStrangerClusters();
       await this.loadStrangerResolutions();
@@ -1184,6 +1270,7 @@ class SQLiteStorage {
         faceEmbeddingModelTag TEXT,
         faceEmbeddingQuality REAL
       );
+      CREATE INDEX IF NOT EXISTS idx_access_logs_ts_id ON access_logs (timestamp DESC, id DESC);
 
       CREATE TABLE IF NOT EXISTS smart_lock_state (
         lockId TEXT PRIMARY KEY,
@@ -1608,6 +1695,149 @@ class SQLiteStorage {
       ...log, photoSnapshot: log.photoSnapshot ? "stored" : "", faceEmbedding: undefined,
       faceEmbeddingModelTag: undefined, faceEmbeddingQuality: undefined,
     })), total: sorted.length };
+  }
+
+  private pgAccessLogWhere(f: AccessLogQuery, params: unknown[]): string[] {
+    const where: string[] = [];
+    const add = (value: unknown) => { params.push(value); return `$${params.length}`; };
+    if (f.status) where.push(`status = ${add(f.status)}`);
+    if (f.type) where.push(`type = ${add(f.type)}`);
+    if (f.from) where.push(`timestamp >= ${add(f.from)}`);
+    if (f.to) where.push(`timestamp < ${add(f.to)}`);
+    if (f.q) {
+      const p = add(`%${escapeLike(f.q)}%`);
+      where.push(`("employeeName" ILIKE ${p} OR "employeeCode" ILIKE ${p} OR department ILIKE ${p} OR reason ILIKE ${p})`);
+    }
+    return where;
+  }
+
+  private sqliteAccessLogWhere(f: AccessLogQuery, params: unknown[]): string[] {
+    const where: string[] = [];
+    if (f.status) { where.push("status = ?"); params.push(f.status); }
+    if (f.type) { where.push("type = ?"); params.push(f.type); }
+    if (f.from) { where.push("timestamp >= ?"); params.push(f.from); }
+    if (f.to) { where.push("timestamp < ?"); params.push(f.to); }
+    if (f.q) {
+      // SQLite LIKE folds ASCII case only; accented Vietnamese matches exactly.
+      const p = `%${escapeLike(f.q)}%`;
+      where.push("(employeeName LIKE ? ESCAPE '\\' OR employeeCode LIKE ? ESCAPE '\\' OR department LIKE ? ESCAPE '\\' OR reason LIKE ? ESCAPE '\\')");
+      params.push(p, p, p, p);
+    }
+    return where;
+  }
+
+  /**
+   * One page of history, newest first, continuing strictly after `cursor`
+   * (keyset paging: page 500 costs the same as page 1). `total` counts every
+   * row matching the filters. Image bytes and face data are never read.
+   */
+  async queryAccessLogs(
+    f: AccessLogQuery,
+    cursor: { timestamp: string; id: string } | null,
+    limit: number,
+  ): Promise<{ logs: AccessLogRecord[]; hasMore: boolean; total: number }> {
+    const n = Math.min(200, Math.max(1, Math.trunc(limit)));
+    if (this.pgPool && this.isPostgres) {
+      const params: unknown[] = [];
+      const where = this.pgAccessLogWhere(f, params);
+      const countSql = `SELECT count(*)::int AS total FROM access_logs ${where.length ? "WHERE " + where.join(" AND ") : ""}`;
+      const countParams = [...params];
+      if (cursor) {
+        params.push(cursor.timestamp, cursor.id);
+        where.push(`(timestamp, id) < ($${params.length - 1}, $${params.length})`);
+      }
+      params.push(n + 1);
+      const [rows, count] = await Promise.all([
+        this.pgPool.query(
+          `SELECT id, timestamp, type, status, "employeeId", "employeeName", "employeeCode", department,
+                  confidence, "livenessScore", "lockAction", "doorName", reason,
+                  CASE WHEN "photoSnapshot" IS NOT NULL AND "photoSnapshot" <> '' THEN 1 ELSE 0 END AS "hasImage"
+             FROM access_logs ${where.length ? "WHERE " + where.join(" AND ") : ""}
+            ORDER BY timestamp DESC, id DESC LIMIT $${params.length}`,
+          params,
+        ),
+        this.pgPool.query(countSql, countParams),
+      ]);
+      const logs = rows.rows.map((row: any) => ({ ...rowToAccessLog(row), photoSnapshot: row.hasImage ? "stored" : "" }));
+      return { logs: logs.slice(0, n), hasMore: logs.length > n, total: Number(count.rows[0]?.total || 0) };
+    }
+    if (this.isNativeSqlite && this.db) {
+      const params: unknown[] = [];
+      const where = this.sqliteAccessLogWhere(f, params);
+      const count = this.db.prepare(`SELECT count(*) AS total FROM access_logs ${where.length ? "WHERE " + where.join(" AND ") : ""}`).get(...(params as any[])) as any;
+      if (cursor) {
+        where.push("(timestamp < ? OR (timestamp = ? AND id < ?))");
+        params.push(cursor.timestamp, cursor.timestamp, cursor.id);
+      }
+      const rows = this.db.prepare(`SELECT id, timestamp, type, status, employeeId, employeeName, employeeCode,
+        department, confidence, livenessScore, lockAction, doorName, reason,
+        CASE WHEN photoSnapshot IS NOT NULL AND photoSnapshot <> '' THEN 1 ELSE 0 END AS hasImage
+        FROM access_logs ${where.length ? "WHERE " + where.join(" AND ") : ""}
+        ORDER BY timestamp DESC, id DESC LIMIT ?`).all(...(params as any[]), n + 1) as any[];
+      const logs = rows.map((row) => ({ ...rowToAccessLog(row), photoSnapshot: row.hasImage ? "stored" : "" }));
+      return { logs: logs.slice(0, n), hasMore: logs.length > n, total: Number(count?.total || 0) };
+    }
+    const matching = this.fallbackData.access_logs
+      .filter((log) => matchesAccessLogQuery(log, f))
+      .sort((a, b) => b.timestamp.localeCompare(a.timestamp) || b.id.localeCompare(a.id));
+    const after = cursor
+      ? matching.filter((l) => l.timestamp < cursor.timestamp || (l.timestamp === cursor.timestamp && l.id < cursor.id))
+      : matching;
+    const logs = after.slice(0, n).map((log) => ({
+      ...log, photoSnapshot: log.photoSnapshot ? "stored" : "", faceEmbedding: undefined,
+      faceEmbeddingModelTag: undefined, faceEmbeddingQuality: undefined,
+    }));
+    return { logs, hasMore: after.length > n, total: matching.length };
+  }
+
+  /** Totals, hour-of-day buckets (in `timeZone`) and granted entries per department for the filters. */
+  async accessLogStats(f: AccessLogQuery, timeZone: string): Promise<AccessLogStats> {
+    if (this.pgPool && this.isPostgres) {
+      const params: unknown[] = [];
+      const where = this.pgAccessLogWhere(f, params);
+      // Only well-formed ISO instants can be bucketed; anything else is skipped, not fatal.
+      where.push(`timestamp ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}T'`);
+      const clause = "WHERE " + where.join(" AND ");
+      // Postgres refuses a parameter it cannot type, so the time zone is added
+      // only to the query that uses it, and cast explicitly.
+      const deptParams = [...params];
+      params.push(timeZone);
+      const tz = `$${params.length}::text`;
+      const [hours, depts] = await Promise.all([
+        this.pgPool.query(
+          `SELECT extract(hour FROM (timestamp::timestamptz AT TIME ZONE ${tz}))::int AS h,
+                  count(*)::int AS scans,
+                  count(*) FILTER (WHERE status = 'GRANTED')::int AS granted,
+                  count(*) FILTER (WHERE status = 'DENIED')::int AS denied,
+                  count(*) FILTER (WHERE type = 'ENTRY')::int AS entries,
+                  count(*) FILTER (WHERE type = 'ENTRY' AND status = 'GRANTED')::int AS granted_entries,
+                  count(*) FILTER (WHERE type = 'EXIT')::int AS exits
+             FROM access_logs ${clause} GROUP BY 1`,
+          params,
+        ),
+        this.pgPool.query(
+          `SELECT coalesce(nullif(department, ''), 'Khác') AS name, count(*)::int AS count
+             FROM access_logs ${clause} AND type = 'ENTRY' AND status = 'GRANTED'
+            GROUP BY 1 ORDER BY 2 DESC, 1 LIMIT 50`,
+          deptParams,
+        ),
+      ]);
+      const stats: AccessLogStats = { total: 0, granted: 0, denied: 0, entries: 0, exits: 0, byHour: emptyHours(), grantedEntriesByDepartment: [] };
+      for (const r of hours.rows) {
+        stats.total += r.scans; stats.granted += r.granted; stats.denied += r.denied; stats.entries += r.entries; stats.exits += r.exits;
+        const b = stats.byHour[r.h];
+        if (b) Object.assign(b, { totalScans: r.scans, totalEntries: r.entries, grantedEntries: r.granted_entries, deniedEntries: r.entries - r.granted_entries, exits: r.exits });
+      }
+      stats.grantedEntriesByDepartment = depts.rows.map((r: any) => ({ name: r.name, count: r.count }));
+      return stats;
+    }
+    if (this.isNativeSqlite && this.db) {
+      const params: unknown[] = [];
+      const where = this.sqliteAccessLogWhere(f, params);
+      const rows = this.db.prepare(`SELECT timestamp, type, status, department FROM access_logs ${where.length ? "WHERE " + where.join(" AND ") : ""}`).all(...(params as any[])) as any[];
+      return accumulateStats(rows, timeZone);
+    }
+    return accumulateStats(this.fallbackData.access_logs.filter((log) => matchesAccessLogQuery(log, f)), timeZone);
   }
 
   async getAccessLogById(id: string): Promise<AccessLogRecord | undefined> {

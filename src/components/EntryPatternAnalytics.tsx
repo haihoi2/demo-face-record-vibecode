@@ -1,4 +1,4 @@
-import React, { useMemo, useState } from "react";
+import React, { useEffect, useMemo, useState } from "react";
 import {
   BarChart,
   Bar,
@@ -21,10 +21,13 @@ import {
   BarChart3,
   Layers,
 } from "lucide-react";
-import { AccessLog } from "../types";
+import { AccessLogFilters, AccessLogStats, fetchLogStats } from "../utils/accessLogs";
 
 interface EntryPatternAnalyticsProps {
-  logs: AccessLog[];
+  /** The same filters as the history table; the chart's own range narrows them further. */
+  filters: AccessLogFilters;
+  /** Bumped when new entries arrive, to refetch. */
+  refreshKey?: number;
 }
 
 type TimeRangeFilter = "ALL" | "TODAY" | "7DAYS";
@@ -42,82 +45,63 @@ interface HourlyDataPoint {
   totalScans: number;
 }
 
-export const EntryPatternAnalytics: React.FC<EntryPatternAnalyticsProps> = ({ logs }) => {
+export const EntryPatternAnalytics: React.FC<EntryPatternAnalyticsProps> = ({ filters, refreshKey }) => {
   const [timeRange, setTimeRange] = useState<TimeRangeFilter>("ALL");
   const [viewWindow, setViewWindow] = useState<ViewWindow>("BUSINESS_HOURS");
   const [displayMode, setDisplayMode] = useState<DisplayMode>("ENTRY_STATUS");
   const [selectedHour, setSelectedHour] = useState<number | null>(null);
 
-  // Filter logs by selected time range
-  const filteredLogs = useMemo(() => {
-    if (logs.length === 0) return [];
-    const now = new Date();
-
+  // Counted by the server over the whole history (hour of day in the site's
+  // time zone), for the table's filters narrowed to this chart's range.
+  const [serverStats, setServerStats] = useState<AccessLogStats | null>(null);
+  useEffect(() => {
+    let active = true;
+    let extraFrom: string | undefined;
     if (timeRange === "TODAY") {
-      const todayStr = now.toDateString();
-      return logs.filter((log) => new Date(log.timestamp).toDateString() === todayStr);
+      const midnight = new Date();
+      midnight.setHours(0, 0, 0, 0);
+      extraFrom = midnight.toISOString();
+    } else if (timeRange === "7DAYS") {
+      extraFrom = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
     }
+    fetchLogStats(filters, extraFrom)
+      .then((s) => active && setServerStats(s))
+      .catch(() => active && setServerStats(null));
+    return () => {
+      active = false;
+    };
+  }, [filters, refreshKey, timeRange]);
 
-    if (timeRange === "7DAYS") {
-      const sevenDaysAgo = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
-      return logs.filter((log) => new Date(log.timestamp) >= sevenDaysAgo);
-    }
+  const allHours: HourlyDataPoint[] = useMemo(
+    () =>
+      Array.from({ length: 24 }, (_, h) => {
+        const b = serverStats?.byHour?.[h];
+        return {
+          hour: h,
+          hourLabel: `${h.toString().padStart(2, "0")}:00`,
+          displayHour: `${h}h`,
+          grantedEntries: b?.grantedEntries ?? 0,
+          deniedEntries: b?.deniedEntries ?? 0,
+          totalEntries: b?.totalEntries ?? 0,
+          exits: b?.exits ?? 0,
+          totalScans: b?.totalScans ?? 0,
+        };
+      }),
+    [serverStats]
+  );
 
-    return logs;
-  }, [logs, timeRange]);
-
-  // Aggregate hourly statistics
-  const hourlyData = useMemo(() => {
-    const hoursMap: Record<number, HourlyDataPoint> = {};
-
-    for (let h = 0; h < 24; h++) {
-      const formattedHour = `${h.toString().padStart(2, "0")}:00`;
-      hoursMap[h] = {
-        hour: h,
-        hourLabel: formattedHour,
-        displayHour: `${h}h`,
-        grantedEntries: 0,
-        deniedEntries: 0,
-        totalEntries: 0,
-        exits: 0,
-        totalScans: 0,
-      };
-    }
-
-    filteredLogs.forEach((log) => {
-      const date = new Date(log.timestamp);
-      const h = date.getHours();
-      if (hoursMap[h]) {
-        hoursMap[h].totalScans += 1;
-        if (log.type === "ENTRY") {
-          hoursMap[h].totalEntries += 1;
-          if (log.status === "GRANTED") {
-            hoursMap[h].grantedEntries += 1;
-          } else {
-            hoursMap[h].deniedEntries += 1;
-          }
-        } else if (log.type === "EXIT") {
-          hoursMap[h].exits += 1;
-        }
-      }
-    });
-
-    const allHours = Object.values(hoursMap);
-
-    if (viewWindow === "BUSINESS_HOURS") {
-      // 06:00 to 20:00 (15 hours typical workday)
-      return allHours.filter((item) => item.hour >= 6 && item.hour <= 20);
-    }
-
-    return allHours;
-  }, [filteredLogs, viewWindow]);
+  const hourlyData = useMemo(
+    () => (viewWindow === "BUSINESS_HOURS" ? allHours.filter((item) => item.hour >= 6 && item.hour <= 20) : allHours),
+    [allHours, viewWindow]
+  );
 
   // Summary Metrics calculations
   const stats = useMemo(() => {
-    const totalEntries = filteredLogs.filter((l) => l.type === "ENTRY").length;
-    const grantedEntries = filteredLogs.filter((l) => l.type === "ENTRY" && l.status === "GRANTED").length;
-    const deniedEntries = filteredLogs.filter((l) => l.type === "ENTRY" && l.status === "DENIED").length;
-    const totalExits = filteredLogs.filter((l) => l.type === "EXIT").length;
+    const sum = (key: keyof HourlyDataPoint) => allHours.reduce((n, d) => n + (d[key] as number), 0);
+    const totalEntries = serverStats?.entries ?? 0;
+    const grantedEntries = sum("grantedEntries");
+    const deniedEntries = sum("deniedEntries");
+    const totalExits = serverStats?.exits ?? 0;
 
     // Find peak entry hour
     let peakHour = 8;
@@ -134,11 +118,7 @@ export const EntryPatternAnalytics: React.FC<EntryPatternAnalyticsProps> = ({ lo
       .padStart(2, "0")}:00`;
 
     // Morning rush (07:00 - 09:59)
-    const morningRushCount = filteredLogs.filter((l) => {
-      if (l.type !== "ENTRY") return false;
-      const h = new Date(l.timestamp).getHours();
-      return h >= 7 && h <= 9;
-    }).length;
+    const morningRushCount = allHours.filter((d) => d.hour >= 7 && d.hour <= 9).reduce((n, d) => n + d.totalEntries, 0);
 
     const morningRushPct = totalEntries > 0 ? Math.round((morningRushCount / totalEntries) * 100) : 0;
     const successRate = totalEntries > 0 ? Math.round((grantedEntries / totalEntries) * 100) : 100;
@@ -155,22 +135,10 @@ export const EntryPatternAnalytics: React.FC<EntryPatternAnalyticsProps> = ({ lo
       morningRushPct,
       successRate,
     };
-  }, [filteredLogs, hourlyData]);
+  }, [serverStats, allHours, hourlyData]);
 
   // Department distribution during entries
-  const departmentBreakdown = useMemo(() => {
-    const deptMap: Record<string, number> = {};
-    filteredLogs
-      .filter((l) => l.type === "ENTRY" && l.status === "GRANTED")
-      .forEach((l) => {
-        const dept = l.department || "Khác";
-        deptMap[dept] = (deptMap[dept] || 0) + 1;
-      });
-
-    return Object.entries(deptMap)
-      .map(([name, count]) => ({ name, count }))
-      .sort((a, b) => b.count - a.count);
-  }, [filteredLogs]);
+  const departmentBreakdown = serverStats?.grantedEntriesByDepartment ?? [];
 
   // Custom Chart Tooltip
   const CustomTooltip = ({ active, payload, label }: any) => {

@@ -1,4 +1,4 @@
-import React, { useState } from "react";
+import React, { useCallback, useEffect, useState } from "react";
 import {
   ClipboardList,
   Search,
@@ -19,74 +19,127 @@ import {
   ChevronUp,
   UserX,
   UserPlus,
+  ChevronLeft,
+  ChevronRight,
+  CalendarDays,
+  Loader2,
 } from "lucide-react";
 import { AccessLog } from "../types";
 import { EntryPatternAnalytics } from "./EntryPatternAnalytics";
 import { ProtectedImage } from "./ProtectedImage";
+import {
+  AccessLogFilters,
+  AccessLogStats,
+  EMPTY_LOG_FILTERS,
+  downloadLogCsv,
+  fetchLogPage,
+  fetchLogStats,
+} from "../utils/accessLogs";
 
 interface AccessLogsProps {
-  logs: AccessLog[];
   onClearLogs: () => void;
-  onOpenStrangerClusters?: (preselectedPhoto?: string) => void;
+  /** Opens the stranger panel on the group containing this capture. */
+  onOpenStrangerClusters?: (logId?: string) => void;
+  /** Newest log id the app has seen; a change refreshes the first page and the totals. */
+  latestLogId?: string;
 }
 
+const PAGE_SIZE = 50;
+
+/**
+ * The whole access history, filtered, counted and paged by the server. Search,
+ * the summary cards, the chart and the CSV all cover every matching entry -
+ * not just the newest page, which is what they used to silently describe.
+ */
 export const AccessLogs: React.FC<AccessLogsProps> = ({
-  logs,
   onClearLogs,
   onOpenStrangerClusters,
+  latestLogId,
 }) => {
-  const [searchTerm, setSearchTerm] = useState<string>("");
-  const [statusFilter, setStatusFilter] = useState<"ALL" | "GRANTED" | "DENIED">("ALL");
-  const [typeFilter, setTypeFilter] = useState<"ALL" | "ENTRY" | "EXIT">("ALL");
+  const [searchInput, setSearchInput] = useState<string>("");
+  const [filters, setFilters] = useState<AccessLogFilters>(EMPTY_LOG_FILTERS);
   const [showAnalytics, setShowAnalytics] = useState<boolean>(true);
+  // Cursors that led to the current page; empty = first page.
+  const [cursorStack, setCursorStack] = useState<string[]>([]);
+  const [rows, setRows] = useState<AccessLog[]>([]);
+  const [total, setTotal] = useState<number>(0);
+  const [nextCursor, setNextCursor] = useState<string | null>(null);
+  const [stats, setStats] = useState<AccessLogStats | null>(null);
+  const [loading, setLoading] = useState<boolean>(true);
+  const [error, setError] = useState<string | null>(null);
+  const [exporting, setExporting] = useState<boolean>(false);
+  const [refreshKey, setRefreshKey] = useState<number>(0);
 
-  const filteredLogs = logs.filter((log) => {
-    // Search filter
-    const term = searchTerm.toLowerCase();
-    const matchName = log.employeeName?.toLowerCase().includes(term);
-    const matchCode = log.employeeCode?.toLowerCase().includes(term);
-    const matchDept = log.department?.toLowerCase().includes(term);
-    const matchReason = log.reason?.toLowerCase().includes(term);
-    const matchesSearch = !term || matchName || matchCode || matchDept || matchReason;
+  const statusFilter = filters.status;
+  const typeFilter = filters.type;
+  const setStatusFilter = (status: AccessLogFilters["status"]) => setFilters((f) => ({ ...f, status }));
+  const setTypeFilter = (type: AccessLogFilters["type"]) => setFilters((f) => ({ ...f, type }));
 
-    // Status filter
-    const matchesStatus =
-      statusFilter === "ALL" || log.status === statusFilter;
+  // Search is sent to the server once typing pauses.
+  useEffect(() => {
+    const t = setTimeout(() => setFilters((f) => (f.q === searchInput ? f : { ...f, q: searchInput })), 350);
+    return () => clearTimeout(t);
+  }, [searchInput]);
 
-    // Type filter
-    const matchesType = typeFilter === "ALL" || log.type === typeFilter;
+  // Any filter change starts again from the first page.
+  useEffect(() => {
+    setCursorStack([]);
+  }, [filters]);
 
-    return matchesSearch && matchesStatus && matchesType;
-  });
+  const currentCursor = cursorStack.length > 0 ? cursorStack[cursorStack.length - 1] : null;
 
-  const grantedCount = logs.filter((l) => l.status === "GRANTED").length;
-  const deniedCount = logs.filter((l) => l.status === "DENIED").length;
+  const load = useCallback(async () => {
+    setLoading(true);
+    setError(null);
+    try {
+      const page = await fetchLogPage(filters, currentCursor, PAGE_SIZE);
+      setRows(page.logs);
+      setTotal(page.total);
+      setNextCursor(page.hasMore ? page.nextCursor : null);
+    } catch (err: any) {
+      setError(err?.message || "Không tải được nhật ký");
+    } finally {
+      setLoading(false);
+    }
+  }, [filters, currentCursor]);
 
-  const exportCSV = () => {
-    const headers = ["ID", "Thời Gian", "Loại", "Trạng Thái", "Mã NV", "Họ Tên", "Phòng Ban", "Độ Trùng Khớp (%)", "Hành Động Khóa"];
-    const rows = filteredLogs.map((l) => [
-      l.id,
-      new Date(l.timestamp).toLocaleString("vi-VN"),
-      l.type === "ENTRY" ? "Vào" : "Ra",
-      l.status === "GRANTED" ? "Thành Công" : "Từ Chối",
-      l.employeeCode || "N/A",
-      l.employeeName || "Không xác định",
-      l.department || "N/A",
-      l.confidence + "%",
-      l.lockAction,
-    ]);
+  useEffect(() => {
+    void load();
+  }, [load, refreshKey]);
 
-    const csvContent =
-      "data:text/csv;charset=utf-8,\uFEFF" +
-      [headers.join(","), ...rows.map((e) => e.map((val) => `"${val}"`).join(","))].join("\n");
+  useEffect(() => {
+    let active = true;
+    fetchLogStats(filters)
+      .then((s) => active && setStats(s))
+      .catch(() => active && setStats(null));
+    return () => {
+      active = false;
+    };
+  }, [filters, refreshKey]);
 
-    const encodedUri = encodeURI(csvContent);
-    const link = document.createElement("a");
-    link.setAttribute("href", encodedUri);
-    link.setAttribute("download", `nhat_ky_vao_ra_${new Date().toISOString().slice(0, 10)}.csv`);
-    document.body.appendChild(link);
-    link.click();
-    document.body.removeChild(link);
+  // A new entry arrived: refresh while the operator is looking at the newest page.
+  useEffect(() => {
+    if (cursorStack.length === 0) setRefreshKey((k) => k + 1);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [latestLogId]);
+
+  const grantedCount = stats?.granted ?? 0;
+  const deniedCount = stats?.denied ?? 0;
+  const statsTotal = stats?.total ?? total;
+  const pageStart = total === 0 ? 0 : cursorStack.length * PAGE_SIZE + 1;
+  const pageEnd = cursorStack.length * PAGE_SIZE + rows.length;
+  const filtersActive = JSON.stringify(filters) !== JSON.stringify(EMPTY_LOG_FILTERS);
+
+  const handleExport = async () => {
+    setExporting(true);
+    setError(null);
+    try {
+      await downloadLogCsv(filters);
+    } catch (err: any) {
+      setError(err?.message || "Xuất CSV thất bại");
+    } finally {
+      setExporting(false);
+    }
   };
 
   return (
@@ -98,8 +151,8 @@ export const AccessLogs: React.FC<AccessLogsProps> = ({
             Tổng Lượt Quét Cửa
           </span>
           <div className="flex items-baseline justify-between mt-1">
-            <span className="text-2xl font-bold font-mono text-slate-900">
-              {logs.length}
+            <span className="text-2xl font-bold font-mono text-slate-900 tabular-nums">
+              {statsTotal.toLocaleString("vi-VN")}
             </span>
             <Scan className="w-5 h-5 text-indigo-500" />
           </div>
@@ -135,8 +188,8 @@ export const AccessLogs: React.FC<AccessLogsProps> = ({
           </span>
           <div className="flex items-baseline justify-between mt-1">
             <span className="text-2xl font-bold font-mono text-blue-600">
-              {logs.length > 0
-                ? Math.round((grantedCount / logs.length) * 100)
+              {statsTotal > 0
+                ? Math.round((grantedCount / statsTotal) * 100)
                 : 100}
               %
             </span>
@@ -152,7 +205,9 @@ export const AccessLogs: React.FC<AccessLogsProps> = ({
             <BarChart3 className="w-4 h-4 text-indigo-600" />
             Biểu Đồ Xu Hướng Vào Ra Theo Giờ
           </span>
-          <span className="text-xs text-slate-500 font-mono">({logs.length} bản ghi)</span>
+          <span className="text-xs text-slate-500 font-mono tabular-nums">
+            ({statsTotal.toLocaleString("vi-VN")} bản ghi{filtersActive ? " khớp bộ lọc" : ""})
+          </span>
         </div>
 
         <button
@@ -176,7 +231,7 @@ export const AccessLogs: React.FC<AccessLogsProps> = ({
 
       {/* Entry Pattern Analytics Visualization Section */}
       {showAnalytics && (
-        <EntryPatternAnalytics logs={logs} />
+        <EntryPatternAnalytics filters={filters} refreshKey={refreshKey} />
       )}
 
       {/* Filter and Control Bar */}
@@ -188,10 +243,46 @@ export const AccessLogs: React.FC<AccessLogsProps> = ({
             id="input-search-logs"
             type="text"
             placeholder="Tìm theo tên, mã NV, phòng ban..."
-            value={searchTerm}
-            onChange={(e) => setSearchTerm(e.target.value)}
+            value={searchInput}
+            onChange={(e) => setSearchInput(e.target.value)}
             className="w-full pl-9 pr-4 py-2 bg-slate-50 border border-slate-200 rounded-xl text-xs focus:outline-hidden focus:ring-2 focus:ring-indigo-500/30 focus:border-indigo-500 transition"
           />
+        </div>
+
+        {/* Date range (local calendar days, inclusive) */}
+        <div className="flex items-center gap-1.5 text-xs text-slate-600">
+          <CalendarDays className="w-4 h-4 text-slate-400 shrink-0" />
+          <input
+            id="input-logs-from"
+            type="date"
+            value={filters.fromDate}
+            max={filters.toDate || undefined}
+            onChange={(e) => setFilters((f) => ({ ...f, fromDate: e.target.value }))}
+            aria-label="Từ ngày"
+            className="px-2 py-1.5 bg-slate-50 border border-slate-200 rounded-lg text-xs"
+          />
+          <span>–</span>
+          <input
+            id="input-logs-to"
+            type="date"
+            value={filters.toDate}
+            min={filters.fromDate || undefined}
+            onChange={(e) => setFilters((f) => ({ ...f, toDate: e.target.value }))}
+            aria-label="Đến ngày"
+            className="px-2 py-1.5 bg-slate-50 border border-slate-200 rounded-lg text-xs"
+          />
+          {filtersActive && (
+            <button
+              type="button"
+              onClick={() => {
+                setSearchInput("");
+                setFilters(EMPTY_LOG_FILTERS);
+              }}
+              className="ml-1 px-2 py-1 rounded-lg text-[11px] font-semibold text-slate-500 hover:text-slate-800 hover:bg-slate-100"
+            >
+              Xóa lọc
+            </button>
+          )}
         </div>
 
         {/* Filter Pills */}
@@ -267,19 +358,20 @@ export const AccessLogs: React.FC<AccessLogsProps> = ({
           {/* Export CSV */}
           <button
             id="btn-export-csv"
-            onClick={exportCSV}
-            disabled={filteredLogs.length === 0}
+            onClick={() => void handleExport()}
+            disabled={total === 0 || exporting}
+            title={`Xuất toàn bộ ${statsTotal.toLocaleString("vi-VN")} dòng khớp bộ lọc`}
             className="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 disabled:opacity-40 text-white rounded-xl text-xs font-semibold flex items-center gap-1.5 transition cursor-pointer"
           >
-            <Download className="w-3.5 h-3.5" />
-            <span className="hidden sm:inline">Xuất CSV</span>
+            {exporting ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Download className="w-3.5 h-3.5" />}
+            <span className="hidden sm:inline">{exporting ? "Đang xuất..." : "Xuất CSV"}</span>
           </button>
 
           {/* Clear Logs */}
           <button
             id="btn-clear-logs"
             onClick={onClearLogs}
-            disabled={logs.length === 0}
+            disabled={total === 0}
             className="p-1.5 text-slate-400 hover:text-rose-600 rounded-xl hover:bg-rose-50 border border-slate-200 transition"
             title="Xóa toàn bộ nhật ký"
           >
@@ -287,6 +379,12 @@ export const AccessLogs: React.FC<AccessLogsProps> = ({
           </button>
         </div>
       </div>
+
+      {error && (
+        <p role="alert" className="text-xs font-semibold text-rose-700 bg-rose-50 border border-rose-200 rounded-xl px-3 py-2">
+          {error}
+        </p>
+      )}
 
       {/* Access Logs Table */}
       <div className="bg-white rounded-2xl border border-slate-200 overflow-hidden shadow-xs">
@@ -304,15 +402,19 @@ export const AccessLogs: React.FC<AccessLogsProps> = ({
               </tr>
             </thead>
             <tbody className="divide-y divide-slate-100">
-              {filteredLogs.length === 0 ? (
+              {rows.length === 0 ? (
                 <tr>
                   <td colSpan={7} className="py-12 text-center text-slate-400">
-                    <ClipboardList className="w-8 h-8 mx-auto mb-2 opacity-40" />
-                    <p>Không tìm thấy bản ghi log nào phù hợp</p>
+                    {loading ? (
+                      <Loader2 className="w-6 h-6 mx-auto mb-2 animate-spin opacity-60" />
+                    ) : (
+                      <ClipboardList className="w-8 h-8 mx-auto mb-2 opacity-40" />
+                    )}
+                    <p>{loading ? "Đang tải nhật ký..." : "Không tìm thấy bản ghi log nào phù hợp"}</p>
                   </td>
                 </tr>
               ) : (
-                filteredLogs.map((log) => {
+                rows.map((log) => {
                   const logDate = new Date(log.timestamp);
                   const formattedDate = logDate.toLocaleDateString("vi-VN");
                   const formattedTime = logDate.toLocaleTimeString("vi-VN", {
@@ -363,7 +465,7 @@ export const AccessLogs: React.FC<AccessLogsProps> = ({
                             {onOpenStrangerClusters && (
                               <button
                                 id={`btn-quick-reg-log-${log.id}`}
-                                onClick={() => onOpenStrangerClusters(log.photoSnapshot)}
+                                onClick={() => onOpenStrangerClusters(log.id)}
                                 className="mt-1 inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-gradient-to-r from-amber-500 to-rose-500 hover:from-amber-600 hover:to-rose-600 text-white text-[10px] font-bold shadow-2xs transition cursor-pointer"
                                 title="Khai báo nhanh người lạ này thành nhân viên"
                               >
@@ -415,7 +517,7 @@ export const AccessLogs: React.FC<AccessLogsProps> = ({
                         </div>
                         {log.livenessScore && (
                           <div className="text-[10px] text-slate-700 mt-0.5">
-                            Sống thật: {log.livenessScore}%
+                            Chất lượng ảnh: {log.livenessScore}%
                           </div>
                         )}
                       </td>
@@ -445,6 +547,33 @@ export const AccessLogs: React.FC<AccessLogsProps> = ({
               )}
             </tbody>
           </table>
+        </div>
+
+        {/* Pager */}
+        <div className="flex items-center justify-between gap-3 px-4 py-3 border-t border-slate-100 text-xs text-slate-600">
+          <span className="tabular-nums" data-testid="logs-page-range">
+            {total === 0
+              ? "0 bản ghi"
+              : `Hiển thị ${pageStart.toLocaleString("vi-VN")}–${pageEnd.toLocaleString("vi-VN")} / ${total.toLocaleString("vi-VN")}`}
+          </span>
+          <div className="flex items-center gap-1.5">
+            <button
+              type="button"
+              disabled={cursorStack.length === 0 || loading}
+              onClick={() => setCursorStack((stack) => stack.slice(0, -1))}
+              className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg border border-slate-200 bg-white hover:bg-slate-50 disabled:opacity-40"
+            >
+              <ChevronLeft className="w-3.5 h-3.5" /> Mới hơn
+            </button>
+            <button
+              type="button"
+              disabled={!nextCursor || loading}
+              onClick={() => nextCursor && setCursorStack((stack) => [...stack, nextCursor])}
+              className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg border border-slate-200 bg-white hover:bg-slate-50 disabled:opacity-40"
+            >
+              Cũ hơn <ChevronRight className="w-3.5 h-3.5" />
+            </button>
+          </div>
         </div>
       </div>
     </div>

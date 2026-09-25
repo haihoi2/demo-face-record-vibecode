@@ -136,6 +136,13 @@ export default function App() {
     setIsStrangerModalOpen(true);
   };
 
+  /** Open the stranger panel on the group containing this capture, however old. */
+  const handleOpenStrangerModalForLog = (logId?: string) => {
+    setPreselectedStrangerPhoto(null);
+    setPreselectedStrangerLogId(logId || null);
+    setIsStrangerModalOpen(true);
+  };
+
   // --- Deep link: webhook alerts link to <base>/#strangers/<logId> ---
   const applyHashRoute = useCallback(() => {
     if (typeof window === "undefined") return;
@@ -708,9 +715,9 @@ export default function App() {
 
         {activeTab === "logs" && (
           <AccessLogs
-            logs={accessLogs}
+            latestLogId={accessLogs[0]?.id}
             onClearLogs={handleClearLogs}
-            onOpenStrangerClusters={(photo) => handleOpenStrangerModal(photo)}
+            onOpenStrangerClusters={(logId) => handleOpenStrangerModalForLog(logId)}
           />
         )}
 

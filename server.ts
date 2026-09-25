@@ -27,9 +27,11 @@ import {
   UserRecord,
   OrgCatalogRecord,
   OrgEntryRecord,
+  AccessLogQuery,
 } from "./src/server/db";
 import { envNumber } from "./src/server/env";
 import { guardAsyncRoutes, jsonErrorHandler } from "./src/server/asyncRoutes";
+import { csvCell } from "./src/server/csv";
 import {
   UserRole,
   isUserRole,
@@ -6159,16 +6161,183 @@ const publicAccessLog = (log: AccessLogRecord) => {
   return { ...metadata, photoSnapshot: imageUrl, imageUrl, hasImage: Boolean(log.photoSnapshot) };
 };
 
+// ---------------------------------------------------------------------------
+// Access history ("Nhật ký vào ra"): filtered, keyset-paged, aggregated and
+// exported on the server, so search, totals, the chart and the CSV cover the
+// whole history instead of the newest page the browser happened to load.
+// ---------------------------------------------------------------------------
+const SITE_TIMEZONE = (() => {
+  const tz = String(process.env.SITE_TIMEZONE || "").trim() || "Asia/Ho_Chi_Minh";
+  try {
+    new Intl.DateTimeFormat("en", { timeZone: tz });
+    return tz;
+  } catch {
+    return "Asia/Ho_Chi_Minh";
+  }
+})();
+const LOG_EXPORT_MAX_ROWS = envInt("LOG_EXPORT_MAX_ROWS", 100_000, 1, 1_000_000);
+
+/** Validated filters from a query string; `error` names the first bad parameter. */
+function accessLogQueryFrom(q: Record<string, unknown>): { query: AccessLogQuery } | { error: string } {
+  const query: AccessLogQuery = {};
+  const text = typeof q.q === "string" ? q.q.trim() : "";
+  if (text.length > 100) return { error: "Từ khóa tìm kiếm tối đa 100 ký tự" };
+  if (text) query.q = text;
+  if (q.status !== undefined && q.status !== "" && q.status !== "ALL") {
+    if (q.status !== "GRANTED" && q.status !== "DENIED") return { error: "status phải là GRANTED hoặc DENIED" };
+    query.status = q.status;
+  }
+  if (q.type !== undefined && q.type !== "" && q.type !== "ALL") {
+    if (q.type !== "ENTRY" && q.type !== "EXIT") return { error: "type phải là ENTRY hoặc EXIT" };
+    query.type = q.type;
+  }
+  for (const key of ["from", "to"] as const) {
+    const raw = q[key];
+    if (raw === undefined || raw === "") continue;
+    const t = Date.parse(String(raw));
+    if (!Number.isFinite(t)) return { error: `${key} không phải thời điểm hợp lệ` };
+    query[key] = new Date(t).toISOString();
+  }
+  if (query.from && query.to && query.from >= query.to) return { error: "from phải trước to" };
+  return { query };
+}
+
+const encodeLogCursor = (log: { timestamp: string; id: string }) =>
+  Buffer.from(JSON.stringify({ timestamp: log.timestamp, id: log.id }), "utf8").toString("base64url");
+function decodeLogCursor(value: unknown): { timestamp: string; id: string } | null {
+  try {
+    const parsed = JSON.parse(Buffer.from(String(value), "base64url").toString("utf8"));
+    if (typeof parsed?.timestamp !== "string" || typeof parsed?.id !== "string") return null;
+    if (!Number.isFinite(Date.parse(parsed.timestamp)) || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(parsed.id)) return null;
+    return { timestamp: parsed.timestamp, id: parsed.id };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Express 4 does not catch a rejected async handler: the rejection goes
+ * unhandled and takes the whole process down - gate watchers included. Every
+ * history route answers a database error with a 500 instead.
+ */
+function failHistoryRequest(res: Response, err: any) {
+  console.error("[Logs] Lỗi truy vấn nhật ký vào ra:", err?.message || err);
+  if (res.headersSent) {
+    res.end(); // a CSV already streaming: close it rather than corrupt it
+    return;
+  }
+  res.status(500).json({ success: false, error: "Không truy vấn được nhật ký vào ra" });
+}
+
+app.get("/api/logs/stats", requireOperatorRole("viewer"), async (req: Request, res: Response) => {
+  try {
+    const parsed = accessLogQueryFrom(req.query as any);
+    if ("error" in parsed) {
+      res.status(400).json({ success: false, error: parsed.error });
+      return;
+    }
+    const stats = await db.accessLogStats(parsed.query, SITE_TIMEZONE);
+    res.setHeader("Cache-Control", "private, no-store");
+    res.json({ success: true, timeZone: SITE_TIMEZONE, filters: parsed.query, ...stats });
+  } catch (err: any) {
+    failHistoryRequest(res, err);
+  }
+
+});
+
+
+app.get("/api/logs/export.csv", requireOperatorRole("viewer"), async (req: Request, res: Response) => {
+  try {
+    const parsed = accessLogQueryFrom(req.query as any);
+    if ("error" in parsed) {
+      res.status(400).json({ success: false, error: parsed.error });
+      return;
+    }
+    const first = await db.queryAccessLogs(parsed.query, null, 200);
+    if (first.total > LOG_EXPORT_MAX_ROWS) {
+      res.status(413).json({
+        success: false,
+        total: first.total,
+        max: LOG_EXPORT_MAX_ROWS,
+        error: `Có ${first.total} dòng khớp bộ lọc, vượt giới hạn xuất ${LOG_EXPORT_MAX_ROWS}. Hãy thu hẹp khoảng thời gian.`,
+      });
+      return;
+    }
+    const when = new Intl.DateTimeFormat("vi-VN", { timeZone: SITE_TIMEZONE, dateStyle: "short", timeStyle: "medium" });
+    const day = (iso?: string) => (iso ? iso.slice(0, 10) : "");
+    const name = `nhat_ky_vao_ra${parsed.query.from ? "_tu_" + day(parsed.query.from) : ""}${parsed.query.to ? "_den_" + day(parsed.query.to) : ""}.csv`;
+    res.setHeader("Content-Type", "text/csv; charset=utf-8");
+    res.setHeader("Content-Disposition", `attachment; filename="${name}"`);
+    res.setHeader("Cache-Control", "private, no-store");
+    res.setHeader("X-Total-Count", String(first.total));
+    const header = ["ID", "Thời gian", "Loại", "Trạng thái", "Mã NV", "Họ tên", "Phòng ban", "Độ trùng khớp (%)", "Cửa", "Hành động khóa", "Lý do"];
+    res.write("\uFEFF" + header.map(csvCell).join(",") + "\n"); // BOM so Excel reads UTF-8
+    let page = first;
+    for (;;) {
+      for (const l of page.logs) {
+        res.write([
+          l.id, when.format(new Date(l.timestamp)), l.type === "ENTRY" ? "Vào" : "Ra",
+          l.status === "GRANTED" ? "Thành công" : "Từ chối", l.employeeCode || "", l.employeeName || "",
+          l.department || "", l.confidence, l.doorName || "", l.lockAction || "", l.reason || "",
+        ].map(csvCell).join(",") + "\n");
+      }
+      const last = page.logs[page.logs.length - 1];
+      if (!page.hasMore || !last) break;
+      page = await db.queryAccessLogs(parsed.query, { timestamp: last.timestamp, id: last.id }, 200);
+    }
+    console.log(`[Logs] ${operatorActor(req)} đã xuất ${first.total} dòng nhật ký vào ra.`);
+    res.end();
+  } catch (err: any) {
+    failHistoryRequest(res, err);
+  }
+
+});
+
 app.get(LOG_ROUTES, requireOperatorRole("viewer"), async (req, res) => {
-  const page = boundedInt(req.query.page, 1, 1, 1_000_000);
-  const limit = boundedInt(req.query.limit, 50, 1, 100);
-  const result = await db.getAccessLogsPage(page, limit);
-  const total = result.total;
-  const logs = result.logs.map(publicAccessLog);
-  res.setHeader("X-Total-Count", String(total));
-  res.setHeader("X-Page", String(page));
-  res.setHeader("X-Page-Limit", String(limit));
-  res.json({ success: true, version: 1, logs, page, limit, total, hasMore: page * limit < total });
+  try {
+    // Keyset mode: any filter, a cursor, or ?paging=cursor. The page-number mode
+    // below is kept for callers that only want the newest rows.
+    const keyset = req.query.paging === "cursor" || req.query.cursor !== undefined ||
+      ["q", "status", "type", "from", "to"].some((k) => req.query[k] !== undefined && req.query[k] !== "");
+    if (keyset) {
+      const parsed = accessLogQueryFrom(req.query as any);
+      if ("error" in parsed) {
+        res.status(400).json({ success: false, error: parsed.error });
+        return;
+      }
+      const cursor = req.query.cursor ? decodeLogCursor(req.query.cursor) : null;
+      if (req.query.cursor && !cursor) {
+        res.status(400).json({ success: false, error: "Cursor không hợp lệ" });
+        return;
+      }
+      const limit = boundedInt(req.query.limit, 50, 1, 200);
+      const result = await db.queryAccessLogs(parsed.query, cursor, limit);
+      const last = result.logs[result.logs.length - 1];
+      res.setHeader("X-Total-Count", String(result.total));
+      res.json({
+        success: true,
+        version: 2,
+        logs: result.logs.map(publicAccessLog),
+        total: result.total,
+        limit,
+        hasMore: result.hasMore,
+        nextCursor: result.hasMore && last ? encodeLogCursor(last) : null,
+      });
+      return;
+    }
+    const page = boundedInt(req.query.page, 1, 1, 1_000_000);
+    const limit = boundedInt(req.query.limit, 50, 1, 100);
+    const result = await db.getAccessLogsPage(page, limit);
+    const total = result.total;
+    const logs = result.logs.map(publicAccessLog);
+    res.setHeader("X-Total-Count", String(total));
+    res.setHeader("X-Page", String(page));
+    res.setHeader("X-Page-Limit", String(limit));
+    res.json({ success: true, version: 1, logs, page, limit, total, hasMore: page * limit < total });
+  } catch (err: any) {
+    failHistoryRequest(res, err);
+  }
+
 });
 
 app.get("/api/logs/:id/image", requireOperatorRole("viewer"), async (req, res) => {
