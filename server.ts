@@ -1970,6 +1970,18 @@ async function sendDoorControllerCommand(
     triggeredBy,
   };
 
+  // Fail closed: every supported auth scheme needs a token. Without one the
+  // command would go out unauthenticated, so it is not sent - and the reason
+  // is logged where the operator looks, instead of an opaque network error.
+  if (!doorControllerConfig.apiToken || !doorControllerConfig.apiToken.trim()) {
+    logEntry.error = "Chưa cấu hình mã xác thực bộ điều khiển cửa - lệnh không được gửi";
+    doorApiLogs.unshift(logEntry);
+    if (doorApiLogs.length > 60) doorApiLogs = doorApiLogs.slice(0, 60);
+    db.saveDoorApiLog(logEntry);
+    broadcastSSE("door_api_log", logEntry);
+    return logEntry;
+  }
+
   try {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 7000);

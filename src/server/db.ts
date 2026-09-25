@@ -231,9 +231,14 @@ export interface DoorApiLogRecord {
   triggeredBy: string;
 }
 
+// Off, with no URL, until an admin saves a real controller on the Door
+// Controller page. The previous default was enabled and pointed at
+// https://smartlock.eton.vn/api/door/control - a hostname that does not resolve -
+// so every fresh instance (a new install, an isolated test gateway, a CI run)
+// dispatched real OPEN/CLOSE commands for "CỔNG CHÍNH" to it, unauthenticated.
 export const DEFAULT_DOOR_CONTROLLER_CONFIG: DoorControllerConfigRecord = {
-  enabled: true,
-  apiUrl: "https://smartlock.eton.vn/api/door/control",
+  enabled: false,
+  apiUrl: "",
   apiToken: "" /* set via the Door Controller page; never ship a real token in source */,
   authHeaderType: "BEARER",
   customHeaderName: "X-Door-Token",

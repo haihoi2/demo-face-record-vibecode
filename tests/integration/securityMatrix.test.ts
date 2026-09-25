@@ -174,3 +174,60 @@ describe("legacy /config/ai alias", () => {
     assert.ok([401, 403].includes(write.status), `POST /config/ai returned ${write.status}`);
   });
 });
+
+describe("door controller defaults", () => {
+  it("a fresh instance has no door controller and sends nothing when the lock is operated", async () => {
+    const cfg = await api<any>("/api/door-controller/config");
+    assert.equal(cfg.status, 200, cfg.text.slice(0, 200));
+    const config = cfg.body?.config ?? cfg.body;
+    assert.equal(config.enabled, false, "the compiled default must be off");
+    assert.equal(config.apiUrl, "", "the compiled default must not name any controller");
+
+    const before = await api<any>("/api/door-controller/logs");
+    const beforeCount = (before.body?.logs ?? before.body ?? []).length;
+    const unlocked = await api("/api/lock/unlock", {
+      method: "POST",
+      body: JSON.stringify({ source: "door default regression" }),
+    });
+    assert.equal(unlocked.status, 200, unlocked.text.slice(0, 200));
+    await api("/api/lock/lock", { method: "POST", body: JSON.stringify({ source: "door default regression" }) });
+
+    const afterLogs = await api<any>("/api/door-controller/logs");
+    const logs = afterLogs.body?.logs ?? afterLogs.body ?? [];
+    assert.equal(logs.length, beforeCount, "no controller call may be attempted without a configured controller");
+    assert.doesNotMatch(afterLogs.text, /smartlock\.eton\.vn/);
+  });
+});
+
+describe("door controller without a token", () => {
+  it("refuses to send the command and says why, instead of calling out unauthenticated", async () => {
+    const saved = await api<any>("/api/door-controller/config", {
+      method: "POST",
+      body: JSON.stringify({
+        enabled: true,
+        // .invalid never resolves: if a request were attempted it would fail
+        // as a network error, so the refusal message proves nothing was sent.
+        apiUrl: "https://door.example.invalid/api/door/control",
+        apiToken: "",
+        authHeaderType: "BEARER",
+        triggerOnManualUnlock: true,
+      }),
+    });
+    assert.equal(saved.status, 200, saved.text.slice(0, 300));
+    try {
+      await api("/api/lock/unlock", { method: "POST", body: JSON.stringify({ source: "tokenless regression" }) });
+      await api("/api/lock/lock", { method: "POST", body: JSON.stringify({ source: "tokenless regression" }) });
+      const logs = await api<any>("/api/door-controller/logs");
+      const entries = logs.body?.logs ?? logs.body ?? [];
+      const latest = entries.find((e: any) => /example\.invalid/.test(e.url || ""));
+      assert.ok(latest, "the refused command is still logged for the operator");
+      assert.match(latest.error || "", /Chưa cấu hình mã xác thực/);
+      assert.equal(latest.success, false);
+    } finally {
+      await api("/api/door-controller/config", {
+        method: "POST",
+        body: JSON.stringify({ enabled: false, apiUrl: "", apiToken: "" }),
+      });
+    }
+  });
+});
