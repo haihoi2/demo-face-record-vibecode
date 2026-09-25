@@ -24,7 +24,24 @@ import {
   FaceTemplateRecord,
   StrangerResolutionRecord,
   sameResolutionIntent,
+  UserRecord,
 } from "./src/server/db";
+import {
+  UserRole,
+  isUserRole,
+  roleAtLeast,
+  requiredRoleFor,
+  hashPassword,
+  verifyPassword,
+  timingDummyHash,
+  normalizeUsername,
+  validateUsername,
+  validatePassword,
+  lockRemainingMs,
+  LOGIN_MAX_FAILURES,
+  LOGIN_LOCK_MS,
+  ROLE_LABELS,
+} from "./src/server/auth";
 import { STRANGER_DEEP_LINK_HASH } from "./src/types";
 import type {
   FaceObservation,
@@ -152,20 +169,33 @@ app.use(express.json({ limit: "50mb" }));
 app.use(express.urlencoded({ extended: true, limit: "50mb" }));
 app.use(express.text({ limit: "50mb", type: ["text/*", "application/octet-stream"] }));
 
-// Short-lived, HttpOnly operator sessions protect biometric reads and stranger
-// adjudication. The bootstrap token is entered once and is never persisted by
-// browser JavaScript. Production fails closed when no operator identity/token is configured.
-type OperatorRole = "viewer" | "operator";
-interface OperatorSession { actor: string; role: OperatorRole; expiresAt: number; csrfToken: string }
+// Short-lived, HttpOnly sessions protect the whole API. Two ways in:
+//  - a named account (username + password, role admin/operator/viewer), the
+//    everyday login - see src/server/auth.ts for the permission table;
+//  - the bootstrap token from the environment, which signs in as admin so the
+//    deployment can never be locked out of its own account management.
+// Neither secret is persisted by browser JavaScript. Production fails closed
+// when no bootstrap identity/token is configured.
+type OperatorRole = UserRole;
+interface OperatorSession {
+  actor: string;
+  role: OperatorRole;
+  expiresAt: number;
+  csrfToken: string;
+  /** Account id and the account's sessionVersion when issued; absent for the bootstrap token. */
+  uid?: string;
+  ver?: number;
+  displayName?: string;
+}
 const OPERATOR_COOKIE = "smartface_operator_session";
 const OPERATOR_SESSION_TTL_MS = 8 * 60 * 60 * 1000;
 
 const authPrincipals = () => [
-  { actor: String(process.env.OPERATOR_ID || "").trim(), token: String(process.env.OPERATOR_TOKEN || ""), role: "operator" as const },
+  { actor: String(process.env.OPERATOR_ID || "").trim(), token: String(process.env.OPERATOR_TOKEN || ""), role: "admin" as const },
   { actor: String(process.env.VIEWER_ID || "").trim(), token: String(process.env.VIEWER_TOKEN || ""), role: "viewer" as const },
 ].filter((principal) => principal.actor && principal.token);
 
-const authConfigured = () => authPrincipals().some((principal) => principal.role === "operator");
+const authConfigured = () => authPrincipals().some((principal) => principal.role === "admin");
 const sessionSecret = () => String(process.env.OPERATOR_SESSION_SECRET || process.env.OPERATOR_TOKEN || "");
 const constantTimeEqual = (left: string, right: string) => {
   const a = Buffer.from(left);
@@ -188,7 +218,15 @@ const readOperatorSession = (req: Request): OperatorSession | null => {
   if (!constantTimeEqual(signature, expected)) return null;
   try {
     const session = JSON.parse(Buffer.from(payload, "base64url").toString("utf8")) as OperatorSession;
-    if (!session.actor || !session.csrfToken || !["viewer", "operator"].includes(session.role) || session.expiresAt <= Date.now()) return null;
+    if (!session.actor || !session.csrfToken || !isUserRole(session.role) || session.expiresAt <= Date.now()) return null;
+    if (session.uid) {
+      // The cookie says who; the account record says what they may do NOW.
+      // Disabling, demoting or resetting the password of an account takes
+      // effect on its next request instead of when the 8-hour cookie expires.
+      const user = db.getUserById(session.uid);
+      if (!user || user.disabled || user.sessionVersion !== session.ver) return null;
+      return { ...session, role: user.role, actor: user.username, displayName: user.displayName };
+    }
     return session;
   } catch {
     return null;
@@ -204,8 +242,13 @@ const requireOperatorRole = (role: OperatorRole): RequestHandler => (req: Reques
     res.status(401).json({ success: false, code: "AUTH_REQUIRED", error: "Operator authentication required" });
     return;
   }
-  if (role === "operator" && session.role !== "operator") {
-    res.status(403).json({ success: false, code: "ROLE_REQUIRED", error: "Operator role required" });
+  if (!roleAtLeast(session.role, role)) {
+    res.status(403).json({
+      success: false,
+      code: "ROLE_REQUIRED",
+      requiredRole: role,
+      error: `Tài khoản ${ROLE_LABELS[session.role]} không có quyền thực hiện thao tác này (cần quyền ${ROLE_LABELS[role]})`,
+    });
     return;
   }
   (req as any).operatorSession = session;
@@ -275,15 +318,24 @@ const operatorCookieAttributes = () => {
   return `Path=/; HttpOnly; SameSite=${crossSite ? "None" : "Lax"}; Max-Age=${Math.floor(OPERATOR_SESSION_TTL_MS / 1000)}${secure ? "; Secure" : ""}`;
 };
 
-app.post("/api/operator/session", (req, res) => {
+/** What the browser learns about its own session. Never includes a password hash. */
+const sessionPayload = (session: OperatorSession) => ({
+  success: true,
+  actor: session.actor,
+  username: session.uid ? session.actor : null,
+  displayName: session.displayName || session.actor,
+  role: session.role,
+  roleLabel: ROLE_LABELS[session.role],
+  authMethod: session.uid ? "account" : "token",
+  expiresAt: new Date(session.expiresAt).toISOString(),
+  csrfToken: session.csrfToken,
+});
+
+const INVALID_LOGIN = "Tên đăng nhập hoặc mật khẩu không đúng";
+
+app.post("/api/operator/session", async (req, res) => {
   if (!authConfigured()) {
-    res.status(503).json({ success: false, error: "Operator authentication is not configured" });
-    return;
-  }
-  const supplied = String((req.body as any)?.token || "");
-  const principal = authPrincipals().find((candidate) => constantTimeEqual(supplied, candidate.token));
-  if (!principal) {
-    res.status(401).json({ success: false, error: "Invalid operator credentials" });
+    res.status(503).json({ success: false, code: "AUTH_NOT_CONFIGURED", error: "Operator authentication is not configured" });
     return;
   }
   const cookieAttributes = operatorCookieAttributes();
@@ -293,18 +345,76 @@ app.post("/api/operator/session", (req, res) => {
   }
   const origin = String(req.headers.origin || "").trim().replace(/\/+$/, "").toLowerCase();
   if (origin && origin !== requestOrigin(req) && (!CORS_ALLOWED_ORIGINS.length || !isOriginAllowed(origin))) {
-    res.status(403).json({ success: false, error: "Request origin is not allowed" });
+    res.status(403).json({ success: false, code: "ORIGIN_FORBIDDEN", error: "Request origin is not allowed" });
     return;
   }
-  const session: OperatorSession = {
-    actor: principal.actor,
-    role: principal.role,
-    expiresAt: Date.now() + OPERATOR_SESSION_TTL_MS,
-    csrfToken: randomUUID(),
-  };
+
+  const body = (req.body || {}) as Record<string, unknown>;
+  const base = { expiresAt: Date.now() + OPERATOR_SESSION_TTL_MS, csrfToken: randomUUID() };
+  let session: OperatorSession;
+
+  if (body.username !== undefined || body.password !== undefined) {
+    // ---- named account
+    const username = normalizeUsername(body.username);
+    const password = typeof body.password === "string" ? body.password : "";
+    const user = username ? db.getUserByUsername(username) : undefined;
+    if (!user) {
+      // Spend the same time as a real check so latency does not reveal which usernames exist.
+      await verifyPassword(password, await timingDummyHash());
+      res.status(401).json({ success: false, code: "INVALID_CREDENTIALS", error: INVALID_LOGIN });
+      return;
+    }
+    const lockedMs = lockRemainingMs(user.lockedUntil);
+    if (lockedMs > 0) {
+      const minutes = Math.ceil(lockedMs / 60000);
+      res.status(429).json({
+        success: false,
+        code: "ACCOUNT_LOCKED",
+        retryAfterSeconds: Math.ceil(lockedMs / 1000),
+        error: `Tài khoản tạm khóa do nhập sai mật khẩu nhiều lần. Thử lại sau ${minutes} phút.`,
+      });
+      return;
+    }
+    const passwordOk = await verifyPassword(password, user.passwordHash);
+    if (!passwordOk || user.disabled) {
+      if (!passwordOk) {
+        const failures = (user.failedLogins || 0) + 1;
+        const locking = failures >= LOGIN_MAX_FAILURES;
+        db.saveUser({
+          ...user,
+          failedLogins: locking ? 0 : failures,
+          lockedUntil: locking ? new Date(Date.now() + LOGIN_LOCK_MS).toISOString() : user.lockedUntil,
+          updatedAt: new Date().toISOString(),
+        });
+        if (locking) console.warn(`[Accounts] Tạm khóa tài khoản ${user.username} sau ${failures} lần đăng nhập sai.`);
+      }
+      // A disabled account gets the same answer as a wrong password.
+      res.status(401).json({ success: false, code: "INVALID_CREDENTIALS", error: INVALID_LOGIN });
+      return;
+    }
+    const now = new Date().toISOString();
+    db.saveUser({ ...user, failedLogins: 0, lockedUntil: null, lastLoginAt: now, updatedAt: now });
+    session = {
+      ...base,
+      actor: user.username,
+      role: user.role,
+      uid: user.id,
+      ver: user.sessionVersion,
+      displayName: user.displayName,
+    };
+  } else {
+    // ---- bootstrap token (environment), signs in as its configured principal
+    const supplied = String(body.token || "");
+    const principal = authPrincipals().find((candidate) => constantTimeEqual(supplied, candidate.token));
+    if (!principal) {
+      res.status(401).json({ success: false, code: "INVALID_CREDENTIALS", error: "Mã khởi tạo không đúng" });
+      return;
+    }
+    session = { ...base, actor: principal.actor, role: principal.role };
+  }
+
   res.setHeader("Set-Cookie", `${OPERATOR_COOKIE}=${signOperatorSession(session)}; ${cookieAttributes}`);
-  res.json({ success: true, actor: session.actor, role: session.role,
-    expiresAt: new Date(session.expiresAt).toISOString(), csrfToken: session.csrfToken });
+  res.json(sessionPayload(session));
 });
 
 app.delete("/api/operator/session", requireOperatorRole("viewer"), requireCsrf, (_req: Request, res: Response) => {
@@ -320,10 +430,208 @@ app.get(
   (req: Request, res: Response) => {
     const session = (req as any).operatorSession as OperatorSession;
     res.setHeader("Cache-Control", "private, no-store");
-    res.json({ success: true, actor: session.actor, role: session.role,
-      expiresAt: new Date(session.expiresAt).toISOString(), csrfToken: session.csrfToken });
+    res.json(sessionPayload(session));
   },
 );
+
+// ---- own password (any signed-in account) ----
+app.post("/api/operator/password", requireOperatorRole("viewer"), requireCsrf, async (req: Request, res: Response) => {
+  const session = (req as any).operatorSession as OperatorSession;
+  if (!session.uid) {
+    res.status(400).json({ success: false, code: "TOKEN_SESSION", error: "Phiên đăng nhập bằng mã khởi tạo không có mật khẩu để đổi" });
+    return;
+  }
+  const user = db.getUserById(session.uid);
+  if (!user) {
+    res.status(401).json({ success: false, code: "AUTH_REQUIRED", error: "Operator authentication required" });
+    return;
+  }
+  const current = typeof req.body?.currentPassword === "string" ? req.body.currentPassword : "";
+  const next = req.body?.newPassword;
+  if (!(await verifyPassword(current, user.passwordHash))) {
+    res.status(401).json({ success: false, code: "INVALID_CREDENTIALS", error: "Mật khẩu hiện tại không đúng" });
+    return;
+  }
+  const invalid = validatePassword(next);
+  if (invalid) {
+    res.status(400).json({ success: false, code: "WEAK_PASSWORD", error: invalid });
+    return;
+  }
+  if (next === current) {
+    res.status(400).json({ success: false, code: "WEAK_PASSWORD", error: "Mật khẩu mới phải khác mật khẩu hiện tại" });
+    return;
+  }
+  const updated = db.saveUser({
+    ...user,
+    passwordHash: await hashPassword(next),
+    sessionVersion: user.sessionVersion + 1,
+    updatedAt: new Date().toISOString(),
+  });
+  // Every other session of this account dies with the old version; this one
+  // is re-issued so the person changing the password stays signed in.
+  const fresh: OperatorSession = {
+    ...session,
+    ver: updated.sessionVersion,
+    csrfToken: randomUUID(),
+    expiresAt: Date.now() + OPERATOR_SESSION_TTL_MS,
+  };
+  const cookieAttributes = operatorCookieAttributes();
+  if (cookieAttributes) res.setHeader("Set-Cookie", `${OPERATOR_COOKIE}=${signOperatorSession(fresh)}; ${cookieAttributes}`);
+  console.log(`[Accounts] ${user.username} đã đổi mật khẩu.`);
+  res.json(sessionPayload(fresh));
+});
+
+// ---- account management (admin; the boundary enforces it too) ----
+const publicUser = (u: UserRecord) => ({
+  id: u.id,
+  username: u.username,
+  displayName: u.displayName,
+  role: u.role,
+  roleLabel: ROLE_LABELS[u.role],
+  disabled: u.disabled,
+  locked: lockRemainingMs(u.lockedUntil) > 0,
+  lastLoginAt: u.lastLoginAt,
+  createdAt: u.createdAt,
+  updatedAt: u.updatedAt,
+  createdBy: u.createdBy,
+});
+
+const displayNameOf = (value: unknown, fallback: string): string | null => {
+  if (value === undefined) return fallback;
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  return trimmed.length >= 1 && trimmed.length <= 80 ? trimmed : null;
+};
+
+app.get("/api/users", requireOperatorRole("admin"), (_req: Request, res: Response) => {
+  const users = [...db.getUsers()].sort((a, b) => a.username.localeCompare(b.username)).map(publicUser);
+  res.setHeader("Cache-Control", "private, no-store");
+  res.json({ success: true, users });
+});
+
+app.post("/api/users", requireOperatorRole("admin"), requireCsrf, async (req: Request, res: Response) => {
+  const username = normalizeUsername(req.body?.username);
+  const badName = validateUsername(username);
+  if (badName) {
+    res.status(400).json({ success: false, code: "INVALID_USERNAME", error: badName });
+    return;
+  }
+  if (db.getUserByUsername(username) || authPrincipals().some((p) => p.actor.toLowerCase() === username)) {
+    res.status(409).json({ success: false, code: "USERNAME_TAKEN", error: `Tên đăng nhập ${username} đã tồn tại` });
+    return;
+  }
+  const role = req.body?.role;
+  if (!isUserRole(role)) {
+    res.status(400).json({ success: false, code: "INVALID_ROLE", error: "Vai trò phải là admin, operator hoặc viewer" });
+    return;
+  }
+  const displayName = displayNameOf(req.body?.displayName, username);
+  if (!displayName) {
+    res.status(400).json({ success: false, code: "INVALID_DISPLAY_NAME", error: "Tên hiển thị gồm 1-80 ký tự" });
+    return;
+  }
+  const weak = validatePassword(req.body?.password);
+  if (weak) {
+    res.status(400).json({ success: false, code: "WEAK_PASSWORD", error: weak });
+    return;
+  }
+  const now = new Date().toISOString();
+  const actor = operatorActor(req);
+  const user = db.saveUser({
+    id: `USR-${randomUUID()}`,
+    username,
+    displayName,
+    role,
+    passwordHash: await hashPassword(req.body.password),
+    disabled: false,
+    sessionVersion: 1,
+    failedLogins: 0,
+    lockedUntil: null,
+    lastLoginAt: null,
+    createdAt: now,
+    updatedAt: now,
+    createdBy: actor || null,
+  });
+  console.log(`[Accounts] ${actor} đã tạo tài khoản ${username} (${role}).`);
+  res.status(201).json({ success: true, user: publicUser(user) });
+});
+
+app.put("/api/users/:id", requireOperatorRole("admin"), requireCsrf, async (req: Request, res: Response) => {
+  const target = db.getUserById(String(req.params.id || ""));
+  if (!target) {
+    res.status(404).json({ success: false, code: "USER_NOT_FOUND", error: "Không tìm thấy tài khoản" });
+    return;
+  }
+  const session = (req as any).operatorSession as OperatorSession;
+  const body = req.body || {};
+  const next: UserRecord = { ...target };
+
+  if (body.role !== undefined) {
+    if (!isUserRole(body.role)) {
+      res.status(400).json({ success: false, code: "INVALID_ROLE", error: "Vai trò phải là admin, operator hoặc viewer" });
+      return;
+    }
+    next.role = body.role;
+  }
+  if (body.disabled !== undefined) {
+    if (typeof body.disabled !== "boolean") {
+      res.status(400).json({ success: false, code: "INVALID_DISABLED", error: "disabled phải là true hoặc false" });
+      return;
+    }
+    // Disabling ends every issued session for good: re-enabling later must not
+    // quietly revive a cookie that was out in the world while it was disabled.
+    if (body.disabled && !target.disabled) next.sessionVersion = target.sessionVersion + 1;
+    next.disabled = body.disabled;
+  }
+  if (body.displayName !== undefined) {
+    const name = displayNameOf(body.displayName, target.displayName);
+    if (!name) {
+      res.status(400).json({ success: false, code: "INVALID_DISPLAY_NAME", error: "Tên hiển thị gồm 1-80 ký tự" });
+      return;
+    }
+    next.displayName = name;
+  }
+  // An admin cannot lock themselves out by accident; the bootstrap token
+  // remains the recovery path for any other mistake.
+  if (session.uid === target.id && (next.disabled || next.role !== "admin")) {
+    res.status(409).json({ success: false, code: "SELF_LOCKOUT", error: "Không thể tự vô hiệu hóa hoặc hạ quyền tài khoản đang đăng nhập" });
+    return;
+  }
+  if (body.password !== undefined) {
+    const weak = validatePassword(body.password);
+    if (weak) {
+      res.status(400).json({ success: false, code: "WEAK_PASSWORD", error: weak });
+      return;
+    }
+    next.passwordHash = await hashPassword(body.password);
+    next.sessionVersion = target.sessionVersion + 1; // sign out everywhere
+  }
+  if (body.unlock === true || body.password !== undefined) {
+    next.failedLogins = 0;
+    next.lockedUntil = null;
+  }
+  next.updatedAt = new Date().toISOString();
+  const saved = db.saveUser(next);
+  const changes = ["role", "disabled", "displayName", "password", "unlock"].filter((k) => body[k] !== undefined);
+  console.log(`[Accounts] ${operatorActor(req)} đã cập nhật ${target.username}: ${changes.join(", ") || "không đổi"}.`);
+  res.json({ success: true, user: publicUser(saved) });
+});
+
+app.delete("/api/users/:id", requireOperatorRole("admin"), requireCsrf, (req: Request, res: Response) => {
+  const target = db.getUserById(String(req.params.id || ""));
+  if (!target) {
+    res.status(404).json({ success: false, code: "USER_NOT_FOUND", error: "Không tìm thấy tài khoản" });
+    return;
+  }
+  const session = (req as any).operatorSession as OperatorSession;
+  if (session.uid === target.id) {
+    res.status(409).json({ success: false, code: "SELF_LOCKOUT", error: "Không thể xóa tài khoản đang đăng nhập" });
+    return;
+  }
+  db.deleteUser(target.id);
+  console.log(`[Accounts] ${operatorActor(req)} đã xóa tài khoản ${target.username}.`);
+  res.json({ success: true });
+});
 
 const configuredBearer = (name: "DEVICE_INGEST_TOKEN" | "INTERNAL_API_TOKEN") =>
   String(process.env[name] || "").trim();
@@ -349,7 +657,7 @@ const requireInternalToken: RequestHandler = (req: Request, res: Response, next:
 const requireRecognitionIngest: RequestHandler = (req: Request, res: Response, next: NextFunction) => {
   const session = readOperatorSession(req);
   if (session) {
-    if (session.role !== "operator") {
+    if (!roleAtLeast(session.role, "operator")) {
       res.status(403).json({ success: false, code: "ROLE_REQUIRED", error: "Operator role required" });
       return;
     }
@@ -463,9 +771,12 @@ app.use((req: Request, res: Response, next: NextFunction) => {
   if (recognitionPath(pathName) && req.method === "POST") return requireRecognitionIngest(req, res, next);
   const sensitive = pathName.startsWith("/api/") || legacySensitivePath(pathName) || recognitionPath(pathName);
   if (!sensitive) return next();
-  const role: OperatorRole = req.method === "GET" || req.method === "HEAD" ? "viewer" : "operator";
+  // Who may call what lives in one table (src/server/auth.ts). Reads need an
+  // allowed origin; writes need the session CSRF token as well.
+  const role = requiredRoleFor(req.method, pathName);
+  const isRead = req.method === "GET" || req.method === "HEAD";
   requireOperatorRole(role)(req, res, () => {
-    if (role === "viewer") requireAllowedReadOrigin(req, res, next);
+    if (isRead) requireAllowedReadOrigin(req, res, next);
     else requireCsrf(req, res, next);
   });
 });
@@ -5613,7 +5924,7 @@ app.get("/api/logs/:id/image", requireOperatorRole("viewer"), async (req, res) =
   res.send(image);
 });
 
-app.post(["/api/logs/clear", "/logs/clear"], requireOperatorRole("operator"), requireCsrf, (_req, res) => {
+app.post(["/api/logs/clear", "/logs/clear"], requireOperatorRole("admin"), requireCsrf, (_req, res) => {
   accessLogs = [];
   db.clearAccessLogs();
   broadcastSSE("logs_cleared", {});

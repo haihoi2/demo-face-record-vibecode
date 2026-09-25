@@ -326,6 +326,27 @@ export interface FaceTemplateRecord {
   streamId?: string;
 }
 
+/**
+ * An operator account. `passwordHash` never leaves the server: every API
+ * response goes through publicUser() in server.ts, which drops it.
+ */
+export interface UserRecord {
+  id: string;
+  username: string;
+  displayName: string;
+  role: "admin" | "operator" | "viewer";
+  passwordHash: string;
+  disabled: boolean;
+  /** Bumped on password reset, role change or disable - invalidates issued sessions. */
+  sessionVersion: number;
+  failedLogins: number;
+  lockedUntil: string | null;
+  lastLoginAt: string | null;
+  createdAt: string;
+  updatedAt: string;
+  createdBy: string | null;
+}
+
 export type StrangerResolutionAction = "QUICK_REGISTER" | "MERGE" | "DISMISS" | "RESTORE";
 
 export interface StrangerResolutionRecord {
@@ -1046,6 +1067,13 @@ class SQLiteStorage {
           "updatedAt" VARCHAR(64)
         );
 
+        CREATE TABLE IF NOT EXISTS app_users (
+          id VARCHAR(64) PRIMARY KEY,
+          username VARCHAR(64) NOT NULL UNIQUE,
+          data JSONB NOT NULL,
+          "updatedAt" VARCHAR(64)
+        );
+
         -- Migration: stranger-alert settings for databases created before they existed
         ALTER TABLE webhook_config ADD COLUMN IF NOT EXISTS "strangerConfig" TEXT;
         ALTER TABLE access_logs ADD COLUMN IF NOT EXISTS "faceEmbedding" BYTEA;
@@ -1059,6 +1087,7 @@ class SQLiteStorage {
       await this.loadAiRecognitionConfig();
       await this.loadCameraStreamsConfig();
       await this.loadFaceTemplates();
+      await this.loadUsers();
       console.log("[PostgreSQL] Các bảng dữ liệu đã sẵn sàng trên PostgreSQL!");
     } catch (err) {
       console.error("[PostgreSQL] Lỗi khởi tạo bảng:", err);
@@ -1279,6 +1308,7 @@ class SQLiteStorage {
     stranger_resolution_events?: StrangerResolutionRecord[];
     face_templates?: FaceTemplateRecord[];
     ai_recognition_config?: AiRecognitionConfigRecord;
+    app_users?: UserRecord[];
   } = {
     employees: [],
     access_logs: [],
@@ -2880,6 +2910,146 @@ class SQLiteStorage {
     }
     this.resolvedClustersCache = this.resolvedClustersCache.filter((id) => id !== restore.clusterId);
     return restore;
+  }
+
+  // ================= OPERATOR ACCOUNTS =================
+  // Every request re-checks the account behind its session (disabled? demoted?
+  // password reset?), so reads must be synchronous: accounts live in memory,
+  // hydrated from PostgreSQL at startup, and every write goes to all active
+  // stores - the same arrangement as the face-template gallery.
+  private usersCache: UserRecord[] = [];
+  private usersHydrated = false;
+
+  private parseUserRow(raw: unknown): UserRecord | null {
+    try {
+      const parsed = typeof raw === "string" ? JSON.parse(raw) : raw;
+      return parsed && typeof parsed === "object" && (parsed as any).id && (parsed as any).username
+        ? (parsed as UserRecord)
+        : null;
+    } catch {
+      return null;
+    }
+  }
+
+  private localUsers(): UserRecord[] {
+    if (this.isNativeSqlite && this.db) {
+      try {
+        this.ensureSqliteUsers();
+        const rows = this.db.prepare("SELECT data FROM app_users").all() as any[];
+        return rows.map((r) => this.parseUserRow(r.data)).filter(Boolean) as UserRecord[];
+      } catch (err) {
+        console.error("[SQLite] Lỗi đọc app_users:", err);
+      }
+    }
+    return this.fallbackData.app_users || [];
+  }
+
+  private async loadUsers() {
+    if (!this.pgPool) return;
+    try {
+      const res = await this.pgPool.query("SELECT data FROM app_users");
+      const remote = res.rows.map((r: any) => this.parseUserRow(r.data)).filter(Boolean) as UserRecord[];
+      // Accounts created or changed while the process ran on the local stores
+      // (PostgreSQL unreachable at the time) are merged in, newest write wins,
+      // and pushed back so PostgreSQL ends up complete.
+      const merged = new Map<string, UserRecord>(remote.map((u) => [u.id, u]));
+      const toPush: UserRecord[] = [];
+      for (const local of this.localUsers()) {
+        const current = merged.get(local.id);
+        if (!current || Date.parse(local.updatedAt) > Date.parse(current.updatedAt)) {
+          merged.set(local.id, local);
+          toPush.push(local);
+        }
+      }
+      this.usersCache = [...merged.values()];
+      this.usersHydrated = true;
+      for (const u of toPush) this.saveUser(u);
+      if (this.usersCache.length > 0) {
+        console.log(`[PostgreSQL] Đã nạp ${this.usersCache.length} tài khoản vận hành.`);
+      }
+    } catch (err) {
+      console.error("[PostgreSQL] Lỗi nạp app_users:", err);
+    }
+  }
+
+  private ensureSqliteUsers() {
+    if (!(this.isNativeSqlite && this.db)) return;
+    try {
+      this.db.exec(`
+        CREATE TABLE IF NOT EXISTS app_users (
+          id TEXT PRIMARY KEY,
+          username TEXT NOT NULL UNIQUE,
+          data TEXT NOT NULL,
+          updatedAt TEXT
+        );
+      `);
+    } catch {}
+  }
+
+  getUsers(): UserRecord[] {
+    if (!this.usersHydrated && this.usersCache.length === 0) this.usersCache = this.localUsers();
+    return this.usersCache;
+  }
+
+  getUserById(id: string): UserRecord | undefined {
+    return this.getUsers().find((u) => u.id === id);
+  }
+
+  getUserByUsername(username: string): UserRecord | undefined {
+    const wanted = String(username || "").toLowerCase();
+    return this.getUsers().find((u) => u.username === wanted);
+  }
+
+  /** Insert or replace by id. Writes through to every active store. */
+  saveUser(user: UserRecord): UserRecord {
+    const rec: UserRecord = JSON.parse(JSON.stringify(user));
+    this.getUsers();
+    const idx = this.usersCache.findIndex((u) => u.id === rec.id);
+    if (idx >= 0) this.usersCache[idx] = rec; else this.usersCache.push(rec);
+    const json = JSON.stringify(rec);
+
+    if (this.pgPool && this.isPostgres) {
+      this.pgPool
+        .query(
+          `INSERT INTO app_users (id, username, data, "updatedAt") VALUES ($1, $2, $3::jsonb, $4)
+           ON CONFLICT (id) DO UPDATE SET username = EXCLUDED.username, data = EXCLUDED.data, "updatedAt" = EXCLUDED."updatedAt"`,
+          [rec.id, rec.username, json, rec.updatedAt]
+        )
+        .catch((e: any) => console.error("[PostgreSQL] Lỗi lưu tài khoản:", e?.message));
+    }
+    if (this.isNativeSqlite && this.db) {
+      try {
+        this.ensureSqliteUsers();
+        this.db
+          .prepare("INSERT OR REPLACE INTO app_users (id, username, data, updatedAt) VALUES (?, ?, ?, ?)")
+          .run(rec.id, rec.username, json, rec.updatedAt);
+      } catch (err) {
+        console.error("[SQLite] Lỗi lưu tài khoản:", err);
+      }
+    }
+    const fb = this.fallbackData.app_users || [];
+    const fi = fb.findIndex((u) => u.id === rec.id);
+    if (fi >= 0) fb[fi] = rec; else fb.push(rec);
+    this.fallbackData.app_users = fb;
+    this.saveFallback();
+    return rec;
+  }
+
+  deleteUser(id: string): boolean {
+    this.getUsers();
+    const before = this.usersCache.length;
+    this.usersCache = this.usersCache.filter((u) => u.id !== id);
+    if (this.pgPool && this.isPostgres) {
+      this.pgPool.query("DELETE FROM app_users WHERE id = $1", [id]).catch((e: any) =>
+        console.error("[PostgreSQL] Lỗi xóa tài khoản:", e?.message)
+      );
+    }
+    if (this.isNativeSqlite && this.db) {
+      try { this.ensureSqliteUsers(); this.db.prepare("DELETE FROM app_users WHERE id = ?").run(id); } catch {}
+    }
+    this.fallbackData.app_users = (this.fallbackData.app_users || []).filter((u) => u.id !== id);
+    this.saveFallback();
+    return this.usersCache.length < before;
   }
 
   // ================= FACE TEMPLATES (real engine gallery) =================

@@ -129,6 +129,15 @@ CREATE INDEX IF NOT EXISTS idx_stranger_resolution_events_cluster
 
 -- AI recognition engine settings (engine mode, Gemini model, thresholds).
 -- Single row id = 'default'; the server hydrates it into memory at startup.
+-- Operator accounts. `data` holds the full record including the scrypt
+-- password hash, which the API never returns.
+CREATE TABLE IF NOT EXISTS app_users (
+  id VARCHAR(64) PRIMARY KEY,
+  username VARCHAR(64) NOT NULL UNIQUE,
+  data JSONB NOT NULL,
+  "updatedAt" VARCHAR(64)
+);
+
 CREATE TABLE IF NOT EXISTS ai_recognition_config (
   id VARCHAR(64) PRIMARY KEY,
   config_json JSONB NOT NULL,

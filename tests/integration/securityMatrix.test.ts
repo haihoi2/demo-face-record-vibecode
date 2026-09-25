@@ -87,7 +87,10 @@ describe("complete fail-closed authorization matrix", () => {
     const operatorCookie = await authenticateAs(OPERATOR_TOKEN);
     const session = await rawApi<any>("/api/operator/session", { headers: { Cookie: operatorCookie, Origin: "http://allowed.test" } });
     assert.equal(session.status, 200, session.text);
-    assert.equal(session.body.role, "operator");
+    // The environment token is the bootstrap login and signs in as admin, so
+    // account management can never be locked out. Named accounts carry roles.
+    assert.equal(session.body.role, "admin");
+    assert.equal(session.body.authMethod, "token");
     assert.ok(session.body.csrfToken);
 
     const rejected = await rawApi<any>("/api/lock/lock", {

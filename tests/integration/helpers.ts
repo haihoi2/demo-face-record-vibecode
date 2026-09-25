@@ -49,6 +49,29 @@ export async function authenticateAs(token: string): Promise<string> {
   return cookie;
 }
 
+/** Sign in with a named account. Returns the raw response so failures can be asserted. */
+export async function loginWithPassword(username: string, password: string) {
+  const res = await rawApi<any>("/api/operator/session", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ username, password }),
+  });
+  const cookie = res.headers.get("set-cookie")?.split(";", 1)[0] || "";
+  if (cookie && res.body?.csrfToken) csrfByCookie.set(cookie, res.body.csrfToken);
+  return { ...res, cookie };
+}
+
+/** Call the API as a specific session cookie, attaching its CSRF token to writes. */
+export function apiAs<T = any>(cookie: string, path: string, init: RequestInit = {}): Promise<ApiResponse<T>> {
+  const headers = new Headers(init.headers);
+  headers.set("Cookie", cookie);
+  if (!/^(GET|HEAD|OPTIONS)$/i.test(init.method || "GET")) {
+    headers.set("X-CSRF-Token", csrfByCookie.get(cookie) || "");
+    if (!headers.has("Content-Type")) headers.set("Content-Type", "application/json");
+  }
+  return rawApi<T>(path, { ...init, headers });
+}
+
 export function csrfTokenForCookie(cookie: string): string {
   return csrfByCookie.get(cookie) || "";
 }
