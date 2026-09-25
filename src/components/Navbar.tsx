@@ -16,6 +16,7 @@ import {
   Video,
   Camera,
   Users,
+  Building2,
 } from "lucide-react";
 import { SmartLockState } from "../types";
 import type { OperatorRole, OperatorSessionInfo } from "../utils/api";
@@ -32,7 +33,8 @@ export type NavTabType =
   | "door"
   | "cameras"
   | "config"
-  | "users";
+  | "users"
+  | "catalog";
 
 /**
  * The least role that sees each tab. Hiding a tab is a courtesy - the server
@@ -50,6 +52,7 @@ export const TAB_MIN_ROLE: Record<NavTabType, OperatorRole> = {
   cameras: "viewer",
   config: "admin",
   users: "admin",
+  catalog: "operator",
 };
 
 /** Signed out, only the viewer-level tabs show; every call behind them asks to sign in. */
@@ -165,6 +168,22 @@ export const Navbar: React.FC<NavbarProps> = ({
             >
               <UserPlus className="w-4 h-4" />
               <span className="hidden sm:inline">Đăng Ký Khuôn Mặt</span>
+            </button>
+            )}
+
+            {canSeeTab(session, "catalog") && (
+            <button
+              id="nav-tab-catalog"
+              onClick={() => setActiveTab("catalog")}
+              className={`flex items-center gap-2 px-3 py-2 rounded-lg text-sm font-medium transition-all ${
+                activeTab === "catalog"
+                  ? "bg-indigo-50 text-indigo-700 shadow-xs border border-indigo-100 font-semibold"
+                  : "text-slate-600 hover:text-slate-900 hover:bg-slate-100"
+              }`}
+              title="Quản lý danh mục phòng ban và chức vụ dùng khi đăng ký nhân viên"
+            >
+              <Building2 className="w-4 h-4 text-indigo-600" />
+              <span className="hidden sm:inline">Phòng ban &amp; Chức vụ</span>
             </button>
             )}
 

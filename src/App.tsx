@@ -24,6 +24,7 @@ import { soundEffects } from "./utils/audio";
 import { safeJsonFetch, operatorJsonFetch, normalizeApiUrl, getApiBaseUrl, getCustomBackendUrl, setCustomBackendUrl } from "./utils/api";
 import { OperatorSessionBar } from "./components/OperatorSessionBar";
 import { UsersPage } from "./components/UsersPage";
+import { OrgCatalogPage } from "./components/OrgCatalogPage";
 import { useOperatorSession } from "./utils/session";
 import {
   isNetlifyOrStaticHost,
@@ -746,6 +747,10 @@ export default function App() {
         )}
 
         {activeTab === "users" && canSeeTab(operatorSession, "users") && <UsersPage />}
+
+        {activeTab === "catalog" && canSeeTab(operatorSession, "catalog") && (
+          <OrgCatalogPage onEmployeesChanged={() => void fetchData()} />
+        )}
 
         {activeTab === "config" && (
           <AiConfigPage

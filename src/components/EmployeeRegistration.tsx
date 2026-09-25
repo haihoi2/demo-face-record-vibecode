@@ -29,6 +29,7 @@ import {
 } from "../types";
 import { safeJsonFetch, compressImage } from "../utils/api";
 import { ProtectedImage } from "./ProtectedImage";
+import { orgChoice, orgOptions, useOrgCatalog } from "../utils/orgCatalog";
 
 /** One enrolled template as returned by GET /api/employees/:id/templates.
  *  Raw embeddings are never sent to the browser, so every field is optional. */
@@ -157,6 +158,16 @@ export const EmployeeRegistration: React.FC<EmployeeRegistrationProps> = ({
   const [employeeCode, setEmployeeCode] = useState<string>("");
   const [department, setDepartment] = useState<string>("Phòng Kỹ Thuật AI");
   const [position, setPosition] = useState<string>("Kỹ sư phần mềm");
+  // Departments and positions come from the managed catalog; the server
+  // refuses any value that is not an active entry there.
+  const orgCatalog = useOrgCatalog();
+  const departmentOptions = orgOptions(orgCatalog.departments);
+  const positionOptions = orgOptions(orgCatalog.positions);
+  useEffect(() => {
+    setDepartment((current) => orgChoice(departmentOptions, current));
+    setPosition((current) => orgChoice(positionOptions, current));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [departmentOptions.join("\n"), positionOptions.join("\n")]);
   const [accessLevel, setAccessLevel] = useState<"ALL_ACCESS" | "OFFICE_HOURS" | "RESTRICTED">("ALL_ACCESS");
   const [photoBase64, setPhotoBase64] = useState<string>("");
 
@@ -443,8 +454,9 @@ export const EmployeeRegistration: React.FC<EmployeeRegistrationProps> = ({
   const applyPreset = (preset: typeof samplePresets[0]) => {
     setName(preset.name);
     setEmployeeCode(preset.code);
-    setDepartment(preset.dept);
-    setPosition(preset.pos);
+    // Sample presets only fill values the catalog actually offers.
+    if (departmentOptions.includes(preset.dept)) setDepartment(preset.dept);
+    if (positionOptions.includes(preset.pos)) setPosition(preset.pos);
     setPhotoBase64(preset.photo);
     setErrorMsg(null);
   };
@@ -777,14 +789,13 @@ export const EmployeeRegistration: React.FC<EmployeeRegistrationProps> = ({
                   id="select-department"
                   value={department}
                   onChange={(e) => setDepartment(e.target.value)}
+                  disabled={departmentOptions.length === 0}
                   className="w-full px-3.5 py-2.5 bg-slate-50 border border-slate-200 rounded-xl text-sm focus:outline-hidden focus:ring-2 focus:ring-indigo-500/30 focus:border-indigo-500 transition"
                 >
-                  <option value="Phòng Kỹ Thuật AI">Phòng Kỹ Thuật AI</option>
-                  <option value="Phòng Nhân Sự">Phòng Nhân Sự</option>
-                  <option value="Phòng Tài Chính - Kế Toán">Phòng Tài Chính - Kế Toán</option>
-                  <option value="Ban Điều Hành">Ban Điều Hành</option>
-                  <option value="Phòng Kinh Doanh">Phòng Kinh Doanh</option>
-                  <option value="Bộ Phận Vận Hành & Bảo Mật">Bộ Phận Vận Hành &amp; Bảo Mật</option>
+                  {departmentOptions.length === 0 && <option value="">Đang tải danh mục...</option>}
+                  {departmentOptions.map((name) => (
+                    <option key={name} value={name}>{name}</option>
+                  ))}
                 </select>
               </div>
 
@@ -793,14 +804,18 @@ export const EmployeeRegistration: React.FC<EmployeeRegistrationProps> = ({
                 <label className="block text-xs font-bold text-slate-700 mb-1">
                   Chức Danh / Vị Trí
                 </label>
-                <input
+                <select
                   id="input-position"
-                  type="text"
-                  placeholder="Ví dụ: Kỹ sư phần mềm"
                   value={position}
                   onChange={(e) => setPosition(e.target.value)}
+                  disabled={positionOptions.length === 0}
                   className="w-full px-3.5 py-2.5 bg-slate-50 border border-slate-200 rounded-xl text-sm focus:outline-hidden focus:ring-2 focus:ring-indigo-500/30 focus:border-indigo-500 transition"
-                />
+                >
+                  {positionOptions.length === 0 && <option value="">Đang tải danh mục...</option>}
+                  {positionOptions.map((name) => (
+                    <option key={name} value={name}>{name}</option>
+                  ))}
+                </select>
               </div>
             </div>
 

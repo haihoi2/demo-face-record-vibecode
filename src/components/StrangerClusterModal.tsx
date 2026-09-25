@@ -27,6 +27,7 @@ import {
 import { StrangerCluster, StrangerPhoto, Employee, AccessLog } from "../types";
 import { operatorJsonFetch } from "../utils/api";
 import { ProtectedImage } from "./ProtectedImage";
+import { orgChoice, orgOptions, useOrgCatalog } from "../utils/orgCatalog";
 import { soundEffects } from "../utils/audio";
 
 interface StrangerClusterModalProps {
@@ -81,14 +82,15 @@ export const StrangerClusterModal: React.FC<StrangerClusterModalProps> = ({
   const [adoptPhoto, setAdoptPhoto] = useState<boolean>(false);
 
   // Quick department options
-  const DEPARTMENTS = [
-    "Phòng Kỹ Thuật AI",
-    "Phòng Nhân Sự",
-    "Phòng Kinh Doanh & Marketing",
-    "Ban Điều Hành",
-    "Phòng Vận Hành & An Ninh",
-    "Khách Thường Trực / Đối Tác",
-  ];
+  // Same managed catalog as the registration form; the server refuses anything else.
+  const orgCatalog = useOrgCatalog();
+  const departmentOptions = orgOptions(orgCatalog.departments);
+  const positionOptions = orgOptions(orgCatalog.positions);
+  useEffect(() => {
+    setDepartment((current) => orgChoice(departmentOptions, current));
+    setPosition((current) => orgChoice(positionOptions, current));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [departmentOptions.join("\n"), positionOptions.join("\n")]);
 
   /**
    * Selects the cluster addressed by the caller: either by photo (in-app click)
@@ -195,7 +197,7 @@ export const StrangerClusterModal: React.FC<StrangerClusterModalProps> = ({
     const nextNum = Math.floor(4000 + Math.random() * 900);
     setEmployeeCode(`NV-${nextNum}`);
     setName(cluster.suggestedName ? cluster.suggestedName.split("(")[0].trim() : "");
-    setPosition("Chuyên viên");
+    setPosition((current) => orgChoice(positionOptions, positionOptions.includes("Chuyên viên") ? "Chuyên viên" : current));
     setAccessLevel("ALL_ACCESS");
     // Reset the merge panel so a previous cluster's pick never leaks into this one.
     setFormMode("CREATE");
@@ -910,7 +912,7 @@ export const StrangerClusterModal: React.FC<StrangerClusterModalProps> = ({
                               onChange={(e) => setDepartment(e.target.value)}
                               className="w-full px-3 py-2 text-xs rounded-xl border border-slate-200 focus:outline-hidden focus:ring-2 focus:ring-indigo-500 bg-white"
                             >
-                              {DEPARTMENTS.map((d) => (
+                              {departmentOptions.map((d) => (
                                 <option key={d} value={d}>
                                   {d}
                                 </option>
@@ -923,14 +925,18 @@ export const StrangerClusterModal: React.FC<StrangerClusterModalProps> = ({
                             <label className="block text-xs font-semibold text-slate-700 mb-1">
                               Chức vụ
                             </label>
-                            <input
+                            <select
                               id="input-quick-emp-position"
-                              type="text"
-                              placeholder="VD: Kỹ sư / Chuyên viên"
                               value={position}
                               onChange={(e) => setPosition(e.target.value)}
-                              className="w-full px-3 py-2 text-xs rounded-xl border border-slate-200 focus:outline-hidden focus:ring-2 focus:ring-indigo-500"
-                            />
+                              className="w-full px-3 py-2 text-xs rounded-xl border border-slate-200 focus:outline-hidden focus:ring-2 focus:ring-indigo-500 bg-white"
+                            >
+                              {positionOptions.map((pos) => (
+                                <option key={pos} value={pos}>
+                                  {pos}
+                                </option>
+                              ))}
+                            </select>
                           </div>
 
                           {/* Access Level */}
