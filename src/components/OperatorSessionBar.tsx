@@ -1,17 +1,18 @@
 import React, { useCallback, useEffect, useRef, useState } from "react";
-import { KeyRound, LogOut, ShieldCheck, ShieldAlert, Eye, UserCog, ChevronUp } from "lucide-react";
+import { KeyRound } from "lucide-react";
 import {
   OperatorCredentials,
   changeOwnPassword,
-  closeOperatorSession,
   openOperatorSession,
   readOperatorSession,
   setOperatorLoginResolver,
 } from "../utils/api";
-import { ROLE_BADGE, setOperatorSession, useOperatorSession } from "../utils/session";
+import { onSessionUiRequest, setOperatorSession } from "../utils/session";
 
 /**
- * Sign-in, role display, password change and sign-out.
+ * The sign-in and change-password dialogs. Renders nothing until one is
+ * needed: the visible entry point is the user menu in the top bar
+ * (UserMenu), which opens these through requestSessionUi().
  *
  * Everyday login is a named account (username + password). The bootstrap code
  * from the server environment is still accepted behind "Dùng mã khởi tạo" - it
@@ -22,7 +23,6 @@ import { ROLE_BADGE, setOperatorSession, useOperatorSession } from "../utils/ses
  * retried once the person signs back in.
  */
 export const OperatorSessionBar: React.FC = () => {
-  const session = useOperatorSession();
   const [open, setOpen] = useState(false);
   const [mode, setMode] = useState<"account" | "token">("account");
   const [username, setUsername] = useState("");
@@ -30,7 +30,6 @@ export const OperatorSessionBar: React.FC = () => {
   const [token, setToken] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [menuOpen, setMenuOpen] = useState(false);
   const [pwOpen, setPwOpen] = useState(false);
   const [pwCurrent, setPwCurrent] = useState("");
   const [pwNext, setPwNext] = useState("");
@@ -61,6 +60,19 @@ export const OperatorSessionBar: React.FC = () => {
   useEffect(() => {
     if (open) firstField.current?.focus();
   }, [open, mode]);
+
+  useEffect(
+    () =>
+      onSessionUiRequest((request) => {
+        if (request === "login") {
+          setError(null);
+          setOpen(true);
+        } else {
+          openPasswordDialog();
+        }
+      }),
+    []
+  );
 
   const settle = useCallback((signedIn: boolean) => {
     const resolve = pending.current;
@@ -104,26 +116,14 @@ export const OperatorSessionBar: React.FC = () => {
     }
   };
 
-  const signOut = async () => {
-    setMenuOpen(false);
-    setBusy(true);
-    try {
-      await closeOperatorSession();
-    } finally {
-      setOperatorSession(null);
-      setBusy(false);
-    }
-  };
-
-  const openPasswordDialog = () => {
-    setMenuOpen(false);
+  function openPasswordDialog() {
     setPwCurrent("");
     setPwNext("");
     setPwConfirm("");
     setPwError(null);
     setPwDone(false);
     setPwOpen(true);
-  };
+  }
 
   const submitPassword = async (event: React.FormEvent) => {
     event.preventDefault();
@@ -146,66 +146,8 @@ export const OperatorSessionBar: React.FC = () => {
     }
   };
 
-  const badge = session ? ROLE_BADGE[session.role] : null;
-  const RoleIcon = session?.role === "admin" ? ShieldCheck : session?.role === "operator" ? UserCog : Eye;
-
   return (
     <>
-      <div className="fixed bottom-4 right-4 z-40">
-        {session && badge ? (
-          <div className="relative">
-            {menuOpen && (
-              <div className="absolute bottom-full right-0 mb-2 w-56 rounded-xl border border-slate-200 bg-white shadow-xl p-1.5">
-                {session.authMethod === "account" && (
-                  <button
-                    type="button"
-                    onClick={openPasswordDialog}
-                    className="w-full flex items-center gap-2 px-3 py-2 rounded-lg text-xs font-semibold text-slate-700 hover:bg-slate-50"
-                  >
-                    <KeyRound className="w-4 h-4" /> Đổi mật khẩu
-                  </button>
-                )}
-                <button
-                  type="button"
-                  onClick={signOut}
-                  data-testid="btn-operator-sign-out"
-                  className="w-full flex items-center gap-2 px-3 py-2 rounded-lg text-xs font-semibold text-rose-700 hover:bg-rose-50"
-                >
-                  <LogOut className="w-4 h-4" /> Đăng xuất
-                </button>
-              </div>
-            )}
-            <button
-              type="button"
-              onClick={() => setMenuOpen((v) => !v)}
-              disabled={busy}
-              aria-expanded={menuOpen}
-              className="flex items-center gap-2 rounded-xl border border-slate-200 bg-white/95 backdrop-blur px-3 py-2 shadow-lg hover:border-slate-300 transition focus-visible:outline-2 focus-visible:outline-slate-900"
-            >
-              <RoleIcon className="w-4 h-4 text-slate-600 shrink-0" />
-              <div className="min-w-0 leading-tight text-left">
-                <div className="text-xs font-bold text-slate-900 truncate max-w-[12rem]">{session.displayName}</div>
-                <span className={`inline-block mt-0.5 px-1.5 py-px rounded border text-[10px] font-bold ${badge.className}`}>
-                  {badge.label}
-                  {session.authMethod === "token" ? " · mã khởi tạo" : ""}
-                </span>
-              </div>
-              <ChevronUp className={`w-3.5 h-3.5 text-slate-400 transition ${menuOpen ? "" : "rotate-180"}`} />
-            </button>
-          </div>
-        ) : (
-          <button
-            type="button"
-            onClick={() => setOpen(true)}
-            data-testid="btn-operator-sign-in"
-            className="flex items-center gap-2 rounded-xl bg-slate-900 text-white px-3.5 py-2.5 text-xs font-bold shadow-lg hover:bg-slate-800 transition"
-          >
-            <ShieldAlert className="w-4 h-4" />
-            Đăng nhập
-          </button>
-        )}
-      </div>
-
       {open && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/50 backdrop-blur-sm p-4">
           <form

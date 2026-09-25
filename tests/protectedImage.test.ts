@@ -60,7 +60,6 @@ describe("protected biometric images", () => {
   it("offers operator sign-in and sign-out instead of a browser prompt", () => {
     const bar = read("src/components/OperatorSessionBar.tsx");
     assert.match(bar, /openOperatorSession/);
-    assert.match(bar, /closeOperatorSession/);
     assert.match(bar, /setOperatorLoginResolver/);
     assert.match(bar, /autoComplete="current-password"/);
     assert.match(bar, /type="password"/);
@@ -70,6 +69,16 @@ describe("protected biometric images", () => {
     assert.doesNotMatch(api, /window\.prompt/);
 
     assert.match(read("src/App.tsx"), /<OperatorSessionBar \/>/);
+  });
+
+  it("puts the signed-in user, change password and sign-out in the top bar", () => {
+    const navbar = read("src/components/Navbar.tsx");
+    assert.match(navbar, /<UserMenu \/>/);
+    const menu = read("src/components/UserMenu.tsx");
+    assert.match(menu, /closeOperatorSession/, "sign-out must clear the server session, not just the UI");
+    assert.match(menu, /requestSessionUi\("password"\)/);
+    assert.match(menu, /requestSessionUi\("login"\)/);
+    assert.doesNotMatch(read("src/components/OperatorSessionBar.tsx"), /fixed bottom-4/, "no floating widget");
   });
 
   it("paginates stranger clusters and resolves deep links through authoritative lookup", () => {

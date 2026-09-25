@@ -20,6 +20,7 @@ import {
 import { SmartLockState } from "../types";
 import type { OperatorRole, OperatorSessionInfo } from "../utils/api";
 import { hasRole, useOperatorSession } from "../utils/session";
+import { UserMenu } from "./UserMenu";
 
 export type NavTabType =
   | "scanner"
@@ -338,6 +339,9 @@ export const Navbar: React.FC<NavbarProps> = ({
                 </>
               )}
             </div>
+
+            {/* Signed-in user: role, change password, sign out */}
+            <UserMenu />
           </div>
         </div>
       </div>

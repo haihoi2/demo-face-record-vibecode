@@ -42,3 +42,19 @@ export const ROLE_BADGE: Record<OperatorRole, { label: string; className: string
   operator: { label: "Vận hành", className: "bg-emerald-100 text-emerald-800 border-emerald-200" },
   viewer: { label: "Chỉ xem", className: "bg-slate-100 text-slate-700 border-slate-200" },
 };
+
+/**
+ * Requests from anywhere in the UI (the top-bar user menu) to the dialog host
+ * (OperatorSessionBar, mounted once in App): open sign-in or change-password.
+ */
+export type SessionUiRequest = "login" | "password";
+const uiListeners = new Set<(request: SessionUiRequest) => void>();
+
+export function requestSessionUi(request: SessionUiRequest): void {
+  for (const listener of uiListeners) listener(request);
+}
+
+export function onSessionUiRequest(listener: (request: SessionUiRequest) => void): () => void {
+  uiListeners.add(listener);
+  return () => uiListeners.delete(listener);
+}
