@@ -6638,7 +6638,11 @@ app.post("/api/strangers/restore", requireOperatorRole("operator"), requireCsrf,
       return;
     }
     const restored = await db.restoreStrangerResolution({
-      id: `${resolutionId(clusterId)}-restore-${randomUUID()}`,
+      // stranger_resolution_events.id is VARCHAR(128). The old form -
+      // RES-<80 chars>-restore-<uuid> - was 129 characters, so every restore
+      // failed on PostgreSQL (SQLite does not enforce lengths). The cluster and
+      // the resolution being undone are recorded in their own fields below.
+      id: `RESTORE-${randomUUID()}`,
       clusterId,
       action: "RESTORE",
       actor: operatorActor(req),
