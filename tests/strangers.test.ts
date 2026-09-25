@@ -6,7 +6,7 @@ import { readFileSync } from "node:fs";
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 
-import { clusterStrangerFaces } from "../src/server/strangers";
+import { clusterStrangerFaces, strangerCaptureDecision, STRANGER_SAME_PERSON_COSINE } from "../src/server/strangers";
 import { AccessLogRecord } from "../src/server/db";
 
 function makeLog(overrides: Partial<AccessLogRecord> = {}): AccessLogRecord {
@@ -169,5 +169,56 @@ describe("stranger capture quality floor", () => {
     assert.doesNotMatch(server, /recognizeObservations\([^)]*FACE_STRANGER_MIN_QUALITY/);
     assert.doesNotMatch(server, /FACE_STRANGER_MIN_QUALITY[^\n]*unlockDoor/);
     assert.match(server, /summary\.suppressed = "stranger-quality"/);
+  });
+});
+
+describe("stranger capture cooldown (per person, not per gate)", () => {
+  const A = [1, 0, 0];
+  const A2 = [0.9, Math.sqrt(1 - 0.81), 0]; // same person again: cosine 0.9 with A
+  const B = [0, 1, 0];                        // someone else: cosine 0 with A
+  const WINDOW = 60_000;
+
+  it("captures a second, different stranger who arrives inside the window", () => {
+    const first = strangerCaptureDecision([], A, 0, WINDOW);
+    assert.equal(first.capture, true);
+    const second = strangerCaptureDecision(first.recent, B, 5_000, WINDOW);
+    assert.equal(second.capture, true, "a different person is not suppressed by the first one's cooldown");
+  });
+
+  it("captures one person lingering only once, extending their window while they stay", () => {
+    let state = strangerCaptureDecision([], A, 0, WINDOW);
+    for (const t of [20_000, 50_000, 90_000, 140_000]) {
+      state = strangerCaptureDecision(state.recent, A2, t, WINDOW);
+      assert.equal(state.capture, false, `still suppressed at ${t} ms`);
+    }
+    const back = strangerCaptureDecision(state.recent, A2, 140_000 + WINDOW + 1, WINDOW);
+    assert.equal(back.capture, true, "captured again after being away for a whole window");
+  });
+
+  it("uses the calibrated same-person threshold by default", () => {
+    assert.equal(STRANGER_SAME_PERSON_COSINE, 0.45);
+  });
+});
+
+describe("stranger grouping at the calibrated threshold", () => {
+  it("groups a returning stranger whose similarity is in the measured same-person range", () => {
+    const a = [1, 0];
+    const b = [0.55, Math.sqrt(1 - 0.55 * 0.55)]; // cosine 0.55: typical same-camera repeat on this site
+    const clusters = clusterStrangerFaces([
+      makeLog({ id: "LOG-R1", faceEmbedding: a, faceEmbeddingModelTag: "arcface" }),
+      makeLog({ id: "LOG-R2", faceEmbedding: b, faceEmbeddingModelTag: "arcface" }),
+    ], []);
+    assert.equal(clusters.length, 1, "0.55 was below the old 0.6 threshold and left both as singletons");
+    assert.equal(clusters[0].totalSightings, 2);
+  });
+
+  it("keeps different people apart at the highest different-person similarity measured (0.289)", () => {
+    const a = [1, 0];
+    const b = [0.289, Math.sqrt(1 - 0.289 * 0.289)];
+    const clusters = clusterStrangerFaces([
+      makeLog({ id: "LOG-D1", faceEmbedding: a, faceEmbeddingModelTag: "arcface" }),
+      makeLog({ id: "LOG-D2", faceEmbedding: b, faceEmbeddingModelTag: "arcface" }),
+    ], []);
+    assert.equal(clusters.length, 2);
   });
 });

@@ -1,5 +1,16 @@
 import { createHash } from "crypto";
 import { AccessLogRecord } from "./db";
+import { envNumber } from "./env";
+
+/**
+ * Cosine at or above which two stranger captures are treated as the same
+ * person - for grouping in the cluster panel and for the per-person capture
+ * cooldown. Measured on this site (2026-09-25): across 137 pairs of templates
+ * of DIFFERENT people the highest similarity was 0.289; the same person seen
+ * again by the same camera typically scores 0.50-0.62. The previous default,
+ * 0.6, sat above most genuine repeats, so every stranger stayed a singleton.
+ */
+export const STRANGER_SAME_PERSON_COSINE = envNumber("FACE_STRANGER_CLUSTER_COSINE", 0.45, { min: 0, max: 1 });
 
 export interface StrangerPhoto {
   logId: string;
@@ -95,10 +106,10 @@ export function clusterStrangerFaces(
   const dismissedLogs = new Set(
     resolvedClusterIds.filter((id) => id.startsWith("log:")).map((id) => id.slice(4)),
   );
-  const thresholdValue = options.cosineThreshold ?? Number(process.env.FACE_STRANGER_CLUSTER_COSINE || 0.6);
+  const thresholdValue = options.cosineThreshold ?? STRANGER_SAME_PERSON_COSINE;
   const threshold = Number.isFinite(thresholdValue)
     ? Math.max(-1, Math.min(1, thresholdValue))
-    : 0.6;
+    : STRANGER_SAME_PERSON_COSINE;
 
   const logs = accessLogs
     .filter(
@@ -202,4 +213,37 @@ export function clusterStrangerFaces(
     return recent || a.clusterId.localeCompare(b.clusterId);
   });
   return clusters;
+}
+
+
+export interface RecentStranger {
+  at: number;
+  embedding: number[];
+}
+
+/**
+ * Per-person capture cooldown at one gate. Returns whether this sighting should
+ * be stored, and the updated list of recent strangers for the gate.
+ *
+ * A sighting that matches someone captured within `windowMs` is suppressed and
+ * extends that person's window, so one person lingering is captured once. A
+ * sighting that matches nobody is captured and remembered, so two strangers
+ * arriving together are both captured.
+ */
+export function strangerCaptureDecision(
+  recent: RecentStranger[],
+  embedding: number[],
+  nowMs: number,
+  windowMs: number,
+  threshold = STRANGER_SAME_PERSON_COSINE,
+  max = 32,
+): { capture: boolean; recent: RecentStranger[] } {
+  const live = recent.filter((r) => nowMs - r.at < windowMs).map((r) => ({ ...r }));
+  const same = live.find((r) => cosineSimilarity(r.embedding, embedding) >= threshold);
+  if (same) {
+    same.at = nowMs;
+    return { capture: false, recent: live };
+  }
+  live.push({ at: nowMs, embedding });
+  return { capture: true, recent: live.slice(-max) };
 }

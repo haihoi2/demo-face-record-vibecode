@@ -54,7 +54,7 @@ import type {
   ObservationMatch,
 } from "./src/types";
 import { runLocalFaceRecognition } from "./src/utils/localBiometrics";
-import { clusterStrangerFaces } from "./src/server/strangers";
+import { clusterStrangerFaces, strangerCaptureDecision, RecentStranger } from "./src/server/strangers";
 import { faceWorkerPool } from "./src/server/faceWorkerPool";
 import {
   extractFaces,
@@ -67,6 +67,7 @@ import {
 import type { ExtractedFace, UnclearReason } from "./src/server/faceEmbedding";
 import {
   buildGallery,
+  cosine,
   fuseDecision,
   recognizeObservations,
   DEFAULT_FUSION_THRESHOLDS,
@@ -1812,6 +1813,11 @@ async function enrollTemplateFromImage(
     const faces = detected.filter((f) => f.clear);
     if (faces.length === 0) return { rejected: "not-frontal", detectedFaces: detected.length };
     const best = faces.reduce((a, b) => (b.quality > a.quality ? b : a));
+    // The same image registered twice adds nothing to matching and takes a slot
+    // from the template cap (staging had such a pair at cosine 1.000).
+    if (db.getFaceTemplatesForEmployee(employeeId).some((t) => cosine(t.embedding, best.embedding) >= 0.995)) {
+      return { rejected: "duplicate", detectedFaces: detected.length };
+    }
     if (best.quality < minQuality) {
       return { rejected: "low-quality", quality: Math.round(best.quality * 1000) / 1000, detectedFaces: faces.length };
     }
@@ -3740,6 +3746,8 @@ const FACE_GRANT_COOLDOWN_SECONDS = envInt("FACE_GRANT_COOLDOWN_SECONDS", 20, 0,
  * lingering in front of an exit camera must not write one every 5 s.
  */
 const FACE_STRANGER_COOLDOWN_SECONDS = envInt("FACE_STRANGER_COOLDOWN_SECONDS", 60, 0, 86_400);
+/** Strangers captured recently at each gate, for the per-person cooldown. */
+const recentStrangersByGate = new Map<string, RecentStranger[]>();
 
 /** Last GRANTED write per `${gate}:${employeeId}`. */
 const lastGrantAtByGateEmployee = new Map<string, number>();
@@ -3980,15 +3988,32 @@ async function applyRecognitionOutcome(input: RecognitionOutcomeInput): Promise<
       return result;
     }
     if (input.cooldowns && strangerCooldownMs > 0) {
-      const last = lastStrangerLogAtByGate.get(gateKey) || 0;
-      if (last > 0 && nowMs - last < strangerCooldownMs) {
-        stats.strangersSuppressed += 1;
-        stats.lastSuppressed = "stranger-cooldown";
-        stats.lastSuppressedAt = new Date(nowMs).toISOString();
-        summary.suppressed = "stranger-cooldown";
-        return result;
+      // Per PERSON, not per gate: suppress only a stranger already captured at
+      // this gate within the window. Two strangers arriving together each get a
+      // capture; one person lingering gets one, however long they stand there.
+      const embedding = input.strangerObservation?.embedding;
+      if (embedding && embedding.length > 0) {
+        const decision = strangerCaptureDecision(recentStrangersByGate.get(gateKey) || [], embedding, nowMs, strangerCooldownMs);
+        recentStrangersByGate.set(gateKey, decision.recent);
+        if (!decision.capture) {
+          stats.strangersSuppressed += 1;
+          stats.lastSuppressed = "stranger-cooldown";
+          stats.lastSuppressedAt = new Date(nowMs).toISOString();
+          summary.suppressed = "stranger-cooldown";
+          return result;
+        }
+      } else {
+        // No embedding (non-ONNX path): fall back to one capture per gate per window.
+        const last = lastStrangerLogAtByGate.get(gateKey) || 0;
+        if (last > 0 && nowMs - last < strangerCooldownMs) {
+          stats.strangersSuppressed += 1;
+          stats.lastSuppressed = "stranger-cooldown";
+          stats.lastSuppressedAt = new Date(nowMs).toISOString();
+          summary.suppressed = "stranger-cooldown";
+          return result;
+        }
+        lastStrangerLogAtByGate.set(gateKey, nowMs);
       }
-      lastStrangerLogAtByGate.set(gateKey, nowMs);
     }
   }
 
@@ -5653,6 +5678,11 @@ async function prepareTemplateFromImage(
     const faces = detected.filter((f) => f.clear);
     if (faces.length === 0) return { rejected: "not-frontal", detectedFaces: detected.length };
     const best = faces.reduce((a, b) => (b.quality > a.quality ? b : a));
+    // The same image registered twice adds nothing to matching and takes a slot
+    // from the template cap (staging had such a pair at cosine 1.000).
+    if (db.getFaceTemplatesForEmployee(employeeId).some((t) => cosine(t.embedding, best.embedding) >= 0.995)) {
+      return { rejected: "duplicate", detectedFaces: detected.length };
+    }
     if (best.quality < FACE_ENROLL_MIN_QUALITY) {
       return { rejected: "low-quality", quality: Math.round(best.quality * 1000) / 1000, detectedFaces: faces.length };
     }
@@ -5794,6 +5824,8 @@ app.post(EMPLOYEE_TEMPLATE_ROUTES, requireOperatorRole("operator"), requireCsrf,
           ? "Không phát hiện khuôn mặt nào trong ảnh."
           : outcome.rejected === "low-quality"
           ? `Khuôn mặt có chất lượng ${outcome.quality} < ngưỡng ${qualityGate}.`
+          : outcome.rejected === "duplicate"
+          ? "Ảnh này đã được đăng ký làm mẫu cho nhân viên này."
           : outcome.rejected === "not-frontal"
           ? "Khuôn mặt không nhìn thẳng vào camera (quay đi, cúi hoặc nghiêng). Hãy chụp lại khi nhìn thẳng."
           : "Không tạo được mẫu khuôn mặt từ ảnh này.",
