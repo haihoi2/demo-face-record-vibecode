@@ -616,8 +616,26 @@ class SQLiteStorage {
         max: 10,
       });
 
-      // Test connection
-      const client = await this.pgPool.connect();
+      // Test connection. Retried with backoff: the first attempt races the
+      // container's startup burst (ONNX session creation and worker spawn can
+      // starve the event loop past the 7 s handshake timeout), and a single
+      // failure used to drop the process onto SQLite/JSON for its whole life -
+      // writes then silently diverged from PostgreSQL until the next restart.
+      const maxAttempts = 6;
+      let client: any;
+      for (let attempt = 1; ; attempt++) {
+        try {
+          client = await this.pgPool.connect();
+          break;
+        } catch (connectErr: any) {
+          if (attempt >= maxAttempts) throw connectErr;
+          const delayMs = Math.min(2000 * 2 ** (attempt - 1), 15000);
+          console.warn(
+            `[PostgreSQL] Kết nối thất bại lần ${attempt}/${maxAttempts} (${connectErr?.message}); thử lại sau ${delayMs}ms.`
+          );
+          await new Promise((resolve) => setTimeout(resolve, delayMs));
+        }
+      }
       try {
         await client.query("SELECT 1");
         this.postgresConnected = true;
