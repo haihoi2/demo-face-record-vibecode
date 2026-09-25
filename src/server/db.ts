@@ -3,6 +3,15 @@ import path from "path";
 import { createRequire } from "module";
 import { randomUUID } from "crypto";
 import { Pool } from "pg";
+import {
+  INITIAL_STORAGE_STATE,
+  isConnectionError,
+  recordConnectionError,
+  recordQueryOk,
+  StorageStatus,
+  storageStatus,
+  StorageTrackerState,
+} from "./dbStatus";
 
 // Safe dynamic loader for Node 22 native sqlite DatabaseSync
 function getDatabaseSyncClass(): any {
@@ -702,6 +711,7 @@ class SQLiteStorage {
   private postgresDatabase = "";
   private postgresCounts: Record<string, number> = {};
   private onSyncCallbacks: Array<() => void> = [];
+  private storage: StorageTrackerState = { ...INITIAL_STORAGE_STATE };
 
   constructor() {
     this.init();
@@ -724,9 +734,12 @@ class SQLiteStorage {
 
   private async initPostgres() {
     const databaseUrl = process.env.DATABASE_URL;
+    this.storage.sqliteActive = this.isNativeSqlite;
     if (!databaseUrl || !databaseUrl.startsWith("postgres")) {
       return;
     }
+    this.storage.postgresConfigured = true;
+    this.storage.connecting = true;
 
     try {
       try {
@@ -741,6 +754,7 @@ class SQLiteStorage {
         idleTimeoutMillis: 30000,
         max: 10,
       });
+      this.watchPostgresPool(this.pgPool);
 
       // Test connection. Retried with backoff: the first attempt races the
       // container's startup burst (ONNX session creation and worker spawn can
@@ -766,6 +780,8 @@ class SQLiteStorage {
         await client.query("SELECT 1");
         this.postgresConnected = true;
         this.isPostgres = true;
+        this.storage.postgresActive = true;
+        this.storage.connecting = false;
         console.log(`[PostgreSQL] Đã kết nối cơ sở dữ liệu PostgreSQL thành công (${this.postgresHost}/${this.postgresDatabase})!`);
         await this.createPostgresTables();
         await this.syncWithPostgres();
@@ -773,10 +789,73 @@ class SQLiteStorage {
         client.release();
       }
     } catch (err: any) {
-      console.warn(`[PostgreSQL] Không thể kết nối PostgreSQL (${err?.message}). Tiếp tục với SQLite/JSON.`);
       this.isPostgres = false;
       this.postgresConnected = false;
+      this.storage.postgresActive = false;
+      this.storage.connecting = false;
+      this.storage.fellBackAt = Date.now();
+      console.error(
+        `[PostgreSQL] ⚠ KHÔNG kết nối được PostgreSQL (${err?.message}). Đang chạy trên ${
+          this.isNativeSqlite ? "SQLite" : "JSON"
+        } DỰ PHÒNG: dữ liệu mới chỉ nằm trên máy chủ cổng, cần chép lại vào PostgreSQL. ` +
+          "Khởi động lại gateway khi PostgreSQL đã sẵn sàng."
+      );
     }
+  }
+
+  /**
+   * Track whether queries reach PostgreSQL. Writes are fire-and-forget, so a
+   * connection loss mid-run would otherwise only show up as log lines. Also
+   * the pool's "error" listener: without one, an idle connection dropped by a
+   * PostgreSQL restart emits an unhandled "error" and kills the process.
+   */
+  private watchPostgresPool(pool: Pool) {
+    const noteOk = () => {
+      if (this.storage.outageStartedAt != null) console.log("[PostgreSQL] Kết nối PostgreSQL đã hồi phục.");
+      this.storage = recordQueryOk(this.storage, Date.now());
+    };
+    const noteError = (err: unknown) => {
+      if (!isConnectionError(err)) return;
+      if (this.storage.outageStartedAt == null) {
+        console.error(`[PostgreSQL] ⚠ Mất kết nối PostgreSQL (${(err as any)?.message}). Bản ghi mới có thể chưa được lưu.`);
+      }
+      this.storage = recordConnectionError(this.storage, Date.now());
+    };
+    pool.on("error", (err) => noteError(err));
+    const rawQuery = pool.query.bind(pool) as (...args: any[]) => any;
+    (pool as any).query = (...args: any[]) => {
+      const result = rawQuery(...args);
+      if (result && typeof result.then === "function") {
+        return result.then(
+          (value: unknown) => {
+            noteOk();
+            return value;
+          },
+          (err: unknown) => {
+            noteError(err);
+            throw err;
+          },
+        );
+      }
+      return result;
+    };
+    const rawConnect = pool.connect.bind(pool) as (...args: any[]) => any;
+    (pool as any).connect = (...args: any[]) => {
+      const result = rawConnect(...args);
+      if (result && typeof result.then === "function") {
+        // Startup retries report through fellBackAt, not as a runtime outage.
+        return result.catch((err: unknown) => {
+          if (!this.storage.connecting) noteError(err);
+          throw err;
+        });
+      }
+      return result;
+    };
+  }
+
+  /** Where writes are going, and whether that is where the site expects them. */
+  getStorageStatus(): StorageStatus {
+    return storageStatus(this.storage);
   }
 
   private async syncWithPostgres() {

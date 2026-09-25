@@ -25,6 +25,7 @@ import { safeJsonFetch, operatorJsonFetch, normalizeApiUrl, getApiBaseUrl, getCu
 import { OperatorSessionBar } from "./components/OperatorSessionBar";
 import { UsersPage } from "./components/UsersPage";
 import { OrgCatalogPage } from "./components/OrgCatalogPage";
+import { StorageAlert } from "./components/StorageAlert";
 import { useOperatorSession } from "./utils/session";
 import {
   isNetlifyOrStaticHost,
@@ -597,6 +598,7 @@ export default function App() {
 
       {/* Main Content Area */}
       <main className="flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 lg:px-8 py-6">
+        <StorageAlert />
         {operatorSession?.role === "viewer" && (
           <div className="mb-4 rounded-xl border border-slate-200 bg-slate-50 px-4 py-2.5 text-xs text-slate-600">
             Bạn đang đăng nhập với quyền <span className="font-bold text-slate-800">Chỉ xem</span>: xem được toàn bộ lịch sử

@@ -2495,8 +2495,17 @@ function lockDoor(source: string) {
 // ----------------- API ROUTES -----------------
 
 // Health check
+// Public, so it says only whether storage is degraded, never where it points.
+// Stays HTTP 200 when degraded: the gates keep working on the local fallback
+// store (owner's choice), and a failing healthcheck would only restart them.
 app.get("/api/health", (_req, res) => {
-  res.json({ status: "ok", time: new Date().toISOString() });
+  const storage = db.getStorageStatus();
+  res.json({ status: storage.degraded ? "degraded" : "ok", time: new Date().toISOString() });
+});
+
+// Details for the dashboard banner (any signed-in role).
+app.get("/api/storage-status", (_req, res) => {
+  res.json({ success: true, ...db.getStorageStatus() });
 });
 
 // SSE endpoint for real-time mobile notifications and lock status
