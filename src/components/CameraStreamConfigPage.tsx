@@ -391,18 +391,30 @@ export const CameraStreamConfigPage: React.FC = () => {
     };
   }, []);
 
-  // Save Configuration (global settings + gate name/enabled + full stream lists)
+  // Save Configuration (global settings + gate name/enabled only).
+  //
+  // This deliberately does NOT send a `streams` array. Streams are added,
+  // edited, reordered and deleted through the per-stream routes, which act on
+  // one stream at a time. Sending a rebuilt list here made Save a whole-document
+  // write from this page's local state: if that state was loaded before another
+  // change - a stream added from the API, an edit in another tab, a gate someone
+  // else touched - Save silently reverted it. Editing one gate could disable a
+  // stream on the other. The server keeps its own list when `streams` is absent
+  // (applyGateConfigPatch: `streams: replaced ? patchStreams : base.streams`).
   const handleSaveConfig = async () => {
     try {
       setSaving(true);
       setSaveError(null);
       setSaveSuccess(false);
 
-      // Always send an explicit stream list per gate so the server replaces it consistently.
-      const payload: CameraStreamsConfig = {
+      const gateScalars = (gate: GateStreamConfig) => {
+        const { streams: _streams, ...rest } = gate;
+        return rest;
+      };
+      const payload = {
         ...config,
-        entryGate: withStreams(config.entryGate, deriveGateStreams(config.entryGate, "entry")),
-        exitGate: withStreams(config.exitGate, deriveGateStreams(config.exitGate, "exit")),
+        entryGate: gateScalars(config.entryGate),
+        exitGate: gateScalars(config.exitGate),
       };
 
       const res = await operatorJsonFetch<any>("/api/camera-streams/config", {

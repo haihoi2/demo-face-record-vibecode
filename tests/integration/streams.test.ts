@@ -643,3 +643,51 @@ describe("camera streams config durability", () => {
     }
   });
 });
+
+/**
+ * Regression: the config page's Save button used to post a rebuilt stream list
+ * for BOTH gates from its own local state, making it a whole-document write.
+ * A stale page then silently reverted streams it did not know about - including
+ * on the gate the operator was not editing. Streams are owned by the per-stream
+ * routes; a gate patch without `streams` must leave the list alone.
+ */
+describe("whole-config save does not clobber stream lists", () => {
+  it("preserves both gates' streams when the patch omits them", async () => {
+    const before = await getConfig();
+    const marker = `ITEST no-clobber ${Date.now().toString(36)}`;
+    const created = await postJson("/api/camera-streams/exit/streams", {
+      label: marker,
+      sourceType: "RTSP",
+      rtspUrl: "rtsp://127.0.0.1:1/Streaming/Channels/4098",
+      rtspTransport: "TCP",
+      enabled: false,
+      priority: 91,
+    });
+    assert.equal(created.status, 201, created.text.slice(0, 300));
+    const addedId = created.body.stream.id;
+
+    try {
+      // Exactly what the page now sends: gate scalars, no `streams` key.
+      const { streams: _e, ...entryScalars } = before.entryGate as any;
+      const { streams: _x, ...exitScalars } = before.exitGate as any;
+      const saved = await postJson("/api/camera-streams/config", {
+        entryGate: entryScalars,
+        exitGate: exitScalars,
+      });
+      assert.equal(saved.status, 200, saved.text.slice(0, 300));
+
+      const after = await getConfig();
+      assert.ok(
+        after.exitGate.streams.some((s: any) => s.id === addedId),
+        "a stream the saving page never knew about must survive the save"
+      );
+      assert.deepEqual(
+        after.entryGate.streams.map((s: any) => s.id),
+        before.entryGate.streams.map((s: any) => s.id),
+        "saving must not alter the gate that was not edited"
+      );
+    } finally {
+      await api(`/api/camera-streams/exit/streams/${encodeURIComponent(addedId)}`, { method: "DELETE" });
+    }
+  });
+});
