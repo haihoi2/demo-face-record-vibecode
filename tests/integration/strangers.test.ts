@@ -42,12 +42,15 @@ async function makeDeniedLog(seed: number): Promise<AccessLog> {
   return body.log as AccessLog;
 }
 
+// The capture's group, or undefined once it has been resolved. Looked up by
+// capture rather than scanned from the first page: groups are ordered by
+// sightings, so a fresh single-capture group falls off page one whenever
+// earlier test files have left 20+ larger groups behind.
 async function clusterFor(logId: string) {
-  const res = await api<any>("/api/strangers/clusters?limit=20");
+  const res = await api<any>(`/api/strangers/lookup?logId=${encodeURIComponent(logId)}`);
+  if (res.status === 410) return undefined;
   assert.equal(res.status, 200, res.text.slice(0, 300));
-  return res.body.clusters.find((cluster: any) =>
-    cluster.photos.some((photo: any) => photo.logId === logId),
-  );
+  return res.body.cluster;
 }
 
 
