@@ -238,7 +238,10 @@ describe("FaceWorkerPoolManager - backpressure", () => {
   it("rejects immediately once the queue is full and drains the queue afterwards", async () => {
     const c = quietConsole();
     try {
-      await withPool(1, { createWorker: stubWorker, queueMax: 2, taskTimeoutMs: 150 }, async (pool) => {
+      // The queued tasks drain on a respawned worker under the same per-task
+      // budget; 150 ms was not enough for a thread respawn on a loaded CI box.
+      // 400 ms still catches the 3 s stall well before it would finish.
+      await withPool(1, { createWorker: stubWorker, queueMax: 2, taskTimeoutMs: 400 }, async (pool) => {
         const slow = pool.dispatchFaceTask(makePayload({ testEmployeeId: "__SLOW__" }));
         const q1 = pool.dispatchFaceTask(makePayload());
         const q2 = pool.dispatchFaceTask(makePayload());
@@ -268,11 +271,15 @@ describe("FaceWorkerPoolManager - per-task timeout", () => {
   it("rejects a stalled task and respawns the worker so the next task succeeds", async () => {
     const c = quietConsole();
     try {
-      await withPool(1, { createWorker: stubWorker, taskTimeoutMs: 100 }, async (pool) => {
+      // 400 ms still catches the 3 s stall promptly, and leaves the recovery
+      // task below - which runs under the same per-task budget and must first
+      // respawn a worker thread - room to finish on a loaded CI machine. At
+      // 100 ms it failed intermittently whenever the suite was CPU-bound.
+      await withPool(1, { createWorker: stubWorker, taskTimeoutMs: 400 }, async (pool) => {
         const slowPayload = makePayload({ testEmployeeId: "__SLOW__" });
         const t0 = Date.now();
         await assert.rejects(pool.dispatchFaceTask(slowPayload), (err: Error) => {
-          assert.match(err.message, /timed out after 100 ms/);
+          assert.match(err.message, /timed out after 400 ms/);
           assert.match(err.message, new RegExp(slowPayload.taskId));
           return true;
         });
