@@ -115,6 +115,7 @@ const flattenGateStreams = (
 const REJECT_REASONS: Record<string, string> = {
   "no-face": "Không thấy khuôn mặt nào trong khung hình",
   "low-quality": "Khuôn mặt quá nhỏ hoặc quá mờ so với ngưỡng chất lượng",
+  "not-frontal": "Khuôn mặt không nhìn thẳng vào camera (quay đi, cúi hoặc nghiêng) — hãy chụp lại khi nhìn thẳng",
   "frame-grab-failed": "Không lấy được khung hình từ camera",
   "engine-disabled": "Động cơ nhận diện thật chưa được bật trên máy chủ",
   "engine-unavailable": "Máy chủ không nạp được mô hình nhận diện",

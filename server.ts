@@ -57,12 +57,13 @@ import { clusterStrangerFaces } from "./src/server/strangers";
 import { faceWorkerPool } from "./src/server/faceWorkerPool";
 import {
   extractFaces,
+  CLEAR_FACE_LIMITS,
   getFaceEngine,
   getFaceEngineInfo,
   isFaceEngineReady,
   loadImage,
 } from "./src/server/faceEmbedding";
-import type { ExtractedFace } from "./src/server/faceEmbedding";
+import type { ExtractedFace, UnclearReason } from "./src/server/faceEmbedding";
 import {
   buildGallery,
   fuseDecision,
@@ -1539,8 +1540,22 @@ interface EngineObservation {
 }
 
 /**
- * Decode once, detect + embed, and turn every face into an observation tagged
- * with its stream. Never throws: a bad frame yields an empty list.
+ * Faces the detector found but that were not clear enough to use - head turned,
+ * bowed or tilted (see CLEAR_FACE_LIMITS). They are neither matched nor kept as
+ * stranger captures; this counts them so the gate is visible, not silent.
+ */
+const clearFaceGate = {
+  clear: 0,
+  unclear: 0,
+  byReason: { landmarks: 0, yaw: 0, aspect: 0, roll: 0 } as Record<UnclearReason, number>,
+  lastUnclearAt: null as string | null,
+};
+
+/**
+ * Decode once, detect + embed, and turn every CLEAR face into an observation
+ * tagged with its stream. Unclear faces are dropped here, before matching, so a
+ * face looking away can neither be recognised nor tracked as a stranger. Never
+ * throws: a bad frame yields an empty list.
  */
 async function observeFrame(
   image: Buffer | string,
@@ -1551,7 +1566,15 @@ async function observeFrame(
   try {
     const rgb = await loadImage(image);
     if (!rgb) return [];
-    const faces = await extractFaces(rgb);
+    const detected = await extractFaces(rgb);
+    const faces = detected.filter((f) => f.clear);
+    clearFaceGate.clear += faces.length;
+    for (const f of detected) {
+      if (f.clear) continue;
+      clearFaceGate.unclear += 1;
+      clearFaceGate.byReason[f.unclearReason || "landmarks"] += 1;
+      clearFaceGate.lastUnclearAt = new Date().toISOString();
+    }
     return faces.map((f) => ({
       observation: {
         streamId,
@@ -1717,6 +1740,7 @@ app.get(["/api/face-engine/status", "/api/face-engine/status/", "/api/face-engin
       matchingModelTag: templates.filter((t) => t.modelTag === modelTag).length,
     },
     thresholds: currentFusionThresholds(),
+    clearFace: { limits: CLEAR_FACE_LIMITS, ...clearFaceGate },
     limits: {
       maxObservationsPerDecision: FACE_MAX_OBSERVATIONS,
       maxFramesPerStream: FACE_SCAN_MAX_FRAMES,
@@ -1782,8 +1806,12 @@ async function enrollTemplateFromImage(
   }
   const minQuality = opts.minQuality ?? FACE_ENROLL_MIN_QUALITY;
   try {
-    const faces = await extractFaces(image);
-    if (faces.length === 0) return { rejected: "no-face", detectedFaces: 0 };
+    const detected = await extractFaces(image);
+    if (detected.length === 0) return { rejected: "no-face", detectedFaces: 0 };
+    // A template must be a face looking at the camera: a turned or bowed head
+    // makes a poor reference and drags every later comparison down.
+    const faces = detected.filter((f) => f.clear);
+    if (faces.length === 0) return { rejected: "not-frontal", detectedFaces: detected.length };
     const best = faces.reduce((a, b) => (b.quality > a.quality ? b : a));
     if (best.quality < minQuality) {
       return { rejected: "low-quality", quality: Math.round(best.quality * 1000) / 1000, detectedFaces: faces.length };
@@ -5619,8 +5647,12 @@ async function prepareTemplateFromImage(
     return { rejected: "template-cap" };
   }
   try {
-    const faces = await extractFaces(image);
-    if (faces.length === 0) return { rejected: "no-face", detectedFaces: 0 };
+    const detected = await extractFaces(image);
+    if (detected.length === 0) return { rejected: "no-face", detectedFaces: 0 };
+    // A template must be a face looking at the camera: a turned or bowed head
+    // makes a poor reference and drags every later comparison down.
+    const faces = detected.filter((f) => f.clear);
+    if (faces.length === 0) return { rejected: "not-frontal", detectedFaces: detected.length };
     const best = faces.reduce((a, b) => (b.quality > a.quality ? b : a));
     if (best.quality < FACE_ENROLL_MIN_QUALITY) {
       return { rejected: "low-quality", quality: Math.round(best.quality * 1000) / 1000, detectedFaces: faces.length };
@@ -5763,6 +5795,8 @@ app.post(EMPLOYEE_TEMPLATE_ROUTES, requireOperatorRole("operator"), requireCsrf,
           ? "Không phát hiện khuôn mặt nào trong ảnh."
           : outcome.rejected === "low-quality"
           ? `Khuôn mặt có chất lượng ${outcome.quality} < ngưỡng ${qualityGate}.`
+          : outcome.rejected === "not-frontal"
+          ? "Khuôn mặt không nhìn thẳng vào camera (quay đi, cúi hoặc nghiêng). Hãy chụp lại khi nhìn thẳng."
           : "Không tạo được mẫu khuôn mặt từ ảnh này.",
     });
     return;
