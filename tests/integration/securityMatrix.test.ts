@@ -157,3 +157,20 @@ describe("complete fail-closed authorization matrix", () => {
     assert.equal(employees.text.includes("FORGED"), false, "recognition mutated roster from clientEmployees");
   });
 });
+
+describe("legacy /config/ai alias", () => {
+  it("rejects reads and writes of the recognition config without a session", async () => {
+    for (const path of ["/config/ai", "/config/ai/"]) {
+      const read = await rawApi(path);
+      assert.equal(read.status, 401, `GET ${path} must require a session`);
+    }
+    // A write attempt must be refused before the handler runs. The body would
+    // drop the accept threshold to near zero if it ever reached the handler.
+    const write = await rawApi("/config/ai", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ localModel: { similarityThreshold: 0.01 } }),
+    });
+    assert.ok([401, 403].includes(write.status), `POST /config/ai returned ${write.status}`);
+  });
+});

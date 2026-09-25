@@ -379,8 +379,12 @@ const recognitionPath = (pathName: string) => [
   "/api/recognize-face", "/recognize-face", "/api/face/recognize",
   "/api/face-recognize", "/api/face-recognition", "/api/recognize",
 ].includes(pathName.replace(/\/+$/, ""));
+// Every API route also registered WITHOUT the /api prefix must be listed here.
+// tests/boundaryCoverage.test.ts enumerates the route paths in this file and
+// fails if one falls outside the boundary - /config/ai did, which left the
+// recognition thresholds writable without a session.
 const legacySensitivePath = (pathName: string) =>
-  /^(?:\/(?:events|lock|status|employees?|logs|notifications|webhook))(?:\/|$)/.test(pathName);
+  /^(?:\/(?:events|lock|status|employees?|logs|notifications|webhook|config))(?:\/|$)/.test(pathName);
 
 function redactedUrl(value: string): string {
   try {
