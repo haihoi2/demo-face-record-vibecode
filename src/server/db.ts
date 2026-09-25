@@ -1084,6 +1084,20 @@ class SQLiteStorage {
           "updatedAt" VARCHAR(64)
         );
 
+        -- Also in init-db.sql, which only runs when a database is first made:
+        -- without these here, a database created any other way had no table
+        -- for camera or door settings and silently kept them in SQLite only.
+        CREATE TABLE IF NOT EXISTS camera_streams_config (
+          id VARCHAR(64) PRIMARY KEY,
+          data JSONB NOT NULL,
+          "updatedAt" VARCHAR(64)
+        );
+        CREATE TABLE IF NOT EXISTS door_controller_config (
+          id VARCHAR(64) PRIMARY KEY,
+          data JSONB NOT NULL,
+          "updatedAt" VARCHAR(64)
+        );
+
         CREATE TABLE IF NOT EXISTS app_users (
           id VARCHAR(64) PRIMARY KEY,
           username VARCHAR(64) NOT NULL UNIQUE,
