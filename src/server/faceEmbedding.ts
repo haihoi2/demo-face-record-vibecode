@@ -22,6 +22,7 @@
  *               so `embedFace()` L2-normalises before returning.
  */
 
+import { envNumber } from "./env";
 import { spawn } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
@@ -128,9 +129,8 @@ function env(name: string, fallback: string): string {
   return v === undefined || v === "" ? fallback : v;
 }
 
-function envNumber(name: string, fallback: number): number {
-  const v = Number(process.env[name]);
-  return Number.isFinite(v) ? v : fallback;
+function envNumberOrDefault(name: string, fallback: number): number {
+  return envNumber(name, fallback);
 }
 
 function modelDir(): string {
@@ -143,19 +143,19 @@ function recognizerModelName(): string {
   return env("FACE_RECOGNIZER_MODEL", DEFAULT_RECOGNIZER);
 }
 function detectThreshold(): number {
-  return envNumber("FACE_DETECT_THRESHOLD", 0.5);
+  return envNumberOrDefault("FACE_DETECT_THRESHOLD", 0.5);
 }
 function nmsIouThreshold(): number {
-  return envNumber("FACE_NMS_IOU", 0.4);
+  return envNumberOrDefault("FACE_NMS_IOU", 0.4);
 }
 function detectorInputSize(): number {
-  return envNumber("FACE_DETECT_SIZE", 640);
+  return envNumberOrDefault("FACE_DETECT_SIZE", 640);
 }
 function ffmpegPath(): string {
   return env("FFMPEG_PATH", "ffmpeg");
 }
 function ffmpegTimeoutMs(): number {
-  return envNumber("FACE_FFMPEG_TIMEOUT_MS", 10_000);
+  return envNumberOrDefault("FACE_FFMPEG_TIMEOUT_MS", 10_000);
 }
 
 function log(level: "warn" | "error" | "info", msg: string, err?: unknown): void {
@@ -532,7 +532,7 @@ async function createEngine(): Promise<Engine> {
     graphOptimizationLevel: "all",
     // Keep the gateway responsive: the worker pool already provides parallelism
     // across frames, so per-session thread fan-out only fights for the same CPU.
-    intraOpNumThreads: envNumber("FACE_ORT_THREADS", 2),
+    intraOpNumThreads: envNumberOrDefault("FACE_ORT_THREADS", 2),
   };
   const t0 = Date.now();
   const [detector, recognizer] = await Promise.all([
@@ -965,10 +965,7 @@ export function facePose(landmarks: ReadonlyArray<readonly [number, number]>): F
   return [pose.yaw, pose.aspect, pose.rollDeg].every(Number.isFinite) ? pose : null;
 }
 
-const envLimit = (name: string, fallback: number, min: number, max: number) => {
-  const v = Number(process.env[name]);
-  return Number.isFinite(v) && v >= min && v <= max ? v : fallback;
-};
+const envLimit = (name: string, fallback: number, min: number, max: number) => envNumber(name, fallback, { min, max });
 
 /**
  * What counts as a clear, recognisable face. Calibrated on this site's own

@@ -28,6 +28,7 @@ import {
   OrgCatalogRecord,
   OrgEntryRecord,
 } from "./src/server/db";
+import { envNumber } from "./src/server/env";
 import {
   UserRole,
   isUserRole,
@@ -1426,12 +1427,10 @@ const FACE_ENGINE_SETTING: FaceEngineSetting = (() => {
 })();
 
 function envFloat(name: string, fallback: number, min = 0, max = 1): number {
-  const v = Number(process.env[name]);
-  return Number.isFinite(v) && v >= min && v <= max ? v : fallback;
+  return envNumber(name, fallback, { min, max });
 }
 function envInt(name: string, fallback: number, min: number, max: number): number {
-  const v = Number(process.env[name]);
-  return Number.isInteger(v) && v >= min && v <= max ? v : fallback;
+  return envNumber(name, fallback, { min, max, integer: true });
 }
 
 /** Minimum capture quality an enrolment frame must reach to become a template. */
