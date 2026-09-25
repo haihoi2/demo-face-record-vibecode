@@ -46,6 +46,7 @@ import {
   ThreadPoolTelemetry,
 } from "../types";
 import { apiFetch, operatorJsonFetch } from "../utils/api";
+import { ProtectedImage } from "./ProtectedImage";
 
 const DEFAULT_STREAMS_CONFIG: CameraStreamsConfig = {
   entryGate: {
@@ -1601,7 +1602,7 @@ export const CameraStreamConfigPage: React.FC = () => {
               </button>
             </div>
             <div className="relative aspect-video max-h-72 w-full bg-slate-950 rounded-lg overflow-hidden border border-slate-800 flex items-center justify-center">
-              <img
+              <ProtectedImage
                 key={`row-snap-${s.id}-${snapshotTimestamp}`}
                 src={`/api/camera-streams/snapshot?gate=${currentGateKey}&stream=${encodeURIComponent(s.id)}&t=${snapshotTimestamp}`}
                 alt={`Snapshot ${s.label}`}
@@ -2185,6 +2186,8 @@ export const CameraStreamConfigPage: React.FC = () => {
                     />
                   ) : previewStream.sourceType === "RTSP" ? (
                     rtspViewMode === "MJPEG" ? (
+                      // Deliberately a plain <img>: this is a continuous multipart
+                      // stream, so a fetch()/blob() round trip would never resolve.
                       <img
                         key={`mjpeg-${previewStream.id}-${previewTimestamp}`}
                         src={`/api/camera-streams/mjpeg?gate=${currentGateKey}&stream=${encodeURIComponent(previewStream.id)}&t=${previewTimestamp}`}
@@ -2197,14 +2200,14 @@ export const CameraStreamConfigPage: React.FC = () => {
                         className="w-full h-full object-contain"
                       />
                     ) : rtspViewMode === "SNAPSHOT" ? (
-                      <img
+                      <ProtectedImage
                         key={`snap-${previewStream.id}-${previewTimestamp}`}
                         src={`/api/camera-streams/snapshot?gate=${currentGateKey}&stream=${encodeURIComponent(previewStream.id)}&t=${previewTimestamp}`}
                         alt="RTSP Snapshot"
                         className="w-full h-full object-contain"
                       />
                     ) : (
-                      <img
+                      <ProtectedImage
                         src={`/api/camera-streams/test-frame?gate=${currentGateKey}&source=${encodeURIComponent(
                           previewStream.sourceType
                         )}&t=${previewTimestamp}`}
@@ -2213,6 +2216,8 @@ export const CameraStreamConfigPage: React.FC = () => {
                       />
                     )
                   ) : previewStream.sourceType === "HTTP_MJPEG" && previewStream.httpUrl ? (
+                    // Deliberately a plain <img>: httpUrl is the camera's own host,
+                    // which must never receive the operator session cookie.
                     <img
                       key={`http-${previewStream.id}-${previewTimestamp}`}
                       src={previewStream.httpUrl}
@@ -2223,7 +2228,7 @@ export const CameraStreamConfigPage: React.FC = () => {
                       className="w-full h-full object-contain"
                     />
                   ) : (
-                    <img
+                    <ProtectedImage
                       src={`/api/camera-streams/test-frame?gate=${currentGateKey}&source=${encodeURIComponent(
                         previewStream.sourceType
                       )}&t=${previewTimestamp}`}
@@ -2373,16 +2378,14 @@ export const CameraStreamConfigPage: React.FC = () => {
                             key={s.id}
                             className="relative aspect-video bg-slate-900 rounded-xl overflow-hidden border border-slate-800 flex items-center justify-center"
                           >
-                            <img
+                            <ProtectedImage
                               src={
                                 s.sourceType === "RTSP" || s.sourceType === "BACKEND_UVC"
                                   ? `/api/camera-streams/snapshot?gate=${key}&stream=${encodeURIComponent(s.id)}&t=${previewTimestamp}`
                                   : `/api/camera-streams/test-frame?gate=${key}&source=${encodeURIComponent(s.sourceType)}&t=${previewTimestamp}`
                               }
                               alt={s.label}
-                              onError={(e) => {
-                                (e.target as HTMLImageElement).src = `/api/camera-streams/test-frame?gate=${key}&source=${encodeURIComponent(s.sourceType)}%20Offline`;
-                              }}
+                              fallbackSrc={`/api/camera-streams/test-frame?gate=${key}&source=${encodeURIComponent(s.sourceType)}%20Offline`}
                               className="w-full h-full object-contain"
                             />
                             <div className="absolute top-2 left-2 bg-black/60 text-white text-[11px] px-2 py-1 rounded font-mono flex items-center gap-1.5">
