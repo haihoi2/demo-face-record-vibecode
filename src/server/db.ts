@@ -347,6 +347,23 @@ export interface UserRecord {
   createdBy: string | null;
 }
 
+/** One managed value of the organisation catalog (a department or a position). */
+export interface OrgEntryRecord {
+  id: string;
+  name: string;
+  description: string;
+  /** Inactive entries stay on existing employees but are not offered for new ones. */
+  active: boolean;
+  createdAt: string;
+  updatedAt: string;
+  createdBy: string | null;
+}
+
+export interface OrgCatalogRecord {
+  departments: OrgEntryRecord[];
+  positions: OrgEntryRecord[];
+}
+
 export type StrangerResolutionAction = "QUICK_REGISTER" | "MERGE" | "DISMISS" | "RESTORE";
 
 export interface StrangerResolutionRecord {
@@ -1074,6 +1091,12 @@ class SQLiteStorage {
           "updatedAt" VARCHAR(64)
         );
 
+        CREATE TABLE IF NOT EXISTS org_catalog (
+          id VARCHAR(64) PRIMARY KEY,
+          data JSONB NOT NULL,
+          "updatedAt" VARCHAR(64)
+        );
+
         -- Migration: stranger-alert settings for databases created before they existed
         ALTER TABLE webhook_config ADD COLUMN IF NOT EXISTS "strangerConfig" TEXT;
         ALTER TABLE access_logs ADD COLUMN IF NOT EXISTS "faceEmbedding" BYTEA;
@@ -1088,6 +1111,7 @@ class SQLiteStorage {
       await this.loadCameraStreamsConfig();
       await this.loadFaceTemplates();
       await this.loadUsers();
+      await this.loadOrgCatalog();
       console.log("[PostgreSQL] Các bảng dữ liệu đã sẵn sàng trên PostgreSQL!");
     } catch (err) {
       console.error("[PostgreSQL] Lỗi khởi tạo bảng:", err);
@@ -1309,6 +1333,7 @@ class SQLiteStorage {
     face_templates?: FaceTemplateRecord[];
     ai_recognition_config?: AiRecognitionConfigRecord;
     app_users?: UserRecord[];
+    org_catalog?: OrgCatalogRecord;
   } = {
     employees: [],
     access_logs: [],
@@ -2910,6 +2935,84 @@ class SQLiteStorage {
     }
     this.resolvedClustersCache = this.resolvedClustersCache.filter((id) => id !== restore.clusterId);
     return restore;
+  }
+
+  // ================= ORGANISATION CATALOG (departments, positions) =================
+  // One small document, read synchronously when an employee is created, so it
+  // is hydrated into memory at startup and every save writes through - the same
+  // arrangement as the camera configuration.
+  private orgCatalogCache: OrgCatalogRecord | null = null;
+
+  private localOrgCatalog(): OrgCatalogRecord | null {
+    if (this.isNativeSqlite && this.db) {
+      try {
+        this.ensureSqliteOrgCatalog();
+        const row: any = this.db.prepare("SELECT config_json FROM org_catalog WHERE id = 'default'").get();
+        if (row?.config_json) return JSON.parse(row.config_json);
+      } catch (err) {
+        console.error("[SQLite] Lỗi đọc org_catalog:", err);
+      }
+    }
+    return this.fallbackData.org_catalog || null;
+  }
+
+  private ensureSqliteOrgCatalog() {
+    if (!(this.isNativeSqlite && this.db)) return;
+    try {
+      this.db.exec("CREATE TABLE IF NOT EXISTS org_catalog (id TEXT PRIMARY KEY, config_json TEXT NOT NULL)");
+    } catch {}
+  }
+
+  private async loadOrgCatalog() {
+    if (!this.pgPool) return;
+    try {
+      const res = await this.pgPool.query("SELECT data FROM org_catalog WHERE id = 'default'");
+      const raw = res.rows[0]?.data;
+      const remote = raw ? ((typeof raw === "string" ? JSON.parse(raw) : raw) as OrgCatalogRecord) : null;
+      if (remote) {
+        this.orgCatalogCache = remote;
+      } else {
+        // First run against PostgreSQL: keep whatever the local stores hold.
+        const local = this.localOrgCatalog();
+        if (local) this.saveOrgCatalog(local);
+      }
+    } catch (err) {
+      console.error("[PostgreSQL] Lỗi nạp org_catalog:", err);
+    }
+  }
+
+  /** The catalog, or null when it has never been created (the caller seeds it). */
+  getOrgCatalog(): OrgCatalogRecord | null {
+    return this.orgCatalogCache || this.localOrgCatalog();
+  }
+
+  saveOrgCatalog(catalog: OrgCatalogRecord): OrgCatalogRecord {
+    const snapshot: OrgCatalogRecord = JSON.parse(JSON.stringify(catalog));
+    const json = JSON.stringify(snapshot);
+    this.orgCatalogCache = snapshot;
+    if (this.pgPool && this.isPostgres) {
+      this.pgPool
+        .query(
+          `INSERT INTO org_catalog (id, data, "updatedAt") VALUES ('default', $1::jsonb, $2)
+           ON CONFLICT (id) DO UPDATE SET data = EXCLUDED.data, "updatedAt" = EXCLUDED."updatedAt"`,
+          [json, new Date().toISOString()]
+        )
+        .catch((e: any) => console.error("[PostgreSQL] Lỗi lưu org_catalog:", e?.message));
+    }
+    if (this.isNativeSqlite && this.db) {
+      try {
+        this.ensureSqliteOrgCatalog();
+        this.db
+          .prepare(`INSERT INTO org_catalog (id, config_json) VALUES ('default', ?)
+                    ON CONFLICT(id) DO UPDATE SET config_json = excluded.config_json`)
+          .run(json);
+      } catch (err) {
+        console.error("[SQLite] Lỗi lưu org_catalog:", err);
+      }
+    }
+    this.fallbackData.org_catalog = snapshot;
+    this.saveFallback();
+    return snapshot;
   }
 
   // ================= OPERATOR ACCOUNTS =================

@@ -129,6 +129,13 @@ CREATE INDEX IF NOT EXISTS idx_stranger_resolution_events_cluster
 
 -- AI recognition engine settings (engine mode, Gemini model, thresholds).
 -- Single row id = 'default'; the server hydrates it into memory at startup.
+-- Managed departments and positions, as one document.
+CREATE TABLE IF NOT EXISTS org_catalog (
+  id VARCHAR(64) PRIMARY KEY,
+  data JSONB NOT NULL,
+  "updatedAt" VARCHAR(64)
+);
+
 -- Operator accounts. `data` holds the full record including the scrypt
 -- password hash, which the API never returns.
 CREATE TABLE IF NOT EXISTS app_users (

@@ -16,6 +16,7 @@ import {
   rawApi,
   recognize,
   type Employee,
+  ensureFixtureCatalog,
 } from "./helpers";
 
 interface AccessLog {
@@ -48,6 +49,10 @@ async function clusterFor(logId: string) {
     cluster.photos.some((photo: any) => photo.logId === logId),
   );
 }
+
+
+// Quick-register uses the fixture department/position, which must exist in the catalog.
+before(() => ensureFixtureCatalog());
 
 describe("operator authorization", () => {
   it("rejects unauthenticated stranger, access-log, and image reads", async () => {

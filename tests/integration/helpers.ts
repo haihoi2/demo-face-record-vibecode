@@ -164,12 +164,35 @@ export function uniqueTestCode(prefix = "ITEST"): string {
   return `${prefix}-${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`.toUpperCase();
 }
 
+/**
+ * Department and position used by test fixtures. New employees must use active
+ * catalog entries, so these are created on first use (idempotently: a 409
+ * DUPLICATE means another test already made them).
+ */
+export const FIXTURE_DEPARTMENT = "Integration Test Dept";
+export const FIXTURE_POSITION = "Fixture";
+let fixtureCatalog: Promise<void> | null = null;
+export function ensureFixtureCatalog(): Promise<void> {
+  if (!fixtureCatalog) {
+    fixtureCatalog = (async () => {
+      for (const [kind, name] of [["departments", FIXTURE_DEPARTMENT], ["positions", FIXTURE_POSITION]] as const) {
+        const res = await postJson(`/api/org/${kind}`, { name });
+        if (res.status !== 201 && res.status !== 409) {
+          throw new Error(`creating fixture ${kind} "${name}" failed: HTTP ${res.status} ${res.text.slice(0, 200)}`);
+        }
+      }
+    })();
+  }
+  return fixtureCatalog;
+}
+
 export async function createTempEmployee(overrides: Partial<Employee> = {}): Promise<Employee> {
+  await ensureFixtureCatalog();
   const payload = {
     name: overrides.name || `Integration Fixture ${Date.now()}`,
     employeeCode: overrides.employeeCode || uniqueTestCode(),
-    department: overrides.department || "Integration Test Dept",
-    position: overrides.position || "Fixture",
+    department: overrides.department || FIXTURE_DEPARTMENT,
+    position: overrides.position || FIXTURE_POSITION,
     photoUrl: overrides.photoUrl || noFaceJpegDataUrl(),
     accessLevel: overrides.accessLevel || "ALL_ACCESS",
   };

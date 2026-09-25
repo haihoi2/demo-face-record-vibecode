@@ -25,6 +25,8 @@ import {
   StrangerResolutionRecord,
   sameResolutionIntent,
   UserRecord,
+  OrgCatalogRecord,
+  OrgEntryRecord,
 } from "./src/server/db";
 import {
   UserRole,
@@ -5296,6 +5298,207 @@ app.get(EMPLOYEE_ROUTES, (_req, res) => {
   res.json(employees);
 });
 
+// =========================================================================
+// ORGANISATION CATALOG - managed departments (phòng ban) and positions (chức vụ)
+// =========================================================================
+// New employees must use an active entry, so the list keeps the roster
+// consistent. Renaming an entry renames it on every employee that carries it;
+// deleting is refused while anyone still uses it (deactivate instead). The
+// catalog is seeded on first use from the values already in use, so no
+// existing employee becomes invalid.
+type OrgKind = "departments" | "positions";
+const ORG_KINDS: readonly OrgKind[] = ["departments", "positions"];
+const ORG_EMPLOYEE_FIELD = { departments: "department", positions: "position" } as const;
+const ORG_LABEL: Record<OrgKind, string> = { departments: "Phòng ban", positions: "Chức vụ" };
+const ORG_DEFAULTS = {
+  departments: [
+    "Phòng Kỹ Thuật AI", "Phòng Nhân Sự", "Phòng Tài Chính - Kế Toán", "Ban Điều Hành",
+    "Phòng Kinh Doanh", "Bộ Phận Vận Hành & Bảo Mật", "Phòng Hành chính - Nhân sự",
+  ],
+  positions: ["Nhân viên", "Nhân viên mới", "Chuyên viên", "Kỹ sư phần mềm"],
+} as const;
+const NEW_EMPLOYEE_DEFAULTS = { departments: "Phòng Hành chính - Nhân sự", positions: "Nhân viên" } as const;
+const NEW_STRANGER_DEFAULTS = { departments: "Phòng Kỹ Thuật AI", positions: "Nhân viên mới" } as const;
+
+const cleanOrgName = (value: unknown): string | null => {
+  if (typeof value !== "string") return null;
+  const name = value.normalize("NFC").trim().replace(/\s+/g, " ");
+  return name.length >= 1 && name.length <= 120 ? name : null;
+};
+/** Comparison key: case- and spacing-insensitive, so "phòng  nhân sự" matches "Phòng Nhân Sự". */
+const orgKey = (name: string) => name.normalize("NFC").trim().replace(/\s+/g, " ").toLocaleLowerCase("vi");
+const isOrgKind = (value: unknown): value is OrgKind => ORG_KINDS.includes(value as OrgKind);
+
+function newOrgEntry(name: string, actor: string | null, description = ""): OrgEntryRecord {
+  const now = new Date().toISOString();
+  return { id: `ORG-${randomUUID()}`, name, description, active: true, createdAt: now, updatedAt: now, createdBy: actor };
+}
+
+function orgCatalog(): OrgCatalogRecord {
+  const existing = db.getOrgCatalog();
+  if (existing) return existing;
+  const seed = (kind: OrgKind): OrgEntryRecord[] => {
+    const byKey = new Map<string, string>();
+    const field = ORG_EMPLOYEE_FIELD[kind];
+    for (const raw of [...ORG_DEFAULTS[kind], ...employees.map((e) => e[field])]) {
+      const name = cleanOrgName(raw);
+      if (name && !byKey.has(orgKey(name))) byKey.set(orgKey(name), name);
+    }
+    return [...byKey.values()].map((name) => newOrgEntry(name, "system"));
+  };
+  const seeded = db.saveOrgCatalog({ departments: seed("departments"), positions: seed("positions") });
+  console.log(`[Org] Khởi tạo danh mục: ${seeded.departments.length} phòng ban, ${seeded.positions.length} chức vụ (từ dữ liệu hiện có).`);
+  return seeded;
+}
+
+/** The catalog spelling of `value` (or of the fallback when empty), if it is an active entry. */
+function resolveOrgName(kind: OrgKind, value: unknown, fallback: string): { name: string } | { error: string } {
+  const supplied = typeof value === "string" && value.trim() ? value : fallback;
+  const entry = orgCatalog()[kind].find((e) => e.active && orgKey(e.name) === orgKey(String(supplied)));
+  return entry
+    ? { name: entry.name }
+    : { error: `${ORG_LABEL[kind]} "${String(supplied).trim()}" không có trong danh mục đang dùng` };
+}
+
+const orgUsage = (kind: OrgKind, name: string) => {
+  const field = ORG_EMPLOYEE_FIELD[kind];
+  return employees.filter((e) => orgKey(String(e[field] || "")) === orgKey(name)).length;
+};
+const publicOrgList = (kind: OrgKind) =>
+  [...orgCatalog()[kind]]
+    .sort((a, b) => a.name.localeCompare(b.name, "vi"))
+    .map((e) => ({ ...e, employeeCount: orgUsage(kind, e.name) }));
+
+app.get("/api/org", requireOperatorRole("viewer"), (_req: Request, res: Response) => {
+  res.json({ success: true, departments: publicOrgList("departments"), positions: publicOrgList("positions") });
+});
+
+app.get("/api/org/:kind", requireOperatorRole("viewer"), (req: Request, res: Response) => {
+  const kind = req.params.kind;
+  if (!isOrgKind(kind)) {
+    res.status(404).json({ success: false, error: "Danh mục không tồn tại" });
+    return;
+  }
+  res.json({ success: true, kind, items: publicOrgList(kind) });
+});
+
+app.post("/api/org/:kind", requireOperatorRole("operator"), requireCsrf, (req: Request, res: Response) => {
+  const kind = req.params.kind;
+  if (!isOrgKind(kind)) {
+    res.status(404).json({ success: false, error: "Danh mục không tồn tại" });
+    return;
+  }
+  const name = cleanOrgName(req.body?.name);
+  if (!name) {
+    res.status(400).json({ success: false, code: "INVALID_NAME", error: `Tên ${ORG_LABEL[kind].toLowerCase()} gồm 1-120 ký tự` });
+    return;
+  }
+  const catalog = orgCatalog();
+  if (catalog[kind].some((e) => orgKey(e.name) === orgKey(name))) {
+    res.status(409).json({ success: false, code: "DUPLICATE", error: `${ORG_LABEL[kind]} "${name}" đã có trong danh mục` });
+    return;
+  }
+  const description = typeof req.body?.description === "string" ? req.body.description.trim().slice(0, 300) : "";
+  const entry = newOrgEntry(name, operatorActor(req) || null, description);
+  db.saveOrgCatalog({ ...catalog, [kind]: [...catalog[kind], entry] });
+  console.log(`[Org] ${operatorActor(req)} đã thêm ${ORG_LABEL[kind].toLowerCase()} "${name}".`);
+  broadcastSSE("org_catalog_updated", { kind });
+  res.status(201).json({ success: true, item: { ...entry, employeeCount: 0 } });
+});
+
+app.put("/api/org/:kind/:id", requireOperatorRole("operator"), requireCsrf, (req: Request, res: Response) => {
+  const kind = req.params.kind;
+  if (!isOrgKind(kind)) {
+    res.status(404).json({ success: false, error: "Danh mục không tồn tại" });
+    return;
+  }
+  const catalog = orgCatalog();
+  const current = catalog[kind].find((e) => e.id === req.params.id);
+  if (!current) {
+    res.status(404).json({ success: false, error: `Không tìm thấy ${ORG_LABEL[kind].toLowerCase()}` });
+    return;
+  }
+  const body = req.body || {};
+  const next: OrgEntryRecord = { ...current };
+  if (body.name !== undefined) {
+    const name = cleanOrgName(body.name);
+    if (!name) {
+      res.status(400).json({ success: false, code: "INVALID_NAME", error: `Tên ${ORG_LABEL[kind].toLowerCase()} gồm 1-120 ký tự` });
+      return;
+    }
+    if (catalog[kind].some((e) => e.id !== current.id && orgKey(e.name) === orgKey(name))) {
+      res.status(409).json({ success: false, code: "DUPLICATE", error: `${ORG_LABEL[kind]} "${name}" đã có trong danh mục` });
+      return;
+    }
+    next.name = name;
+  }
+  if (body.description !== undefined) {
+    if (typeof body.description !== "string") {
+      res.status(400).json({ success: false, error: "Mô tả không hợp lệ" });
+      return;
+    }
+    next.description = body.description.trim().slice(0, 300);
+  }
+  if (body.active !== undefined) {
+    if (typeof body.active !== "boolean") {
+      res.status(400).json({ success: false, error: "active phải là true hoặc false" });
+      return;
+    }
+    next.active = body.active;
+  }
+  next.updatedAt = new Date().toISOString();
+
+  // A rename carries every employee with it, so the roster never points at a
+  // name the catalog no longer has.
+  let renamedEmployees = 0;
+  if (next.name !== current.name) {
+    const field = ORG_EMPLOYEE_FIELD[kind];
+    for (const employee of employees) {
+      if (orgKey(String(employee[field] || "")) === orgKey(current.name)) {
+        employee[field] = next.name;
+        db.saveEmployee(employee);
+        broadcastSSE("employee_updated", employee);
+        renamedEmployees += 1;
+      }
+    }
+  }
+  db.saveOrgCatalog({ ...catalog, [kind]: catalog[kind].map((e) => (e.id === current.id ? next : e)) });
+  console.log(
+    `[Org] ${operatorActor(req)} đã cập nhật ${ORG_LABEL[kind].toLowerCase()} "${current.name}"` +
+      (next.name !== current.name ? ` -> "${next.name}" (${renamedEmployees} nhân viên)` : "") + "."
+  );
+  broadcastSSE("org_catalog_updated", { kind });
+  res.json({ success: true, item: { ...next, employeeCount: orgUsage(kind, next.name) }, renamedEmployees });
+});
+
+app.delete("/api/org/:kind/:id", requireOperatorRole("operator"), requireCsrf, (req: Request, res: Response) => {
+  const kind = req.params.kind;
+  if (!isOrgKind(kind)) {
+    res.status(404).json({ success: false, error: "Danh mục không tồn tại" });
+    return;
+  }
+  const catalog = orgCatalog();
+  const current = catalog[kind].find((e) => e.id === req.params.id);
+  if (!current) {
+    res.status(404).json({ success: false, error: `Không tìm thấy ${ORG_LABEL[kind].toLowerCase()}` });
+    return;
+  }
+  const inUse = orgUsage(kind, current.name);
+  if (inUse > 0) {
+    res.status(409).json({
+      success: false,
+      code: "IN_USE",
+      employeeCount: inUse,
+      error: `${ORG_LABEL[kind]} "${current.name}" đang được ${inUse} nhân viên sử dụng. Hãy chuyển họ sang mục khác hoặc ngừng sử dụng mục này thay vì xóa.`,
+    });
+    return;
+  }
+  db.saveOrgCatalog({ ...catalog, [kind]: catalog[kind].filter((e) => e.id !== current.id) });
+  console.log(`[Org] ${operatorActor(req)} đã xóa ${ORG_LABEL[kind].toLowerCase()} "${current.name}".`);
+  broadcastSSE("org_catalog_updated", { kind });
+  res.json({ success: true });
+});
+
 app.post(EMPLOYEE_ROUTES, async (req, res) => {
   console.log(`[API] Received POST /api/employees with body keys:`, Object.keys(req.body || {}));
   const { name, employeeCode, department, position, photoUrl, accessLevel } =
@@ -5307,6 +5510,16 @@ app.post(EMPLOYEE_ROUTES, async (req, res) => {
   }
   if (!isAccessLevel(accessLevel || "ALL_ACCESS")) {
     res.status(400).json({ error: "Quyền truy cập không hợp lệ" });
+    return;
+  }
+  const departmentName = resolveOrgName("departments", department, NEW_EMPLOYEE_DEFAULTS.departments);
+  if ("error" in departmentName) {
+    res.status(400).json({ code: "UNKNOWN_DEPARTMENT", error: departmentName.error });
+    return;
+  }
+  const positionName = resolveOrgName("positions", position, NEW_EMPLOYEE_DEFAULTS.positions);
+  if ("error" in positionName) {
+    res.status(400).json({ code: "UNKNOWN_POSITION", error: positionName.error });
     return;
   }
 
@@ -5323,8 +5536,8 @@ app.post(EMPLOYEE_ROUTES, async (req, res) => {
     id: `EMP-${randomUUID()}`,
     name: name.trim(),
     employeeCode: employeeCode.trim().toUpperCase(),
-    department: department ? department.trim() : "Phòng Hành chính - Nhân sự",
-    position: position ? position.trim() : "Nhân viên",
+    department: departmentName.name,
+    position: positionName.name,
     photoUrl,
     registeredAt: new Date().toISOString(),
     accessLevel: accessLevel || "ALL_ACCESS",
@@ -6126,8 +6339,18 @@ app.post(["/api/strangers/quick-register", "/api/strangers/register"], requireOp
       res.status(400).json({ success: false, error: "sourceLogId phải là một thành viên của cụm" });
       return;
     }
+    const departmentName = resolveOrgName("departments", normalizedDepartment, NEW_STRANGER_DEFAULTS.departments);
+    if ("error" in departmentName) {
+      res.status(400).json({ success: false, code: "UNKNOWN_DEPARTMENT", error: departmentName.error });
+      return;
+    }
+    const positionName = resolveOrgName("positions", normalizedPosition, NEW_STRANGER_DEFAULTS.positions);
+    if ("error" in positionName) {
+      res.status(400).json({ success: false, code: "UNKNOWN_POSITION", error: positionName.error });
+      return;
+    }
     const intent = { name: normalizedName, employeeCode: normalizedEmployeeCode,
-      department: normalizedDepartment, position: normalizedPosition, accessLevel, photoUrl: normalizedPhotoUrl };
+      department: departmentName.name, position: positionName.name, accessLevel, photoUrl: normalizedPhotoUrl };
 
     const existingResolution = db.getStrangerResolution(String(clusterId || ""));
     if (existingResolution) {
@@ -6162,8 +6385,8 @@ app.post(["/api/strangers/quick-register", "/api/strangers/register"], requireOp
       id: newEmpId,
       name: normalizedName,
       employeeCode: normalizedEmployeeCode,
-      department: normalizedDepartment || "Phòng Kỹ Thuật AI",
-      position: normalizedPosition || "Nhân viên mới",
+      department: departmentName.name,
+      position: positionName.name,
       photoUrl: normalizedPhotoUrl || logImageUrl(validated.logIds[0]),
       registeredAt: new Date().toISOString(),
       accessLevel,

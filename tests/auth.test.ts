@@ -86,6 +86,12 @@ describe("permission table", () => {
     ["POST", "/api/employees/EMP-1/templates/capture", "operator"],
     ["DELETE", "/api/employees/EMP-1/templates/FT-1", "operator"],
     ["POST", "/api/recognize-face", "operator"],
+    // operator: manage departments and positions
+    ["GET", "/api/org", "viewer"],
+    ["GET", "/api/org/departments", "viewer"],
+    ["POST", "/api/org/departments", "operator"],
+    ["PUT", "/api/org/positions/ORG-1", "operator"],
+    ["DELETE", "/api/org/departments/ORG-1", "operator"],
 
     // admin only: the door, the integrations, the engine, accounts, destructive edits
     ["POST", "/api/lock/unlock", "admin"],

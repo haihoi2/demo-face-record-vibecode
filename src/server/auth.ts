@@ -35,7 +35,8 @@ export const roleAtLeast = (role: UserRole, required: UserRole): boolean =>
 //   operator  view history; add/edit/remove camera streams and gate watch
 //             settings; approve new members (create employee, stranger
 //             register/merge/dismiss/restore); register faces (enrol, capture,
-//             remove a template); run recognition
+//             remove a template); manage departments and positions;
+//             run recognition
 //   viewer    view only
 //
 // Anything not listed below is decided by the defaults at the bottom: reads
@@ -74,6 +75,9 @@ const RULES: readonly Rule[] = [
     pattern: /^\/api\/strangers\/(?:quick-register|register|merge|assign|dismiss|reject|restore)$/,
     role: "operator",
   },
+
+  // --- operator: the department and position catalog
+  { methods: WRITE, pattern: /^\/api\/org\/(?:departments|positions)(?:\/[^/]+)?$/, role: "operator" },
 
   // --- operator: registering faces
   { methods: ["POST"], pattern: /^\/api\/employees\/[^/]+\/templates(?:\/capture)?$/, role: "operator" },
