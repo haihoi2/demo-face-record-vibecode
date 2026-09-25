@@ -1034,6 +1034,7 @@ class SQLiteStorage {
       await this.loadStrangerResolutions();
       await this.loadStrangerResolutionEvents();
       await this.loadAiRecognitionConfig();
+      await this.loadCameraStreamsConfig();
       await this.loadFaceTemplates();
       console.log("[PostgreSQL] Các bảng dữ liệu đã sẵn sàng trên PostgreSQL!");
     } catch (err) {
@@ -2205,35 +2206,113 @@ class SQLiteStorage {
   }
 
   // ================= CAMERA STREAMS CONFIG =================
-  getCameraStreamsConfig(defaultConfig: CameraStreamsConfigRecord): CameraStreamsConfigRecord {
+  // Gate URLs, stream lists and watcher settings. The read path is synchronous
+  // (every request resolves the gate config), so the PostgreSQL row is hydrated
+  // into memory at startup exactly like the AI config, and every save writes
+  // through to each active store. Before this, the config lived only in SQLite
+  // and the JSON fallback: on a host where ./data is not persisted the whole
+  // camera configuration silently reverted to the compiled defaults.
+  private cameraConfigCache: CameraStreamsConfigRecord | null = null;
+  private cameraConfigLoadedCallbacks: Array<(config: CameraStreamsConfigRecord) => void> = [];
+
+  /** Fires once the PostgreSQL row has been hydrated (only when PostgreSQL is active). */
+  public onCameraStreamsConfigLoaded(cb: (config: CameraStreamsConfigRecord) => void) {
+    this.cameraConfigLoadedCallbacks.push(cb);
+  }
+
+  /** Config as persisted by the local stores, ignoring the PostgreSQL cache. */
+  private localCameraStreamsConfig(): CameraStreamsConfigRecord | null {
     if (this.isNativeSqlite && this.db) {
       try {
-        const row = this.db.prepare("SELECT config_json FROM camera_streams_config WHERE id = 'default'").get();
-        if (row && row.config_json) {
-          return JSON.parse(row.config_json);
-        }
+        const row: any = this.db
+          .prepare("SELECT config_json FROM camera_streams_config WHERE id = 'default'")
+          .get();
+        if (row?.config_json) return JSON.parse(row.config_json);
       } catch (err) {
         console.error("[SQLite] Lỗi getCameraStreamsConfig:", err);
       }
     }
-    return this.fallbackData.camera_streams_config || defaultConfig;
+    return this.fallbackData.camera_streams_config || null;
+  }
+
+  private async loadCameraStreamsConfig() {
+    if (!this.pgPool) return;
+    try {
+      const res = await this.pgPool.query(
+        "SELECT data FROM camera_streams_config WHERE id = 'default'"
+      );
+      const raw = res.rows[0]?.data;
+      const parsed = raw
+        ? ((typeof raw === "string" ? JSON.parse(raw) : raw) as CameraStreamsConfigRecord)
+        : null;
+      if (parsed) {
+        this.cameraConfigCache = parsed;
+        console.log("[PostgreSQL] Đã nạp cấu hình luồng camera.");
+      } else {
+        // First run against PostgreSQL: adopt whatever the local stores hold so
+        // an existing deployment keeps its gates instead of reverting to defaults.
+        const local = this.localCameraStreamsConfig();
+        if (local) {
+          this.cameraConfigCache = local;
+          this.saveCameraStreamsConfig(local);
+          console.log("[PostgreSQL] Đã di chuyển cấu hình luồng camera từ bộ lưu cục bộ.");
+        }
+      }
+      for (const cb of this.cameraConfigLoadedCallbacks) {
+        try {
+          if (this.cameraConfigCache) cb(this.cameraConfigCache);
+        } catch (e: any) {
+          console.error("[PostgreSQL] Lỗi callback cấu hình luồng camera:", e?.message);
+        }
+      }
+    } catch (err) {
+      console.error("[PostgreSQL] Lỗi nạp cấu hình luồng camera:", err);
+    }
+  }
+
+  /** Precedence: PostgreSQL (hydrated cache) > native SQLite row > JSON fallback > defaults. */
+  getCameraStreamsConfig(defaultConfig: CameraStreamsConfigRecord): CameraStreamsConfigRecord {
+    if (this.cameraConfigCache) return this.cameraConfigCache;
+    return this.localCameraStreamsConfig() || defaultConfig;
   }
 
   saveCameraStreamsConfig(config: CameraStreamsConfigRecord): void {
+    const snapshot: CameraStreamsConfigRecord = JSON.parse(JSON.stringify(config));
+    const json = JSON.stringify(snapshot);
+
+    if (this.pgPool && this.isPostgres) {
+      // Cache first so the next synchronous read reflects the change even
+      // before the row lands.
+      this.cameraConfigCache = snapshot;
+      this.pgPool
+        .query(
+          `INSERT INTO camera_streams_config (id, data, "updatedAt")
+           VALUES ('default', $1::jsonb, $2)
+           ON CONFLICT (id) DO UPDATE SET
+             data = EXCLUDED.data,
+             "updatedAt" = EXCLUDED."updatedAt"`,
+          [json, new Date().toISOString()]
+        )
+        .catch((err: any) =>
+          console.error("[PostgreSQL] Lỗi lưu cấu hình luồng camera:", err?.message)
+        );
+    }
+
     if (this.isNativeSqlite && this.db) {
       try {
-        const stmt = this.db.prepare(`
-          INSERT INTO camera_streams_config (id, config_json)
-          VALUES ('default', ?)
-          ON CONFLICT(id) DO UPDATE SET config_json = excluded.config_json
-        `);
-        stmt.run(JSON.stringify(config));
+        this.db
+          .prepare(`
+            INSERT INTO camera_streams_config (id, config_json)
+            VALUES ('default', ?)
+            ON CONFLICT(id) DO UPDATE SET config_json = excluded.config_json
+          `)
+          .run(json);
         return;
       } catch (err) {
         console.error("[SQLite] Lỗi saveCameraStreamsConfig:", err);
       }
     }
-    this.fallbackData.camera_streams_config = config;
+    this.fallbackData.camera_streams_config = snapshot;
     this.saveFallback();
   }
 

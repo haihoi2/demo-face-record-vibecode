@@ -606,3 +606,40 @@ describe("camera streams: multi-stream gate config", () => {
     });
   });
 });
+
+/**
+ * Camera configuration must survive a process restart. Before it was persisted
+ * server-side beyond the local stores, a host without a durable ./data reverted
+ * every gate to the compiled defaults.
+ */
+describe("camera streams config durability", () => {
+  it("round-trips an edited gate through the server's own store", async () => {
+    const before = await getConfig();
+    const label = `ITEST durability ${Date.now().toString(36)}`;
+    const created = await postJson("/api/camera-streams/exit/streams", {
+      label,
+      sourceType: "RTSP",
+      rtspUrl: "rtsp://127.0.0.1:1/Streaming/Channels/4099",
+      rtspTransport: "TCP",
+      enabled: false,
+      priority: 90,
+    });
+    assert.equal(created.status, 201, created.text.slice(0, 300));
+    const addedId = created.body.stream.id;
+    try {
+      // Re-read through a fresh request: the value must come back from the
+      // server's store, not the caller's optimism.
+      const after = await getConfig();
+      const found = after.exitGate.streams.find((s: any) => s.id === addedId);
+      assert.ok(found, "the added stream must be readable back from the server");
+      assert.equal(found.label, label);
+      assert.equal(found.enabled, false);
+      assert.ok(
+        after.exitGate.streams.length > before.exitGate.streams.length,
+        "adding a stream must append, never replace the gate's list"
+      );
+    } finally {
+      await api(`/api/camera-streams/exit/streams/${encodeURIComponent(addedId)}`, { method: "DELETE" });
+    }
+  });
+});

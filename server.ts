@@ -1050,6 +1050,15 @@ db.onAiRecognitionConfigLoaded(() => {
   );
 });
 
+db.onCameraStreamsConfigLoaded(() => {
+  cameraStreamsConfig = loadCameraStreamsConfig();
+  syncGateWatchers(); // the hydrated row may carry a different gate/watch config
+  const gates = (["entryGate", "exitGate"] as const)
+    .map((k) => `${k}=${cameraStreamsConfig[k].streams.length} luồng`)
+    .join(", ");
+  console.log(`[Camera Config] Đã khôi phục cấu hình luồng camera từ PostgreSQL: ${gates}`);
+});
+
 // Listen to Postgres sync events to refresh memory models
 db.onSync(() => {
   aiRecognitionConfig = db.getAiRecognitionConfig(DEFAULT_AI_RECOGNITION_CONFIG);
