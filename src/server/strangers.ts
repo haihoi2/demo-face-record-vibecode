@@ -247,3 +247,44 @@ export function strangerCaptureDecision(
   live.push({ at: nowMs, embedding });
   return { capture: true, recent: live.slice(-max) };
 }
+
+
+/**
+ * Gather up to `size` recent candidate captures from a paged source, so they
+ * can be grouped together rather than page by page.
+ */
+export async function collectStrangerWindow(
+  fetchPage: (
+    cursor: { timestamp: string; id: string } | null,
+    limit: number,
+  ) => Promise<{ logs: AccessLogRecord[]; hasMore: boolean }>,
+  size: number,
+  pageSize = 100,
+): Promise<AccessLogRecord[]> {
+  const logs: AccessLogRecord[] = [];
+  let cursor: { timestamp: string; id: string } | null = null;
+  while (logs.length < size) {
+    const page = await fetchPage(cursor, Math.min(pageSize, size - logs.length));
+    logs.push(...page.logs);
+    const last = page.logs[page.logs.length - 1];
+    if (!page.hasMore || !last) break;
+    cursor = { timestamp: last.timestamp, id: last.id };
+  }
+  return logs;
+}
+
+/**
+ * One page of finished groups, continuing right after the group named by
+ * `afterClusterId`. If that group is no longer present (it was resolved in the
+ * meantime) paging restarts from the top, and `restarted` says so.
+ */
+export function pageStrangerClusters<T extends { clusterId: string }>(
+  all: T[],
+  afterClusterId: string | null,
+  limit: number,
+): { clusters: T[]; hasMore: boolean; restarted: boolean } {
+  const after = afterClusterId ? all.findIndex((c) => c.clusterId === afterClusterId) : -1;
+  const start = after >= 0 ? after + 1 : 0;
+  const clusters = all.slice(start, start + limit);
+  return { clusters, hasMore: start + limit < all.length, restarted: Boolean(afterClusterId) && after < 0 };
+}

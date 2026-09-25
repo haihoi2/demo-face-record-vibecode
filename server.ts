@@ -54,7 +54,13 @@ import type {
   ObservationMatch,
 } from "./src/types";
 import { runLocalFaceRecognition } from "./src/utils/localBiometrics";
-import { clusterStrangerFaces, strangerCaptureDecision, RecentStranger } from "./src/server/strangers";
+import {
+  clusterStrangerFaces,
+  collectStrangerWindow,
+  pageStrangerClusters,
+  strangerCaptureDecision,
+  RecentStranger,
+} from "./src/server/strangers";
 import { faceWorkerPool } from "./src/server/faceWorkerPool";
 import {
   extractFaces,
@@ -6235,8 +6241,6 @@ app.post(["/api/notifications/mark-read", "/notifications/mark-read"], (_req, re
   res.json({ success: true });
 });
 
-const encodeStrangerCursor = (log: AccessLogRecord) =>
-  Buffer.from(JSON.stringify({ timestamp: log.timestamp, id: log.id }), "utf8").toString("base64url");
 const decodeStrangerCursor = (value: unknown): { timestamp: string; id: string } | null => {
   if (!value) return null;
   try {
@@ -6267,6 +6271,29 @@ const registerStrangerClusters = (clusters: any[], logs: AccessLogRecord[]) => {
   }
 };
 
+/**
+ * Stranger grouping runs over a WINDOW of recent captures, not over one page.
+ * Grouping page by page meant a person who returned later in the day landed on
+ * another page and was never joined; the alert deep link grouped a single
+ * capture and always opened a lone sighting. The panel pages through the
+ * finished groups, and the lookup finds a capture's group, both from the same
+ * window - so the membership an operator acts on is the membership the server
+ * validates. Recomputed only when the window or the adjudications change.
+ */
+const STRANGER_CLUSTER_WINDOW = envInt("FACE_STRANGER_CLUSTER_WINDOW", 500, 50, 5000);
+let strangerWindowCache: { key: string; logs: AccessLogRecord[]; clusters: any[] } | null = null;
+
+async function strangerWindow(): Promise<{ logs: AccessLogRecord[]; clusters: any[] }> {
+  const logs = await collectStrangerWindow((cursor, limit) => db.getStrangerCandidateLogsPage(cursor, limit), STRANGER_CLUSTER_WINDOW);
+  const retired = db.getRetiredStrangerObservationIds();
+  const key = `${logs.length}|${logs[0]?.id || ""}|${logs[logs.length - 1]?.id || ""}|${retired.length}|${DEMO_DATA_ENABLED}`;
+  if (strangerWindowCache?.key === key) return strangerWindowCache;
+  const clusters = clusterStrangerFaces(logs, retired, { includeDemoSeeds: DEMO_DATA_ENABLED });
+  registerStrangerClusters(clusters, logs);
+  strangerWindowCache = { key, logs, clusters };
+  return strangerWindowCache;
+}
+
 // --- Stranger Face Alerts & Clustered Face Quick Registration ---
 app.get(["/api/strangers/clusters", "/api/strangers", "/api/strangers/"], requireOperatorRole("viewer"), async (req, res) => {
   try {
@@ -6276,27 +6303,27 @@ app.get(["/api/strangers/clusters", "/api/strangers", "/api/strangers/"], requir
       res.status(400).json({ success: false, error: "Cursor không hợp lệ" });
       return;
     }
-    const demoSeedsEnabled = DEMO_DATA_ENABLED;
-    const candidatePage = await db.getStrangerCandidateLogsPage(cursor, limit);
-    const clusters = clusterStrangerFaces(candidatePage.logs, db.getRetiredStrangerObservationIds(), {
-      includeDemoSeeds: demoSeedsEnabled && !cursor,
-    });
-    registerStrangerClusters(clusters, candidatePage.logs);
-    const last = candidatePage.logs[candidatePage.logs.length - 1];
-    const nextCursor = candidatePage.hasMore && last ? encodeStrangerCursor(last) : null;
+    const { logs, clusters: all } = await strangerWindow();
+    // The cursor names the last group already shown; continue right after it.
+    const { clusters, hasMore, restarted } = pageStrangerClusters(all, cursor?.id || null, limit);
+    const last = clusters[clusters.length - 1];
+    const nextCursor = last && hasMore
+      ? Buffer.from(JSON.stringify({ timestamp: last.lastSeen, id: last.clusterId }), "utf8").toString("base64url")
+      : null;
 
     res.json({
       success: true,
       clusters,
-      totalUnregisteredLogs: null,
-      totalClusters: clusters.length,
+      totalUnregisteredLogs: logs.length,
+      totalClusters: all.length,
       page: 1,
       limit,
       cursor: req.query.cursor || null,
+      restarted,
       nextCursor,
       hasMore: Boolean(nextCursor),
-      demoSeedsEnabled,
-      workBound: limit,
+      demoSeedsEnabled: DEMO_DATA_ENABLED,
+      workBound: STRANGER_CLUSTER_WINDOW,
     });
   } catch (err: any) {
     console.error("[Strangers] Lỗi gom cụm ảnh khuôn mặt người lạ:", err);
@@ -6317,6 +6344,14 @@ app.get("/api/strangers/lookup", requireOperatorRole("viewer"), async (req, res)
   const log = await db.getStrangerCandidateLogById(logId);
   if (!log) {
     res.status(404).json({ success: false, status: "MISSING", error: "Không tìm thấy lượt quét người lạ" });
+    return;
+  }
+  // The capture's group within the same window the panel shows; a capture older
+  // than the window is looked up on its own, as before.
+  const { clusters } = await strangerWindow();
+  const inWindow = clusters.find((c) => c.photos.some((photo: any) => photo.logId === logId));
+  if (inWindow) {
+    res.json({ success: true, cluster: inWindow });
     return;
   }
   const [cluster] = clusterStrangerFaces([log], db.getRetiredStrangerObservationIds());

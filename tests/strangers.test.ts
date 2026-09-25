@@ -6,7 +6,13 @@ import { readFileSync } from "node:fs";
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 
-import { clusterStrangerFaces, strangerCaptureDecision, STRANGER_SAME_PERSON_COSINE } from "../src/server/strangers";
+import {
+  clusterStrangerFaces,
+  collectStrangerWindow,
+  pageStrangerClusters,
+  strangerCaptureDecision,
+  STRANGER_SAME_PERSON_COSINE,
+} from "../src/server/strangers";
 import { AccessLogRecord } from "../src/server/db";
 
 function makeLog(overrides: Partial<AccessLogRecord> = {}): AccessLogRecord {
@@ -220,5 +226,58 @@ describe("stranger grouping at the calibrated threshold", () => {
       makeLog({ id: "LOG-D2", faceEmbedding: b, faceEmbeddingModelTag: "arcface" }),
     ], []);
     assert.equal(clusters.length, 2);
+  });
+});
+
+describe("grouping over a window, not page by page", () => {
+  // 120 captures, newest first. The first and the 110th are the same person;
+  // everything else is a distinct passer-by.
+  const oneHot = (k: number) => Array.from({ length: 128 }, (_, j) => (j === k ? 1 : 0));
+  const person = oneHot(0);
+  const logs = Array.from({ length: 120 }, (_, i) => {
+    const other = oneHot(i + 1); // orthogonal to everyone else: a distinct passer-by
+    return makeLog({
+      id: `LOG-W${String(1000 - i).padStart(4, "0")}`,
+      timestamp: new Date(Date.UTC(2026, 8, 25, 10, 0, 0) - i * 60_000).toISOString(),
+      faceEmbedding: i === 0 || i === 110 ? person : other,
+      faceEmbeddingModelTag: "arcface",
+    });
+  });
+  const pagedSource = async (cursor: { timestamp: string; id: string } | null, limit: number) => {
+    const start = cursor ? logs.findIndex((l) => l.id === cursor.id) + 1 : 0;
+    const page = logs.slice(start, start + Math.min(limit, 50)); // the store returns at most 50
+    return { logs: page, hasMore: start + page.length < logs.length };
+  };
+
+  it("joins a returning stranger whose two captures are on different pages", async () => {
+    const perPage = clusterStrangerFaces(logs.slice(0, 50), []);
+    assert.ok(!perPage.some((c) => c.totalSightings > 1), "page by page, the return visit is never joined");
+
+    const window = await collectStrangerWindow(pagedSource, 500);
+    assert.equal(window.length, 120, "the window gathers every page");
+    const grouped = clusterStrangerFaces(window, []);
+    const repeat = grouped.find((c) => c.totalSightings === 2);
+    assert.ok(repeat, "over the window the two visits form one group");
+    assert.deepEqual(repeat!.photos.map((p) => p.logId).sort(), ["LOG-W0890", "LOG-W1000"]);
+  });
+
+  it("stops at the window size", async () => {
+    assert.equal((await collectStrangerWindow(pagedSource, 70)).length, 70);
+  });
+
+  it("pages through groups exactly once, and restarts if the cursor's group is gone", () => {
+    const all = Array.from({ length: 7 }, (_, i) => ({ clusterId: `c${i}` }));
+    const seen: string[] = [];
+    let after: string | null = null;
+    for (;;) {
+      const page = pageStrangerClusters(all, after, 3);
+      seen.push(...page.clusters.map((c) => c.clusterId));
+      if (!page.hasMore) break;
+      after = page.clusters[page.clusters.length - 1].clusterId;
+    }
+    assert.deepEqual(seen, all.map((c) => c.clusterId));
+    const gone = pageStrangerClusters(all, "resolved-meanwhile", 3);
+    assert.equal(gone.restarted, true);
+    assert.equal(gone.clusters[0].clusterId, "c0");
   });
 });

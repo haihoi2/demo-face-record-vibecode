@@ -226,14 +226,17 @@ describe("persisted stranger cluster cursors and versions", () => {
     await makeDeniedLog(91990);
     const first = await api<any>("/api/strangers/clusters?limit=1");
     assert.equal(first.status, 200, first.text);
-    assert.ok(first.body.clusters.length <= 1);
-    assert.equal(first.body.workBound, 1);
-    assert.equal(first.body.totalClusters, first.body.clusters.length);
-    assert.equal(first.body.totalUnregisteredLogs, null);
+    assert.ok(first.body.clusters.length <= 1, "a page never exceeds its limit");
+    // Grouping runs over a bounded window of recent captures, independent of
+    // the page size, and the page walks the finished groups.
+    assert.ok(first.body.workBound >= 50, "the grouping window is not the page size");
+    assert.ok(first.body.totalClusters >= 2, "totals describe the whole window");
+    assert.equal(typeof first.body.totalUnregisteredLogs, "number");
     assert.equal(typeof first.body.nextCursor, "string");
     const second = await api<any>(`/api/strangers/clusters?limit=1&cursor=${encodeURIComponent(first.body.nextCursor)}`);
     assert.equal(second.status, 200, second.text);
     assert.ok(second.body.clusters.length <= 1);
+    assert.notEqual(second.body.clusters[0]?.clusterId, first.body.clusters[0]?.clusterId, "the next page continues, it does not repeat");
     const lookup = await api<any>(`/api/strangers/lookup?logId=${encodeURIComponent(older.id)}`);
     assert.equal(lookup.status, 200, lookup.text);
     assert.ok(lookup.body.cluster.observationCount >= 1);
