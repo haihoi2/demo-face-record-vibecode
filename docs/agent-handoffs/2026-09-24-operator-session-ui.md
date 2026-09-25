@@ -69,7 +69,7 @@ result:  exit 0 — dist/server.cjs 381.2kb, dist/faceWorker.cjs 7.8kb
 - **Known risks:**
   1. `ProtectedImage` fetches each image separately and holds an object URL per mounted instance. On a long access-log page this is more requests than a plain `<img>` would issue. If it bites, add a small blob cache keyed by URL.
   2. Sign-in is a shared bootstrap token, not per-person credentials, so the `actor` recorded on an adjudication is the principal's name, not an individual's. Real per-user accounts remain unbuilt.
-  3. Three camera-preview `<img>` sites in `CameraStreamConfigPage.tsx` (`/api/camera-streams/snapshot` and `test-frame`) are still bare. They work same-origin because the browser attaches the cookie, and they carry their own `onError` fallback chain, so converting them was left out of this change deliberately. They will not render on a split-origin deployment.
+  3. ~~Camera-preview `<img>` sites are still bare.~~ **Resolved in `8ac3b32`** — five single-shot previews (two `snapshot`, three `test-frame`) now go through `ProtectedImage`, which gained `fallbackSrc` to replace the grid tile's `onError` chain. `/api/camera-streams/mjpeg` and `previewStream.httpUrl` remain plain `<img>` on purpose: the former is a continuous multipart stream that a `fetch()`/`blob()` round trip would never resolve, the latter is the camera's own host and must not receive the operator cookie. A test pins that distinction.
 - **Unresolved questions:** whether the viewer principal is wanted on this site at all; nothing in the UI distinguishes the two roles beyond the badge.
 - **Dependencies on other agents/commits:** none outstanding.
 - **Requested integration action/order:** merge `agent/build/ci-baseline` into `main` as one unit.
