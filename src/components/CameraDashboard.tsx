@@ -55,6 +55,7 @@ import {
   demoOfflinePersistenceEnabled,
 } from "../utils/offlineEngine";
 import { ProtectedImage } from "./ProtectedImage";
+import { hasRole, useOperatorSession } from "../utils/session";
 
 const DEFAULT_STREAMS_CONFIG: CameraStreamsConfig = {
   entryGate: {
@@ -372,6 +373,8 @@ export const CameraDashboard: React.FC<CameraDashboardProps> = ({
   onNavigateToManualTrack,
   onNavigateToLogs,
 }) => {
+  // Manual door commands are admin-only; the server refuses them for anyone else.
+  const canOperateDoor = hasRole(useOperatorSession(), "admin");
   const [config, setConfig] = useState<CameraStreamsConfig>(DEFAULT_STREAMS_CONFIG);
   const [loadingConfig, setLoadingConfig] = useState<boolean>(true);
   const [currentTime, setCurrentTime] = useState<string>("");
@@ -2352,6 +2355,7 @@ export const CameraDashboard: React.FC<CameraDashboardProps> = ({
             </button>
 
             {/* Quick Gate Unlock Button */}
+            {canOperateDoor && (
             <button
               id={`btn-unlock-${gateConfig.gateType.toLowerCase()}`}
               onClick={() => handleGateUnlock(gateConfig.name)}
@@ -2361,6 +2365,7 @@ export const CameraDashboard: React.FC<CameraDashboardProps> = ({
               <KeyRound className="w-3.5 h-3.5 text-emerald-400" />
               <span>Mở Cổng Này</span>
             </button>
+            )}
           </div>
 
           {/* Honest cost of the frame count (manual scans only) */}
@@ -2695,6 +2700,7 @@ export const CameraDashboard: React.FC<CameraDashboardProps> = ({
                   {lockState?.isLocked === false ? "Đang mở" : "Đang khóa"}
                 </b>
               </span>
+              {canOperateDoor && (
               <button
                 onClick={onTriggerManualUnlock}
                 className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg bg-slate-900 hover:bg-slate-800 text-white font-semibold cursor-pointer"
@@ -2702,6 +2708,7 @@ export const CameraDashboard: React.FC<CameraDashboardProps> = ({
                 <KeyRound className="w-3.5 h-3.5" />
                 Mở thủ công
               </button>
+              )}
             </div>
           </div>
         </div>

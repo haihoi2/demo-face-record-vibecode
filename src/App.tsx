@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useCallback } from "react";
-import { Navbar, NavTabType } from "./components/Navbar";
+import { Navbar, NavTabType, canSeeTab } from "./components/Navbar";
 import { FaceScanner } from "./components/FaceScanner";
 import { CameraDashboard } from "./components/CameraDashboard";
 import { SmartLockCard } from "./components/SmartLockCard";
@@ -23,6 +23,8 @@ import { Bell, CheckCircle2, AlertTriangle, Sparkles, X, Code2, Copy, Check, Cam
 import { soundEffects } from "./utils/audio";
 import { safeJsonFetch, operatorJsonFetch, normalizeApiUrl, getApiBaseUrl, getCustomBackendUrl, setCustomBackendUrl } from "./utils/api";
 import { OperatorSessionBar } from "./components/OperatorSessionBar";
+import { UsersPage } from "./components/UsersPage";
+import { useOperatorSession } from "./utils/session";
 import {
   isNetlifyOrStaticHost,
   getStoredEmployees,
@@ -91,6 +93,13 @@ function parseStrangerDeepLink(rawHash: string): { open: boolean; logId: string 
 
 export default function App() {
   const [activeTab, setActiveTab] = useState<NavTabType>("scanner");
+  const operatorSession = useOperatorSession();
+
+  // Signing out, or being demoted, can leave the current tab out of reach:
+  // fall back to the live dashboard rather than a screen of refused calls.
+  useEffect(() => {
+    if (!canSeeTab(operatorSession, activeTab)) setActiveTab("scanner");
+  }, [operatorSession, activeTab]);
 
   const [employees, setEmployees] = useState<Employee[]>([]);
   const [accessLogs, setAccessLogs] = useState<AccessLog[]>([]);
@@ -580,6 +589,12 @@ export default function App() {
 
       {/* Main Content Area */}
       <main className="flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 lg:px-8 py-6">
+        {operatorSession?.role === "viewer" && (
+          <div className="mb-4 rounded-xl border border-slate-200 bg-slate-50 px-4 py-2.5 text-xs text-slate-600">
+            Bạn đang đăng nhập với quyền <span className="font-bold text-slate-800">Chỉ xem</span>: xem được toàn bộ lịch sử
+            ra vào; các thao tác thay đổi được ẩn hoặc sẽ bị máy chủ từ chối.
+          </div>
+        )}
         {/* Notice Banner for Netlify or Client-Only Environments */}
         {isNetlifyOrStaticHost() && !getApiBaseUrl() && (
           <div className="mb-6 rounded-2xl bg-gradient-to-r from-blue-50 to-indigo-50 border border-blue-200/80 p-4 sm:p-5 shadow-xs flex flex-col md:flex-row md:items-center justify-between gap-4">
@@ -729,6 +744,8 @@ export default function App() {
         {activeTab === "cameras" && (
           <CameraStreamConfigPage />
         )}
+
+        {activeTab === "users" && canSeeTab(operatorSession, "users") && <UsersPage />}
 
         {activeTab === "config" && (
           <AiConfigPage

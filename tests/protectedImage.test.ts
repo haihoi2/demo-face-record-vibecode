@@ -61,7 +61,8 @@ describe("protected biometric images", () => {
     const bar = read("src/components/OperatorSessionBar.tsx");
     assert.match(bar, /openOperatorSession/);
     assert.match(bar, /closeOperatorSession/);
-    assert.match(bar, /setOperatorTokenResolver/);
+    assert.match(bar, /setOperatorLoginResolver/);
+    assert.match(bar, /autoComplete="current-password"/);
     assert.match(bar, /type="password"/);
     assert.doesNotMatch(bar, /localStorage|sessionStorage/);
 

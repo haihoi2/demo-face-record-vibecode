@@ -15,8 +15,11 @@ import {
   KeyRound,
   Video,
   Camera,
+  Users,
 } from "lucide-react";
 import { SmartLockState } from "../types";
+import type { OperatorRole, OperatorSessionInfo } from "../utils/api";
+import { hasRole, useOperatorSession } from "../utils/session";
 
 export type NavTabType =
   | "scanner"
@@ -27,7 +30,30 @@ export type NavTabType =
   | "webhook"
   | "door"
   | "cameras"
-  | "config";
+  | "config"
+  | "users";
+
+/**
+ * The least role that sees each tab. Hiding a tab is a courtesy - the server
+ * refuses the underlying calls regardless - but it keeps people from landing
+ * on screens where every button would be refused.
+ */
+export const TAB_MIN_ROLE: Record<NavTabType, OperatorRole> = {
+  scanner: "viewer",
+  manual: "operator",
+  register: "operator",
+  logs: "viewer",
+  mobile: "viewer",
+  webhook: "admin",
+  door: "admin",
+  cameras: "viewer",
+  config: "admin",
+  users: "admin",
+};
+
+/** Signed out, only the viewer-level tabs show; every call behind them asks to sign in. */
+export const canSeeTab = (session: OperatorSessionInfo | null, tab: NavTabType): boolean =>
+  TAB_MIN_ROLE[tab] === "viewer" || hasRole(session, TAB_MIN_ROLE[tab]);
 
 interface NavbarProps {
   activeTab: NavTabType;
@@ -48,6 +74,7 @@ export const Navbar: React.FC<NavbarProps> = ({
   onOpenStrangers,
   strangerCount,
 }) => {
+  const session = useOperatorSession();
   const [currentTime, setCurrentTime] = useState<string>("");
 
   useEffect(() => {
@@ -93,6 +120,7 @@ export const Navbar: React.FC<NavbarProps> = ({
 
           {/* Navigation Tabs */}
           <nav className="flex items-center gap-1 sm:gap-2">
+            {canSeeTab(session, "scanner") && (
             <button
               id="nav-tab-scanner"
               onClick={() => setActiveTab("scanner")}
@@ -106,7 +134,9 @@ export const Navbar: React.FC<NavbarProps> = ({
               <ScanFace className="w-4 h-4" />
               <span className="hidden sm:inline">Quét Cửa AI</span>
             </button>
+            )}
 
+            {canSeeTab(session, "manual") && (
             <button
               id="nav-tab-manual"
               onClick={() => setActiveTab("manual")}
@@ -120,7 +150,9 @@ export const Navbar: React.FC<NavbarProps> = ({
               <Camera className="w-4 h-4 text-indigo-600" />
               <span className="hidden sm:inline">Nhận diện thủ công- Manual track</span>
             </button>
+            )}
 
+            {canSeeTab(session, "register") && (
             <button
               id="nav-tab-register"
               onClick={() => setActiveTab("register")}
@@ -133,7 +165,9 @@ export const Navbar: React.FC<NavbarProps> = ({
               <UserPlus className="w-4 h-4" />
               <span className="hidden sm:inline">Đăng Ký Khuôn Mặt</span>
             </button>
+            )}
 
+            {canSeeTab(session, "logs") && (
             <button
               id="nav-tab-logs"
               onClick={() => setActiveTab("logs")}
@@ -146,7 +180,9 @@ export const Navbar: React.FC<NavbarProps> = ({
               <ClipboardList className="w-4 h-4" />
               <span className="hidden sm:inline">Nhật Ký Vào Ra</span>
             </button>
+            )}
 
+            {canSeeTab(session, "mobile") && (
             <button
               id="nav-tab-mobile"
               onClick={() => setActiveTab("mobile")}
@@ -164,7 +200,9 @@ export const Navbar: React.FC<NavbarProps> = ({
                 </span>
               )}
             </button>
+            )}
 
+            {canSeeTab(session, "webhook") && (
             <button
               id="nav-tab-webhook"
               onClick={() => setActiveTab("webhook")}
@@ -177,7 +215,9 @@ export const Navbar: React.FC<NavbarProps> = ({
               <Send className="w-4 h-4 text-indigo-600" />
               <span className="hidden sm:inline">Webhook Eton</span>
             </button>
+            )}
 
+            {canSeeTab(session, "door") && (
             <button
               id="nav-tab-door"
               onClick={() => setActiveTab("door")}
@@ -190,7 +230,9 @@ export const Navbar: React.FC<NavbarProps> = ({
               <KeyRound className="w-4 h-4 text-emerald-600" />
               <span className="hidden sm:inline">API Mở Cửa</span>
             </button>
+            )}
 
+            {canSeeTab(session, "cameras") && (
             <button
               id="nav-tab-cameras"
               onClick={() => setActiveTab("cameras")}
@@ -203,7 +245,9 @@ export const Navbar: React.FC<NavbarProps> = ({
               <Video className="w-4 h-4 text-blue-600" />
               <span className="hidden sm:inline">Luồng Camera</span>
             </button>
+            )}
 
+            {canSeeTab(session, "config") && (
             <button
               id="nav-tab-config"
               onClick={() => setActiveTab("config")}
@@ -216,6 +260,23 @@ export const Navbar: React.FC<NavbarProps> = ({
               <Sliders className="w-4 h-4 text-indigo-600" />
               <span className="hidden sm:inline">Cấu Hình AI</span>
             </button>
+            )}
+
+            {canSeeTab(session, "users") && (
+            <button
+              id="nav-tab-users"
+              onClick={() => setActiveTab("users")}
+              className={`flex items-center gap-2 px-3 py-2 rounded-lg text-sm font-medium transition-all ${
+                activeTab === "users"
+                  ? "bg-indigo-50 text-indigo-700 shadow-xs border border-indigo-100"
+                  : "text-slate-600 hover:text-slate-900 hover:bg-slate-100"
+              }`}
+              title="Tạo và quản lý tài khoản đăng nhập, phân quyền"
+            >
+              <Users className="w-4 h-4 text-indigo-600" />
+              <span className="hidden sm:inline">Tài khoản</span>
+            </button>
+            )}
           </nav>
 
           {/* Real-time status & Door lock widget badge */}

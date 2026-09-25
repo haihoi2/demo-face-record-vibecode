@@ -205,38 +205,61 @@ export async function safeJsonFetch<T = any>(
   }
 }
 
+export type OperatorRole = "admin" | "operator" | "viewer";
+
 export interface OperatorSessionInfo {
   actor: string;
-  role: "viewer" | "operator";
+  /** Account username; null for the bootstrap token session. */
+  username: string | null;
+  displayName: string;
+  role: OperatorRole;
+  roleLabel: string;
+  authMethod: "account" | "token";
   expiresAt: string;
 }
 
+export type OperatorCredentials = { username: string; password: string } | { token: string };
+
+const toSessionInfo = (d: any): OperatorSessionInfo => ({
+  actor: String(d?.actor || ""),
+  username: d?.username ?? null,
+  displayName: String(d?.displayName || d?.actor || ""),
+  role: (["admin", "operator", "viewer"].includes(d?.role) ? d.role : "viewer") as OperatorRole,
+  roleLabel: String(d?.roleLabel || ""),
+  authMethod: d?.authMethod === "account" ? "account" : "token",
+  expiresAt: String(d?.expiresAt || ""),
+});
+
 /**
- * How a 401 asks for credentials. The UI registers a modal here; without one
- * (tests, non-browser callers) the request simply stays rejected rather than
- * blocking on a dialog.
+ * How a 401 gets a person signed in. The UI registers a dialog here that
+ * resolves true once the person has signed in; the failed request is then
+ * retried once. Without one (tests, non-browser callers) the request simply
+ * stays rejected rather than blocking on a dialog.
  */
-type OperatorTokenResolver = () => Promise<string | null>;
-let operatorTokenResolver: OperatorTokenResolver | null = null;
-export function setOperatorTokenResolver(resolver: OperatorTokenResolver | null): void {
-  operatorTokenResolver = resolver;
+type OperatorLoginResolver = () => Promise<boolean>;
+let operatorLoginResolver: OperatorLoginResolver | null = null;
+export function setOperatorLoginResolver(resolver: OperatorLoginResolver | null): void {
+  operatorLoginResolver = resolver;
 }
 
-/** Exchange a bootstrap token for the HttpOnly session cookie. */
-export async function openOperatorSession(token: string): Promise<OperatorSessionInfo> {
-  const res = await safeJsonFetch<OperatorSessionInfo & { success: boolean; error?: string; csrfToken?: string }>(
-    "/api/operator/session",
-    { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ token }) },
-  );
-  if (!res.ok || !res.data?.success) throw new Error(res.data?.error || "Xác thực vận hành thất bại");
-  return { actor: res.data.actor, role: res.data.role, expiresAt: res.data.expiresAt };
+/** Sign in with an account or the bootstrap token. The server sets an HttpOnly cookie. */
+export async function openOperatorSession(credentials: OperatorCredentials): Promise<OperatorSessionInfo> {
+  const res = await safeJsonFetch<any>("/api/operator/session", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(credentials),
+  });
+  if (!res.ok || !res.data?.success) {
+    throw new Error(res.data?.error || res.error || "Đăng nhập thất bại");
+  }
+  return toSessionInfo(res.data);
 }
 
 /** Current session, or null when unauthenticated. Never throws. */
 export async function readOperatorSession(): Promise<OperatorSessionInfo | null> {
-  const res = await safeJsonFetch<OperatorSessionInfo & { success: boolean }>("/api/operator/session");
+  const res = await safeJsonFetch<any>("/api/operator/session");
   if (!res.ok || !res.data?.success) return null;
-  return { actor: res.data.actor, role: res.data.role, expiresAt: res.data.expiresAt };
+  return toSessionInfo(res.data);
 }
 
 /** Clear the server session cookie. Requires the session CSRF token. */
@@ -248,16 +271,26 @@ export async function closeOperatorSession(): Promise<void> {
   clearSessionCsrfToken();
 }
 
+/** Change the signed-in account's own password. Other sessions of the account end. */
+export async function changeOwnPassword(currentPassword: string, newPassword: string): Promise<OperatorSessionInfo> {
+  const res = await safeJsonFetch<any>("/api/operator/password", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ currentPassword, newPassword }),
+  });
+  if (!res.ok || !res.data?.success) throw new Error(res.data?.error || res.error || "Đổi mật khẩu thất bại");
+  return toSessionInfo(res.data);
+}
+
 export async function operatorJsonFetch<T = any>(
   url: string,
   options?: RequestInit,
   fallback?: T,
 ): Promise<{ ok: boolean; status: number; data: T; error?: string }> {
   const response = await safeJsonFetch<T>(url, options, fallback);
-  if (response.status !== 401 || !operatorTokenResolver) return response;
-  const token = await operatorTokenResolver();
-  if (!token) return response;
-  await openOperatorSession(token);
+  if (response.status !== 401 || !operatorLoginResolver) return response;
+  const signedIn = await operatorLoginResolver();
+  if (!signedIn) return response;
   return safeJsonFetch<T>(url, options, fallback);
 }
 

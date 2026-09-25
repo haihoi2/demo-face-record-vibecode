@@ -20,6 +20,7 @@ import { MobileNotification, SmartLockState } from "../types";
 import { soundEffects } from "../utils/audio";
 import { operatorJsonFetch } from "../utils/api";
 import { clientDoorUnlock, demoOfflinePersistenceEnabled } from "../utils/offlineEngine";
+import { hasRole, useOperatorSession } from "../utils/session";
 
 interface MobileCompanionProps {
   notifications: MobileNotification[];
@@ -36,6 +37,8 @@ export const MobileCompanion: React.FC<MobileCompanionProps> = ({
   onMarkRead,
   sseConnected,
 }) => {
+  // Manual door commands are admin-only; the server refuses them for anyone else.
+  const canOperateDoor = hasRole(useOperatorSession(), "admin");
   const [filter, setFilter] = useState<"ALL" | "SUCCESS" | "WARNING">("ALL");
   const [isUnlocking, setIsUnlocking] = useState<boolean>(false);
   const shouldUseClientFallback = demoOfflinePersistenceEnabled();
@@ -197,6 +200,7 @@ export const MobileCompanion: React.FC<MobileCompanionProps> = ({
                   </span>
                 </div>
 
+                {canOperateDoor && (
                 <button
                   id="btn-mobile-remote-unlock"
                   disabled={isUnlocking}
@@ -219,6 +223,7 @@ export const MobileCompanion: React.FC<MobileCompanionProps> = ({
                     </>
                   )}
                 </button>
+                )}
               </div>
             </div>
 

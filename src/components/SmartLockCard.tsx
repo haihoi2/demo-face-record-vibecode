@@ -17,6 +17,7 @@ import { SmartLockState } from "../types";
 import { soundEffects } from "../utils/audio";
 import { operatorJsonFetch } from "../utils/api";
 import { clientDoorUnlock, clientDoorLock, demoOfflinePersistenceEnabled } from "../utils/offlineEngine";
+import { hasRole, useOperatorSession } from "../utils/session";
 
 interface SmartLockCardProps {
   lockState: SmartLockState;
@@ -27,6 +28,8 @@ export const SmartLockCard: React.FC<SmartLockCardProps> = ({
   lockState,
   onRefresh,
 }) => {
+  // Manual door commands are admin-only; the server refuses them for anyone else.
+  const canOperateDoor = hasRole(useOperatorSession(), "admin");
   const [copiedIndex, setCopiedIndex] = useState<number | null>(null);
   const [isTriggering, setIsTriggering] = useState<boolean>(false);
   const shouldUseClientFallback = demoOfflinePersistenceEnabled();
@@ -232,7 +235,14 @@ export const SmartLockCard: React.FC<SmartLockCardProps> = ({
           </div>
 
           {/* Action Trigger Buttons */}
-          <div className="pt-5 border-t border-slate-100 mt-5 flex gap-3">
+          {!canOperateDoor && (
+            <p className="pt-5 border-t border-slate-100 mt-5 text-xs text-slate-500">
+              Mở/đóng cửa thủ công cần quyền <span className="font-semibold text-slate-700">Quản trị</span>.
+              Cửa vẫn tự mở khi nhận diện đúng nhân viên.
+            </p>
+          )}
+          <div className={`${canOperateDoor ? "pt-5 border-t border-slate-100 mt-5" : ""} flex gap-3`}>
+            {canOperateDoor && (
             <button
               id="btn-trigger-unlock-api"
               disabled={isTriggering || !lockState.isLocked}
@@ -242,7 +252,9 @@ export const SmartLockCard: React.FC<SmartLockCardProps> = ({
               <Unlock className="w-4 h-4" />
               <span>Gửi Lệnh Mở Khóa Qua API</span>
             </button>
+            )}
 
+            {canOperateDoor && (
             <button
               id="btn-trigger-lock-api"
               disabled={isTriggering || lockState.isLocked}
@@ -252,6 +264,7 @@ export const SmartLockCard: React.FC<SmartLockCardProps> = ({
               <Lock className="w-4 h-4" />
               <span>Gửi Lệnh Đóng Khóa</span>
             </button>
+            )}
           </div>
         </div>
 

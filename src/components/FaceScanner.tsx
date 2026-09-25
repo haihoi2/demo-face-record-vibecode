@@ -37,6 +37,7 @@ import {
   isNetlifyOrStaticHost,
 } from "../utils/offlineEngine";
 import { ProtectedImage } from "./ProtectedImage";
+import { hasRole, useOperatorSession } from "../utils/session";
 
 interface FaceScannerProps {
   employees: Employee[];
@@ -53,6 +54,8 @@ export const FaceScanner: React.FC<FaceScannerProps> = ({
   onTriggerManualUnlock,
   onOpenStrangerClusters,
 }) => {
+  // Manual door commands are admin-only; the server refuses them for anyone else.
+  const canOperateDoor = hasRole(useOperatorSession(), "admin");
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
 
@@ -732,6 +735,7 @@ export const FaceScanner: React.FC<FaceScannerProps> = ({
             </div>
 
             {/* Manual Emergency Unlock Trigger */}
+            {canOperateDoor && (
             <button
               id="btn-manual-unlock"
               onClick={onTriggerManualUnlock}
@@ -741,6 +745,7 @@ export const FaceScanner: React.FC<FaceScannerProps> = ({
               <KeyRound className="w-3.5 h-3.5 text-amber-400" />
               <span>Mở Khóa API Thủ Công</span>
             </button>
+            )}
           </div>
         </div>
 
