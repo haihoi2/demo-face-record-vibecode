@@ -1125,27 +1125,17 @@ export const CameraDashboard: React.FC<CameraDashboardProps> = ({
         onRecognitionComplete(finalResult);
 
         if (finalResult.recognized) {
-          // Trigger smart lock unlock
-          try {
-            const unlock = await operatorJsonFetch("/api/lock/unlock", {
-              method: "POST",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({
-                source: `${gateConfig.name} (Quét Cửa Tự Động)`,
-                reason: `Nhận diện khuôn mặt hợp lệ: ${finalResult.employee?.name || "Nhân viên"}`,
-              }),
-            });
-            if (!unlock.ok) throw new Error(unlock.error || `Unlock failed (HTTP ${unlock.status})`);
-            soundEffects.playSuccess();
-          } catch (err) {
-            if (demoOfflinePersistenceEnabled()) {
-              clientDoorUnlock(`${gateConfig.name} (Client Fallback)`, undefined, undefined, { simulated: true });
-              soundEffects.playSuccess();
-            } else {
-              console.warn("Không thể mở cửa sau nhận diện:", err);
-              soundEffects.playDenied();
-            }
+          // The server already actuated the door when it made this decision:
+          // scan-rtsp and recognize-face both unlock through
+          // applyRecognitionOutcome, subject to the per-person cooldown. The
+          // browser must not unlock again - doing so doubled every actuation,
+          // logged a second "manual" unlock the browser had decided on, and let
+          // client code open a physical door, which it may never do.
+          if (demoOfflinePersistenceEnabled()) {
+            // Static demo with no backend: visual simulation only.
+            clientDoorUnlock(`${gateConfig.name} (Client Fallback)`, undefined, undefined, { simulated: true });
           }
+          soundEffects.playSuccess();
         } else if ((finalResult.totalFacesDetected ?? faces.length) > 0) {
           soundEffects.playStrangerAlert();
         }
