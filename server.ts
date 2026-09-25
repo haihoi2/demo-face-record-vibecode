@@ -29,6 +29,7 @@ import {
   OrgEntryRecord,
 } from "./src/server/db";
 import { envNumber } from "./src/server/env";
+import { guardAsyncRoutes, jsonErrorHandler } from "./src/server/asyncRoutes";
 import {
   UserRole,
   isUserRole,
@@ -83,6 +84,9 @@ import type { FaceGallery } from "./src/server/faceFusion";
 dotenv.config();
 
 const app = express();
+// Before any route: a rejected async handler must answer 500, not kill the
+// process (and every gate watcher with it). See src/server/asyncRoutes.ts.
+guardAsyncRoutes(app);
 const PORT = 3000;
 
 // =========================================================================
@@ -7735,6 +7739,7 @@ async function startServer() {
     });
   }
 
+  app.use(jsonErrorHandler);
   app.listen(PORT, "0.0.0.0", () => {
     console.log(`Server running on http://0.0.0.0:${PORT} (Mode: ${isProduction ? "production" : "development"})`);
     // Backend gate watchers start here, AFTER the camera config is loaded and
