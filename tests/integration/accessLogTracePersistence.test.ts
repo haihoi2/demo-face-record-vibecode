@@ -103,6 +103,12 @@ if (phase === "write") {
   out.replay = await db.saveAccessLog(log({ trackId: "entry-999999", recordingChannel: "9" }));
   out.concurrent = await Promise.all(Array.from({ length: 8 }, (_, i) => db.saveAccessLog(log({ id: "LOG-DUP", trackId: "dup-" + i }))));
   out.invalid = await db.saveAccessLog(log({ id: "LOG-BAD", trackId: "t".repeat(65), recordingChannel: "1".repeat(17), capturedAt: "garbage" }));
+  // Not awaited, like the existing callers: the next read must still see it.
+  const rywIds = Array.from({ length: 10 }, (_, i) => "LOG-RYW-" + i);
+  for (const id of rywIds) db.saveAccessLog(log({ id, status: "DENIED", employeeId: undefined, employeeName: undefined, trackId: "ryw" }));
+  out.rywMeta = (await Promise.all(rywIds.map((id) => db.getAccessLogMetaById(id)))).filter(Boolean).length;
+  for (const id of rywIds) db.saveAccessLog(log({ id: id + "-S", status: "DENIED", employeeId: undefined, employeeName: undefined }));
+  out.rywStranger = (await Promise.all(rywIds.map((id) => db.getStrangerCandidateLogById(id + "-S")))).filter(Boolean).length;
   out.longId = await db.saveAccessLog(log({ id: "LOG-" + "9".repeat(60), trackId: "k".repeat(64), recordingChannel: "1".repeat(16) }));
 }
 out.t1 = await db.getAccessLogMetaById("LOG-T1");
@@ -210,6 +216,9 @@ describe("PostgreSQL: access-log trace migration and persistence", () => {
     assert.equal(r.code, 0, r.stderr.slice(-2000));
     assert.doesNotMatch(r.stdout + r.stderr, STARTUP_FAILURE);
     assert.equal(r.out.mode, "postgresql");
+    // First boot: these rows did not exist before, so this is the real read-after-write race.
+    assert.equal(r.out.rywMeta, 10, "an unawaited save is visible to the next read by id");
+    assert.equal(r.out.rywStranger, 10, "...and to the stranger lookup");
 
     const cols = (await client!.query(
       `SELECT column_name, data_type, character_maximum_length, is_nullable, column_default
@@ -251,6 +260,8 @@ describe("PostgreSQL: access-log trace migration and persistence", () => {
     assert.deepEqual(r.out.concurrent, Array(8).fill(true));
     assert.equal(r.out.invalid, true, "an invalid trace never fails the event");
     assert.equal(r.out.longId, true, "values at the column limits fit");
+    assert.equal(r.out.rywMeta, 10, "an unawaited save is visible to the next read by id");
+    assert.equal(r.out.rywStranger, 10, "...and to the stranger lookup");
     assert.deepEqual(r.out.t1, EXPECTED_T1, "the first write wins");
     const dup = (await client!.query(`SELECT count(*)::int AS n, min("trackId") AS t FROM access_logs WHERE id = 'LOG-DUP'`)).rows[0];
     assert.equal(dup.n, 1);
@@ -313,6 +324,8 @@ describe("SQLite: access-log trace migration and persistence", () => {
     assert.equal(first.out.mode, "sqlite");
     assert.deepEqual(first.out.concurrent, Array(8).fill(true));
     assert.equal(first.out.invalid, true);
+    assert.equal(first.out.rywMeta, 10);
+    assert.equal(first.out.rywStranger, 10);
     assertRoundTrip(first.out);
     assert.deepEqual(first.out.legacy, { id: "LOG-LEGACY-1", timestamp: "2026-09-20T01:02:03.000Z", type: "EXIT", status: "DENIED" });
     assert.deepEqual(first.out.strangerLegacyEmbedding, [0.6, 0.8]);

@@ -139,6 +139,9 @@ export function normalizeAccessLogTrace(input: {
   return out;
 }
 
+/** Longest an access-log read on PostgreSQL waits for this process's own in-flight inserts. */
+const ACCESS_LOG_READ_YOUR_WRITES_MS = 2_000;
+
 /** Row value (NULL/empty on old rows) -> optional field. */
 const optionalText = (v: unknown): string | undefined => (v == null || v === "" ? undefined : String(v));
 
@@ -790,6 +793,14 @@ class SQLiteStorage {
   private postgresCounts: Record<string, number> = {};
   private onSyncCallbacks: Array<() => void> = [];
   private storage: StorageTrackerState = { ...INITIAL_STORAGE_STATE };
+  /**
+   * PostgreSQL access-log inserts still in flight, by log id. saveAccessLog
+   * callers that do not await the write answer the client before PostgreSQL
+   * has the row, so an immediate follow-up read (open the stranger alert that
+   * was just raised) could miss it. Access-log reads on PostgreSQL wait for
+   * these first, bounded by ACCESS_LOG_READ_YOUR_WRITES_MS.
+   */
+  private pendingAccessLogWrites = new Map<string, Promise<boolean>>();
 
   constructor() {
     this.init();
@@ -1820,6 +1831,20 @@ class SQLiteStorage {
   }
 
   // ================= ACCESS LOGS =================
+  /** Waits (bounded) for in-flight PostgreSQL access-log inserts: one id, or all of them. */
+  private async settleAccessLogWrites(id?: string): Promise<void> {
+    const pending = id === undefined
+      ? [...this.pendingAccessLogWrites.values()]
+      : [this.pendingAccessLogWrites.get(id)].filter((p): p is Promise<boolean> => Boolean(p));
+    if (!pending.length) return;
+    let timer: NodeJS.Timeout | undefined;
+    await Promise.race([
+      Promise.all(pending),
+      new Promise<void>((resolve) => { timer = setTimeout(resolve, ACCESS_LOG_READ_YOUR_WRITES_MS); }),
+    ]);
+    if (timer) clearTimeout(timer);
+  }
+
   getAccessLogs(defaults: AccessLogRecord[]): AccessLogRecord[] {
     if (this.isNativeSqlite && this.db) {
       try {
@@ -1847,6 +1872,7 @@ class SQLiteStorage {
   async getAccessLogsPage(page: number, limit: number): Promise<{ logs: AccessLogRecord[]; total: number }> {
     const offset = Math.max(0, (page - 1) * limit);
     if (this.pgPool && this.isPostgres) {
+      await this.settleAccessLogWrites();
       const [rows, count] = await Promise.all([
         this.pgPool.query(
           `SELECT id, timestamp, type, status, "employeeId", "employeeName", "employeeCode", department,
@@ -1917,6 +1943,7 @@ class SQLiteStorage {
   ): Promise<{ logs: AccessLogRecord[]; hasMore: boolean; total: number }> {
     const n = Math.min(200, Math.max(1, Math.trunc(limit)));
     if (this.pgPool && this.isPostgres) {
+      await this.settleAccessLogWrites();
       const params: unknown[] = [];
       const where = this.pgAccessLogWhere(f, params);
       const countSql = `SELECT count(*)::int AS total FROM access_logs ${where.length ? "WHERE " + where.join(" AND ") : ""}`;
@@ -1974,6 +2001,7 @@ class SQLiteStorage {
   /** Totals, hour-of-day buckets (in `timeZone`) and granted entries per department for the filters. */
   async accessLogStats(f: AccessLogQuery, timeZone: string): Promise<AccessLogStats> {
     if (this.pgPool && this.isPostgres) {
+      await this.settleAccessLogWrites();
       const params: unknown[] = [];
       const where = this.pgAccessLogWhere(f, params);
       // Only well-formed ISO instants can be bucketed; anything else is skipped, not fatal.
@@ -2037,6 +2065,7 @@ class SQLiteStorage {
       recordingChannel: optionalText(r.recordingChannel),
     });
     if (this.pgPool && this.isPostgres) {
+      await this.settleAccessLogWrites(id);
       const result = await this.pgPool.query(
         `SELECT id, timestamp, type, status, "capturedAt", "trackId", "recordingChannel"
            FROM access_logs WHERE id = $1`,
@@ -2056,6 +2085,7 @@ class SQLiteStorage {
 
   async getAccessLogById(id: string): Promise<AccessLogRecord | undefined> {
     if (this.pgPool && this.isPostgres) {
+      await this.settleAccessLogWrites(id);
       const result = await this.pgPool.query(
         `SELECT id, "photoSnapshot" FROM access_logs WHERE id = $1`,
         [id],
@@ -2082,6 +2112,7 @@ class SQLiteStorage {
     const boundedLimit = Math.min(100, Math.max(1, Math.trunc(limit)));
     const fetchLimit = boundedLimit + 1;
     if (this.pgPool && this.isPostgres) {
+      await this.settleAccessLogWrites();
       const params: unknown[] = [];
       const cursorWhere = cursor
         ? ` AND (timestamp, id) < ($1, $2)`
@@ -2188,6 +2219,11 @@ class SQLiteStorage {
           return false;
         },
       );
+      const write = authoritative;
+      this.pendingAccessLogWrites.set(log.id, write);
+      void write.then(() => {
+        if (this.pendingAccessLogWrites.get(log.id) === write) this.pendingAccessLogWrites.delete(log.id);
+      });
     }
 
     if (this.isNativeSqlite && this.db) {
