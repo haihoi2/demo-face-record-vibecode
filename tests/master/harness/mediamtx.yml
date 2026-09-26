@@ -1,0 +1,35 @@
+# MediaMTX config of the MT replay harness (tests/master/harness/harness.sh).
+#
+# Serves recorded or scripted clips as RTSP on the Docker test network so the
+# gateway reads them exactly as it reads the NVR. Test-only: no credentials,
+# no host port is published, nothing here may point at a real camera or NVR.
+logLevel: info
+logDestinations: [stdout]
+
+# Anyone on the test network may publish/read; the API (path readiness times,
+# used to anchor ground truth to wall-clock time) is readable from the network.
+authMethod: internal
+authInternalUsers:
+  - user: any
+    pass:
+    ips: []
+    permissions:
+      - action: publish
+      - action: read
+      - action: playback
+      - action: api
+
+api: true
+apiAddress: :9997
+
+rtsp: true
+rtspTransports: [tcp]
+rtspAddress: :8554
+rtmp: false
+hls: false
+webrtc: false
+srt: false
+
+paths:
+  all_others:
+    source: publisher
