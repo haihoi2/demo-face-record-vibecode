@@ -11,9 +11,11 @@ describe("protected biometric images", () => {
     assert.match(component, /URL\.createObjectURL/);
     assert.match(component, /URL\.revokeObjectURL/);
 
+    // FaceThumb / FaceImage (src/components/FaceImage.tsx) render through ProtectedImage.
+    assert.match(read("src/components/FaceImage.tsx"), /<ProtectedImage/);
     for (const path of ["src/components/AccessLogs.tsx", "src/components/StrangerClusterModal.tsx"]) {
       const source = read(path);
-      assert.match(source, /<ProtectedImage/);
+      assert.match(source, /<(?:ProtectedImage|FaceThumb|FaceImage)\b/);
       assert.doesNotMatch(source, /<img[\s\S]{0,160}normalizeApiAssetUrl\(/);
     }
   });
