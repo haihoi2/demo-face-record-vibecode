@@ -549,9 +549,12 @@ export const CameraStreamConfigPage: React.FC = () => {
     body: any | undefined,
     fallbackStreams: () => GateStreamSource[]
   ): Promise<{ streams: GateStreamSource[]; usedFallback: boolean }> => {
-    const res = await fetch(path, {
+    // apiFetch, not fetch: every stream mutation is CSRF-protected and needs the
+    // session token header (a bare fetch is refused with 403 CSRF_REQUIRED), and
+    // the guard takes JSON only - a body-less DELETE included (else 415).
+    const res = await apiFetch(path, {
       method,
-      headers: body !== undefined ? { "Content-Type": "application/json" } : undefined,
+      headers: { "Content-Type": "application/json" },
       body: body !== undefined ? JSON.stringify(body) : undefined,
     });
     if (res.status === 404) {
