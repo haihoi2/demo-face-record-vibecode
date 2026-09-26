@@ -92,6 +92,16 @@ export interface FaceEngineInfo {
   modelDir: string;
   detectorModel: string;
   recognizerModel: string;
+  /** fp32 | int8 | custom (an explicit FACE_DETECTOR_MODEL file). */
+  detectorVariant: FaceModelVariant | "custom";
+  /** fp32 | custom (an explicit FACE_RECOGNIZER_MODEL file). */
+  recognizerVariant: FaceModelVariant | "custom";
+  /** Template/embedding compatibility tag of the recogniser (faceModelTagFor). */
+  modelTag: string;
+  /** Set when a variant setting was unknown or unsupported and not applied as written. */
+  variantWarning: string | null;
+  /** How pictures smaller than the detector input are letterboxed (FACE_DETECT_UPSCALE). */
+  detectUpscale: DetectUpscaleMode;
   detectorInputSize: number;
   embeddingDim: number;
   detectThreshold: number;
@@ -106,8 +116,54 @@ export interface FaceEngineInfo {
 // ---------------------------------------------------------------------------
 
 const DEFAULT_MODEL_DIR = "/app/models";
-const DEFAULT_DETECTOR = "det_10g.onnx";
-const DEFAULT_RECOGNIZER = "w600k_r50.onnx";
+
+/**
+ * Detector variants. `fp32` is InsightFace buffalo_l's det_10g as shipped;
+ * `int8` is the ONNX Runtime static QDQ quantization made by
+ * scripts/perf/quantize.py (U8S8 for the VNNI path, per-channel weights, MinMax
+ * calibration on real gate captures, the 9 output heads kept FP32). On 130
+ * held-out captures it finds 109/110 faces >= 60 px, box IoU median 0.98, and
+ * moves embeddings (through its landmarks) by a median cosine of 0.011
+ * (scripts/perf/int8-eval.ts), at about 1/3 of the FP32 latency.
+ *
+ * Selection: FACE_DETECTOR_VARIANT=fp32|int8 (blank/unknown = fp32); an
+ * explicit FACE_DETECTOR_MODEL file name wins. A selected file that is missing
+ * or corrupt fails the engine load (fail closed) - never a silent fallback.
+ *
+ * The RECOGNISER has no INT8 variant on purpose: the best ArcFace INT8 measured
+ * (2026-09-26) drifted a median cosine of 0.021 from FP32 (p95 0.077), over the
+ * 0.02 bar. FACE_MODEL_VARIANT / FACE_RECOGNIZER_VARIANT are therefore ignored
+ * (and reported in variantWarning). Should an INT8 recogniser be loaded through
+ * an explicit FACE_RECOGNIZER_MODEL, the template tag follows the file name
+ * (faceModelTagFor), so its embeddings never silently mix with FP32 templates.
+ */
+export type FaceModelVariant = "fp32" | "int8";
+export const FACE_MODEL_VARIANTS: readonly FaceModelVariant[] = ["fp32", "int8"];
+export const FACE_DETECTOR_FILES: Readonly<Record<FaceModelVariant, string>> = {
+  fp32: "det_10g.onnx",
+  int8: "det_10g_int8.onnx",
+};
+export const FACE_RECOGNIZER_FILE = "w600k_r50.onnx";
+/** Env names that would select an INT8 recogniser; recognised only to warn. */
+const UNSUPPORTED_VARIANT_ENVS = ["FACE_MODEL_VARIANT", "FACE_RECOGNIZER_VARIANT"] as const;
+
+/** Blank/undefined -> fp32; case- and whitespace-insensitive; anything else -> fp32 with `invalid` set. */
+export function parseFaceModelVariant(raw: string | undefined | null): { variant: FaceModelVariant; invalid?: string } {
+  const v = typeof raw === "string" ? raw.trim().toLowerCase() : "";
+  if (v === "") return { variant: "fp32" };
+  if ((FACE_MODEL_VARIANTS as readonly string[]).includes(v)) return { variant: v as FaceModelVariant };
+  return { variant: "fp32", invalid: String(raw).slice(0, 32) };
+}
+
+/**
+ * Identity stamped on templates and embeddings: `arcface_<recogniser file
+ * without .onnx>`. Must stay byte-identical to server.ts faceModelTag() for
+ * FP32 (`arcface_w600k_r50`) so existing templates remain usable.
+ */
+export function faceModelTagFor(recognizerFile: string): string {
+  const base = String(recognizerFile || "unknown").replace(/\.onnx$/i, "");
+  return `arcface_${base}`;
+}
 
 /** ArcFace canonical 5-point template for a 112x112 crop. */
 export const ARCFACE_TEMPLATE: ReadonlyArray<readonly [number, number]> = [
@@ -137,10 +193,29 @@ function modelDir(): string {
   return env("FACE_MODEL_DIR", DEFAULT_MODEL_DIR);
 }
 function detectorModelName(): string {
-  return env("FACE_DETECTOR_MODEL", DEFAULT_DETECTOR);
+  return env("FACE_DETECTOR_MODEL", FACE_DETECTOR_FILES[parseFaceModelVariant(process.env.FACE_DETECTOR_VARIANT).variant]);
 }
 function recognizerModelName(): string {
-  return env("FACE_RECOGNIZER_MODEL", DEFAULT_RECOGNIZER);
+  return env("FACE_RECOGNIZER_MODEL", FACE_RECOGNIZER_FILE);
+}
+/** Variant of a loaded model file: fp32/int8 for the known files, "custom" for an explicit other file. */
+function detectorVariantOf(file: string): FaceModelVariant | "custom" {
+  for (const v of FACE_MODEL_VARIANTS) if (FACE_DETECTOR_FILES[v] === file) return v;
+  return "custom";
+}
+function recognizerVariantOf(file: string): FaceModelVariant | "custom" {
+  return file === FACE_RECOGNIZER_FILE ? "fp32" : "custom";
+}
+/** Operator-facing notes about variant settings that were not applied as written. */
+function variantWarnings(): string[] {
+  const out: string[] = [];
+  const det = parseFaceModelVariant(process.env.FACE_DETECTOR_VARIANT);
+  if (det.invalid !== undefined) out.push("FACE_DETECTOR_VARIANT: unknown value, using fp32");
+  for (const name of UNSUPPORTED_VARIANT_ENVS) {
+    const v = (process.env[name] || "").trim().toLowerCase();
+    if (v && v !== "fp32") out.push(`${name}: ignored, the recogniser runs fp32 only (INT8 failed the drift bar)`);
+  }
+  return out;
 }
 function detectThreshold(): number {
   return envNumberOrDefault("FACE_DETECT_THRESHOLD", 0.5);
@@ -150,6 +225,27 @@ function nmsIouThreshold(): number {
 }
 function detectorInputSize(): number {
   return envNumberOrDefault("FACE_DETECT_SIZE", 640);
+}
+
+/**
+ * How the detector letterbox treats a picture SMALLER than its input size on
+ * both axes (a stored 224-448 px face crop, a tiny upload). Larger pictures -
+ * every camera frame, browser capture and stored full frame - are always
+ * area-downscaled and are not affected.
+ *   none      (default) keep native pixels, pad bottom/right, no upscale;
+ *   area      legacy: stretch with resizeArea, which degenerates to a blocky
+ *             nearest-neighbour enlargement;
+ *   bilinear  stretch with bilinear interpolation (what InsightFace does).
+ * Measured 2026-09-26 on 199 real gate faces cropped 2.5x/288 px
+ * (scripts/perf/crop-eval.ts): the face is found again in 93% of crops with
+ * `none`, 86% with `bilinear`, 84% with `area`. Set FACE_DETECT_UPSCALE=area
+ * to restore the old behaviour.
+ */
+export type DetectUpscaleMode = "area" | "none" | "bilinear";
+export const DEFAULT_DETECT_UPSCALE: DetectUpscaleMode = "none";
+export function detectUpscaleMode(): DetectUpscaleMode {
+  const v = (process.env.FACE_DETECT_UPSCALE || "").trim().toLowerCase();
+  return v === "none" || v === "bilinear" || v === "area" ? v : DEFAULT_DETECT_UPSCALE;
 }
 function ffmpegPath(): string {
   return env("FFMPEG_PATH", "ffmpeg");
@@ -473,6 +569,28 @@ export function resizeArea(src: RgbImage, dstW: number, dstH: number): RgbImage 
   return { width: dstW, height: dstH, data: out };
 }
 
+/**
+ * Bilinear resize (pixel-centre aligned, edge-clamped), used to ENLARGE small
+ * pictures for the detector without the blocky steps resizeArea produces there.
+ */
+export function resizeBilinear(src: RgbImage, dstW: number, dstH: number): RgbImage {
+  const out = new Uint8Array(dstW * dstH * 3);
+  const px = new Float32Array(3);
+  const sx = src.width / dstW;
+  const sy = src.height / dstH;
+  for (let dy = 0; dy < dstH; dy++) {
+    const y = (dy + 0.5) * sy - 0.5;
+    for (let dx = 0; dx < dstW; dx++) {
+      sampleBilinear(src, (dx + 0.5) * sx - 0.5, y, px);
+      const o = (dy * dstW + dx) * 3;
+      out[o] = Math.round(px[0]);
+      out[o + 1] = Math.round(px[1]);
+      out[o + 2] = Math.round(px[2]);
+    }
+  }
+  return { width: dstW, height: dstH, data: out };
+}
+
 /** Bilinear RGB sample with edge clamping. Returns [r, g, b] as floats. */
 function sampleBilinear(img: RgbImage, x: number, y: number, out: Float32Array): void {
   const x0 = Math.floor(x);
@@ -512,6 +630,9 @@ interface Engine {
   recognizerInput: string;
   recognizerOutput: string;
   loadTimeMs: number;
+  /** File names actually loaded, so status and the model tag describe the running sessions. */
+  detectorFile: string;
+  recognizerFile: string;
 }
 
 let enginePromise: Promise<Engine> | null = null;
@@ -521,8 +642,10 @@ let engineError: string | null = null;
 
 async function createEngine(): Promise<Engine> {
   const dir = modelDir();
-  const detPath = path.join(dir, detectorModelName());
-  const recPath = path.join(dir, recognizerModelName());
+  const detectorFile = detectorModelName();
+  const recognizerFile = recognizerModelName();
+  const detPath = path.join(dir, detectorFile);
+  const recPath = path.join(dir, recognizerFile);
   for (const p of [detPath, recPath]) {
     if (!fs.existsSync(p)) throw new Error(`model file missing: ${p}`);
   }
@@ -548,6 +671,8 @@ async function createEngine(): Promise<Engine> {
     recognizerInput: recognizer.inputNames[0],
     recognizerOutput: recognizer.outputNames[0],
     loadTimeMs,
+    detectorFile,
+    recognizerFile,
   };
 }
 
@@ -560,12 +685,13 @@ export async function getFaceEngine(): Promise<Engine | null> {
   if (engineRef) return engineRef;
   if (!enginePromise) {
     engineLoading = true;
+    for (const w of variantWarnings()) log("warn", w);
     enginePromise = createEngine();
     enginePromise
       .then((e) => {
         engineRef = e;
         engineError = null;
-        log("info", `engine ready in ${e.loadTimeMs}ms (${detectorModelName()}, ${recognizerModelName()})`);
+        log("info", `engine ready in ${e.loadTimeMs}ms (${e.detectorFile}, ${e.recognizerFile}, tag=${faceModelTagFor(e.recognizerFile)})`);
       })
       .catch((err) => {
         engineError = err instanceof Error ? err.message : String(err);
@@ -590,12 +716,20 @@ export function isFaceEngineReady(): boolean {
 
 /** Snapshot for a status endpoint. Never throws, never triggers a load. */
 export function getFaceEngineInfo(): FaceEngineInfo {
+  const detectorModel = engineRef ? engineRef.detectorFile : detectorModelName();
+  const recognizerModel = engineRef ? engineRef.recognizerFile : recognizerModelName();
+  const warnings = variantWarnings();
   return {
     ready: engineRef !== null,
     loading: engineLoading,
     modelDir: modelDir(),
-    detectorModel: detectorModelName(),
-    recognizerModel: recognizerModelName(),
+    detectorModel,
+    recognizerModel,
+    detectorVariant: detectorVariantOf(detectorModel),
+    recognizerVariant: recognizerVariantOf(recognizerModel),
+    modelTag: faceModelTagFor(recognizerModel),
+    variantWarning: warnings.length ? warnings.join("; ") : null,
+    detectUpscale: detectUpscaleMode(),
     detectorInputSize: detectorInputSize(),
     embeddingDim: EMBEDDING_DIM,
     detectThreshold: detectThreshold(),
@@ -630,10 +764,17 @@ interface Letterboxed {
  * un-projecting is a single divide by `scale` with no pad offset.
  */
 function letterboxForDetector(img: RgbImage, size: number): Letterboxed {
-  const scale = Math.min(size / img.width, size / img.height);
+  const mode = detectUpscaleMode();
+  const fit = Math.min(size / img.width, size / img.height);
+  const scale = fit > 1 && mode === "none" ? 1 : fit;
   const newW = Math.max(1, Math.round(img.width * scale));
   const newH = Math.max(1, Math.round(img.height * scale));
-  const resized = resizeArea(img, newW, newH);
+  const resized =
+    newW === img.width && newH === img.height
+      ? img
+      : scale > 1 && mode === "bilinear"
+        ? resizeBilinear(img, newW, newH)
+        : resizeArea(img, newW, newH);
   // NCHW float32, (px - 127.5) / 128.0, zero-padded region stays at the value
   // that a black pixel maps to, exactly as a zeroed uint8 canvas would.
   const plane = size * size;
