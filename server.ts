@@ -3649,13 +3649,18 @@ app.post("/api/camera-streams/test-stream", (req, res) => {
 
 // Capture single JPEG snapshot frame from RTSP/HTTP stream via FFmpeg
 app.get("/api/camera-streams/snapshot", async (req, res) => {
+  if (req.query.url !== undefined) {
+    return res.status(400).json({ success: false, code: "URL_OVERRIDE_NOT_ALLOWED", error: "Tham số url không được hỗ trợ; chỉ dùng luồng đã cấu hình." });
+  }
   const resolved = resolveGateStream(req.query.gate, req.query.stream);
   if (resolved.error) {
     return res.status(400).json({ success: false, error: resolved.error });
   }
   const gateParam = resolved.gateKey;
   const stream = resolved.stream;
-  const streamUrl = String(req.query.url || stream.rtspUrl || "").trim();
+  // Only the configured stream: a caller-supplied ?url= let any signed-in
+  // viewer make the gateway dial an arbitrary RTSP destination (SSRF).
+  const streamUrl = String(stream.rtspUrl || "").trim();
   const transport = stream.rtspTransport === "UDP" ? "udp" : "tcp";
 
   if (!streamUrl || !streamUrl.toLowerCase().startsWith("rtsp://")) {
@@ -3681,12 +3686,17 @@ app.get("/api/camera-streams/snapshot", async (req, res) => {
 
 // Real-time Live MJPEG Video Stream Proxy for Browsers
 app.get("/api/camera-streams/mjpeg", (req, res) => {
+  if (req.query.url !== undefined) {
+    return res.status(400).send("Tham số url không được hỗ trợ; chỉ dùng luồng đã cấu hình.");
+  }
   const resolved = resolveGateStream(req.query.gate, req.query.stream);
   if (resolved.error) {
     return res.status(400).send(resolved.error);
   }
   const stream = resolved.stream;
-  const streamUrl = String(req.query.url || stream.rtspUrl || "").trim();
+  // Only the configured stream: a caller-supplied ?url= let any signed-in
+  // viewer make the gateway dial an arbitrary RTSP destination (SSRF).
+  const streamUrl = String(stream.rtspUrl || "").trim();
   const transport = stream.rtspTransport === "UDP" ? "udp" : "tcp";
 
   if (!streamUrl || !streamUrl.toLowerCase().startsWith("rtsp://")) {
@@ -4566,7 +4576,8 @@ async function performGateScan(input: GateScanRequest): Promise<GateScanResult> 
         recognized: false,
         gate: gateParam,
         error: "Không thể lấy khung hình từ luồng RTSP. Hãy kiểm tra địa chỉ IP, tài khoản/mật khẩu hoặc kết nối mạng LAN.",
-        details: outcomes[0]?.grabs[0]?.errorLog || "",
+        // FFmpeg echoes the input URL, login included: never return it raw.
+        details: redactRtsp(outcomes[0]?.grabs[0]?.errorLog || ""),
         frameCaptureDurationMs,
         streams: streamResults,
         fusion: fusionSummary,
@@ -6032,7 +6043,7 @@ app.post(EMPLOYEE_TEMPLATE_CAPTURE_ROUTES, requireOperatorRole("operator"), requ
   for (let i = 0; i < grabs.length; i++) {
     const g = grabs[i];
     if (!g.ok || !g.jpeg) {
-      rejected.push({ frameIndex: i, reason: "frame-grab-failed", detail: g.errorLog.slice(-160) });
+      rejected.push({ frameIndex: i, reason: "frame-grab-failed", detail: redactRtsp(g.errorLog).slice(-160) });
       continue;
     }
     const outcome = await enrollTemplateFromImage(employee.id, g.jpeg, {
