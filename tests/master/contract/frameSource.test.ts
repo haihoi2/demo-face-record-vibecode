@@ -40,16 +40,20 @@ async function loadFactory(): Promise<{ factory: Factory | null; why?: string }>
   return { factory: (opts) => (isClass ? new cand(opts) : cand(opts)) };
 }
 
+const SRC_W = 1280;
+const SRC_H = 720;
+
 function sourceOptions(url: string, gate: "ENTRY" | "EXIT" = "EXIT") {
-  // Superset of plausible option names; an implementation ignores what it does not use.
-  return { gate, streamId: `mt-contract-${gate.toLowerCase()}`, url, rtspUrl: url, fps: 8, targetFps: 8, transport: "tcp", staleMs: 1000 };
+  // STR's StreamReaderOptions (createStreamReader) plus a few aliases an
+  // implementation ignores. The synthetic publisher below is 1280x720.
+  return { gate, streamId: `mt-contract-${gate.toLowerCase()}`, url, rtspUrl: url, sourceWidth: SRC_W, sourceHeight: SRC_H, fps: 8, staleMs: 1000 };
 }
 
 function publish(path: string, opts: { realtime?: boolean; seconds?: number } = {}): ChildProcess {
   const args = [
     "-hide_banner", "-loglevel", "error",
     ...(opts.realtime === false ? [] : ["-re"]),
-    "-f", "lavfi", "-i", `testsrc2=size=1280x720:rate=25${opts.seconds ? `:duration=${opts.seconds}` : ""}`,
+    "-f", "lavfi", "-i", `testsrc2=size=${SRC_W}x${SRC_H}:rate=25${opts.seconds ? `:duration=${opts.seconds}` : ""}`,
     "-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency", "-g", "50", "-pix_fmt", "yuv420p",
     "-f", "rtsp", "-rtsp_transport", "tcp", `${MTX}/${path}`,
   ];

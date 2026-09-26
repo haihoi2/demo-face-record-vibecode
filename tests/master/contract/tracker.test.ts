@@ -3,13 +3,12 @@
  * biometric data): one track per person through crossing, short occlusion and
  * dropped frames. Identities are fixed random unit vectors + noise.
  *
- * Skips while src/server/pipeline/tracker.ts is absent or exposes an API the
- * adapter does not recognise. Recognised shape (to confirm with TRK at W2):
- *   createTracker(opts?) | new Tracker(opts?)  ->  {
- *     update(frame: Frame, detections: FaceDetection[], embeddings?: (Float32Array|undefined)[]): TrackUpdate[] | { updates: TrackUpdate[] }
- *     end?() | flush?(): unknown
- *   }
- * MT_TRACKER_EXPORT names the factory when it is called something else.
+ * Skips while src/server/pipeline/tracker.ts is absent. Bound to TRK's API
+ * (feat/rt-trk 5d014d6): new FaceTracker({ gate, modelTag, clock }), then per
+ * frame plan(frame, inputs) -> embeddings only where asked -> update(frame,
+ * inputs) -> TrackerStep.updates[] (detectionIndex, trackId); endAll() at the end.
+ * A generic createTracker/update(frame, detections, embeddings) shape is also
+ * accepted; MT_TRACKER_EXPORT names the export when it is something else.
  */
 import assert from "node:assert/strict";
 import { existsSync } from "node:fs";
@@ -107,13 +106,33 @@ export function droppedFrames(): Step[] {
   return [0, 1, 2, 5, 6, 9, 10, 11, 15, 16].map((seq, k) => ({ frame: frame(seq), detections: [det(900 + k * 10, 500, 60 + k * 6)], embeddings: [noisy(a, 400 + k)], who: ["A"] }));
 }
 
-type Bound = { update(step: Step): TrackUpdate[]; end(): void };
+type Upd = TrackUpdate & { detectionIndex?: number; state?: string };
+type Bound = { update(step: Step): Upd[]; end(): void };
+const MODEL_TAG = "arcface_w600k_r50";
 
 async function bindTracker(): Promise<{ make: (() => Bound) | null; why?: string }> {
   if (!existsSync(MODULE)) return { make: null, why: "tracker.ts not in this build (TRK, W1)" };
   const spec: string = MODULE.href;
   const mod: any = await import(spec);
   const named = process.env.MT_TRACKER_EXPORT;
+  if (!named && typeof mod.FaceTracker === "function") {
+    return {
+      make: () => {
+        let now = 0;
+        const tr = new mod.FaceTracker({ gate: "EXIT", modelTag: MODEL_TAG, clock: () => now });
+        return {
+          update: (s: Step) => {
+            now = s.frame.capturedAtMs;
+            const bare = s.detections.map((detection) => ({ detection, quality: 0.8 }));
+            const plan = tr.plan(s.frame, bare);
+            const inputs = bare.map((x, i) => (plan.needsEmbedding[i] ? { ...x, embedding: s.embeddings[i], embeddingModelTag: MODEL_TAG } : x));
+            return tr.update(s.frame, inputs).updates;
+          },
+          end: () => tr.endAll("shutdown", now + 60_000),
+        };
+      },
+    };
+  }
   const cand = (named && mod[named]) || mod.createTracker || mod.Tracker || mod.default;
   if (typeof cand !== "function") return { make: null, why: `no recognised tracker export (found: ${Object.keys(mod).join(", ")})` };
   const isClass = /^class\s/.test(Function.prototype.toString.call(cand));
@@ -133,13 +152,21 @@ async function bindTracker(): Promise<{ make: (() => Bound) | null; why?: string
   };
 }
 
-/** trackId per ground-truth person, from the updates' detection boxes. */
-function tracksByPerson(steps: Step[], run: (s: Step) => TrackUpdate[]) {
+/**
+ * Confirmed trackIds per ground-truth person. Tentative tracks (detector
+ * flicker, first frames of fast motion) owe no outcome, so they are counted
+ * separately and only reported as a diagnostic.
+ */
+function tracksByPerson(steps: Step[], run: (s: Step) => Upd[], tentative?: Set<string>) {
   const map = new Map<string, Set<string>>();
   for (const s of steps) {
     const updates = run(s);
     for (const u of updates) {
-      const idx = s.detections.findIndex((d) => d.box.every((v, k) => Math.abs(v - u.detection.box[k]) < 1e-6));
+      if (u.state !== undefined && u.state !== "confirmed") {
+        tentative?.add(u.trackId);
+        continue;
+      }
+      const idx = typeof u.detectionIndex === "number" ? u.detectionIndex : s.detections.findIndex((d) => d.box.every((v, k) => Math.abs(v - u.detection.box[k]) < 1e-6));
       if (idx < 0) continue;
       const who = s.who[idx];
       if (!map.has(who)) map.set(who, new Set());
@@ -154,8 +181,11 @@ describe("pipeline-contract: tracker scenarios", () => {
     const { make, why } = await bindTracker();
     if (!make) return t.skip(why);
     const tr = make();
-    const m = tracksByPerson(crossing(), (s) => tr.update(s));
+    const tentative = new Set<string>();
+    const m = tracksByPerson(crossing(), (s) => tr.update(s), tentative);
     tr.end();
+    const orphans = [...tentative].filter((id) => ![...m.values()].some((set) => set.has(id)));
+    t.diagnostic(`tentative tracks that never confirmed: ${orphans.length}`);
     assert.equal(m.get("A")?.size, 1, `A spread over tracks ${[...(m.get("A") || [])]}`);
     assert.equal(m.get("B")?.size, 1, `B spread over tracks ${[...(m.get("B") || [])]}`);
     assert.notEqual([...m.get("A")!][0], [...m.get("B")!][0], "A and B merged into one track");
