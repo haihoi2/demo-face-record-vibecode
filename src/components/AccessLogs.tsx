@@ -23,10 +23,13 @@ import {
   ChevronRight,
   CalendarDays,
   Loader2,
+  Film,
 } from "lucide-react";
 import { AccessLog } from "../types";
 import { EntryPatternAnalytics } from "./EntryPatternAnalytics";
 import { ProtectedImage } from "./ProtectedImage";
+import { RecordingPlayer } from "./RecordingPlayer";
+import { useRecordingGates } from "../utils/recordings";
 import {
   AccessLogFilters,
   AccessLogStats,
@@ -68,6 +71,8 @@ export const AccessLogs: React.FC<AccessLogsProps> = ({
   const [loading, setLoading] = useState<boolean>(true);
   const [error, setError] = useState<string | null>(null);
   const [exporting, setExporting] = useState<boolean>(false);
+  const recordingGates = useRecordingGates();
+  const [recordingOf, setRecordingOf] = useState<{ id: string; title: string } | null>(null);
   const [refreshKey, setRefreshKey] = useState<number>(0);
 
   const statusFilter = filters.status;
@@ -435,6 +440,22 @@ export const AccessLogs: React.FC<AccessLogsProps> = ({
                           alt="Face snapshot"
                           className="w-10 h-10 rounded-lg object-cover border border-slate-200 shadow-xs"
                         />
+                        {recordingGates[log.type === "EXIT" ? "EXIT" : "ENTRY"] && (
+                          <button
+                            type="button"
+                            data-testid={`btn-recording-${log.id}`}
+                            onClick={() =>
+                              setRecordingOf({
+                                id: log.id,
+                                title: `${log.type === "EXIT" ? "Cổng ra" : "Cổng vào"} · ${formattedTime} ${formattedDate}`,
+                              })
+                            }
+                            className="mt-1 inline-flex items-center gap-1 px-1.5 py-0.5 rounded-md border border-slate-200 bg-white text-[10px] font-semibold text-slate-600 hover:bg-slate-50 hover:text-indigo-700"
+                            title="Xem đoạn ghi của đầu ghi quanh thời điểm này"
+                          >
+                            <Film className="w-3 h-3" /> Đoạn ghi
+                          </button>
+                        )}
                       </td>
 
                       {/* Timestamp */}
@@ -576,6 +597,15 @@ export const AccessLogs: React.FC<AccessLogsProps> = ({
           </div>
         </div>
       </div>
+      {recordingOf && (
+        <RecordingPlayer
+          logId={recordingOf.id}
+          title={recordingOf.title}
+          before={recordingGates.before}
+          after={recordingGates.after}
+          onClose={() => setRecordingOf(null)}
+        />
+      )}
     </div>
   );
 };

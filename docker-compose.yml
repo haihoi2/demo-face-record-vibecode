@@ -69,6 +69,11 @@ services:
       - FACE_STRANGER_MIN_SIZE_PX=${FACE_STRANGER_MIN_SIZE_PX:-}
       # Compression of the stored access-log photo (FFmpeg -q:v, 2-31; default 8).
       - SNAPSHOT_JPEG_QSCALE=${SNAPSHOT_JPEG_QSCALE:-}
+      # NVR playback for access-history review (server-side only; see .env.example).
+      - RECORDING_NVR_URL=${RECORDING_NVR_URL:-}
+      - RECORDING_ENTRY_CHANNEL=${RECORDING_ENTRY_CHANNEL:-}
+      - RECORDING_EXIT_CHANNEL=${RECORDING_EXIT_CHANNEL:-}
+      - RECORDING_MAX_CONCURRENT=${RECORDING_MAX_CONCURRENT:-}
       - CAMERA_ENTRY_RTSP_URL=${CAMERA_ENTRY_RTSP_URL:-}
       - CAMERA_EXIT_RTSP_URL=${CAMERA_EXIT_RTSP_URL:-}
 

@@ -33,6 +33,16 @@ import { envNumber } from "./src/server/env";
 import { guardAsyncRoutes, jsonErrorHandler } from "./src/server/asyncRoutes";
 import { accessLogExportName, csvCell } from "./src/server/csv";
 import {
+  DEFAULT_RECORDING_WINDOW,
+  playbackFailure,
+  playbackFfmpegArgs,
+  playbackUrl,
+  recordingConfigFromEnv,
+  recordingWindow,
+  recordingWindowFailure,
+  redactRtsp,
+} from "./src/server/recording";
+import {
   UserRole,
   isUserRole,
   roleAtLeast,
@@ -6426,6 +6436,131 @@ app.get(LOG_ROUTES, requireOperatorRole("viewer"), async (req, res) => {
     failHistoryRequest(res, err);
   }
 
+});
+
+// ---------------------------------------------------------------------------
+// NVR playback around an access event (see src/server/recording.ts).
+// ---------------------------------------------------------------------------
+const recordingConfig = recordingConfigFromEnv(process.env);
+/** Each playback holds one NVR session and ~1 core (HEVC decode + H.264 encode). */
+const RECORDING_MAX_CONCURRENT = envInt("RECORDING_MAX_CONCURRENT", 2, 1, 8);
+let activeRecordings = 0;
+
+// Whether the "view recording" button has anything to play; never the address.
+app.get("/api/recordings/config", (_req, res) => {
+  res.json({
+    success: true,
+    enabled: Boolean(recordingConfig),
+    gates: { ENTRY: Boolean(recordingConfig?.channels.ENTRY), EXIT: Boolean(recordingConfig?.channels.EXIT) },
+    windowSeconds: {
+      before: DEFAULT_RECORDING_WINDOW.beforeMs / 1000,
+      after: DEFAULT_RECORDING_WINDOW.afterMs / 1000,
+    },
+  });
+});
+
+app.get("/api/logs/:id/recording", requireOperatorRole("viewer"), async (req, res) => {
+  res.setHeader("Cache-Control", "private, no-store");
+  res.setHeader("X-Content-Type-Options", "nosniff");
+  if (String(req.headers["sec-fetch-site"] || "").toLowerCase() === "cross-site") {
+    res.status(403).json({ success: false, code: "RECORDING_CROSS_SITE_FORBIDDEN", error: "Cross-site recording request is not allowed" });
+    return;
+  }
+  const id = String(req.params.id || "");
+  if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(id)) {
+    res.status(400).json({ success: false, error: "Invalid log id" });
+    return;
+  }
+  if (!recordingConfig) {
+    res.status(503).json({ success: false, code: "RECORDING_NOT_CONFIGURED", error: "Chưa cấu hình đầu ghi để xem lại (RECORDING_NVR_URL)." });
+    return;
+  }
+  const log = await db.getAccessLogById(id);
+  if (!log) {
+    res.status(404).json({ success: false, error: "Không tìm thấy lượt quét" });
+    return;
+  }
+  const gate = log.type === "EXIT" ? "EXIT" : "ENTRY";
+  const channel = recordingConfig.channels[gate];
+  if (!channel) {
+    res.status(404).json({ success: false, code: "RECORDING_NO_CHANNEL", error: "Cổng này chưa được gán kênh ghi hình trên đầu ghi." });
+    return;
+  }
+  const win = recordingWindow(Date.parse(log.timestamp), Date.now());
+  const winFailure = recordingWindowFailure(win);
+  if (winFailure) {
+    if (winFailure.reason === "not-yet-recorded") {
+      res.setHeader("Retry-After", String(winFailure.retryAfterSeconds || 5));
+      res.status(409).json({ success: false, code: "RECORDING_NOT_READY", error: "Đầu ghi chưa ghi xong thời điểm này, thử lại sau vài giây.", retryAfterSeconds: winFailure.retryAfterSeconds });
+    } else {
+      res.status(422).json({ success: false, code: "RECORDING_INVALID_TIME", error: "Thời điểm của lượt quét không hợp lệ." });
+    }
+    return;
+  }
+  const { startMs, endMs } = win as { startMs: number; endMs: number };
+  if (activeRecordings >= RECORDING_MAX_CONCURRENT) {
+    res.setHeader("Retry-After", "10");
+    res.status(429).json({ success: false, code: "RECORDING_BUSY", error: "Đang có quá nhiều đoạn ghi được mở cùng lúc, thử lại sau ít giây." });
+    return;
+  }
+
+  // Viewing footage is a sensitive read: record who looked at what.
+  const session = readOperatorSession(req);
+  const actor = session ? `${session.actor}${session.displayName ? ` (${session.displayName})` : ""}, ${session.role}` : "unknown";
+  const span = `${new Date(startMs).toISOString()}..${new Date(endMs).toISOString()}`;
+  console.log(`[Recording] ${actor} mở đoạn ghi của ${log.id} (${gate}, kênh ${channel}, ${span})`);
+
+  activeRecordings += 1;
+  const durationSeconds = (endMs - startMs) / 1000;
+  const proc = spawn("ffmpeg", playbackFfmpegArgs(playbackUrl(recordingConfig, channel, startMs, endMs), durationSeconds));
+  let stderr = "";
+  let started = false;
+  let finished = false;
+  const done = () => {
+    if (finished) return;
+    finished = true;
+    activeRecordings = Math.max(0, activeRecordings - 1);
+    clearTimeout(firstByteTimer);
+    clearTimeout(hardTimer);
+  };
+  const kill = () => { try { proc.kill("SIGKILL"); } catch {} };
+  // The NVR can accept a playback session and then send nothing: never wait on it.
+  const firstByteTimer = setTimeout(kill, 20_000);
+  const hardTimer = setTimeout(kill, (durationSeconds + 40) * 1000);
+  proc.stderr?.on("data", (c: Buffer) => { stderr = (stderr + c.toString()).slice(-2000); });
+  proc.stdout?.on("data", (chunk: Buffer) => {
+    if (!started) {
+      started = true;
+      clearTimeout(firstByteTimer);
+      res.status(200);
+      res.setHeader("Content-Type", "video/mp4");
+      res.setHeader("Content-Disposition", `inline; filename="doan_ghi_${log.id}.mp4"`);
+    }
+    if (!res.write(chunk)) {
+      proc.stdout?.pause();
+      res.once("drain", () => proc.stdout?.resume());
+    }
+  });
+  // The viewer closed the player: stop pulling from the NVR at once.
+  res.on("close", () => {
+    if (!finished) kill();
+  });
+  proc.on("error", (err) => {
+    done();
+    console.warn(`[Recording] Không chạy được ffmpeg cho ${log.id}: ${redactRtsp(String(err?.message || err))}`);
+    if (!res.headersSent) res.status(500).json({ success: false, code: "RECORDING_FAILED", error: "Không phát được đoạn ghi." });
+    else res.end();
+  });
+  proc.on("close", (code) => {
+    done();
+    if (started) {
+      res.end();
+      return;
+    }
+    const failure = playbackFailure(stderr);
+    console.warn(`[Recording] Không lấy được đoạn ghi ${log.id} (exit ${code}): ${redactRtsp(stderr).trim().slice(-300)}`);
+    if (!res.headersSent && !res.writableEnded) res.status(failure.status).json({ success: false, code: failure.code, error: failure.error });
+  });
 });
 
 app.get("/api/logs/:id/image", requireOperatorRole("viewer"), async (req, res) => {
