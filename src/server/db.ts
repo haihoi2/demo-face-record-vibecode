@@ -71,6 +71,81 @@ export interface AccessLogRecord {
   faceEmbeddingModelTag?: string;
   /** Capture quality (0..1) of the persisted stranger observation. */
   faceEmbeddingQuality?: number;
+  /**
+   * Capture time of the frame the decision was made on (ISO-8601 UTC). Server-owned;
+   * `timestamp` stays the time the event was written. Undefined on older rows.
+   */
+  capturedAt?: string;
+  /** Tracker id of the passage (<= 64 chars). Undefined on older rows. */
+  trackId?: string;
+  /** NVR recording channel of the gate at event time (<= 16 chars). Undefined on older rows. */
+  recordingChannel?: string;
+}
+
+/** Same limits as the PostgreSQL columns (VARCHAR 64 / 16), enforced here for SQLite and JSON too. */
+const TRACK_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$/;
+const RECORDING_CHANNEL_RE = /^[A-Za-z0-9_-]{1,16}$/;
+const ISO_INSTANT_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2}(\.\d{1,9})?)?(Z|[+-]\d{2}:?\d{2})$/;
+/** 2000-01-01T00:00:00Z .. 9999-12-31T23:59:59.999Z: toISOString() stays 24 characters. */
+const CAPTURED_AT_MIN_MS = Date.UTC(2000, 0, 1);
+const CAPTURED_AT_MAX_MS = Date.UTC(9999, 11, 31, 23, 59, 59, 999);
+
+/** What getAccessLogMetaById returns: time, gate and trace of an event, never its image or face data. */
+export type AccessLogMeta = Pick<AccessLogRecord, "id" | "timestamp" | "type" | "status" | "capturedAt" | "trackId" | "recordingChannel">;
+
+export interface AccessLogTrace {
+  capturedAt?: string;
+  trackId?: string;
+  recordingChannel?: string;
+}
+
+/**
+ * Validates the optional trace fields of an access event before they are stored.
+ *
+ * The event itself is a security fact and must never be lost because a trace
+ * value is malformed: an invalid value is dropped (stored as NULL) and named in
+ * `rejected`. It is never truncated (a cut track id could name another passage)
+ * and never allowed to fail the insert (a PostgreSQL VARCHAR overflow would).
+ * `capturedAt` is normalised to `Date#toISOString()` (UTC, milliseconds).
+ */
+export function normalizeAccessLogTrace(input: {
+  capturedAt?: unknown;
+  trackId?: unknown;
+  recordingChannel?: unknown;
+}): AccessLogTrace & { rejected: Array<keyof AccessLogTrace> } {
+  const out: AccessLogTrace & { rejected: Array<keyof AccessLogTrace> } = { rejected: [] };
+  const present = (v: unknown) => v !== undefined && v !== null && v !== "";
+
+  if (present(input.capturedAt)) {
+    const raw = typeof input.capturedAt === "string" ? input.capturedAt.trim() : "";
+    const ms = ISO_INSTANT_RE.test(raw) ? Date.parse(raw) : NaN;
+    if (Number.isFinite(ms) && ms >= CAPTURED_AT_MIN_MS && ms <= CAPTURED_AT_MAX_MS) {
+      out.capturedAt = new Date(ms).toISOString();
+    } else {
+      out.rejected.push("capturedAt");
+    }
+  }
+  if (present(input.trackId)) {
+    if (typeof input.trackId === "string" && TRACK_ID_RE.test(input.trackId)) out.trackId = input.trackId;
+    else out.rejected.push("trackId");
+  }
+  if (present(input.recordingChannel)) {
+    const raw = typeof input.recordingChannel === "number" && Number.isSafeInteger(input.recordingChannel) && input.recordingChannel >= 0
+      ? String(input.recordingChannel)
+      : input.recordingChannel;
+    if (typeof raw === "string" && RECORDING_CHANNEL_RE.test(raw)) out.recordingChannel = raw;
+    else out.rejected.push("recordingChannel");
+  }
+  return out;
+}
+
+/** Row value (NULL/empty on old rows) -> optional field. */
+const optionalText = (v: unknown): string | undefined => (v == null || v === "" ? undefined : String(v));
+
+/** capturedAt, trackId, recordingChannel as bind parameters (NULL when absent or invalid). */
+function accessLogTraceParams(log: AccessLogTrace): [string | null, string | null, string | null] {
+  const t = normalizeAccessLogTrace(log);
+  return [t.capturedAt ?? null, t.trackId ?? null, t.recordingChannel ?? null];
 }
 
 export interface SmartLockStateRecord {
@@ -516,6 +591,9 @@ function rowToAccessLog(r: any): AccessLogRecord {
     faceEmbedding: bufferToEmbedding(r.faceEmbedding, r.faceEmbeddingDims),
     faceEmbeddingModelTag: r.faceEmbeddingModelTag || undefined,
     faceEmbeddingQuality: r.faceEmbeddingQuality == null ? undefined : Number(r.faceEmbeddingQuality),
+    capturedAt: optionalText(r.capturedAt),
+    trackId: optionalText(r.trackId),
+    recordingChannel: optionalText(r.recordingChannel),
   } as AccessLogRecord;
 }
 
@@ -916,8 +994,9 @@ class SQLiteStorage {
             INSERT INTO access_logs (
               id, timestamp, type, status, "employeeId", "employeeName", "employeeCode",
               department, "photoSnapshot", confidence, "livenessScore", "lockAction", "doorName", reason,
-              "faceEmbedding", "faceEmbeddingDims", "faceEmbeddingModelTag", "faceEmbeddingQuality"
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
+              "faceEmbedding", "faceEmbeddingDims", "faceEmbeddingModelTag", "faceEmbeddingQuality",
+              "capturedAt", "trackId", "recordingChannel"
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)
             ON CONFLICT (id) DO NOTHING
           `, [
             log.id, log.timestamp, log.type, log.status,
@@ -925,7 +1004,8 @@ class SQLiteStorage {
             log.department || null, log.photoSnapshot, log.confidence,
             log.livenessScore ?? null, log.lockAction, log.doorName, log.reason || null,
             log.faceEmbedding?.length ? embeddingToBuffer(log.faceEmbedding) : null,
-            log.faceEmbedding?.length || null, log.faceEmbeddingModelTag || null, log.faceEmbeddingQuality ?? null
+            log.faceEmbedding?.length || null, log.faceEmbeddingModelTag || null, log.faceEmbeddingQuality ?? null,
+            ...accessLogTraceParams(log),
           ]);
         }
         console.log(`[PostgreSQL] Đã khởi tạo và đồng bộ ${existingLogs.length} bản ghi truy cập vào PostgreSQL!`);
@@ -933,7 +1013,8 @@ class SQLiteStorage {
         const pgLogs = await this.pgPool.query(`
           SELECT id, timestamp, type, status, "employeeId", "employeeName", "employeeCode",
                  department, "photoSnapshot", confidence, "livenessScore", "lockAction", "doorName", reason,
-                 "faceEmbedding", "faceEmbeddingDims", "faceEmbeddingModelTag", "faceEmbeddingQuality"
+                 "faceEmbedding", "faceEmbeddingDims", "faceEmbeddingModelTag", "faceEmbeddingQuality",
+                 "capturedAt", "trackId", "recordingChannel"
           FROM access_logs ORDER BY timestamp DESC LIMIT 100
         `);
         for (const r of pgLogs.rows) {
@@ -943,8 +1024,9 @@ class SQLiteStorage {
                 INSERT INTO access_logs (
                   id, timestamp, type, status, employeeId, employeeName, employeeCode,
                   department, photoSnapshot, confidence, livenessScore, lockAction, doorName, reason,
-                  faceEmbedding, faceEmbeddingDims, faceEmbeddingModelTag, faceEmbeddingQuality
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                  faceEmbedding, faceEmbeddingDims, faceEmbeddingModelTag, faceEmbeddingQuality,
+                  capturedAt, trackId, recordingChannel
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(id) DO NOTHING
               `);
               stmt.run(
@@ -953,7 +1035,8 @@ class SQLiteStorage {
                 r.department || null, r.photoSnapshot, r.confidence,
                 r.livenessScore ?? null, r.lockAction, r.doorName, r.reason || null,
                 r.faceEmbedding || null, r.faceEmbeddingDims || null,
-                r.faceEmbeddingModelTag || null, r.faceEmbeddingQuality ?? null
+                r.faceEmbeddingModelTag || null, r.faceEmbeddingQuality ?? null,
+                r.capturedAt ?? null, r.trackId ?? null, r.recordingChannel ?? null
               );
             } catch {}
           }
@@ -1141,7 +1224,10 @@ class SQLiteStorage {
           "faceEmbedding" BYTEA,
           "faceEmbeddingDims" INTEGER,
           "faceEmbeddingModelTag" VARCHAR(128),
-          "faceEmbeddingQuality" REAL
+          "faceEmbeddingQuality" REAL,
+          "capturedAt" VARCHAR(64),
+          "trackId" VARCHAR(64),
+          "recordingChannel" VARCHAR(16)
         );
 
         CREATE TABLE IF NOT EXISTS smart_lock_state (
@@ -1279,6 +1365,12 @@ class SQLiteStorage {
         ALTER TABLE access_logs ADD COLUMN IF NOT EXISTS "faceEmbeddingDims" INTEGER;
         ALTER TABLE access_logs ADD COLUMN IF NOT EXISTS "faceEmbeddingModelTag" VARCHAR(128);
         ALTER TABLE access_logs ADD COLUMN IF NOT EXISTS "faceEmbeddingQuality" REAL;
+        -- Real-time pipeline trace (2026-09-26): additive, nullable, no default, so
+        -- the ALTER is a catalog-only change (no table rewrite) and code that
+        -- predates it keeps working. Rollback: DROP COLUMN (see handoff notes).
+        ALTER TABLE access_logs ADD COLUMN IF NOT EXISTS "capturedAt" VARCHAR(64);
+        ALTER TABLE access_logs ADD COLUMN IF NOT EXISTS "trackId" VARCHAR(64);
+        ALTER TABLE access_logs ADD COLUMN IF NOT EXISTS "recordingChannel" VARCHAR(16);
         -- Matches the history ordering (newest first, id as tie-break) so a page
         -- is an index range scan instead of a sort of the whole table.
         CREATE INDEX IF NOT EXISTS idx_access_logs_ts_id ON access_logs ("timestamp" DESC, id DESC);
@@ -1347,7 +1439,10 @@ class SQLiteStorage {
         faceEmbedding BLOB,
         faceEmbeddingDims INTEGER,
         faceEmbeddingModelTag TEXT,
-        faceEmbeddingQuality REAL
+        faceEmbeddingQuality REAL,
+        capturedAt TEXT,
+        trackId TEXT,
+        recordingChannel TEXT
       );
       CREATE INDEX IF NOT EXISTS idx_access_logs_ts_id ON access_logs (timestamp DESC, id DESC);
 
@@ -1491,6 +1586,9 @@ class SQLiteStorage {
       "ALTER TABLE access_logs ADD COLUMN faceEmbeddingDims INTEGER",
       "ALTER TABLE access_logs ADD COLUMN faceEmbeddingModelTag TEXT",
       "ALTER TABLE access_logs ADD COLUMN faceEmbeddingQuality REAL",
+      "ALTER TABLE access_logs ADD COLUMN capturedAt TEXT",
+      "ALTER TABLE access_logs ADD COLUMN trackId TEXT",
+      "ALTER TABLE access_logs ADD COLUMN recordingChannel TEXT",
     ]) {
       try { this.db.exec(migration); } catch { /* column already present */ }
     }
@@ -1753,6 +1851,7 @@ class SQLiteStorage {
         this.pgPool.query(
           `SELECT id, timestamp, type, status, "employeeId", "employeeName", "employeeCode", department,
                   confidence, "livenessScore", "lockAction", "doorName", reason,
+                  "capturedAt", "trackId", "recordingChannel",
                   CASE WHEN "photoSnapshot" IS NOT NULL AND "photoSnapshot" <> '' THEN 1 ELSE 0 END AS "hasImage"
              FROM access_logs ORDER BY timestamp DESC, id DESC LIMIT $1 OFFSET $2`,
           [limit, offset],
@@ -1764,6 +1863,7 @@ class SQLiteStorage {
     if (this.isNativeSqlite && this.db) {
       const rows = this.db.prepare(`SELECT id, timestamp, type, status, employeeId, employeeName, employeeCode,
         department, confidence, livenessScore, lockAction, doorName, reason,
+        capturedAt, trackId, recordingChannel,
         CASE WHEN photoSnapshot IS NOT NULL AND photoSnapshot <> '' THEN 1 ELSE 0 END AS hasImage
         FROM access_logs ORDER BY timestamp DESC, id DESC LIMIT ? OFFSET ?`).all(limit, offset) as any[];
       const count = this.db.prepare("SELECT count(*) AS total FROM access_logs").get() as any;
@@ -1830,6 +1930,7 @@ class SQLiteStorage {
         this.pgPool.query(
           `SELECT id, timestamp, type, status, "employeeId", "employeeName", "employeeCode", department,
                   confidence, "livenessScore", "lockAction", "doorName", reason,
+                  "capturedAt", "trackId", "recordingChannel",
                   CASE WHEN "photoSnapshot" IS NOT NULL AND "photoSnapshot" <> '' THEN 1 ELSE 0 END AS "hasImage"
              FROM access_logs ${where.length ? "WHERE " + where.join(" AND ") : ""}
             ORDER BY timestamp DESC, id DESC LIMIT $${params.length}`,
@@ -1850,6 +1951,7 @@ class SQLiteStorage {
       }
       const rows = this.db.prepare(`SELECT id, timestamp, type, status, employeeId, employeeName, employeeCode,
         department, confidence, livenessScore, lockAction, doorName, reason,
+        capturedAt, trackId, recordingChannel,
         CASE WHEN photoSnapshot IS NOT NULL AND photoSnapshot <> '' THEN 1 ELSE 0 END AS hasImage
         FROM access_logs ${where.length ? "WHERE " + where.join(" AND ") : ""}
         ORDER BY timestamp DESC, id DESC LIMIT ?`).all(...(params as any[]), n + 1) as any[];
@@ -1924,19 +2026,32 @@ class SQLiteStorage {
    * getAccessLogById below is NOT a general lookup on PostgreSQL: it loads only
    * id + photoSnapshot for the image route, so its timestamp/type are undefined.
    */
-  async getAccessLogMetaById(
-    id: string,
-  ): Promise<Pick<AccessLogRecord, "id" | "timestamp" | "type" | "status"> | undefined> {
+  async getAccessLogMetaById(id: string): Promise<AccessLogMeta | undefined> {
+    const meta = (r: any): AccessLogMeta => ({
+      id: r.id,
+      timestamp: r.timestamp,
+      type: r.type,
+      status: r.status,
+      capturedAt: optionalText(r.capturedAt),
+      trackId: optionalText(r.trackId),
+      recordingChannel: optionalText(r.recordingChannel),
+    });
     if (this.pgPool && this.isPostgres) {
       const result = await this.pgPool.query(
-        `SELECT id, timestamp, type, status FROM access_logs WHERE id = $1`,
+        `SELECT id, timestamp, type, status, "capturedAt", "trackId", "recordingChannel"
+           FROM access_logs WHERE id = $1`,
         [id],
       );
-      const r = result.rows[0];
-      return r ? { id: r.id, timestamp: r.timestamp, type: r.type, status: r.status } : undefined;
+      return result.rows[0] ? meta(result.rows[0]) : undefined;
     }
-    const log = await this.getAccessLogById(id);
-    return log ? { id: log.id, timestamp: log.timestamp, type: log.type, status: log.status } : undefined;
+    if (this.isNativeSqlite && this.db) {
+      const row = this.db.prepare(
+        "SELECT id, timestamp, type, status, capturedAt, trackId, recordingChannel FROM access_logs WHERE id = ?",
+      ).get(id) as any;
+      return row ? meta(row) : undefined;
+    }
+    const row = this.fallbackData.access_logs.find((log) => log.id === id);
+    return row ? meta(row) : undefined;
   }
 
   async getAccessLogById(id: string): Promise<AccessLogRecord | undefined> {
@@ -1978,7 +2093,8 @@ class SQLiteStorage {
           `SELECT id, timestamp, type, status, "employeeId", "employeeName", "employeeCode", department,
                   CASE WHEN "photoSnapshot" IS NOT NULL AND "photoSnapshot" <> '' THEN 'stored' ELSE '' END AS "photoSnapshot",
                   confidence, "livenessScore", "lockAction", "doorName", reason,
-                  "faceEmbedding", "faceEmbeddingDims", "faceEmbeddingModelTag", "faceEmbeddingQuality"
+                  "faceEmbedding", "faceEmbeddingDims", "faceEmbeddingModelTag", "faceEmbeddingQuality",
+                  "capturedAt", "trackId", "recordingChannel"
              FROM access_logs
             WHERE "photoSnapshot" IS NOT NULL AND "photoSnapshot" <> ''
               AND (status = 'DENIED' OR "employeeId" IS NULL OR "employeeName" = 'Không xác định')${cursorWhere}
@@ -1995,7 +2111,8 @@ class SQLiteStorage {
         `SELECT id, timestamp, type, status, employeeId, employeeName, employeeCode, department,
                 CASE WHEN photoSnapshot IS NOT NULL AND photoSnapshot <> '' THEN 'stored' ELSE '' END AS photoSnapshot,
                 confidence, livenessScore, lockAction, doorName, reason,
-                faceEmbedding, faceEmbeddingDims, faceEmbeddingModelTag, faceEmbeddingQuality FROM access_logs
+                faceEmbedding, faceEmbeddingDims, faceEmbeddingModelTag, faceEmbeddingQuality,
+                capturedAt, trackId, recordingChannel FROM access_logs
           WHERE photoSnapshot IS NOT NULL AND photoSnapshot <> ''
             AND (status = 'DENIED' OR employeeId IS NULL OR employeeName = 'Không xác định')${cursorWhere}
           ORDER BY timestamp DESC, id DESC LIMIT ?`,
@@ -2028,17 +2145,34 @@ class SQLiteStorage {
     return this.getStrangerResolutions().flatMap((resolution) => resolution.logIds.map((id) => `log:${id}`));
   }
 
-  /** Insert an immutable physical access event. Replays with the same id are no-ops. */
-  saveAccessLog(log: AccessLogRecord) {
+  /**
+   * Insert an immutable physical access event. Replays with the same id are
+   * no-ops (the first write, including its trace fields, wins).
+   *
+   * Resolves once the authoritative store has the row: `true` when PostgreSQL
+   * (when it is the active authority) or else the local store accepted it or
+   * already had it, `false` when that write failed. Never rejects, so the
+   * existing fire-and-forget callers are unaffected; new callers can await it.
+   * Invalid trace values (capturedAt/trackId/recordingChannel) are stored as
+   * NULL and logged by field name, never failing the event itself.
+   */
+  saveAccessLog(log: AccessLogRecord): Promise<boolean> {
     const embedding = log.faceEmbedding?.length ? embeddingToBuffer(log.faceEmbedding) : null;
     const embeddingDims = log.faceEmbedding?.length || null;
+    const trace = normalizeAccessLogTrace(log);
+    if (trace.rejected.length) {
+      console.warn(`[AccessLog] ${String(log.id).slice(0, 64)}: bỏ giá trị không hợp lệ (${trace.rejected.join(", ")}), bản ghi vẫn được lưu.`);
+    }
+    const traceParams = [trace.capturedAt ?? null, trace.trackId ?? null, trace.recordingChannel ?? null];
+    let authoritative: Promise<boolean> | null = null;
     if (this.pgPool && this.isPostgres) {
-      this.pgPool.query(`
+      authoritative = this.pgPool.query(`
         INSERT INTO access_logs (
           id, timestamp, type, status, "employeeId", "employeeName", "employeeCode",
           department, "photoSnapshot", confidence, "livenessScore", "lockAction", "doorName", reason,
-          "faceEmbedding", "faceEmbeddingDims", "faceEmbeddingModelTag", "faceEmbeddingQuality"
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
+          "faceEmbedding", "faceEmbeddingDims", "faceEmbeddingModelTag", "faceEmbeddingQuality",
+          "capturedAt", "trackId", "recordingChannel"
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)
         ON CONFLICT (id) DO NOTHING
       `, [
         log.id, log.timestamp, log.type, log.status,
@@ -2046,7 +2180,14 @@ class SQLiteStorage {
         log.department || null, log.photoSnapshot, log.confidence,
         log.livenessScore ?? null, log.lockAction, log.doorName, log.reason || null,
         embedding, embeddingDims, log.faceEmbeddingModelTag || null, log.faceEmbeddingQuality ?? null,
-      ]).catch((e) => console.error("[PostgreSQL] Lỗi saveAccessLog:", e.message));
+        ...traceParams,
+      ]).then(
+        () => true,
+        (e) => {
+          console.error("[PostgreSQL] Lỗi saveAccessLog:", e.message);
+          return false;
+        },
+      );
     }
 
     if (this.isNativeSqlite && this.db) {
@@ -2055,8 +2196,9 @@ class SQLiteStorage {
           INSERT OR IGNORE INTO access_logs (
             id, timestamp, type, status, employeeId, employeeName, employeeCode,
             department, photoSnapshot, confidence, livenessScore, lockAction, doorName, reason,
-            faceEmbedding, faceEmbeddingDims, faceEmbeddingModelTag, faceEmbeddingQuality
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            faceEmbedding, faceEmbeddingDims, faceEmbeddingModelTag, faceEmbeddingQuality,
+            capturedAt, trackId, recordingChannel
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         `);
         stmt.run(
           log.id,
@@ -2077,18 +2219,31 @@ class SQLiteStorage {
           embeddingDims,
           log.faceEmbeddingModelTag || null,
           log.faceEmbeddingQuality ?? null,
+          ...traceParams,
         );
-        return;
+        return authoritative ?? Promise.resolve(true);
       } catch (err) {
         console.error("[SQLite] Lỗi saveAccessLog:", err);
       }
     }
+    let localOk = true;
     if (!this.fallbackData.access_logs.some((existing) => existing.id === log.id)) {
-      const stored = { ...log };
+      const stored: AccessLogRecord = {
+        ...log,
+        capturedAt: trace.capturedAt,
+        trackId: trace.trackId,
+        recordingChannel: trace.recordingChannel,
+      };
       this.fallbackData.access_logs.unshift(stored);
       this.prependFallbackStrangerCandidate(stored);
-      this.saveFallback();
+      try {
+        this.writeFallback();
+      } catch (err: any) {
+        console.error("[JSON] Lỗi saveAccessLog:", err?.message);
+        localOk = false;
+      }
     }
+    return authoritative ?? Promise.resolve(localOk);
   }
 
   clearAccessLogs() {

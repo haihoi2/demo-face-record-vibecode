@@ -29,6 +29,16 @@ export interface AccessLog {
   lockAction: string;
   doorName: string;
   reason?: string;
+  /**
+   * When the camera frame behind this event was captured (ISO-8601 UTC); can be
+   * seconds before `timestamp` (when the decision was written). Absent on
+   * events recorded before the real-time pipeline.
+   */
+  capturedAt?: string;
+  /** Tracker id of the passage (one person, one event). Absent on older events. */
+  trackId?: string;
+  /** NVR channel the gate was recorded on at the time of the event. Absent on older events. */
+  recordingChannel?: string;
 }
 
 export interface StrangerPhoto {

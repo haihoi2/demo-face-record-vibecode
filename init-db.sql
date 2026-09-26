@@ -30,7 +30,10 @@ CREATE TABLE IF NOT EXISTS access_logs (
   "faceEmbedding" BYTEA,
   "faceEmbeddingDims" INTEGER,
   "faceEmbeddingModelTag" VARCHAR(128),
-  "faceEmbeddingQuality" REAL
+  "faceEmbeddingQuality" REAL,
+  "capturedAt" VARCHAR(64),        -- ISO-8601 UTC capture time of the decided frame
+  "trackId" VARCHAR(64),           -- tracker id of the passage (one person, one event)
+  "recordingChannel" VARCHAR(16)   -- NVR channel the gate was recorded on
 );
 
 CREATE TABLE IF NOT EXISTS smart_lock_state (
