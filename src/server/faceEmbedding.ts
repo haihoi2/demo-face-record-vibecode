@@ -84,7 +84,7 @@ export interface FacePose {
   rollDeg: number;
 }
 
-export type UnclearReason = "landmarks" | "yaw" | "aspect" | "roll";
+export type UnclearReason = "small" | "landmarks" | "yaw" | "aspect" | "roll";
 
 export interface FaceEngineInfo {
   ready: boolean;
@@ -976,6 +976,14 @@ const envLimit = (name: string, fallback: number, min: number, max: number) => e
  * later on a frontal frame.
  */
 export const CLEAR_FACE_LIMITS = {
+  /**
+   * Shorter side of the face box, in source-frame pixels. Measured on 176
+   * recognised and 149 denied captures (2026-09-26): under 40 px the right
+   * employee scored 0.35 (below every accept threshold) at quality 0.33, while
+   * 40-60 px faces still matched correctly 85% of the time - the 4K entry
+   * camera's normal range - so the floor sits at 40, not higher.
+   */
+  minFacePx: envLimit("FACE_MIN_SIZE_PX", 40, 0, 2000),
   maxYaw: envLimit("FACE_CLEAR_MAX_YAW", 1.5, 0.1, 10),
   minAspect: envLimit("FACE_CLEAR_MIN_ASPECT", 0.3, 0, 5),
   maxAspect: envLimit("FACE_CLEAR_MAX_ASPECT", 2.5, 0.5, 20),
@@ -983,7 +991,14 @@ export const CLEAR_FACE_LIMITS = {
 };
 
 /** null when the face is clear enough to recognise or keep; otherwise the reason it is not. */
-export function clearFaceIssue(pose: FacePose | null, limits = CLEAR_FACE_LIMITS): UnclearReason | null {
+export function clearFaceIssue(
+  pose: FacePose | null,
+  limits = CLEAR_FACE_LIMITS,
+  boxSize?: number,
+): UnclearReason | null {
+  // Size first: a face this small is too far from the gate, and its landmarks
+  // (hence the pose checks below) are not reliable either.
+  if (boxSize !== undefined && boxSize < limits.minFacePx) return "small";
   if (!pose) return "landmarks";
   if (Math.abs(pose.rollDeg) > limits.maxRollDeg) return "roll";
   if (Math.abs(pose.yaw) > limits.maxYaw) return "yaw";
@@ -1023,7 +1038,7 @@ export async function extractFaces(input: ImageInput): Promise<ExtractedFace[]> 
       const boxSize = Math.min(f.box[2] - f.box[0], f.box[3] - f.box[1]);
       const { quality, sharpness } = faceQuality(aligned, boxSize);
       const pose = facePose(f.landmarks);
-      const issue = clearFaceIssue(pose);
+      const issue = clearFaceIssue(pose, CLEAR_FACE_LIMITS, boxSize);
       out.push({ ...f, embedding, quality, sharpness, boxSize, pose, clear: issue === null, ...(issue ? { unclearReason: issue } : {}) });
     }
     out.sort((a, b) => b.score - a.score);

@@ -42,6 +42,28 @@ describe("face pose from five landmarks", () => {
   });
 
   it("uses the calibrated defaults", () => {
-    assert.deepEqual(CLEAR_FACE_LIMITS, { maxYaw: 1.5, minAspect: 0.3, maxAspect: 2.5, maxRollDeg: 45 });
+    assert.deepEqual(CLEAR_FACE_LIMITS, { minFacePx: 40, maxYaw: 1.5, minAspect: 0.3, maxAspect: 2.5, maxRollDeg: 45 });
+  });
+});
+
+describe("minimum face size", () => {
+  it("drops a face smaller than the floor, before looking at its pose", () => {
+    assert.equal(clearFaceIssue(facePose(FRONTAL), CLEAR_FACE_LIMITS, 39), "small");
+    assert.equal(clearFaceIssue(facePose(TURNED), CLEAR_FACE_LIMITS, 20), "small", "size is the first reason given");
+    assert.equal(clearFaceIssue(null, CLEAR_FACE_LIMITS, 10), "small");
+  });
+
+  it("keeps a frontal face at or above the floor", () => {
+    assert.equal(clearFaceIssue(facePose(FRONTAL), CLEAR_FACE_LIMITS, 40), null);
+    assert.equal(clearFaceIssue(facePose(FRONTAL), CLEAR_FACE_LIMITS, 400), null);
+  });
+
+  it("still applies the pose checks to a big face", () => {
+    assert.equal(clearFaceIssue(facePose(TURNED), CLEAR_FACE_LIMITS, 200), "yaw");
+  });
+
+  it("can be switched off, and is not applied when the size is unknown", () => {
+    assert.equal(clearFaceIssue(facePose(FRONTAL), { ...CLEAR_FACE_LIMITS, minFacePx: 0 }, 5), null);
+    assert.equal(clearFaceIssue(facePose(FRONTAL)), null);
   });
 });

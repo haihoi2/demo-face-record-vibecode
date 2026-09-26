@@ -1458,6 +1458,15 @@ const FACE_ENROLL_MIN_QUALITY = envFloat("FACE_ENROLL_MIN_QUALITY", 0.25);
  * are untouched by this: the floor gates STORAGE, never recognition.
  */
 const FACE_STRANGER_MIN_QUALITY = envFloat("FACE_STRANGER_MIN_QUALITY", 0.25);
+/**
+ * A stranger is stored (and grouped) only when their face is at least this
+ * many pixels (shorter side, source frame). Storage only, like the quality
+ * floor: an employee at 40-60 px is still recognised and let in (85% correct
+ * on this site), but an unknown face that small is too far away for an
+ * operator to identify - it was 54% of stranger captures (2026-09-26).
+ * Faces under FACE_MIN_SIZE_PX never reach this point at all.
+ */
+const FACE_STRANGER_MIN_SIZE_PX = envInt("FACE_STRANGER_MIN_SIZE_PX", 60, 0, 2000);
 /** Maximum templates kept per employee; the lowest-quality one is evicted when full. */
 const FACE_TEMPLATE_MAX = envInt("FACE_TEMPLATE_MAX", 12, 1, 200);
 /**
@@ -1560,7 +1569,7 @@ interface EngineObservation {
 const clearFaceGate = {
   clear: 0,
   unclear: 0,
-  byReason: { landmarks: 0, yaw: 0, aspect: 0, roll: 0 } as Record<UnclearReason, number>,
+  byReason: { small: 0, landmarks: 0, yaw: 0, aspect: 0, roll: 0 } as Record<UnclearReason, number>,
   lastUnclearAt: null as string | null,
 };
 
@@ -1824,7 +1833,14 @@ async function enrollTemplateFromImage(
     // A template must be a face looking at the camera: a turned or bowed head
     // makes a poor reference and drags every later comparison down.
     const faces = detected.filter((f) => f.clear);
-    if (faces.length === 0) return { rejected: "not-frontal", detectedFaces: detected.length };
+    if (faces.length === 0) {
+      // Every face too small is a size problem, not a pose one.
+      if (detected.every((f) => f.unclearReason === "small")) {
+        const q = Math.max(...detected.map((f) => f.quality));
+        return { rejected: "low-quality", quality: Math.round(q * 1000) / 1000, detectedFaces: detected.length };
+      }
+      return { rejected: "not-frontal", detectedFaces: detected.length };
+    }
     const best = faces.reduce((a, b) => (b.quality > a.quality ? b : a));
     // The same image registered twice adds nothing to matching and takes a slot
     // from the template cap (staging had such a pair at cosine 1.000).
@@ -3788,7 +3804,7 @@ async function grabRtspFrames(
 type RecognitionTrigger = "api" | "manual" | "watcher";
 
 /** Why a scan that DID decide something deliberately recorded nothing. */
-type OutcomeSuppression = "grant-cooldown" | "stranger-cooldown" | "stranger-quality";
+type OutcomeSuppression = "grant-cooldown" | "stranger-cooldown" | "stranger-quality" | "stranger-small";
 
 /**
  * Re-unlock / re-log dedupe for ONE employee at ONE gate.
@@ -4048,6 +4064,19 @@ async function applyRecognitionOutcome(input: RecognitionOutcomeInput): Promise<
       stats.lastSuppressed = "stranger-quality";
       stats.lastSuppressedAt = new Date(nowMs).toISOString();
       summary.suppressed = "stranger-quality";
+      return result;
+    }
+    // Too far away to identify: same treatment.
+    const strangerBox = input.strangerObservation?.box;
+    if (
+      strangerBox &&
+      FACE_STRANGER_MIN_SIZE_PX > 0 &&
+      Math.min(strangerBox[2] - strangerBox[0], strangerBox[3] - strangerBox[1]) < FACE_STRANGER_MIN_SIZE_PX
+    ) {
+      stats.strangersSuppressed += 1;
+      stats.lastSuppressed = "stranger-small";
+      stats.lastSuppressedAt = new Date(nowMs).toISOString();
+      summary.suppressed = "stranger-small";
       return result;
     }
     if (input.cooldowns && strangerCooldownMs > 0) {
@@ -5741,7 +5770,14 @@ async function prepareTemplateFromImage(
     // A template must be a face looking at the camera: a turned or bowed head
     // makes a poor reference and drags every later comparison down.
     const faces = detected.filter((f) => f.clear);
-    if (faces.length === 0) return { rejected: "not-frontal", detectedFaces: detected.length };
+    if (faces.length === 0) {
+      // Every face too small is a size problem, not a pose one.
+      if (detected.every((f) => f.unclearReason === "small")) {
+        const q = Math.max(...detected.map((f) => f.quality));
+        return { rejected: "low-quality", quality: Math.round(q * 1000) / 1000, detectedFaces: detected.length };
+      }
+      return { rejected: "not-frontal", detectedFaces: detected.length };
+    }
     const best = faces.reduce((a, b) => (b.quality > a.quality ? b : a));
     // The same image registered twice adds nothing to matching and takes a slot
     // from the template cap (staging had such a pair at cosine 1.000).
