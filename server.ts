@@ -32,6 +32,7 @@ import {
 import { envNumber } from "./src/server/env";
 import { guardAsyncRoutes, jsonErrorHandler } from "./src/server/asyncRoutes";
 import { accessLogExportName, csvCell } from "./src/server/csv";
+import { effectivePipelineMode, pipelineModeFromEnv } from "./src/server/pipeline/mode";
 import {
   DEFAULT_RECORDING_WINDOW,
   playbackFailure,
@@ -4867,10 +4868,24 @@ interface GateWatchOutcomeRuntime {
 }
 
 /** The public runtime view (src/types.ts `GateWatchRuntime`) + outcome telemetry. */
+/** Per-gate pipeline rollout (plan W0): only `legacy` runs until the pipeline is wired. */
+const PIPELINE_MODES = (["ENTRY", "EXIT"] as const).reduce((acc, gate) => {
+  const requested = pipelineModeFromEnv(gate);
+  const effective = effectivePipelineMode(requested);
+  if (effective.downgraded) {
+    console.warn(`[Pipeline ${gate}] PIPELINE_MODE_${gate}=${requested} chưa có trong bản này; cổng chạy chế độ legacy.`);
+  }
+  acc[gate] = { mode: effective.mode, requested };
+  return acc;
+}, {} as Record<"ENTRY" | "EXIT", { mode: "legacy" | "shadow" | "live"; requested: "legacy" | "shadow" | "live" }>);
+
 function gateWatchRuntime(state: GateWatcherState): GateWatchRuntime & GateWatchOutcomeRuntime {
+  const pipeline = PIPELINE_MODES[state.gate];
   return {
     gate: state.gate,
     enabled: state.enabled,
+    pipelineMode: pipeline.mode,
+    ...(pipeline.requested !== pipeline.mode ? { pipelineModeRequested: pipeline.requested } : {}),
     intervalSeconds: state.intervalSeconds,
     frames: state.frames,
     running: state.running,

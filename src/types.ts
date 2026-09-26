@@ -333,6 +333,10 @@ export interface GateWatchConfig {
 export interface GateWatchRuntime {
   gate: "ENTRY" | "EXIT";
   enabled: boolean;
+  /** Real-time pipeline rollout for this gate: legacy watcher, shadow, or live. */
+  pipelineMode?: "legacy" | "shadow" | "live";
+  /** Set when the configured mode is not available in this build and legacy runs instead. */
+  pipelineModeRequested?: "legacy" | "shadow" | "live";
   intervalSeconds: number;
   frames: number;
   /** True while a scan is actually in flight. */
