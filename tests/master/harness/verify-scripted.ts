@@ -13,7 +13,7 @@ import { spawnSync } from "node:child_process";
 import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { extractFaces } from "../../../src/server/faceEmbedding.ts";
-import { APPEAR_AT_S, GATES, SLOT_TYPES, STAGGER_S, firstUsableTau, laneCentre } from "./scripted.ts";
+import { APPEAR_AT_S, GATES, SLOT_TYPES, STAGGER_S, firstUsableTau, laneCentre, slotFile } from "./scripted.ts";
 
 const FFMPEG = process.env.FFMPEG_PATH || "ffmpeg";
 
@@ -34,7 +34,7 @@ async function main() {
     const g = GATES[gateKey];
     for (const slot of Object.values(SLOT_TYPES)) {
       if (slot.faces.length === 0) continue;
-      const file = join(dir, "slots", `${gateKey}-${slot.id}.mp4`);
+      const file = join(dir, "slots", slotFile(gateKey, slot.id, 0));
       for (const [lane, key] of slot.faces.entries()) {
         const appear = APPEAR_AT_S + lane * STAGGER_S;
         const first = appear + firstUsableTau();

@@ -9,9 +9,10 @@
  * committed); the repository only has faces.example.json.
  *
  *   node --import tsx tests/master/harness/scripted.ts \
- *     --faces /clips/scripted/faces.json --out /clips/scripted [--cycles 4] [--verify]
+ *     --faces /clips/scripted/faces.json --out /clips/scripted [--cycles 4] [--offsets 0,1,2,3]
+ *     [--gates entry,exit] [--render-offsets 1,2 --no-assemble]   (parallel render, then one assembling run)
  *
- * Output (all under --out): slots/<gate>-<slot>.mp4, <gate>-sequence.mp4,
+ * Output (all under --out): slots/<gate>-<slot>-o<offset>.mp4, <gate>-sequence.mp4,
  * <gate>-empty.mp4 (idle scene), faces/<key>-enrol.jpg, clips.json.
  *
  * Face schedule inside a 25 s slot (tau = time since the face appeared):
@@ -20,7 +21,7 @@
  *   tau = 1.0 to tau = 4.0: a 3 s usable window, the "2-3 s" of the plan.
  */
 import { spawn, spawnSync } from "node:child_process";
-import { copyFileSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, statSync, readFileSync, writeFileSync } from "node:fs";
 import { basename, join } from "node:path";
 import { pathToFileURL } from "node:url";
 import type { ClipTruth, Gate, GroundTruth, PassageTruth, PersonTruth } from "../lib/groundTruth.ts";
@@ -193,11 +194,20 @@ export interface RenderedPerson {
   lastUsableS: number;
 }
 
-async function renderSlot(g: GateSpec, slot: SlotType, faces: Record<string, { img: Rgb; ratio: number }>, bg: Rgb, outFile: string): Promise<RenderedPerson[]> {
-  const people: RenderedPerson[] = slot.faces.map((key, lane) => {
-    const appearS = APPEAR_AT_S + lane * STAGGER_S;
+/** Who appears when in one slot rendered with its faces shifted by `offsetS`. */
+export function slotPeople(slot: SlotType, offsetS = 0): RenderedPerson[] {
+  return slot.faces.map((key, lane) => {
+    const appearS = APPEAR_AT_S + offsetS + lane * STAGGER_S;
     return { key, lane, appearS, firstUsableS: appearS + firstUsableTau(), lastUsableS: appearS + LAST_USABLE_TAU };
   });
+}
+
+export function slotFile(gateKey: string, slotId: string, offsetS: number): string {
+  return `${gateKey}-${slotId}-o${offsetS}.mp4`;
+}
+
+async function renderSlot(g: GateSpec, slot: SlotType, faces: Record<string, { img: Rgb; ratio: number }>, bg: Rgb, outFile: string, offsetS: number): Promise<RenderedPerson[]> {
+  const people = slotPeople(slot, offsetS);
   const frames = Math.round(SLOT_S * g.fps);
   const ff = spawn(FFMPEG, [
     "-hide_banner", "-loglevel", "error", "-y",
@@ -259,6 +269,13 @@ export async function main(argv = process.argv.slice(2)) {
   const out = String(args.out || "");
   const cycles = Math.max(1, Number(args.cycles || 4));
   const gatesWanted = String(args.gates || "entry,exit").split(",") as Array<"entry" | "exit">;
+  // Cycle c shifts every face by offsets[c % n] seconds. The legacy watcher only
+  // decodes keyframes (entry: one every 4 s), so without this every passage of
+  // a slot type would sit at the same keyframe phase; 0,1,2,3 s samples a 4 s
+  // GOP uniformly, as random arrivals do on site.
+  const offsets = String(args.offsets ?? "0,1,2,3").split(",").map(Number).filter((n) => Number.isFinite(n) && n >= 0 && n <= 8);
+  const renderOffsets = new Set(String(args["render-offsets"] ?? offsets.join(",")).split(",").map(Number));
+  const assemble = !args["no-assemble"];
   if (!facesPath || !out) throw new Error("usage: scripted.ts --faces faces.json --out DIR [--cycles N] [--gates entry,exit]");
   const specs = JSON.parse(readFileSync(facesPath, "utf8")) as Record<string, FaceSpec>;
   for (const key of ["A", "Ah", "B", "C"]) if (!specs[key]) throw new Error(`faces.json needs key ${key}`);
@@ -282,23 +299,28 @@ export async function main(argv = process.argv.slice(2)) {
   for (const gateKey of gatesWanted) {
     const g = GATES[gateKey];
     const bg = background(g);
-    const rendered: Record<string, RenderedPerson[]> = {};
-    for (const slot of Object.values(SLOT_TYPES)) {
-      const file = join(out, "slots", `${gateKey}-${slot.id}.mp4`);
-      const t0 = Date.now();
-      rendered[slot.id] = await renderSlot(g, slot, faces, bg, file);
-      console.log(`[scripted] ${gateKey} ${slot.id} rendered in ${((Date.now() - t0) / 1000).toFixed(1)} s`);
+    for (const o of offsets) {
+      if (!renderOffsets.has(o)) continue;
+      for (const slot of Object.values(SLOT_TYPES)) {
+        if (slot.faces.length === 0 && o !== 0) continue; // an empty scene has no phase
+        const file = join(out, "slots", slotFile(gateKey, slot.id, o));
+        if (existsSync(file) && statSync(file).size > 0) continue; // resumable / parallel runs
+        const t0 = Date.now();
+        await renderSlot(g, slot, faces, bg, file, o);
+        console.log(`[scripted] ${gateKey} ${slot.id} +${o}s rendered in ${((Date.now() - t0) / 1000).toFixed(1)} s`);
+      }
     }
+    if (!assemble) continue;
     // Idle scene for CPU-at-idle measurements: 4 empty slots.
-    concat(Array(4).fill(join(out, "slots", `${gateKey}-E.mp4`)), join(out, `${gateKey}-empty.mp4`), join(out, `${gateKey}-empty.txt`));
+    concat(Array(4).fill(join(out, "slots", slotFile(gateKey, "E", 0))), join(out, `${gateKey}-empty.mp4`), join(out, `${gateKey}-empty.txt`));
 
-    const order: string[] = [];
-    for (let c = 0; c < cycles; c++) order.push(...CYCLE);
-    concat(order.map((id) => join(out, "slots", `${gateKey}-${id}.mp4`)), join(out, `${gateKey}-sequence.mp4`), join(out, `${gateKey}-sequence.txt`));
+    const order: Array<{ id: string; o: number }> = [];
+    for (let c = 0; c < cycles; c++) for (const id of CYCLE) order.push({ id, o: SLOT_TYPES[id].faces.length ? offsets[c % offsets.length] : 0 });
+    concat(order.map(({ id, o }) => join(out, "slots", slotFile(gateKey, id, o))), join(out, `${gateKey}-sequence.mp4`), join(out, `${gateKey}-sequence.txt`));
 
-    const passages: PassageTruth[] = order.map((id, i) => {
+    const passages: PassageTruth[] = order.map(({ id, o }, i) => {
       const startS = i * SLOT_S;
-      const people: PersonTruth[] = rendered[id].map((p) => {
+      const people: PersonTruth[] = slotPeople(SLOT_TYPES[id], o).map((p) => {
         const spec = specs[p.key];
         const identity = spec.identity || p.key;
         return {
@@ -311,7 +333,7 @@ export async function main(argv = process.argv.slice(2)) {
           ...(spec.role === "stranger" ? { impostor: false } : {}),
         };
       });
-      return { id: `${gateKey}-${String(i + 1).padStart(3, "0")}-${id}`, startS, endS: startS + SLOT_S, people, tags: SLOT_TYPES[id].tags };
+      return { id: `${gateKey}-${String(i + 1).padStart(3, "0")}-${id}`, startS, endS: startS + SLOT_S, people, tags: [...SLOT_TYPES[id].tags, `offset:${o}`] };
     });
     clips.push({
       id: `scripted-${gateKey}`,
@@ -328,6 +350,7 @@ export async function main(argv = process.argv.slice(2)) {
     });
   }
 
+  if (!assemble) return;
   const now = new Date();
   const doc: GroundTruth = {
     schemaVersion: 1,
