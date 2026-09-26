@@ -1,7 +1,7 @@
 # Plan: real-time gate recognition, built by parallel agents
 
-Status: proposed 2026-09-26. Base: `main` @ `633d995` (live on dev/staging).
-Integration owner: Hermes (backend-integrator) unless the owner names another.
+Status: APPROVED by the owner 2026-09-26. Base: `main` @ `633d995` (live on dev/staging).
+Integration owner for this wave: the Claude Code session that wrote this plan (acting as INT).
 
 ## 1. Goal and acceptance
 
@@ -162,9 +162,14 @@ One agent owns one suite; nothing is tagged without its sign-off.
 | Disk at 76% on root | clips and model artifacts on `/data`; test image removed after gates |
 | Shadow mode acting by mistake | MT security suite asserts no unlock/log in shadow; INT code review |
 
-## 9. Owner decisions needed before W1
+## 9. Owner decisions (2026-09-26)
 
-- Approve this plan and the agent/ownership table.
-- Approve exporting ~50 real passages from the NVR as test clips (biometric data, kept on `/data`).
-- Whether the entry camera's frame rate may be lowered to 8-10 fps on the NVR/camera.
-- Strangers: crops stored for every detected face ≥ 60 px (recommended), or employees only.
+1. Plan and ownership table: **approved**.
+2. Export ~50 real passages from the NVR as test clips: **allowed** (kept in `/data/test-clips`,
+   0700, never committed, deleted after 30 days).
+3. Frame rate: **do not change the camera or NVR**. The reader decodes the stream as delivered and
+   keeps ~8 fps in the buffer (FFmpeg `fps` filter + newest-frame hand-off). Consequence: decoding
+   the 4K entry stream still runs at its full rate (~1.5-2 cores, to be measured in W0); STR should
+   try decoder-side savings (e.g. `-skip_frame nonref`, threads) and report the numbers.
+4. Stranger crops: **stored for every detected face ≥ 60 px** (employees and strangers), so the
+   stranger panel, quick-register, merge and webhooks keep working on crops.
