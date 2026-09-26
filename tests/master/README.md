@@ -28,7 +28,7 @@ a camera or the door controller. `collect.ts` refuses `:8080` and the public hos
 | `contract/` | pipeline-contract suite (FrameSource over the harness; tracker scenarios) |
 | `acceptance/` | section-1 targets, legacy vs pipeline on the same clips |
 | `run-signoff.sh` | full gate run + sign-off report |
-| `results/` | committed metrics of reference runs (no personal data) |
+| `results/` | committed metrics of reference runs (no personal data): `2026-09-26-legacy-scripted.*` is the W1 baseline |
 
 `tests/integration/pipelineWatch.test.ts` is the part of the suite that joins the regular
 integration regression (always runnable, no harness needed).
@@ -65,6 +65,10 @@ tests/master/run-signoff.sh rc1 --replay
 
 - Ground truth of scripted clips: a face grows 40 -> 110 px over 3.5 s and is gone at 4 s, so it
   is >= 60 px for exactly 3 s from `appear + 1.0 s`; the detector check agrees within ~0.1 s.
+- The legacy watcher decodes keyframes only (entry GOP 4 s), so cycle c shifts every face by
+  0/1/2/3 s: a uniform sample of the keyframe phase, as random arrivals give on site (a 3 s usable
+  window then holds an entry keyframe 3 times in 4). Without it the baseline is biased
+  (`results/*-v1-phase-biased.json`, kept for reference; its exit half is unaffected).
 - Passage order keeps the legacy cooldowns (grant 20 s, stranger 60 s) from hiding repeats.
 - Decision latency = access-log timestamp - first >= 60 px moment; logs are attributed per
   passage window (see `lib/metrics.ts`). Strangers are attributed by order (logs carry no identity).
