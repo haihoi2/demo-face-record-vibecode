@@ -37,6 +37,7 @@ import {
   Star,
   X,
   Save,
+  Crop,
 } from "lucide-react";
 import {
   CameraStreamsConfig,
@@ -47,6 +48,9 @@ import {
 } from "../types";
 import { apiFetch, operatorJsonFetch } from "../utils/api";
 import { ProtectedImage } from "./ProtectedImage";
+import { GateAreaEditor } from "./GateAreaEditor";
+import { formatGateArea, streamGateArea } from "../utils/gateArea";
+import { hasRole, useOperatorSession } from "../utils/session";
 
 const DEFAULT_STREAMS_CONFIG: CameraStreamsConfig = {
   entryGate: {
@@ -271,6 +275,9 @@ interface PreviewSource {
 }
 
 export const CameraStreamConfigPage: React.FC = () => {
+  // Drawing a gate area is a camera-stream mutation: operator and up (the server enforces it).
+  const canEditGateArea = hasRole(useOperatorSession(), "operator");
+  const [gateAreaStreamId, setGateAreaStreamId] = useState<string | null>(null);
   const [config, setConfig] = useState<CameraStreamsConfig>(DEFAULT_STREAMS_CONFIG);
   const [telemetry, setTelemetry] = useState<ThreadPoolTelemetry | null>(null);
   const [activeGateTab, setActiveGateTab] = useState<"ENTRY" | "EXIT" | "DUAL_MONITOR">("ENTRY");
@@ -302,8 +309,7 @@ export const CameraStreamConfigPage: React.FC = () => {
   const [previewError, setPreviewError] = useState<string | null>(null);
   const [previewFps] = useState<number>(24);
 
-  // RTSP Custom Options & AI Scan
-  const [rtspViewMode, setRtspViewMode] = useState<"MJPEG" | "SNAPSHOT" | "SIMULATION">("MJPEG");
+  // RTSP test: ONE still per explicit click (no continuous picture in the browser)
   const [isScanningRtsp, setIsScanningRtsp] = useState<boolean>(false);
   const [rtspScanResult, setRtspScanResult] = useState<any | null>(null);
   const [showHikvisionGuide, setShowHikvisionGuide] = useState<boolean>(false);
@@ -937,6 +943,7 @@ export const CameraStreamConfigPage: React.FC = () => {
     setEditingStreamId(null);
     setAddFormOpen(false);
     setSnapshotStreamId(null);
+    setGateAreaStreamId(null);
     setRtspScanResult(null);
     resetStreamMessages();
   };
@@ -1418,6 +1425,7 @@ export const CameraStreamConfigPage: React.FC = () => {
     const canSnapshot = s.sourceType === "RTSP" || s.sourceType === "HTTP_MJPEG" || s.sourceType === "BACKEND_UVC";
     const displayUrl = s.sourceType === "RTSP" ? maskRtspCredentials(s.rtspUrl) : streamUrlOf(s);
     const isEditing = editingStreamId === s.id;
+    const gateArea = streamGateArea(s);
 
     return (
       <div
@@ -1489,6 +1497,16 @@ export const CameraStreamConfigPage: React.FC = () => {
                   {s.resolution || "AUTO"} • {s.fps || 25} FPS
                 </span>
               )}
+              {s.sourceType !== "CLIENT_UVC" && (
+                <span
+                  className={`text-[10px] px-2 py-0.5 rounded-md font-semibold border ${
+                    gateArea ? "bg-amber-50 text-amber-800 border-amber-200" : "bg-white text-slate-500 border-slate-200"
+                  }`}
+                  title={`Vùng cổng: ${formatGateArea(gateArea)}`}
+                >
+                  Vùng cổng: {gateArea ? "đã đặt" : "toàn khung"}
+                </span>
+              )}
             </div>
             <div className="text-xs font-mono text-slate-600 truncate" title={displayUrl}>
               {displayUrl || <span className="italic text-slate-400">Chưa có URL</span>}
@@ -1530,11 +1548,22 @@ export const CameraStreamConfigPage: React.FC = () => {
                   ? "border-slate-800 bg-slate-800 text-white"
                   : "border-slate-300 bg-white text-slate-700 hover:bg-slate-50"
               }`}
-              title="Chụp 1 khung hình snapshot từ luồng này"
+              title="Chụp 1 khung hình từ luồng này để kiểm tra (chỉ khi bấm, không tự làm mới)"
             >
               <ImageIcon className="w-3.5 h-3.5" />
               Xem ảnh
             </button>
+            {canEditGateArea && s.sourceType !== "CLIENT_UVC" && (
+              <button
+                type="button"
+                onClick={() => setGateAreaStreamId(s.id)}
+                className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg border border-amber-200 bg-amber-50 text-amber-800 hover:bg-amber-100 text-xs font-semibold transition-colors"
+                title="Vẽ vùng cổng: phần khung hình hệ thống tìm khuôn mặt"
+              >
+                <Crop className="w-3.5 h-3.5" />
+                Vùng cổng
+              </button>
+            )}
             <button
               type="button"
               onClick={() => (isEditing ? setEditingStreamId(null) : openEditStream(s))}
@@ -1940,7 +1969,7 @@ export const CameraStreamConfigPage: React.FC = () => {
             }`}
           >
             <Eye className="w-4 h-4 text-purple-600" />
-            Xem Đồng Thời 2 Cổng (Dual Monitor)
+            Tổng Quan 2 Cổng
           </button>
         </div>
 
@@ -2075,10 +2104,10 @@ export const CameraStreamConfigPage: React.FC = () => {
                 <div>
                   <h3 className="text-sm font-bold text-slate-900 flex items-center gap-2">
                     <Eye className="w-4 h-4 text-blue-600" />
-                    Trình Xem Thử Nghiệm Luồng Trực Tiếp ({currentGateConfig.name})
+                    Kiểm Tra Luồng Bằng 1 Khung Hình ({currentGateConfig.name})
                   </h3>
                   <p className="text-xs text-slate-700">
-                    Kiểm tra góc quay, chất lượng khung hình thực tế và thử nghiệm nhận diện AI đa luồng.
+                    Chụp 1 khung hình khi bấm để kiểm tra góc quay, và thử nhận diện AI. Ứng dụng không phát hình camera liên tục; bảng điều khiển chỉ hiển thị ảnh khuôn mặt đã chụp.
                   </p>
                 </div>
 
@@ -2102,37 +2131,6 @@ export const CameraStreamConfigPage: React.FC = () => {
 
                   {previewStream?.sourceType === "RTSP" && (
                     <>
-                      {/* RTSP Mode Switcher */}
-                      <div className="flex items-center bg-slate-100 p-0.5 rounded-lg text-xs font-semibold">
-                        <button
-                          type="button"
-                          onClick={() => { setRtspViewMode("MJPEG"); setPreviewTimestamp(Date.now()); }}
-                          className={`px-2.5 py-1 rounded-md transition-colors ${
-                            rtspViewMode === "MJPEG" ? "bg-white text-indigo-700 shadow-xs" : "text-slate-600 hover:text-slate-900"
-                          }`}
-                        >
-                          Proxy MJPEG
-                        </button>
-                        <button
-                          type="button"
-                          onClick={() => { setRtspViewMode("SNAPSHOT"); setPreviewTimestamp(Date.now()); }}
-                          className={`px-2.5 py-1 rounded-md transition-colors ${
-                            rtspViewMode === "SNAPSHOT" ? "bg-white text-indigo-700 shadow-xs" : "text-slate-600 hover:text-slate-900"
-                          }`}
-                        >
-                          Snapshot Thật
-                        </button>
-                        <button
-                          type="button"
-                          onClick={() => { setRtspViewMode("SIMULATION"); setPreviewTimestamp(Date.now()); }}
-                          className={`px-2.5 py-1 rounded-md transition-colors ${
-                            rtspViewMode === "SIMULATION" ? "bg-white text-indigo-700 shadow-xs" : "text-slate-600 hover:text-slate-900"
-                          }`}
-                        >
-                          Mô Phỏng
-                        </button>
-                      </div>
-
                       {/* AI Face Recognition Test Directly from RTSP */}
                       <button
                         type="button"
@@ -2155,7 +2153,7 @@ export const CameraStreamConfigPage: React.FC = () => {
                       className="flex items-center gap-2 px-4 py-2 rounded-lg bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-semibold shadow-xs transition-colors disabled:opacity-50"
                     >
                       <Play className="w-3.5 h-3.5" />
-                      Bật Xem Trực Tiếp
+                      {previewStream?.sourceType === "CLIENT_UVC" ? "Bật webcam kiểm tra" : "Chụp 1 khung kiểm tra"}
                     </button>
                   ) : (
                     <button
@@ -2164,7 +2162,7 @@ export const CameraStreamConfigPage: React.FC = () => {
                       className="flex items-center gap-2 px-4 py-2 rounded-lg bg-rose-600 hover:bg-rose-700 text-white text-xs font-semibold shadow-xs transition-colors"
                     >
                       <Square className="w-3.5 h-3.5" />
-                      Dừng Xem
+                      {previewStream?.sourceType === "CLIENT_UVC" ? "Tắt webcam" : "Ẩn khung hình"}
                     </button>
                   )}
                 </div>
@@ -2200,66 +2198,31 @@ export const CameraStreamConfigPage: React.FC = () => {
                       className="w-full h-full object-cover"
                     />
                   ) : previewStream.sourceType === "RTSP" ? (
-                    rtspViewMode === "MJPEG" ? (
-                      // Deliberately a plain <img>: this is a continuous multipart
-                      // stream, so a fetch()/blob() round trip would never resolve.
-                      <img
-                        key={`mjpeg-${previewStream.id}-${previewTimestamp}`}
-                        src={`/api/camera-streams/mjpeg?gate=${currentGateKey}&stream=${encodeURIComponent(previewStream.id)}&t=${previewTimestamp}`}
-                        alt="RTSP Live MJPEG"
-                        onError={() => {
-                          // If proxy fails (e.g. cloud cannot reach private LAN), fallback gracefully
-                          setRtspViewMode("SNAPSHOT");
-                          setPreviewTimestamp(Date.now());
-                        }}
-                        className="w-full h-full object-contain"
-                      />
-                    ) : rtspViewMode === "SNAPSHOT" ? (
-                      <ProtectedImage
-                        key={`snap-${previewStream.id}-${previewTimestamp}`}
-                        src={`/api/camera-streams/snapshot?gate=${currentGateKey}&stream=${encodeURIComponent(previewStream.id)}&t=${previewTimestamp}`}
-                        alt="RTSP Snapshot"
-                        className="w-full h-full object-contain"
-                      />
-                    ) : (
-                      <ProtectedImage
-                        src={`/api/camera-streams/test-frame?gate=${currentGateKey}&source=${encodeURIComponent(
-                          previewStream.sourceType
-                        )}&t=${previewTimestamp}`}
-                        alt="Camera Stream Simulation"
-                        className="w-full h-full object-contain"
-                      />
-                    )
-                  ) : previewStream.sourceType === "HTTP_MJPEG" && previewStream.httpUrl ? (
-                    // Deliberately a plain <img>: httpUrl is the camera's own host,
-                    // which must never receive the operator session cookie.
-                    <img
-                      key={`http-${previewStream.id}-${previewTimestamp}`}
-                      src={previewStream.httpUrl}
-                      alt="HTTP MJPEG Stream"
-                      onError={(e) => {
-                        (e.target as HTMLImageElement).src = `/api/camera-streams/test-frame?gate=${currentGateKey}&source=HTTP_MJPEG&t=${previewTimestamp}`;
-                      }}
+                    // ONE still per click, fetched with the session; nothing refreshes on its own.
+                    <ProtectedImage
+                      key={`snap-${previewStream.id}-${previewTimestamp}`}
+                      src={`/api/camera-streams/snapshot?gate=${currentGateKey}&stream=${encodeURIComponent(previewStream.id)}&t=${previewTimestamp}`}
+                      alt={`Khung hình kiểm tra của ${previewStream.label}`}
                       className="w-full h-full object-contain"
                     />
                   ) : (
-                    <ProtectedImage
-                      src={`/api/camera-streams/test-frame?gate=${currentGateKey}&source=${encodeURIComponent(
-                        previewStream.sourceType
-                      )}&t=${previewTimestamp}`}
-                      alt="Camera Stream Test"
-                      className="w-full h-full object-contain"
-                    />
+                    <div className="text-center space-y-2 p-6 max-w-md">
+                      <Info className="w-8 h-8 text-slate-500 mx-auto" />
+                      <p className="text-xs text-slate-300">
+                        Ứng dụng không phát hình trực tiếp của camera. Dùng nút “Kiểm tra” ở danh sách luồng để thử
+                        kết nối; toàn cảnh một lượt quét xem bằng nút “Đoạn ghi” trong Nhật ký.
+                      </p>
+                    </div>
                   )
                 ) : (
                   <div className="text-center space-y-2 p-6">
                     <Video className="w-12 h-12 text-slate-700 mx-auto" />
                     <p className="text-sm font-medium text-slate-400">
-                      Trình xem thử nghiệm đang ở trạng thái chờ
+                      Chưa có khung hình kiểm tra
                     </p>
                     <p className="text-xs text-slate-500 max-w-sm mx-auto">
                       {previewStream
-                        ? <>Nhấn "Bật Xem Trực Tiếp" để kết nối luồng <code className="text-indigo-400">{previewStream.label}</code>.</>
+                        ? <>Nhấn "{previewStream.sourceType === "CLIENT_UVC" ? "Bật webcam kiểm tra" : "Chụp 1 khung kiểm tra"}" để kiểm tra luồng <code className="text-indigo-400">{previewStream.label}</code>. Ứng dụng không phát hình camera liên tục.</>
                         : "Hãy thêm ít nhất một luồng camera cho cổng này."}
                     </p>
                   </div>
@@ -2277,7 +2240,7 @@ export const CameraStreamConfigPage: React.FC = () => {
                       <span className="text-slate-400">|</span>
                       <span className="text-emerald-400 font-bold">
                         {previewStream.sourceType}
-                        {previewStream.sourceType === "RTSP" ? ` (${rtspViewMode})` : ""}
+                        {previewStream.sourceType === "RTSP" ? " (1 khung)" : ""}
                       </span>
                     </div>
 
@@ -2350,22 +2313,22 @@ export const CameraStreamConfigPage: React.FC = () => {
             </div>
           </div>
         ) : (
-          /* DUAL MONITOR SPLIT SCREEN */
+          /* TWO-GATE OVERVIEW: stream status only - no camera pictures */
           <div className="p-6 space-y-6">
-            <div className="text-center max-w-md mx-auto space-y-1">
-              <h3 className="text-base font-bold text-slate-900">
-                Giám Sát Đồng Thời Cả 2 Cổng (Cổng Vào & Cổng Ra)
-              </h3>
+            <div className="text-center max-w-xl mx-auto space-y-1">
+              <h3 className="text-base font-bold text-slate-900">Tổng Quan Luồng Của Cả 2 Cổng</h3>
               <p className="text-xs text-slate-700">
-                Màn hình kép hiển thị snapshot của toàn bộ luồng đang bật ở cả 2 cổng, hỗ trợ bảo vệ an ninh kiểm soát lưu lượng song song.
+                Ứng dụng chỉ hiển thị ảnh khuôn mặt đã chụp, không hiển thị hình camera. Toàn cảnh một lượt quét
+                xem bằng nút “Đoạn ghi” trong Nhật ký; kiểm tra một luồng bằng 1 khung hình ở tab của từng cổng.
               </p>
             </div>
 
             <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
               {(["entry", "exit"] as GateKey[]).map((key) => {
                 const gate = config[gateFieldOf(key)];
-                const streams = deriveGateStreams(gate, key).filter((s) => s.enabled);
-                const primary = getPrimaryStream(streams);
+                const all = deriveGateStreams(gate, key);
+                const enabledCount = all.filter((s) => s.enabled).length;
+                const primary = getPrimaryStream(all);
                 const isEntry = key === "entry";
                 return (
                   <div key={key} className="space-y-2">
@@ -2379,54 +2342,38 @@ export const CameraStreamConfigPage: React.FC = () => {
                           isEntry ? "bg-emerald-50 text-emerald-700 border-emerald-200" : "bg-blue-50 text-blue-700 border-blue-200"
                         }`}
                       >
-                        {streams.length} luồng bật
+                        {enabledCount} luồng bật
                       </span>
                     </div>
-                    {streams.length === 0 ? (
-                      <div className="aspect-video bg-slate-900 rounded-xl border border-slate-800 flex items-center justify-center text-xs text-slate-400">
-                        Chưa có luồng nào được bật
+                    {all.length === 0 ? (
+                      <div className="p-4 rounded-xl border border-dashed border-slate-300 text-xs text-slate-500 text-center">
+                        Chưa có luồng nào
                       </div>
                     ) : (
-                      <div className={`grid gap-3 ${streams.length > 1 ? "grid-cols-1 sm:grid-cols-2" : "grid-cols-1"}`}>
-                        {streams.map((s) => (
-                          <div
-                            key={s.id}
-                            className="relative aspect-video bg-slate-900 rounded-xl overflow-hidden border border-slate-800 flex items-center justify-center"
-                          >
-                            <ProtectedImage
-                              src={
-                                s.sourceType === "RTSP" || s.sourceType === "BACKEND_UVC"
-                                  ? `/api/camera-streams/snapshot?gate=${key}&stream=${encodeURIComponent(s.id)}&t=${previewTimestamp}`
-                                  : `/api/camera-streams/test-frame?gate=${key}&source=${encodeURIComponent(s.sourceType)}&t=${previewTimestamp}`
-                              }
-                              alt={s.label}
-                              fallbackSrc={`/api/camera-streams/test-frame?gate=${key}&source=${encodeURIComponent(s.sourceType)}%20Offline`}
-                              className="w-full h-full object-contain"
-                            />
-                            <div className="absolute top-2 left-2 bg-black/60 text-white text-[11px] px-2 py-1 rounded font-mono flex items-center gap-1.5">
-                              {isEntry ? "VÀO" : "RA"} • {s.label}
+                      <ul className="rounded-xl border border-slate-200 divide-y divide-slate-100 bg-white">
+                        {all.map((s) => {
+                          const area = streamGateArea(s);
+                          return (
+                            <li key={s.id} className="px-3 py-2 flex flex-wrap items-center gap-2 text-xs">
+                              <span className={`font-semibold ${s.enabled ? "text-slate-900" : "text-slate-400"}`}>{s.label}</span>
                               {primary?.id === s.id && (
-                                <span className="text-[9px] px-1 py-0.5 rounded bg-indigo-600 text-white font-bold">Chính</span>
+                                <span className="text-[10px] px-1.5 py-0.5 rounded bg-indigo-600 text-white font-bold">Chính</span>
                               )}
-                            </div>
-                          </div>
-                        ))}
-                      </div>
+                              <span className="text-[10px] px-1.5 py-0.5 rounded font-mono bg-slate-100 text-slate-700 border border-slate-200">
+                                {SOURCE_TYPE_LABEL[s.sourceType] || s.sourceType}
+                              </span>
+                              {!s.enabled && <span className="text-[10px] text-slate-500">đã tắt</span>}
+                              <span className="ml-auto text-[10px] text-slate-500" title={formatGateArea(area)}>
+                                Vùng cổng: {area ? "đã đặt" : "toàn khung"}
+                              </span>
+                            </li>
+                          );
+                        })}
+                      </ul>
                     )}
                   </div>
                 );
               })}
-            </div>
-
-            <div className="flex justify-center">
-              <button
-                type="button"
-                onClick={() => setPreviewTimestamp(Date.now())}
-                className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg border border-slate-300 text-slate-700 hover:bg-slate-50 text-xs font-semibold"
-              >
-                <RefreshCw className="w-3.5 h-3.5 text-indigo-600" />
-                Chụp lại toàn bộ snapshot
-              </button>
             </div>
           </div>
         )}
@@ -2492,6 +2439,24 @@ export const CameraStreamConfigPage: React.FC = () => {
           </div>
         </div>
       </div>
+
+      {gateAreaStreamId &&
+        activeGateTab !== "DUAL_MONITOR" &&
+        (() => {
+          const target = currentStreams.find((x) => x.id === gateAreaStreamId);
+          if (!target) return null;
+          return (
+            <GateAreaEditor
+              gateKey={currentGateKey}
+              gateName={currentGateConfig.name}
+              stream={target}
+              onSaved={(streams) => {
+                if (streams && streams.length > 0) applyStreamsLocally(currentGateKey, deriveGateStreams({ ...currentGateConfig, streams }, currentGateKey));
+              }}
+              onClose={() => setGateAreaStreamId(null)}
+            />
+          );
+        })()}
     </div>
   );
 };

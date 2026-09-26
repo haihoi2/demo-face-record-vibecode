@@ -39,19 +39,17 @@ describe("protected biometric images", () => {
     }
   });
 
-  it("keeps streaming and third-party image sources on a plain img", () => {
-    // A multipart MJPEG response never completes, so it cannot be fetched into a
-    // blob; a camera's own host must never receive the operator cookie. Everything
-    // else under /api/camera-streams is a single JPEG and goes through the component.
+  it("shows camera stills only through the component, and no continuous camera stream at all", () => {
+    // Owner decision 2026-09-26: the browser shows captured face crops, never a
+    // live camera picture. The only camera stills left are single frames the
+    // operator asks for (stream test, gate-area editor), fetched with the session.
     const source = read("src/components/CameraStreamConfigPage.tsx");
     const bareApi = source.match(/<img\b[\s\S]{0,240}?src=\{`\/api\/camera-streams\/(\w+)/g) || [];
-    assert.deepEqual(
-      bareApi.map((m) => (m.match(/camera-streams\/(\w+)/) || [])[1]),
-      ["mjpeg"],
-      "only the MJPEG stream may stay a bare <img>"
-    );
+    assert.deepEqual(bareApi, [], "no camera-stream image may be a bare <img>");
     assert.match(source, /<ProtectedImage[\s\S]{0,240}?camera-streams\/snapshot/);
-    assert.match(source, /fallbackSrc=/);
+    for (const path of ["src/components/CameraStreamConfigPage.tsx", "src/components/CameraDashboard.tsx"]) {
+      assert.doesNotMatch(read(path), /camera-streams\/mjpeg/, `${path} must not stream MJPEG`);
+    }
   });
 
   it("passes inline data/blob sources straight through instead of refetching them", () => {
