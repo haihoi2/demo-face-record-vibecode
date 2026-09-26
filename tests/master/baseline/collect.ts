@@ -14,6 +14,8 @@
  *   record  --seconds N --out <sse.jsonl>        capture watcher SSE events
  *   analyze --clips <clips.json> --state <state.json> --ready ENTRY=<iso>,EXIT=<iso>
  *           [--sse sse.jsonl] [--cpu cpu.csv] [--phases phases.json] --name legacy --out <m.json> [--md <m.md>]
+ *           [--decisions logs|shadow]   shadow = score the pipeline_shadow_result SSE stream
+ *                                       (shadow mode writes no access logs by design)
  *
  * Never aim this at the live gateway: `setup` rewrites the camera config and
  * creates employees. It refuses APP_URLs on :8080 or the public hostnames.
@@ -238,6 +240,23 @@ function readJsonl(file: string): any[] {
   }
 }
 
+/**
+ * Shadow mode writes no access log; its decisions arrive as SSE
+ * `pipeline_shadow_result` (contracts.ts ShadowResult). Scored like logs:
+ * employee -> GRANTED, stranger -> DENIED, insufficient -> no decision.
+ */
+export function shadowDecisions(sse: any[]): LogObs[] {
+  return sse
+    .filter((e) => e.event === "pipeline_shadow_result" && e.data && e.data.outcome !== "insufficient")
+    .map((e, i) => ({
+      id: `shadow-${i}-${e.data.trackId}`,
+      gate: e.data.gate === "EXIT" ? "EXIT" : "ENTRY",
+      tsMs: Number(e.data.decidedAtMs) || e.receivedAtMs,
+      status: e.data.outcome === "employee" ? "GRANTED" : "DENIED",
+      employeeId: e.data.employeeId ?? null,
+    }));
+}
+
 function readCpuCsv(file: string): CpuSample[] {
   try {
     return readFileSync(file, "utf8")
@@ -265,9 +284,10 @@ async function analyze(args: Args) {
   if (passages.length === 0) throw new Error("no passages with a known start time (--ready)");
   const from = new Date(Math.min(...passages.map((p) => p.startMs)) - 1000).toISOString();
   const to = new Date(Math.max(...passages.map((p) => p.endMs)) + 60_000).toISOString();
-  const logs = await fetchLogs(from, to);
-
   const sse = args.sse ? readJsonl(String(args.sse)) : [];
+  const source = String(args.decisions || "logs");
+  const logs = source === "shadow" ? shadowDecisions(sse) : await fetchLogs(from, to);
+
   const looks: LookObs[] = sse
     .filter((e) => e.event === "gate_watch_result")
     .map((e) => ({
@@ -295,6 +315,7 @@ async function analyze(args: Args) {
   const name = String(args.name || "run");
   const result = {
     name,
+    decisions: source,
     generatedAt: new Date().toISOString(),
     gateway: BASE_URL.replace(/\/\/[^@/]*@/, "//"),
     ready: Object.fromEntries(Object.entries(ready).map(([k, v]) => [k, new Date(v).toISOString()])),
@@ -324,7 +345,7 @@ async function analyze(args: Args) {
     "|---|---|---|---|",
     ...cpuRows,
     "",
-    "| Gate | looks | failed | look start-to-start p50 / p95 | frame grab p50 | processing p50 |",
+    "| Gate | looks | failed | look start-to-start p50 / p95 | frame grab p50 | scan duration p50 |",
     "|---|---|---|---|---|---|",
     ...lookRows,
     "",

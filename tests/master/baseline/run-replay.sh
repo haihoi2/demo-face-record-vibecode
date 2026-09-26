@@ -6,6 +6,7 @@
 #
 # Environment passed through to the gateway: PIPELINE_MODE_ENTRY, PIPELINE_MODE_EXIT
 # (acceptance runs of the new pipeline), FACE_DETECT_SIZE, FACE_MIN_SIZE_PX.
+# MT_DECISIONS=shadow scores the pipeline_shadow_result stream instead of access logs.
 #
 # What it does (all containers are suffixed -rt-mt; nothing live is touched):
 #   1. fresh throwaway PostgreSQL (tmpfs) + fresh gateway on :3116 (127.0.0.1 only)
@@ -41,7 +42,7 @@ TS="$(date -u +%Y%m%dT%H%M%SZ)"
 OUT="/data/test-clips/results/$TS-$NAME"
 umask 077; mkdir -p "$OUT"
 log() { echo "[run-replay $(date -u +%H:%M:%S)] $*"; }
-now_ms() { date +%s%3N; }
+now_ms() { echo $(( $(date +%s%N) / 1000000 )); }
 
 cleanup() {
   set +e
@@ -144,5 +145,6 @@ kill "$CPU_PID" 2>/dev/null || true; CPU_PID=""
 ( IFS=,; echo "[${PHASES[*]}]" ) > "$OUT/phases.json"
 cat "$OUT/sse-idle.jsonl" "$OUT/sse-busy.jsonl" > "$OUT/sse.jsonl" 2>/dev/null || true
 collect analyze --clips /clips/clips.json --state /out/state.json --ready "ENTRY=$READY_ENTRY,EXIT=$READY_EXIT" \
-  --sse /out/sse.jsonl --cpu /out/cpu.csv --phases /out/phases.json --name "$NAME" --out "/out/$NAME.json" --md "/out/$NAME.md"
+  --sse /out/sse.jsonl --cpu /out/cpu.csv --phases /out/phases.json --decisions "${MT_DECISIONS:-logs}" \
+  --name "$NAME" --out "/out/$NAME.json" --md "/out/$NAME.md"
 log "results in $OUT"

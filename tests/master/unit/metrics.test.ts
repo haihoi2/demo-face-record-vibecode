@@ -132,3 +132,19 @@ describe("MT ground truth", () => {
     assert.match(errors, /overlaps/);
   });
 });
+
+describe("MT collector: shadow decisions", () => {
+  it("scores pipeline_shadow_result events like access logs and ignores insufficient tracks", async () => {
+    const { shadowDecisions } = await import("../baseline/collect.ts");
+    const logs = shadowDecisions([
+      { event: "pipeline_shadow_result", receivedAtMs: 10, data: { gate: "EXIT", outcome: "employee", employeeId: EMP, trackId: "t1", decidedAtMs: 5_600 } },
+      { event: "pipeline_shadow_result", receivedAtMs: 11, data: { gate: "EXIT", outcome: "stranger", trackId: "t2", decidedAtMs: 6_100 } },
+      { event: "pipeline_shadow_result", receivedAtMs: 12, data: { gate: "EXIT", outcome: "insufficient", trackId: "t3", decidedAtMs: 7_000 } },
+      { event: "gate_watch_result", receivedAtMs: 13, data: {} },
+    ]);
+    assert.deepEqual(logs.map((l) => [l.status, l.tsMs, l.employeeId]), [["GRANTED", 5_600, EMP], ["DENIED", 6_100, null]]);
+    const { metrics } = gateMetrics([base([A, B])], logs);
+    assert.equal(metrics.missed, 0);
+    assert.equal(metrics.latencyMs.p95, 600);
+  });
+});
