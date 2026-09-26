@@ -4082,8 +4082,9 @@ async function applyRecognitionOutcome(input: RecognitionOutcomeInput): Promise<
 
   // ---- Step 2: the stored image. ----------------------------------------
   // Annotated with the REAL detector boxes of the frame being stored, so the
-  // picture an operator opens shows what was flagged. Non-data-URL inputs
-  // (and the no-image case) pass straight through, exactly as before.
+  // picture an operator opens shows what was flagged, and re-encoded at
+  // SNAPSHOT_JPEG_QSCALE (full resolution) to keep the stored copy small.
+  // Non-data-URL inputs (and the no-image case) pass straight through.
   const snapshotForLog = await annotateSnapshotWithBoxes(
     input.frameImage as string,
     (input.annotateFaces as Array<{ box2d: [number, number, number, number]; boxSource?: "detector" }>) || detectedFaces
@@ -7058,13 +7059,26 @@ app.post(["/api/strangers/merge", "/api/strangers/assign"], requireOperatorRole(
  * the picture never claims a detection that did not happen. Any failure returns
  * the original image untouched.
  */
+/**
+ * JPEG qscale for the STORED snapshot (FFmpeg -q:v: 2 = best/largest, 31 =
+ * worst). Frames arrive near-lossless (~1.8 MB at 4K) and were stored as is -
+ * 3.7 GB of photos in access_logs after two weeks. Measured on 50 real gate
+ * captures (2026-09-26): q8 at FULL resolution is 2.3x smaller with every face
+ * still detected and every enrolment-grade face still enrolment-grade
+ * (embedding cosine to the original: median 0.96, p10 0.92). Downscaling
+ * instead hurt: even 2560 px wide lost enrolment grade on 10/50, because the
+ * faces in these overview shots are small. Recognition itself runs on the
+ * original frame; only the stored copy is re-encoded.
+ */
+const SNAPSHOT_JPEG_QSCALE = envInt("SNAPSHOT_JPEG_QSCALE", 8, 2, 31);
+
 async function annotateSnapshotWithBoxes(
   imageDataUrl: string,
   faces: Array<{ box2d: [number, number, number, number]; boxSource?: "detector" }>
 ): Promise<string> {
   const drawable = faces.filter((f) => f.boxSource === "detector" && Array.isArray(f.box2d));
   const m = /^data:(image\/\w+);base64,(.+)$/s.exec(imageDataUrl || "");
-  if (drawable.length === 0 || !m) return imageDataUrl;
+  if (!m) return imageDataUrl;
 
   const clamp = (v: number) => Math.min(1000, Math.max(0, Number(v) || 0)) / 1000;
   const filters = drawable.map((f) => {
@@ -7089,8 +7103,8 @@ async function annotateSnapshotWithBoxes(
     const proc = spawn("ffmpeg", [
       "-hide_banner", "-loglevel", "error",
       "-f", "image2pipe", "-i", "pipe:0",
-      "-vf", filters.join(","),
-      "-q:v", "2", "-f", "image2", "-update", "1", "pipe:1",
+      ...(filters.length > 0 ? ["-vf", filters.join(",")] : []),
+      "-q:v", String(SNAPSHOT_JPEG_QSCALE), "-f", "image2", "-update", "1", "pipe:1",
     ]);
     const chunks: Buffer[] = [];
     let settled = false;
