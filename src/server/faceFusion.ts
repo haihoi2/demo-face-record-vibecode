@@ -130,7 +130,12 @@ interface CandidateAgg {
  *      runner-up by `minMargin`; or
  *  (b) multi-agree: at least `minAgreeing` observations agree on the same
  *      identity, each ≥ `minEvidence`, their quality-weighted mean cosine is
- *      ≥ `acceptFused`, and the winner leads the next candidate by `minMargin`.
+ *      ≥ `acceptFused`, the winner leads the next candidate by `minMargin`,
+ *      AND - per observation - it leads that observation's own runner-up by
+ *      `minMargin` on (quality-weighted) average. Only each observation's top
+ *      identity is aggregated, so a lookalike who comes second in EVERY frame
+ *      never becomes a candidate; without the per-observation check, several
+ *      frames each preferring A over B by 0.04 were granted as A.
  * Otherwise reject, labelling why. Agreement across DISTINCT streams adds a
  * small confidence bonus; it never lowers a threshold.
  */
@@ -208,8 +213,21 @@ export function fuseDecision(
     });
   }
 
-  // (b) several views agree
-  if (w.observations >= th.minAgreeing && w.fusedCosine >= th.acceptFused && candidateMargin >= th.minMargin) {
+  // (b) several views agree - and not merely on the better of two lookalikes
+  let marginSum = 0;
+  let marginWeight = 0;
+  for (const e of w.evidence) {
+    const q = Math.max(0.05, e.quality);
+    marginSum += (e.cosine - e.secondCosine) * q;
+    marginWeight += q;
+  }
+  const observationMargin = marginWeight > 0 ? marginSum / marginWeight : 0;
+  if (
+    w.observations >= th.minAgreeing &&
+    w.fusedCosine >= th.acceptFused &&
+    candidateMargin >= th.minMargin &&
+    observationMargin >= th.minMargin
+  ) {
     return base({
       recognized: true, employeeId: w.employeeId, basis: "multi-agree",
       fusedCosine: round(w.fusedCosine), bestCosine: round(w.bestCosine),
@@ -218,7 +236,10 @@ export function fuseDecision(
     });
   }
 
-  const ambiguous = candidateMargin < th.minMargin || (strong == null && w.evidence.some((e) => e.cosine >= th.acceptSingle));
+  const ambiguous =
+    candidateMargin < th.minMargin ||
+    (w.observations >= th.minAgreeing && w.fusedCosine >= th.acceptFused && observationMargin < th.minMargin) ||
+    (strong == null && w.evidence.some((e) => e.cosine >= th.acceptSingle));
   return base({
     recognized: false, employeeId: undefined,
     basis: ambiguous ? "rejected-ambiguous" : "rejected-weak",
