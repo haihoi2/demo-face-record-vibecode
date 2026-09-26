@@ -977,13 +977,15 @@ const envLimit = (name: string, fallback: number, min: number, max: number) => e
  */
 export const CLEAR_FACE_LIMITS = {
   /**
-   * Shorter side of the face box, in source-frame pixels. Measured on 176
-   * recognised and 149 denied captures (2026-09-26): under 40 px the right
-   * employee scored 0.35 (below every accept threshold) at quality 0.33, while
-   * 40-60 px faces still matched correctly 85% of the time - the 4K entry
-   * camera's normal range - so the floor sits at 40, not higher.
+   * Shorter side of the face box, in source-frame pixels. 60 is the owner's
+   * decision (2026-09-26): only faces close to the gate count. Measured cost on
+   * 176 recognised captures: under 40 px recognition fails anyway (right
+   * employee scored 0.35), but 40-60 px faces - the 4K entry camera's normal
+   * range - still matched correctly 85% of the time, so ~23% of recent
+   * entries were at a size this floor now refuses; those people are
+   * recognised once they step closer. Lower it with FACE_MIN_SIZE_PX.
    */
-  minFacePx: envLimit("FACE_MIN_SIZE_PX", 40, 0, 2000),
+  minFacePx: envLimit("FACE_MIN_SIZE_PX", 60, 0, 2000),
   maxYaw: envLimit("FACE_CLEAR_MAX_YAW", 1.5, 0.1, 10),
   minAspect: envLimit("FACE_CLEAR_MIN_ASPECT", 0.3, 0, 5),
   maxAspect: envLimit("FACE_CLEAR_MAX_ASPECT", 2.5, 0.5, 20),

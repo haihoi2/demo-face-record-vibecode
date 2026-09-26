@@ -1461,10 +1461,10 @@ const FACE_STRANGER_MIN_QUALITY = envFloat("FACE_STRANGER_MIN_QUALITY", 0.25);
 /**
  * A stranger is stored (and grouped) only when their face is at least this
  * many pixels (shorter side, source frame). Storage only, like the quality
- * floor: an employee at 40-60 px is still recognised and let in (85% correct
- * on this site), but an unknown face that small is too far away for an
- * operator to identify - it was 54% of stranger captures (2026-09-26).
- * Faces under FACE_MIN_SIZE_PX never reach this point at all.
+ * floor: an unknown face under 60 px is too far away for an operator to
+ * identify - it was 54% of stranger captures (2026-09-26). With the default
+ * FACE_MIN_SIZE_PX (also 60) such faces never reach this point; this floor
+ * matters when FACE_MIN_SIZE_PX is lowered to recognise from further away.
  */
 const FACE_STRANGER_MIN_SIZE_PX = envInt("FACE_STRANGER_MIN_SIZE_PX", 60, 0, 2000);
 /** Maximum templates kept per employee; the lowest-quality one is evicted when full. */

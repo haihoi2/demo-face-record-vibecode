@@ -64,7 +64,7 @@ services:
       # Camera credentials belong in the uncommitted environment, never source.
       # Storage-only floor for stranger snapshots; never affects access decisions.
       - FACE_STRANGER_MIN_QUALITY=${FACE_STRANGER_MIN_QUALITY:-}
-      # Face size floors in pixels: any face (default 40), stored strangers (default 60).
+      # Face size floors in pixels: any face (default 60), stored strangers (default 60).
       - FACE_MIN_SIZE_PX=${FACE_MIN_SIZE_PX:-}
       - FACE_STRANGER_MIN_SIZE_PX=${FACE_STRANGER_MIN_SIZE_PX:-}
       # Compression of the stored access-log photo (FFmpeg -q:v, 2-31; default 8).

@@ -2,12 +2,12 @@
 
 - Branch: `feat/min-face-size`, base `24bbda5`, commit `96384fa`
 - `server.ts touched: yes` (stranger floor, enrolment mapping, gate counter); `src/types.ts` not touched
-- New env: `FACE_MIN_SIZE_PX` (default 40), `FACE_STRANGER_MIN_SIZE_PX` (default 60). No API/schema change.
+- New env: `FACE_MIN_SIZE_PX` (default 60, owner's decision; measured case for 40 below), `FACE_STRANGER_MIN_SIZE_PX` (default 60). No API/schema change.
 - Owner's request: "only capture face big enough".
 
 ## Behaviour
 
-- Face < 40 px (shorter side, source frame): "small" in the clear-face gate -> not recognised,
+- Face < 60 px (shorter side, source frame): "small" in the clear-face gate -> not recognised,
   tracked, stored or enrolled. Counted in `/api/face-engine/status` clearFace.byReason.small.
 - Stranger face < 60 px: not stored/grouped; counted as suppressed "stranger-small".
   Employees between 40 and 60 px are still recognised.
