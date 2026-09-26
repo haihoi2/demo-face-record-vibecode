@@ -6471,19 +6471,10 @@ app.get("/api/logs/:id/recording", requireOperatorRole("viewer"), async (req, re
     res.status(400).json({ success: false, error: "Invalid log id" });
     return;
   }
-  if (!recordingConfig) {
-    res.status(503).json({ success: false, code: "RECORDING_NOT_CONFIGURED", error: "Chưa cấu hình đầu ghi để xem lại (RECORDING_NVR_URL)." });
-    return;
-  }
-  const log = await db.getAccessLogById(id);
+  // Time and gate only (getAccessLogById loads just the image on PostgreSQL).
+  const log = await db.getAccessLogMetaById(id);
   if (!log) {
     res.status(404).json({ success: false, error: "Không tìm thấy lượt quét" });
-    return;
-  }
-  const gate = log.type === "EXIT" ? "EXIT" : "ENTRY";
-  const channel = recordingConfig.channels[gate];
-  if (!channel) {
-    res.status(404).json({ success: false, code: "RECORDING_NO_CHANNEL", error: "Cổng này chưa được gán kênh ghi hình trên đầu ghi." });
     return;
   }
   const win = recordingWindow(Date.parse(log.timestamp), Date.now());
@@ -6498,6 +6489,16 @@ app.get("/api/logs/:id/recording", requireOperatorRole("viewer"), async (req, re
     return;
   }
   const { startMs, endMs } = win as { startMs: number; endMs: number };
+  if (!recordingConfig) {
+    res.status(503).json({ success: false, code: "RECORDING_NOT_CONFIGURED", error: "Chưa cấu hình đầu ghi để xem lại (RECORDING_NVR_URL)." });
+    return;
+  }
+  const gate = log.type === "EXIT" ? "EXIT" : "ENTRY";
+  const channel = recordingConfig.channels[gate];
+  if (!channel) {
+    res.status(404).json({ success: false, code: "RECORDING_NO_CHANNEL", error: "Cổng này chưa được gán kênh ghi hình trên đầu ghi." });
+    return;
+  }
   if (activeRecordings >= RECORDING_MAX_CONCURRENT) {
     res.setHeader("Retry-After", "10");
     res.status(429).json({ success: false, code: "RECORDING_BUSY", error: "Đang có quá nhiều đoạn ghi được mở cùng lúc, thử lại sau ít giây." });

@@ -1919,6 +1919,26 @@ class SQLiteStorage {
     return accumulateStats(this.fallbackData.access_logs.filter((log) => matchesAccessLogQuery(log, f)), timeZone);
   }
 
+  /**
+   * When and at which gate an event happened, without its image or face data.
+   * getAccessLogById below is NOT a general lookup on PostgreSQL: it loads only
+   * id + photoSnapshot for the image route, so its timestamp/type are undefined.
+   */
+  async getAccessLogMetaById(
+    id: string,
+  ): Promise<Pick<AccessLogRecord, "id" | "timestamp" | "type" | "status"> | undefined> {
+    if (this.pgPool && this.isPostgres) {
+      const result = await this.pgPool.query(
+        `SELECT id, timestamp, type, status FROM access_logs WHERE id = $1`,
+        [id],
+      );
+      const r = result.rows[0];
+      return r ? { id: r.id, timestamp: r.timestamp, type: r.type, status: r.status } : undefined;
+    }
+    const log = await this.getAccessLogById(id);
+    return log ? { id: log.id, timestamp: log.timestamp, type: log.type, status: log.status } : undefined;
+  }
+
   async getAccessLogById(id: string): Promise<AccessLogRecord | undefined> {
     if (this.pgPool && this.isPostgres) {
       const result = await this.pgPool.query(

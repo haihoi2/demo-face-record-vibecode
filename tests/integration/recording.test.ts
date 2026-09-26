@@ -6,7 +6,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 
-import { api, rawApi } from "./helpers";
+import { api, noFaceJpegDataUrl, rawApi, recognize } from "./helpers";
 
 describe("NVR playback", () => {
   it("requires a signed-in user", async () => {
@@ -28,11 +28,22 @@ describe("NVR playback", () => {
     assert.ok([400, 404].includes(res.status), String(res.status));
   });
 
-  it("answers 503 with a clear code when no NVR is configured", async () => {
+  it("finds a real event's time and gate on every store, then answers 503 without an NVR", async () => {
     const cfg = await api<any>("/api/recordings/config");
     if (cfg.body.enabled) return; // an environment with a real NVR is not this test's concern
-    const res = await api<any>("/api/logs/LOG-does-not-matter/recording");
-    assert.equal(res.status, 503);
+    // A real, just-written event: its timestamp must be readable (a lookup that
+    // loads only the image made every event "invalid time" on PostgreSQL).
+    const made = await recognize({ imageBase64: noFaceJpegDataUrl(64, 93001), scanType: "EXIT" });
+    assert.equal(made.status, 200, made.text.slice(0, 200));
+    const logId = (made.body as any).log?.id;
+    assert.ok(logId);
+    const res = await api<any>(`/api/logs/${encodeURIComponent(logId)}/recording`);
+    assert.equal(res.status, 503, res.text.slice(0, 200));
     assert.equal(res.body.code, "RECORDING_NOT_CONFIGURED");
+  });
+
+  it("answers 404 for an unknown event", async () => {
+    const res = await api<any>("/api/logs/LOG-does-not-exist-anywhere/recording");
+    assert.equal(res.status, 404);
   });
 });
