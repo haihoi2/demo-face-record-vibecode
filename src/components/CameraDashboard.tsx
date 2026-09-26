@@ -29,6 +29,9 @@ import {
   Radio,
   Hand,
   Info,
+  GitBranch,
+  Gauge,
+  Film,
 } from "lucide-react";
 import {
   CameraStreamsConfig,
@@ -55,7 +58,22 @@ import {
   demoOfflinePersistenceEnabled,
 } from "../utils/offlineEngine";
 import { ProtectedImage } from "./ProtectedImage";
+import { FaceThumb } from "./FaceImage";
 import { hasRole, useOperatorSession } from "../utils/session";
+import {
+  PipelineRuntimeView,
+  Tone,
+  formatDurationMs,
+  formatFps,
+  isFrameAgeWorrying,
+  pipelineModeFallbackNote,
+  pipelineModeHint,
+  pipelineModeLabel,
+  pipelineModeTone,
+  readPipelineRuntime,
+  sourceStatusLabel,
+  sourceStatusTone,
+} from "../utils/pipelineStatus";
 
 const DEFAULT_STREAMS_CONFIG: CameraStreamsConfig = {
   entryGate: {
@@ -232,7 +250,10 @@ const DEFAULT_WATCH: GateWatchConfig = { enabled: false, intervalSeconds: 3, fra
  * Tolerant normaliser for a watcher payload (REST or SSE). A partial object, a
  * missing counter or an unknown gate must never crash or half-populate the panel.
  */
-const normalizeWatchRuntime = (raw: any): GateWatchRuntime | null => {
+/** The runtime plus the pipeline rollout/health the server may attach (all optional). */
+type WatchRuntime = GateWatchRuntime & { pipeline: PipelineRuntimeView };
+
+const normalizeWatchRuntime = (raw: any): WatchRuntime | null => {
   if (!raw || typeof raw !== "object") return null;
   const upper = String(raw.gate || "").toUpperCase();
   if (upper !== "ENTRY" && upper !== "EXIT") return null;
@@ -252,7 +273,30 @@ const normalizeWatchRuntime = (raw: any): GateWatchRuntime | null => {
     consecutiveErrors: Number.isFinite(Number(raw.consecutiveErrors)) ? Number(raw.consecutiveErrors) : 0,
     totalRuns: Number.isFinite(Number(raw.totalRuns)) ? Number(raw.totalRuns) : 0,
     nextRunAt: typeof raw.nextRunAt === "string" ? raw.nextRunAt : undefined,
+    pipeline: readPipelineRuntime(raw),
   };
+};
+
+const TONE_CHIP_CLASS: Record<Tone, string> = {
+  emerald: "bg-emerald-950/80 text-emerald-300 border-emerald-700/70",
+  sky: "bg-sky-950/80 text-sky-300 border-sky-700/70",
+  amber: "bg-amber-950/70 text-amber-300 border-amber-700/70",
+  rose: "bg-rose-950/70 text-rose-300 border-rose-700/70",
+  slate: "bg-slate-800 text-slate-300 border-slate-600",
+};
+
+/** Face images a scan result carries (the access-log rows it wrote), newest first. */
+const resultFaceImages = (result: GateScanResponse | null): { id: string; src: string; name?: string }[] => {
+  if (!result) return [];
+  const logs = [...(Array.isArray(result.logs) ? result.logs : []), ...(result.log ? [result.log] : [])];
+  const seen = new Set<string>();
+  const out: { id: string; src: string; name?: string }[] = [];
+  for (const l of logs) {
+    if (!l || typeof l.photoSnapshot !== "string" || !l.photoSnapshot || seen.has(l.id)) continue;
+    seen.add(l.id);
+    out.push({ id: l.id, src: l.photoSnapshot, name: l.employeeName });
+  }
+  return out;
 };
 
 /** Readable chip for a fusion decision basis. */
@@ -308,9 +352,6 @@ interface PerStreamState {
   lastResult: GateStreamScanResult | null;
   lastScanTime: string | null;
   error: string | null;
-  /** MJPEG proxy failed for this tile -> show a periodic snapshot instead. */
-  mjpegFailed: boolean;
-  snapshotTs: number;
 }
 
 interface StreamScanState {
@@ -322,8 +363,6 @@ interface StreamScanState {
   resultOrigin: "MANUAL" | "WATCHER" | null;
   /** ISO timestamp the backend reported for a watcher result (null for manual scans). */
   resultAt: string | null;
-  viewMode: "MJPEG" | "SNAPSHOT" | "SIMULATION";
-  snapshotTs: number;
   hasError: boolean;
   errorMessage: string | null;
   /** Short notice when the worker pool answered 503 (Retry-After). */
@@ -342,8 +381,6 @@ const createInitialScanState = (): StreamScanState => ({
   activeFaces: [],
   resultOrigin: null,
   resultAt: null,
-  viewMode: "MJPEG",
-  snapshotTs: Date.now(),
   hasError: false,
   errorMessage: null,
   retryNotice: null,
@@ -358,8 +395,6 @@ const emptyPerStream = (): PerStreamState => ({
   lastResult: null,
   lastScanTime: null,
   error: null,
-  mjpegFailed: false,
-  snapshotTs: Date.now(),
 });
 
 export const CameraDashboard: React.FC<CameraDashboardProps> = ({
@@ -382,7 +417,7 @@ export const CameraDashboard: React.FC<CameraDashboardProps> = ({
   const [nowMs, setNowMs] = useState<number>(() => Date.now());
 
   // ---- Backend watcher (server-side auto-scan) state ----
-  const [watchers, setWatchers] = useState<Record<GateKey, GateWatchRuntime | null>>({
+  const [watchers, setWatchers] = useState<Record<GateKey, WatchRuntime | null>>({
     entry: null,
     exit: null,
   });
@@ -490,7 +525,7 @@ export const CameraDashboard: React.FC<CameraDashboardProps> = ({
       }
       const list = res.data?.watchers;
       if (res.ok && Array.isArray(list)) {
-        const next: Record<GateKey, GateWatchRuntime | null> = { entry: null, exit: null };
+        const next: Record<GateKey, WatchRuntime | null> = { entry: null, exit: null };
         for (const raw of list) {
           const w = normalizeWatchRuntime(raw);
           if (w) next[gateKeyOf(w.gate)] = w;
@@ -654,7 +689,6 @@ export const CameraDashboard: React.FC<CameraDashboardProps> = ({
             lastResult: r,
             lastScanTime: atLabel,
             error: r.success ? null : r.error || "Không lấy được khung hình",
-            snapshotTs: Date.now(),
           };
         }
         return {
@@ -664,7 +698,6 @@ export const CameraDashboard: React.FC<CameraDashboardProps> = ({
           resultOrigin: "WATCHER",
           resultAt: atIso,
           activeFaces: faces,
-          snapshotTs: Date.now(),
           perStream,
         };
       });
@@ -1089,7 +1122,6 @@ export const CameraDashboard: React.FC<CameraDashboardProps> = ({
                 lastResult: r,
                 lastScanTime: now,
                 error: r.success ? null : r.error || "Không lấy được khung hình",
-                snapshotTs: Date.now(),
               };
             }
           } else {
@@ -1109,7 +1141,6 @@ export const CameraDashboard: React.FC<CameraDashboardProps> = ({
                 },
                 lastScanTime: now,
                 error: null,
-                snapshotTs: Date.now(),
               };
             }
           }
@@ -1120,7 +1151,6 @@ export const CameraDashboard: React.FC<CameraDashboardProps> = ({
             resultOrigin: "MANUAL",
             resultAt: new Date().toISOString(),
             activeFaces: faces,
-            snapshotTs: Date.now(),
             perStream,
           };
         });
@@ -1287,7 +1317,14 @@ export const CameraDashboard: React.FC<CameraDashboardProps> = ({
     );
   };
 
-  // One live tile per enabled stream
+  /**
+   * One status tile per enabled stream. The browser never shows a site
+   * camera's picture (owner decision 2026-09-26): the server reads the stream,
+   * and the page shows only the face crops it stored. The wider scene is
+   * reviewed through "Đoạn ghi" (NVR playback) in the access log. The one
+   * exception is a CLIENT_UVC primary stream: that is this browser's own
+   * webcam, and the <video> element IS the capture source for the scan.
+   */
   const renderStreamTile = (
     gateConfig: GateStreamConfig,
     stream: GateStreamSource,
@@ -1296,7 +1333,6 @@ export const CameraDashboard: React.FC<CameraDashboardProps> = ({
     setScanState: React.Dispatch<React.SetStateAction<StreamScanState>>,
     videoRef: React.RefObject<HTMLVideoElement | null>
   ) => {
-    const key = gateKeyOf(gateConfig.gateType);
     const isEntry = gateConfig.gateType === "ENTRY";
     const per = scanState.perStream[stream.id] || emptyPerStream();
     const lastResult = scanState.lastResult;
@@ -1305,130 +1341,163 @@ export const CameraDashboard: React.FC<CameraDashboardProps> = ({
     );
     const isClientUvc = stream.sourceType === "CLIENT_UVC";
     const isScanning = scanState.isScanning && (per.isScanning || !Object.values(scanState.perStream).some((p) => p.isScanning));
-
-    // Media URL for this tile
-    const snapshotUrl = `/api/camera-streams/snapshot?gate=${key}&stream=${encodeURIComponent(stream.id)}&t=${per.snapshotTs || scanState.snapshotTs}`;
-    const mjpegUrl = `/api/camera-streams/mjpeg?gate=${key}&stream=${encodeURIComponent(stream.id)}`;
-    const testFrameUrl = `/api/camera-streams/test-frame?gate=${key}&source=${encodeURIComponent(stream.sourceType)}`;
-    let mediaUrl = testFrameUrl;
-    if (stream.sourceType === "RTSP" || stream.sourceType === "BACKEND_UVC") {
-      if (scanState.viewMode === "SIMULATION") mediaUrl = testFrameUrl;
-      else if (scanState.viewMode === "SNAPSHOT" || per.mjpegFailed) mediaUrl = snapshotUrl;
-      else mediaUrl = mjpegUrl;
-    } else if (stream.sourceType === "HTTP_MJPEG") {
-      mediaUrl = per.mjpegFailed ? snapshotUrl : stream.httpUrl || mjpegUrl;
-    }
-
     const perResult = per.lastResult;
 
     return (
       <div
         key={stream.id}
         id={`tile-stream-${stream.id}`}
-        className="relative aspect-video bg-black flex items-center justify-center overflow-hidden rounded-lg border border-slate-800 group"
+        className="relative bg-slate-950 rounded-lg border border-slate-800 overflow-hidden flex flex-col"
       >
-        {isClientUvc ? (
-          isPrimary ? (
+        {isClientUvc && isPrimary && (
+          <div className="relative aspect-video bg-black flex items-center justify-center overflow-hidden">
             <video ref={videoRef} autoPlay playsInline muted className="w-full h-full object-cover" />
-          ) : (
-            <div className="text-center px-4 text-xs text-slate-400 space-y-1">
-              <Camera className="w-6 h-6 mx-auto text-slate-600" />
-              <p>Webcam trình duyệt chỉ hiển thị khi là luồng chính</p>
-            </div>
-          )
-        ) : (
-          <img
-            key={`${stream.id}-${scanState.viewMode}-${per.mjpegFailed ? "snap" : "live"}`}
-            src={mediaUrl}
-            alt={stream.label}
-            onError={(e) => {
-              const img = e.target as HTMLImageElement;
-              if (!per.mjpegFailed && scanState.viewMode === "MJPEG") {
-                // MJPEG proxy failed (ffmpeg timeout / offline RTSP): fall back to snapshot
-                updatePerStream(setScanState, stream.id, { mjpegFailed: true, snapshotTs: Date.now() });
-              } else if (!img.src.includes("/test-frame")) {
-                // Snapshot failed too: show the offline placeholder
-                img.src = `${testFrameUrl}%20Offline`;
-              }
-            }}
-            className="w-full h-full object-cover select-none"
-          />
-        )}
-
-        {/* Radar Scanning Line Animation when active */}
-        {isScanning && (
-          <div className="absolute inset-0 pointer-events-none overflow-hidden">
-            <div className="w-full h-1 bg-gradient-to-r from-transparent via-cyan-400 to-transparent shadow-[0_0_15px_rgba(34,211,238,0.8)] animate-[bounce_2s_infinite]" />
-          </div>
-        )}
-
-        {/* AI Face Bounding Box HUD Overlay (faces seen on this stream) */}
-        {tileFaces.map((face, index) => renderFaceBox(face, index, lastResult))}
-
-        {/* Tile label */}
-        <div className="absolute top-2 left-2 flex flex-col gap-1 pointer-events-none max-w-[85%]">
-          <div className="px-2 py-1 rounded-md bg-black/60 backdrop-blur-sm border border-slate-700/60 text-white text-[11px] font-mono flex items-center gap-1.5">
-            <span className={`w-2 h-2 rounded-full shrink-0 ${isEntry ? "bg-emerald-400" : "bg-blue-400"}`} />
-            <span className="font-bold truncate">{stream.label}</span>
-            {isPrimary && (
-              <span className="inline-flex items-center gap-0.5 px-1.5 py-0.5 rounded bg-indigo-600 text-white text-[9px] font-bold shrink-0">
-                <Star className="w-2.5 h-2.5" />
-                Chính
-              </span>
+            {isScanning && (
+              <div className="absolute inset-0 pointer-events-none overflow-hidden">
+                <div className="w-full h-1 bg-gradient-to-r from-transparent via-cyan-400 to-transparent shadow-[0_0_15px_rgba(34,211,238,0.8)] animate-[bounce_2s_infinite]" />
+              </div>
             )}
-            <span className="px-1 py-0.5 rounded bg-slate-800 text-slate-300 text-[9px] shrink-0">{stream.sourceType}</span>
+            {/* Face boxes only make sense over the picture they were found in */}
+            {tileFaces.map((face, index) => renderFaceBox(face, index, lastResult))}
           </div>
-          {stream.rtspUrl && stream.sourceType === "RTSP" && (
-            <div className="px-2 py-0.5 rounded bg-black/50 text-[10px] font-mono text-slate-400 truncate">
-              {maskRtspCredentials(stream.rtspUrl)}
+        )}
+
+        <div className="p-2.5 space-y-2 flex-1 flex flex-col">
+          {/* Tile label */}
+          <div className="flex flex-col gap-1 min-w-0">
+            <div className="flex items-center gap-1.5 text-white text-[11px] font-mono min-w-0">
+              <span className={`w-2 h-2 rounded-full shrink-0 ${isEntry ? "bg-emerald-400" : "bg-blue-400"}`} />
+              <span className="font-bold truncate">{stream.label}</span>
+              {isPrimary && (
+                <span className="inline-flex items-center gap-0.5 px-1.5 py-0.5 rounded bg-indigo-600 text-white text-[9px] font-bold shrink-0">
+                  <Star className="w-2.5 h-2.5" />
+                  Chính
+                </span>
+              )}
+              <span className="px-1 py-0.5 rounded bg-slate-800 text-slate-300 text-[9px] shrink-0">{stream.sourceType}</span>
             </div>
-          )}
-        </div>
-
-        {/* Per-tile last outcome */}
-        <div className="absolute bottom-2 left-2 right-2 flex items-end justify-between gap-2">
-          <div className="min-w-0">
-            {per.error ? (
-              <div className="px-2 py-1 rounded-md bg-rose-950/85 border border-rose-700/70 text-rose-200 text-[10px] font-medium truncate max-w-[260px]" title={per.error}>
-                <XCircle className="w-3 h-3 inline mr-1 -mt-0.5" />
-                {per.error}
-              </div>
-            ) : perResult ? (
-              <div
-                className={`px-2 py-1 rounded-md backdrop-blur-sm border text-[10px] font-mono flex items-center gap-2 ${
-                  perResult.recognized
-                    ? "bg-emerald-950/85 border-emerald-600/70 text-emerald-200"
-                    : perResult.totalFacesDetected > 0
-                    ? "bg-amber-950/85 border-amber-600/70 text-amber-200"
-                    : "bg-black/60 border-slate-700/60 text-slate-300"
-                }`}
-              >
-                <span>{perResult.totalFacesDetected} mặt</span>
-                <span>•</span>
-                <span>{perResult.recognized ? "Đã nhận diện" : "Chưa khớp"}</span>
-                {typeof perResult.frameCaptureDurationMs === "number" && (
-                  <>
-                    <span>•</span>
-                    <span>{perResult.frameCaptureDurationMs}ms</span>
-                  </>
-                )}
-                {per.lastScanTime && <span className="text-slate-400">{per.lastScanTime}</span>}
-              </div>
-            ) : null}
+            {stream.rtspUrl && stream.sourceType === "RTSP" && (
+              <div className="text-[10px] font-mono text-slate-500 truncate">{maskRtspCredentials(stream.rtspUrl)}</div>
+            )}
           </div>
 
-          {/* Per-tile scan button */}
+          {isClientUvc && !isPrimary ? (
+            <p className="text-[10px] text-slate-400 flex items-center gap-1.5">
+              <Camera className="w-3.5 h-3.5 text-slate-600 shrink-0" />
+              Webcam trình duyệt chỉ dùng được khi là luồng chính.
+            </p>
+          ) : !isClientUvc ? (
+            <p className="text-[10px] text-slate-500 flex items-start gap-1.5">
+              <ScanFace className="w-3.5 h-3.5 text-slate-600 shrink-0 mt-px" />
+              <span>Máy chủ đọc luồng này. Trang chỉ hiển thị ảnh khuôn mặt đã chụp, không hiển thị hình camera.</span>
+            </p>
+          ) : null}
+
+          {isScanning && !isClientUvc && (
+            <div className="h-0.5 w-full rounded bg-gradient-to-r from-transparent via-cyan-400 to-transparent animate-pulse" aria-hidden="true" />
+          )}
+
+          {/* Per-tile last outcome + manual scan */}
+          <div className="mt-auto flex items-end justify-between gap-2">
+            <div className="min-w-0" aria-live="polite">
+              {per.error ? (
+                <div className="px-2 py-1 rounded-md bg-rose-950/85 border border-rose-700/70 text-rose-200 text-[10px] font-medium truncate max-w-[260px]" title={per.error}>
+                  <XCircle className="w-3 h-3 inline mr-1 -mt-0.5" />
+                  {per.error}
+                </div>
+              ) : perResult ? (
+                <div
+                  className={`px-2 py-1 rounded-md border text-[10px] font-mono flex items-center gap-2 ${
+                    perResult.recognized
+                      ? "bg-emerald-950/85 border-emerald-600/70 text-emerald-200"
+                      : perResult.totalFacesDetected > 0
+                      ? "bg-amber-950/85 border-amber-600/70 text-amber-200"
+                      : "bg-slate-900 border-slate-700/60 text-slate-300"
+                  }`}
+                >
+                  <span>{perResult.totalFacesDetected} mặt</span>
+                  <span>•</span>
+                  <span>{perResult.recognized ? "Đã nhận diện" : "Chưa khớp"}</span>
+                  {typeof perResult.frameCaptureDurationMs === "number" && (
+                    <>
+                      <span>•</span>
+                      <span>{perResult.frameCaptureDurationMs}ms</span>
+                    </>
+                  )}
+                  {per.lastScanTime && <span className="text-slate-400">{per.lastScanTime}</span>}
+                </div>
+              ) : (
+                <span className="text-[10px] text-slate-600">Chưa có lượt quét nào trong phiên này</span>
+              )}
+            </div>
+
+            <button
+              id={`btn-scan-stream-${stream.id}`}
+              onClick={() => performStreamScan(gateConfig.gateType, stream.id)}
+              disabled={scanState.isScanning || (isClientUvc && !isPrimary)}
+              className="inline-flex items-center gap-1 px-2 py-1 rounded-md bg-indigo-600/90 hover:bg-indigo-500 text-white text-[10px] font-semibold shadow-xs transition-all cursor-pointer disabled:opacity-50 shrink-0"
+              title={`Quét nhận diện riêng luồng ${stream.label}`}
+            >
+              <ScanFace className={`w-3 h-3 ${per.isScanning ? "animate-spin" : ""}`} />
+              {per.isScanning ? "Đang quét..." : "Quét"}
+            </button>
+          </div>
+        </div>
+      </div>
+    );
+  };
+
+  /**
+   * The newest face images captured at this gate, from the access log the app
+   * already holds (SSE keeps it current). Crops for new rows, legacy frames for
+   * old rows - the thumbnail fits both; a click shows the image enlarged.
+   */
+  const renderRecentFaces = (gateType: "ENTRY" | "EXIT") => {
+    const recent = accessLogs
+      .filter((l) => (l.type || (l as { scanType?: string }).scanType) === gateType && !!l.photoSnapshot)
+      .slice(0, 6);
+    return (
+      <div className="mx-3.5 mt-3 rounded-xl border border-slate-800 bg-slate-900/60 px-3 py-2.5">
+        <div className="flex items-center justify-between gap-2 mb-2">
+          <span className="text-[11px] font-bold text-white flex items-center gap-1.5">
+            <ScanFace className="w-3.5 h-3.5 text-indigo-400" />
+            Khuôn mặt vừa chụp tại cổng
+          </span>
           <button
-            id={`btn-scan-stream-${stream.id}`}
-            onClick={() => performStreamScan(gateConfig.gateType, stream.id)}
-            disabled={scanState.isScanning || (isClientUvc && !isPrimary)}
-            className="inline-flex items-center gap-1 px-2 py-1 rounded-md bg-indigo-600/90 hover:bg-indigo-500 text-white text-[10px] font-semibold shadow-xs transition-all cursor-pointer disabled:opacity-50 shrink-0"
-            title={`Quét nhận diện riêng luồng ${stream.label}`}
+            type="button"
+            onClick={onNavigateToLogs}
+            className="inline-flex items-center gap-1 text-[10px] font-semibold text-slate-400 hover:text-white"
+            title="Mở nhật ký; nút Đoạn ghi ở mỗi dòng phát lại toàn cảnh từ đầu ghi"
           >
-            <ScanFace className={`w-3 h-3 ${per.isScanning ? "animate-spin" : ""}`} />
-            {per.isScanning ? "Đang quét..." : "Quét"}
+            <Film className="w-3 h-3" /> Xem toàn cảnh trong Nhật ký (Đoạn ghi)
           </button>
         </div>
+        {recent.length === 0 ? (
+          <p className="text-[10px] text-slate-500">Chưa có ảnh khuôn mặt nào của cổng này trong phiên.</p>
+        ) : (
+          <ul className="flex flex-wrap gap-2" aria-label="Ảnh khuôn mặt mới nhất">
+            {recent.map((log) => {
+              const at = new Date(log.timestamp).toLocaleTimeString("vi-VN");
+              const who = log.employeeName || "Người lạ";
+              return (
+                <li key={log.id} className="flex flex-col items-center gap-0.5 w-16">
+                  <FaceThumb
+                    src={log.photoSnapshot}
+                    alt={`${who} lúc ${at}`}
+                    caption={`${who} · ${at}`}
+                    className={`w-16 h-16 rounded-lg border-2 ${
+                      log.status === "GRANTED" ? "border-emerald-500/70" : "border-rose-500/70"
+                    }`}
+                  />
+                  <span className="w-full truncate text-center text-[9px] text-slate-300" title={who}>
+                    {who}
+                  </span>
+                  <span className="text-[9px] font-mono text-slate-500">{at}</span>
+                </li>
+              );
+            })}
+          </ul>
+        )}
       </div>
     );
   };
@@ -1764,10 +1833,25 @@ export const CameraDashboard: React.FC<CameraDashboardProps> = ({
               <Server className="w-3.5 h-3.5 text-slate-500 shrink-0 mt-0.5" />
               <span>
                 Máy chủ báo có {result.totalFacesDetected} khuôn mặt trong lượt quét này nhưng sự
-                kiện không kèm chi tiết từng khuôn mặt. Bấm “Quét Ngay” để xem trực tiếp.
+                kiện không kèm chi tiết từng khuôn mặt. Bấm “Quét Ngay” để xem chi tiết từng khuôn mặt.
               </span>
             </div>
           )}
+
+        {/* Face crops the scan stored (access-log rows it wrote), when the result carries them */}
+        {resultFaceImages(result).length > 0 && (
+          <div className="flex flex-wrap gap-2" aria-label="Ảnh khuôn mặt của lượt quét">
+            {resultFaceImages(result).map((img) => (
+              <FaceThumb
+                key={img.id}
+                src={img.src}
+                alt={`${img.name || "Người lạ"} - ảnh lượt quét`}
+                caption={img.name || "Người lạ"}
+                className="w-14 h-14 rounded-lg"
+              />
+            ))}
+          </div>
+        )}
 
         {/* Face cards with stream chip */}
         {faces.length > 0 && (
@@ -1791,6 +1875,106 @@ export const CameraDashboard: React.FC<CameraDashboardProps> = ({
                 )}
               </div>
             ))}
+          </div>
+        )}
+      </div>
+    );
+  };
+
+  /**
+   * Rollout mode and health of the real-time pipeline for one gate, exactly as
+   * the server reports them. Health fields are optional (added by the pipeline
+   * wiring); nothing is shown for a field the server did not send.
+   */
+  const renderPipelineBlock = (view: PipelineRuntimeView, key: GateKey) => {
+    if (!view.mode && !view.requested && !view.state && !view.stats) return null;
+    const fallback = pipelineModeFallbackNote(view);
+    const state = view.state;
+    const stats = view.stats;
+    const ageWorrying = isFrameAgeWorrying(state?.newestFrameAgeMs);
+    return (
+      <div
+        className="px-3 py-2 border-b border-slate-800 space-y-1.5"
+        id={`pipeline-${key}`}
+        aria-label="Chế độ và tình trạng pipeline của cổng"
+      >
+        <div className="flex flex-wrap items-center gap-2 text-[11px]">
+          <span className="text-slate-400 inline-flex items-center gap-1">
+            <GitBranch className="w-3 h-3" /> Chế độ:
+          </span>
+          {view.mode ? (
+            <span
+              className={`inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-bold border ${TONE_CHIP_CLASS[pipelineModeTone(view.mode)]}`}
+              data-testid={`pipeline-mode-${key}`}
+            >
+              {pipelineModeLabel(view.mode)}
+            </span>
+          ) : (
+            <span className="text-slate-500">máy chủ chưa báo</span>
+          )}
+          {view.mode && <span className="text-[10px] text-slate-500">{pipelineModeHint(view.mode)}</span>}
+        </div>
+        {fallback && (
+          <div className="px-2 py-1 rounded-md bg-amber-950/60 border border-amber-700/60 text-[10px] text-amber-200 flex items-start gap-1.5">
+            <AlertTriangle className="w-3 h-3 shrink-0 mt-px" />
+            <span>{fallback}</span>
+          </div>
+        )}
+        {(state || stats) && (
+          <div className="grid grid-cols-2 sm:grid-cols-5 gap-1.5">
+            {state && (
+              <div className={`p-1.5 rounded-md border ${TONE_CHIP_CLASS[sourceStatusTone(state.status)]}`}>
+                <div className="text-[9px] uppercase tracking-wide opacity-80">Luồng hình</div>
+                <div className="font-mono text-[11px] font-bold">{sourceStatusLabel(state.status)}</div>
+              </div>
+            )}
+            {state && (
+              <div className="p-1.5 rounded-md bg-slate-950 border border-slate-800">
+                <div className="text-[9px] uppercase tracking-wide text-slate-500">Tốc độ đọc</div>
+                <div className="font-mono text-[11px] font-bold text-white">{formatFps(state.fps)}</div>
+              </div>
+            )}
+            {state && (
+              <div
+                className={`p-1.5 rounded-md border ${
+                  ageWorrying ? "bg-amber-950/60 border-amber-700/60" : "bg-slate-950 border-slate-800"
+                }`}
+              >
+                <div className={`text-[9px] uppercase tracking-wide ${ageWorrying ? "text-amber-300" : "text-slate-500"}`}>
+                  Khung mới nhất
+                </div>
+                <div className={`font-mono text-[11px] font-bold ${ageWorrying ? "text-amber-200" : "text-white"}`}>
+                  {state.newestFrameAgeMs === null ? "—" : `${formatDurationMs(state.newestFrameAgeMs)} trước`}
+                </div>
+              </div>
+            )}
+            {state && (
+              <div className="p-1.5 rounded-md bg-slate-950 border border-slate-800">
+                <div className="text-[9px] uppercase tracking-wide text-slate-500">Kết nối lại</div>
+                <div className="font-mono text-[11px] font-bold text-white">{state.reconnects ?? "—"}</div>
+              </div>
+            )}
+            {stats && (
+              <div className="p-1.5 rounded-md bg-slate-950 border border-slate-800">
+                <div className="text-[9px] uppercase tracking-wide text-slate-500 inline-flex items-center gap-1">
+                  <Gauge className="w-2.5 h-2.5" /> Độ trễ quyết định
+                </div>
+                <div className="font-mono text-[11px] font-bold text-white">
+                  {formatDurationMs(stats.lastDecisionLatencyMs)}
+                  {typeof stats.decisions === "number" && (
+                    <span className="font-normal text-slate-500"> · {stats.decisions} quyết định</span>
+                  )}
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+        {state?.lastError && (
+          <div className="px-2 py-1 rounded-md bg-rose-950/60 border border-rose-700/70 text-[10px] text-rose-200 flex items-start gap-1.5">
+            <AlertTriangle className="w-3 h-3 shrink-0 mt-px" />
+            <span className="break-words">
+              <b>Lỗi luồng hình:</b> {state.lastError}
+            </span>
           </div>
         )}
       </div>
@@ -1853,7 +2037,6 @@ export const CameraDashboard: React.FC<CameraDashboardProps> = ({
         ? runtime.lastDurationMs / 1000
         : null;
     const scanSec = measuredSec !== null ? measuredSec : estimateScanSeconds(configured.frames);
-    const cycleSec = configured.intervalSeconds + scanSec;
     const tooShort = configured.intervalSeconds < scanSec;
     const nextIn = secondsUntil(runtime?.nextRunAt, nowMs);
     const errors = runtime?.consecutiveErrors || 0;
@@ -1908,6 +2091,8 @@ export const CameraDashboard: React.FC<CameraDashboardProps> = ({
             <span className="text-rose-300/70">Đang hiển thị trạng thái đọc được lần gần nhất.</span>
           </div>
         )}
+
+        {runtime && renderPipelineBlock(runtime.pipeline, key)}
 
         {/* Controls */}
         <div className="px-3 py-2.5 flex flex-wrap items-center gap-2">
@@ -1990,11 +2175,10 @@ export const CameraDashboard: React.FC<CameraDashboardProps> = ({
         <div className="px-3 pb-2.5 text-[10px] leading-relaxed text-slate-500 space-y-1">
           <div className={tooShort ? "text-amber-300" : "text-slate-300"}>
             <b className="font-mono">
-              Nghỉ {configured.intervalSeconds}s (bạn đặt) +{" "}
+              Nghỉ {configured.intervalSeconds}s giữa hai lượt quét (bạn đặt) ·{" "}
               {measuredSec !== null
-                ? `lần quét gần nhất ${fmtSeconds(scanSec)}s (đo được)`
-                : `lần quét ~${fmtSeconds(scanSec)}s (ước tính)`}{" "}
-              ≈ một lượt quét mỗi ~{fmtSeconds(cycleSec)}s
+                ? `mỗi lần quét mất ${fmtSeconds(scanSec)}s (đo được, lần gần nhất)`
+                : `mỗi lần quét mất ~${fmtSeconds(scanSec)}s (ước tính)`}
             </b>{" "}
             <span className="text-slate-500">
               {measuredSec !== null
@@ -2020,8 +2204,8 @@ export const CameraDashboard: React.FC<CameraDashboardProps> = ({
             <div className="text-amber-300">
               Thời gian nghỉ {configured.intervalSeconds} giây còn ngắn hơn thời lượng một lần quét (
               {fmtSeconds(scanSec)} giây): cổng gần như bị quét liên tục và camera cùng cụm worker
-              chịu tải cao nhất. Thực tế vẫn là một lượt mỗi ~{fmtSeconds(cycleSec)} giây, không phải
-              mỗi {configured.intervalSeconds} giây.
+              chịu tải cao nhất. Khoảng nghỉ chỉ bắt đầu sau khi lần quét đã xong, nên từ đầu lượt này
+              đến đầu lượt sau vẫn dài hơn {configured.intervalSeconds} giây.
             </div>
           )}
         </div>
@@ -2100,7 +2284,6 @@ export const CameraDashboard: React.FC<CameraDashboardProps> = ({
     const lastResult = scanState.lastResult;
     const enabledStreams = streams.filter((s) => s.enabled);
     const primary = getPrimaryStream(streams);
-    const hasRtspLike = enabledStreams.some((s) => s.sourceType === "RTSP" || s.sourceType === "BACKEND_UVC");
     const multi = enabledStreams.length > 1;
 
     return (
@@ -2137,44 +2320,20 @@ export const CameraDashboard: React.FC<CameraDashboardProps> = ({
           </div>
 
           <div className="flex items-center gap-2 shrink-0">
-            {/* Live Indicator */}
-            <div className="flex items-center gap-1.5 px-2 py-1 rounded-md bg-slate-900 border border-slate-700/80 text-emerald-400 font-mono text-[11px]">
-              <span className="w-2 h-2 rounded-full bg-emerald-500 animate-ping inline-block" />
-              <span className="font-bold">LIVE {primary?.fps || gateConfig.fps || 25} FPS</span>
-            </div>
-
-            {/* RTSP Mode Selector (applies to all tiles) */}
-            {hasRtspLike && (
-              <div className="hidden md:flex items-center bg-slate-900 border border-slate-700 rounded-lg p-0.5 text-[11px]">
-                <button
-                  onClick={() => setScanState((prev) => ({ ...prev, viewMode: "MJPEG" }))}
-                  className={`px-2 py-0.5 rounded font-medium transition-colors ${
-                    scanState.viewMode === "MJPEG" ? "bg-indigo-600 text-white" : "text-slate-400 hover:text-white"
-                  }`}
-                  title="Luồng video liên tục MJPEG"
+            {/* Rollout mode of this gate (server-owned; absent on an older server) */}
+            {(() => {
+              const mode = watchers[gateKeyOf(gateConfig.gateType)]?.pipeline.mode;
+              if (!mode) return null;
+              return (
+                <span
+                  className={`inline-flex items-center gap-1 px-2 py-1 rounded-md border font-mono text-[10px] font-bold ${TONE_CHIP_CLASS[pipelineModeTone(mode)]}`}
+                  title={pipelineModeHint(mode)}
                 >
-                  MJPEG
-                </button>
-                <button
-                  onClick={() => setScanState((prev) => ({ ...prev, viewMode: "SNAPSHOT", snapshotTs: Date.now() }))}
-                  className={`px-2 py-0.5 rounded font-medium transition-colors ${
-                    scanState.viewMode === "SNAPSHOT" ? "bg-indigo-600 text-white" : "text-slate-400 hover:text-white"
-                  }`}
-                  title="Chế độ chụp ảnh snapshot chu kỳ"
-                >
-                  Snapshot
-                </button>
-                <button
-                  onClick={() => setScanState((prev) => ({ ...prev, viewMode: "SIMULATION" }))}
-                  className={`px-2 py-0.5 rounded font-medium transition-colors ${
-                    scanState.viewMode === "SIMULATION" ? "bg-indigo-600 text-white" : "text-slate-400 hover:text-white"
-                  }`}
-                  title="Khung hình mô phỏng RTSP Test"
-                >
-                  Mô phỏng
-                </button>
-              </div>
-            )}
+                  <GitBranch className="w-3 h-3" />
+                  {pipelineModeLabel(mode)}
+                </span>
+              );
+            })()}
 
             <div className="hidden lg:block px-2 py-1 rounded-md bg-black/60 border border-slate-700/60 text-sky-400 font-mono text-[11px]">
               {currentTime}
@@ -2184,7 +2343,7 @@ export const CameraDashboard: React.FC<CameraDashboardProps> = ({
 
         {/* Stream tiles: one per enabled stream */}
         {enabledStreams.length === 0 ? (
-          <div className="aspect-video bg-black flex flex-col items-center justify-center text-center text-xs text-slate-400 gap-2 p-6">
+          <div className="bg-slate-950 flex flex-col items-center justify-center text-center text-xs text-slate-400 gap-2 p-6">
             <Video className="w-8 h-8 text-slate-700" />
             <p>Cổng này chưa có luồng camera nào được bật.</p>
             <button
@@ -2195,12 +2354,15 @@ export const CameraDashboard: React.FC<CameraDashboardProps> = ({
             </button>
           </div>
         ) : (
-          <div className={`grid gap-2 p-2 bg-black ${multi ? "grid-cols-1 md:grid-cols-2" : "grid-cols-1"}`}>
+          <div className={`grid gap-2 p-2 bg-black/40 ${multi ? "grid-cols-1 md:grid-cols-2" : "grid-cols-1"}`}>
             {enabledStreams.map((s) =>
               renderStreamTile(gateConfig, s, primary?.id === s.id, scanState, setScanState, videoRef)
             )}
           </div>
         )}
+
+        {/* Faces captured here (crops only; the scene is in "Đoạn ghi") */}
+        {renderRecentFaces(gateConfig.gateType)}
 
         {/* Backend watcher: control surface + live status for this gate */}
         {renderWatchPanel(gateConfig, enabledStreams.length)}
@@ -2590,10 +2752,11 @@ export const CameraDashboard: React.FC<CameraDashboardProps> = ({
                   <div key={log.id} className="py-3 flex items-center justify-between gap-3 text-xs">
                     <div className="flex items-center gap-3 min-w-0">
                       {log.photoSnapshot ? (
-                        <ProtectedImage
+                        <FaceThumb
                           src={log.photoSnapshot}
-                          alt={log.employeeName || "User"}
-                          className="w-10 h-10 rounded-xl object-cover border border-slate-200 shrink-0"
+                          alt={`${log.employeeName || "Người lạ"} lúc ${new Date(log.timestamp).toLocaleTimeString("vi-VN")}`}
+                          caption={log.doorName || undefined}
+                          className="w-11 h-11 rounded-xl"
                         />
                       ) : (
                         <div
