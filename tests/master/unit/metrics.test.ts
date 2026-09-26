@@ -148,3 +148,26 @@ describe("MT collector: shadow decisions", () => {
     assert.equal(metrics.latencyMs.p95, 600);
   });
 });
+
+describe("MT scripted passages: schedule and keyframe phase", () => {
+  it("a face is >= 60 px for exactly 3 s, starting 1 s after it appears", async () => {
+    const { faceSizeAt, firstUsableTau, LAST_USABLE_TAU } = await import("../harness/scripted.ts");
+    assert.equal(faceSizeAt(0.999) < 60, true);
+    assert.equal(faceSizeAt(1.0), 60);
+    assert.equal(faceSizeAt(3.99), 110);
+    assert.equal(faceSizeAt(4.0), 0);
+    assert.equal(LAST_USABLE_TAU - firstUsableTau(), 3);
+  });
+
+  it("the default offsets put an entry keyframe inside 3 of 4 lane-0 windows, like random arrivals", async () => {
+    const { GATES, SLOT_TYPES, slotPeople } = await import("../harness/scripted.ts");
+    const gopS = GATES.entry.gop / GATES.entry.fps;
+    let covered = 0;
+    for (const o of [0, 1, 2, 3]) {
+      const [p] = slotPeople(SLOT_TYPES.A1, o);
+      const k = Math.ceil(p.firstUsableS / gopS) * gopS; // first keyframe at or after the window opens
+      if (k < p.lastUsableS) covered++;
+    }
+    assert.equal(covered, 3);
+  });
+});
