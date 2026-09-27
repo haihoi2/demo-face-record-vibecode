@@ -5407,7 +5407,9 @@ interface DesiredPipeline { key: string; url: string; streamId: string; area: Re
 function desiredPipeline(gate: Gate): DesiredPipeline | null {
   const mode = PIPELINE_MODES[gate].mode;
   if (mode === "legacy") return null;
-  const { stream } = resolveGateStream(gate === "EXIT" ? "exit" : "entry");
+  const { gate: gateConfig, stream } = resolveGateStream(gate === "EXIT" ? "exit" : "entry");
+  // A disabled gate runs nothing - same rule as the legacy watcher (review item 8).
+  if (!gateConfig?.enabled) return null;
   const url = String(stream?.rtspUrl || "").trim();
   if (!stream?.enabled || stream.sourceType !== "RTSP" || !/^rtsps?:\/\//i.test(url)) return null;
   const area = normalizeGateArea(stream.roi) ?? null;
@@ -5556,8 +5558,17 @@ function pipelineRuntime(gate: "ENTRY" | "EXIT"): Pick<GateWatchRuntime, "pipeli
       strangers: st.strangers,
       insufficient: st.insufficient,
       framesProcessed: st.framesProcessed,
+      framesDroppedBusy: st.framesDroppedBusy,
+      framesSkippedNoContext: st.framesSkippedNoContext,
       lastLoopMs: st.lastLoopMs,
       contextOk: st.contextOk,
+      worker: {
+        state: st.worker.state,
+        restarts: st.worker.restarts,
+        engineReady: st.worker.engineReady,
+        openTracks: st.worker.openTracks,
+        ...(st.worker.detectInput ? { detectInput: st.worker.detectInput } : {}),
+      },
       ...(st.contextReason ? { contextReason: st.contextReason } : {}),
       ...(st.lastError ? { lastError: redactRtsp(st.lastError) } : {}),
     },

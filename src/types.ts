@@ -366,8 +366,19 @@ export interface GateWatchRuntime {
     strangers?: number;
     insufficient?: number;
     framesProcessed?: number;
+    /** Newest frames not processed because the gate worker was still busy. */
+    framesDroppedBusy?: number;
+    framesSkippedNoContext?: number;
     lastLoopMs?: number;
     contextOk?: boolean;
+    worker?: {
+      state: string;
+      restarts: number;
+      engineReady: boolean;
+      openTracks: number;
+      /** Detector input geometry in use (PIPELINE_DETECT_INPUT -> resolved shape). */
+      detectInput?: string;
+    };
     contextReason?: string;
     lastError?: string;
   };
