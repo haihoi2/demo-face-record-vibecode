@@ -37,6 +37,203 @@ export const DEFAULT_FUSION_THRESHOLDS: FusionThresholds = {
   minMargin: 0.08,
 };
 
+/**
+ * Operating points of the REAL-TIME PIPELINE per recogniser tag, calibrated on
+ * this site's own captures (scripts/perf/calib-eval.ts; numbers and pair-set
+ * sizes in docs/agent-handoffs/2026-09-27-rt-calib.md). The legacy door engine
+ * keeps DEFAULT_FUSION_THRESHOLDS; these apply to pipeline workers only, keyed
+ * by the tag of the recogniser they run. A tag without an entry falls back to
+ * the legacy defaults (reported as such), never to another model's numbers.
+ */
+export const PIPELINE_FUSION_THRESHOLDS_BY_TAG: Readonly<Record<string, Readonly<FusionThresholds>>> = {
+  arcface_w600k_r50: DEFAULT_FUSION_THRESHOLDS,
+};
+
+/** PIPELINE_* threshold overrides (pipeline workers only; the legacy FACE_* ones are untouched). */
+const PIPELINE_THRESHOLD_ENVS: ReadonlyArray<{ env: string; key: keyof FusionThresholds; min: number; max: number; integer?: boolean }> = [
+  { env: "PIPELINE_ACCEPT_SINGLE", key: "acceptSingle", min: 0.01, max: 0.999 },
+  { env: "PIPELINE_ACCEPT_FUSED", key: "acceptFused", min: 0.01, max: 0.999 },
+  { env: "PIPELINE_MIN_EVIDENCE", key: "minEvidence", min: 0.01, max: 0.999 },
+  { env: "PIPELINE_MIN_MARGIN", key: "minMargin", min: 0, max: 0.999 },
+  { env: "PIPELINE_MIN_AGREEING", key: "minAgreeing", min: 1, max: 32, integer: true },
+];
+
+export interface PipelineThresholdSelection {
+  thresholds: FusionThresholds;
+  /** "calibrated" when the tag has a calibrated entry, else "legacy-default". */
+  source: "calibrated" | "legacy-default";
+  /** PIPELINE_* variables applied. */
+  overrides: string[];
+  /** PIPELINE_* variables present but out of range / malformed (ignored). */
+  ignored: string[];
+}
+
+/** Pure: fusion thresholds for a pipeline worker running the recogniser tagged `modelTag`. */
+export function pipelineFusionThresholds(modelTag: string, env: NodeJS.ProcessEnv = process.env): PipelineThresholdSelection {
+  const base = PIPELINE_FUSION_THRESHOLDS_BY_TAG[modelTag];
+  const thresholds: FusionThresholds = { ...(base ?? DEFAULT_FUSION_THRESHOLDS) };
+  const overrides: string[] = [];
+  const ignored: string[] = [];
+  for (const spec of PIPELINE_THRESHOLD_ENVS) {
+    const raw = String(env[spec.env] ?? "").trim();
+    if (raw === "") continue;
+    const n = Number(raw);
+    const ok = Number.isFinite(n) && n >= spec.min && n <= spec.max && (!spec.integer || Number.isInteger(n));
+    if (!ok) {
+      ignored.push(spec.env);
+      continue;
+    }
+    (thresholds as any)[spec.key] = n;
+    overrides.push(spec.env);
+  }
+  return { thresholds, source: base ? "calibrated" : "legacy-default", overrides, ignored };
+}
+
+// ---------------------------------------------------------------------------
+// Gallery derivation for a second recogniser tag (pipeline flow)
+// ---------------------------------------------------------------------------
+
+/**
+ * A picture of an employee that can be embedded again under another recogniser.
+ * Embeddings are never converted between models: a gallery for a new tag is
+ * built by re-embedding source pictures, and this planner only decides WHICH
+ * pictures, deterministically, so the result can be audited and repeated.
+ */
+export interface GalleryDerivationSource {
+  employeeId: string;
+  /** Stable id of the picture: the access-log id of a stored crop, an enrolment photo id, or the template id whose snapshot it is. */
+  sourceId: string;
+  kind: "enrollment_photo" | "template_source" | "access_log_crop";
+  /** ISO time the picture was taken (newer wins between equals). */
+  capturedAt: string;
+  /** 0-1 capture quality when known (template quality / access-log faceEmbeddingQuality). */
+  quality?: number;
+  /** Camera stream the picture came from, when known. */
+  streamId?: string;
+}
+
+export interface GalleryDerivationOptions {
+  /** Tag of the recogniser the gallery is for (faceModelTagFor of its file). */
+  targetTag: string;
+  /** Templates per employee under targetTag, existing ones included. Default 5 (the tracker's evidence budget). */
+  capPerEmployee?: number;
+  /** Sources below this quality are not embedded. Default 0.25 (enrolment grade). */
+  minQuality?: number;
+  /** Employees that should end up covered; those left without any template are reported. */
+  employeeIds?: readonly string[];
+}
+
+export type GalleryDerivationSkip = "alreadyDerived" | "lowQuality" | "capReached" | "invalid";
+
+export interface GalleryDerivationPlan {
+  targetTag: string;
+  /** Sources to embed under targetTag, in execution order (deterministic). */
+  toEmbed: GalleryDerivationSource[];
+  perEmployee: Record<string, { existing: number; planned: number; skipped: Partial<Record<GalleryDerivationSkip, number>> }>;
+  /** Employees (from opts.employeeIds) that will have no template under targetTag after the plan runs. */
+  uncovered: string[];
+}
+
+const KIND_RANK: Record<GalleryDerivationSource["kind"], number> = { enrollment_photo: 0, template_source: 1, access_log_crop: 2 };
+
+/**
+ * Plan the templates to create for `targetTag` from candidate pictures.
+ *
+ * Rules (all deterministic):
+ *  - templates already under targetTag count toward the cap, and a source whose
+ *    id equals an existing target-tag template's sourceLogId or id is skipped;
+ *  - templates of OTHER tags are only consulted for their ids: no embedding is
+ *    ever copied across tags;
+ *  - candidates are ordered enrolment photo > template source > access-log
+ *    crop, then quality (unknown = 0.5) desc, then capturedAt desc, then sourceId;
+ *  - picks alternate across camera streams (round-robin over streamId in that
+ *    order) because on this site same-person cosine across cameras overlaps the
+ *    impostor range - every camera needs templates of its own.
+ */
+export function planGalleryDerivation(
+  existing: readonly FaceTemplate[],
+  sources: readonly GalleryDerivationSource[],
+  opts: GalleryDerivationOptions,
+): GalleryDerivationPlan {
+  const cap = Number.isInteger(opts.capPerEmployee) && (opts.capPerEmployee as number) >= 0 ? (opts.capPerEmployee as number) : 5;
+  const minQuality = typeof opts.minQuality === "number" && Number.isFinite(opts.minQuality) ? opts.minQuality : 0.25;
+  const targetTag = String(opts.targetTag || "");
+  const plan: GalleryDerivationPlan = { targetTag, toEmbed: [], perEmployee: {}, uncovered: [] };
+  if (targetTag === "") return plan;
+
+  const stats = (employeeId: string) =>
+    (plan.perEmployee[employeeId] ??= { existing: 0, planned: 0, skipped: {} });
+  const skip = (employeeId: string, why: GalleryDerivationSkip) => {
+    const s = stats(employeeId).skipped;
+    s[why] = (s[why] ?? 0) + 1;
+  };
+
+  const derived = new Set<string>();
+  for (const t of existing) {
+    if (!t || t.modelTag !== targetTag || !t.employeeId) continue;
+    stats(t.employeeId).existing += 1;
+    if (t.sourceLogId) derived.add(`${t.employeeId}|${t.sourceLogId}`);
+    if (t.id) derived.add(`${t.employeeId}|${t.id}`);
+  }
+
+  const byEmployee = new Map<string, GalleryDerivationSource[]>();
+  for (const s of sources) {
+    if (!s || typeof s.employeeId !== "string" || s.employeeId === "" || typeof s.sourceId !== "string" || s.sourceId === "" || !(s.kind in KIND_RANK)) {
+      if (s && typeof s.employeeId === "string" && s.employeeId !== "") skip(s.employeeId, "invalid");
+      continue;
+    }
+    if (derived.has(`${s.employeeId}|${s.sourceId}`)) {
+      skip(s.employeeId, "alreadyDerived");
+      continue;
+    }
+    if (typeof s.quality === "number" && s.quality < minQuality) {
+      skip(s.employeeId, "lowQuality");
+      continue;
+    }
+    byEmployee.set(s.employeeId, [...(byEmployee.get(s.employeeId) ?? []), s]);
+  }
+
+  const q = (s: GalleryDerivationSource) => (typeof s.quality === "number" && Number.isFinite(s.quality) ? s.quality : 0.5);
+  const order = (a: GalleryDerivationSource, b: GalleryDerivationSource) =>
+    KIND_RANK[a.kind] - KIND_RANK[b.kind] || q(b) - q(a) || String(b.capturedAt).localeCompare(String(a.capturedAt)) || a.sourceId.localeCompare(b.sourceId);
+
+  for (const employeeId of [...byEmployee.keys()].sort()) {
+    const candidates = byEmployee.get(employeeId)!.sort(order);
+    // De-duplicate identical source ids deterministically (first in order wins).
+    const seen = new Set<string>();
+    const unique = candidates.filter((s) => (seen.has(s.sourceId) ? false : (seen.add(s.sourceId), true)));
+    const groups = new Map<string, GalleryDerivationSource[]>();
+    for (const s of unique) {
+      const key = s.streamId ?? "";
+      groups.set(key, [...(groups.get(key) ?? []), s]);
+    }
+    const queues = [...groups.keys()].sort().map((k) => groups.get(k)!);
+    const st = stats(employeeId);
+    let room = Math.max(0, cap - st.existing);
+    let progressed = true;
+    while (room > 0 && progressed) {
+      progressed = false;
+      for (const queue of queues) {
+        if (room === 0) break;
+        const next = queue.shift();
+        if (!next) continue;
+        plan.toEmbed.push(next);
+        st.planned += 1;
+        room -= 1;
+        progressed = true;
+      }
+    }
+    for (const queue of queues) for (const _ of queue) skip(employeeId, "capReached");
+  }
+
+  for (const id of opts.employeeIds ?? []) {
+    const st = plan.perEmployee[id];
+    if (!st || st.existing + st.planned === 0) plan.uncovered.push(id);
+  }
+  plan.uncovered.sort();
+  return plan;
+}
+
 const clamp01 = (v: number) => Math.min(1, Math.max(0, v));
 
 export function l2Normalize(v: ArrayLike<number>): number[] {

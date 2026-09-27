@@ -165,6 +165,86 @@ export function faceModelTagFor(recognizerFile: string): string {
   return `arcface_${base}`;
 }
 
+/**
+ * Recogniser selection for the REAL-TIME PIPELINE workers only (structure rule,
+ * plan section 8a): the legacy watcher/scan/door engine keeps
+ * FACE_RECOGNIZER_MODEL / w600k_r50 and its templates untouched; the pipeline
+ * may run a cheaper recogniser under its OWN template tag.
+ *
+ *   PIPELINE_RECOGNIZER_MODEL    explicit file name inside FACE_MODEL_DIR (wins)
+ *   PIPELINE_RECOGNIZER_VARIANT  r50 | mbf (blank = inherit the legacy recogniser)
+ *
+ * Both unset -> the worker inherits FACE_RECOGNIZER_MODEL exactly as before
+ * (source "default"). The template tag ALWAYS follows the chosen file
+ * (faceModelTagFor), so mbf embeddings are tagged arcface_w600k_mbf and can
+ * never be scored against arcface_w600k_r50 templates: buildGallery drops
+ * foreign tags and the worker refuses a context whose tag differs from its
+ * engine's (fail closed). A selected file that is missing or corrupt fails the
+ * worker's engine load; there is no fallback to another model. An unknown
+ * variant or an unsafe file name is ignored with a warning (like
+ * FACE_DETECTOR_VARIANT), so a typo cannot pick a model by accident.
+ *
+ * Calibrated 2026-09-27 on this site's captures (scripts/perf/calib-eval.ts,
+ * docs/agent-handoffs/2026-09-27-rt-calib.md); the per-model operating points
+ * live in faceFusion.ts PIPELINE_FUSION_THRESHOLDS_BY_TAG.
+ */
+export type PipelineRecognizerVariant = "r50" | "mbf";
+export const PIPELINE_RECOGNIZER_VARIANTS: readonly PipelineRecognizerVariant[] = ["r50", "mbf"];
+export const PIPELINE_RECOGNIZER_FILES: Readonly<Record<PipelineRecognizerVariant, string>> = {
+  /** The legacy FP32 ResNet-50 (buffalo_l), tag arcface_w600k_r50. */
+  r50: FACE_RECOGNIZER_FILE,
+  /** InsightFace buffalo_s/sc MobileFaceNet (w600k_mbf.onnx, 13.6 MB), tag arcface_w600k_mbf. */
+  mbf: "w600k_mbf.onnx",
+};
+/** A bare .onnx file name: no path separators, no traversal, nothing hidden. */
+const SAFE_MODEL_FILE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}\.onnx$/i;
+
+export interface PipelineRecognizerSelection {
+  /** File name inside FACE_MODEL_DIR the pipeline workers load. */
+  file: string;
+  /** Template/embedding tag of that file (faceModelTagFor). */
+  modelTag: string;
+  /** Known variant of the file, or "custom" for any other explicit file. */
+  variant: PipelineRecognizerVariant | "custom";
+  /** Which setting decided: none (inherit the legacy recogniser), the explicit file, or the variant. */
+  source: "default" | "PIPELINE_RECOGNIZER_MODEL" | "PIPELINE_RECOGNIZER_VARIANT";
+  /** Set when a PIPELINE_RECOGNIZER_* value was not applied as written. */
+  warning: string | null;
+}
+
+/** Variant of a recogniser file name, "custom" when it is none of the known files. */
+export function pipelineRecognizerVariantOf(file: string): PipelineRecognizerVariant | "custom" {
+  for (const v of PIPELINE_RECOGNIZER_VARIANTS) if (PIPELINE_RECOGNIZER_FILES[v] === file) return v;
+  return "custom";
+}
+
+/** Pure: decides the pipeline workers' recogniser from an environment (defaults to process.env). */
+export function resolvePipelineRecognizer(env: NodeJS.ProcessEnv = process.env): PipelineRecognizerSelection {
+  const legacyFile = String(env.FACE_RECOGNIZER_MODEL || "").trim() || FACE_RECOGNIZER_FILE;
+  const done = (file: string, source: PipelineRecognizerSelection["source"], warning: string | null): PipelineRecognizerSelection => ({
+    file,
+    modelTag: faceModelTagFor(file),
+    variant: pipelineRecognizerVariantOf(file),
+    source,
+    warning,
+  });
+  const explicit = String(env.PIPELINE_RECOGNIZER_MODEL ?? "").trim();
+  if (explicit !== "") {
+    if (SAFE_MODEL_FILE.test(explicit) && !explicit.includes("..")) return done(explicit, "PIPELINE_RECOGNIZER_MODEL", null);
+    return done(legacyFile, "default", `PIPELINE_RECOGNIZER_MODEL: not a plain .onnx file name, using ${legacyFile}`);
+  }
+  const variant = String(env.PIPELINE_RECOGNIZER_VARIANT ?? "").trim().toLowerCase();
+  if (variant === "") return done(legacyFile, "default", null);
+  if ((PIPELINE_RECOGNIZER_VARIANTS as readonly string[]).includes(variant)) {
+    return done(PIPELINE_RECOGNIZER_FILES[variant as PipelineRecognizerVariant], "PIPELINE_RECOGNIZER_VARIANT", null);
+  }
+  return done(
+    legacyFile,
+    "default",
+    `PIPELINE_RECOGNIZER_VARIANT: unknown value "${variant.slice(0, 32)}" (known: ${PIPELINE_RECOGNIZER_VARIANTS.join(", ")}), using ${legacyFile}`,
+  );
+}
+
 /** ArcFace canonical 5-point template for a 112x112 crop. */
 export const ARCFACE_TEMPLATE: ReadonlyArray<readonly [number, number]> = [
   [38.2946, 51.6963],
