@@ -100,7 +100,32 @@ describe("matchObservations", () => {
   });
 });
 
+/** A face that looks like BOTH employees: cosine `a` to ALICE and `b` to BOB. */
+function lookalike(a: number, b: number, orthAxis: number): number[] {
+  const orth = unit(orthAxis);
+  const c = Math.sqrt(Math.max(0, 1 - a * a - b * b));
+  return ALICE.map((x, i) => a * x + b * BOB[i] + c * orth[i]);
+}
+
 describe("fuseDecision", () => {
+  it("never grants a lookalike: several frames agreeing on ALICE by less than minMargin over BOB", () => {
+    // Every frame prefers ALICE (0.69) over BOB (0.65) - a 0.04 lead, half of minMargin.
+    // Per-frame winners only were aggregated, so BOB never became a candidate and
+    // the multi-agree rule measured ALICE's lead against nobody (margin 1.0).
+    const frames = [0, 1, 2].map((i) => obs(i === 1 ? "cam-2401" : "cam-501", lookalike(0.69, 0.65, 5 + (i % 2)), 0.9, i));
+    const d = recognizeObservations(frames, GALLERY);
+    assert.equal(d.recognized, false, `granted ${d.employeeId} on ${d.basis}`);
+    assert.equal(d.basis, "rejected-ambiguous");
+  });
+
+  it("still grants several frames that clearly prefer one employee over the lookalike", () => {
+    const frames = [0, 1].map((i) => obs("cam-501", lookalike(0.5, 0.3, 5 + i), 0.9, i));
+    const d = recognizeObservations(frames, GALLERY);
+    assert.equal(d.recognized, true);
+    assert.equal(d.employeeId, "ALICE");
+    assert.equal(d.basis, "multi-agree");
+  });
+
   it("rejects with no observations", () => {
     const d = fuseDecision([]);
     assert.equal(d.recognized, false);
