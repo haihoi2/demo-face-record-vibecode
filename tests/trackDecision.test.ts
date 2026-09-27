@@ -233,24 +233,24 @@ describe("trackDecision: employees", () => {
       assert.ok(margin > 0 && margin < DEFAULT_FUSION_THRESHOLDS.minMargin, `margin ${margin}`);
       assert.ok(cos(p, TWIN_A) > DEFAULT_FUSION_THRESHOLDS.acceptSingle);
     }
-    // Characterises faceFusion today: multi-agree compares winning candidates
-    // only, so two frames that both lean to the same twin are accepted there.
+    // faceFusion itself refuses this since the lookalike hotfix (550e568): the
+    // multi-agree rule now checks each frame's own runner-up. It used to grant.
     const fusedOnly = recognizeObservations(
       probes.slice(0, 2).map((p, k) => ({ streamId: "s", frameIndex: k, embedding: Array.from(p), quality: 0.6, detectorScore: 0.9 })),
       GALLERY,
       DEFAULT_FUSION_THRESHOLDS,
     );
-    assert.equal(fusedOnly.recognized, true);
-    assert.equal(fusedOnly.basis, "multi-agree");
+    assert.equal(fusedOnly.recognized, false);
+    assert.equal(fusedOnly.basis, "rejected-ambiguous");
 
+    // The tracker refuses too (fusion first; the track-mean check stays as a second guard).
     const h = new Harness();
     for (let i = 0; i < 16; i++) h.frame(i, [{ d: det(900, 500, 80), q: 0.3 + i * 0.05, who: walk }]);
-    assert.equal(h.results.length, 0, "the track-mean margin check refuses");
+    assert.equal(h.results.length, 0, "no early employee outcome");
     const end = h.tick(T0 + 15 * DT + 2000);
     assert.equal(end.length, 1);
     assert.notEqual(end[0].outcome.kind, "employee");
     assert.equal(end[0].fusionBasis, "rejected-ambiguous");
-    assert.equal(end[0].meanCheckRefused, true);
   });
 
   it("two similar employees split frame by frame are refused by fusion itself", () => {
