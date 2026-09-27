@@ -30,6 +30,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { Worker } from "node:worker_threads";
 
+import { resolvePipelineRecognizer } from "../faceEmbedding";
 import type { Frame, FrameSource, Gate, SourceState } from "./contracts";
 import type { DecisionContext, TrackDecisionResult } from "./trackDecision";
 import type { PipelineWorkerLike } from "./pipelineCore";
@@ -150,6 +151,10 @@ export function resolvePipelineWorkerEntry(): string {
  *   PIPELINE_DETECT_SIZE      -> FACE_DETECT_SIZE       (160-2560, multiple of 32; a wide gate area
  *                                                       letterboxed into 640 shrinks faces ~5x; ignored
  *                                                       with the INT8 detector, whose input is fixed at 640)
+ *   PIPELINE_RECOGNIZER_MODEL /
+ *   PIPELINE_RECOGNIZER_VARIANT -> FACE_RECOGNIZER_MODEL (resolvePipelineRecognizer; the worker's template
+ *                                                       tag follows the file, so its gallery must carry
+ *                                                       that tag or the worker fails closed)
  * Invalid values are ignored (the FACE_* value stays).
  */
 export function pipelineWorkerEnv(env: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
@@ -168,6 +173,8 @@ export function pipelineWorkerEnv(env: NodeJS.ProcessEnv = process.env): NodeJS.
   // every detection (logged by faceEmbedding, returned as "no face").
   const int8 = String(out.FACE_DETECTOR_VARIANT ?? "").trim().toLowerCase() === "int8" && !String(out.FACE_DETECTOR_MODEL ?? "").trim();
   if (size && !(int8 && size !== "640")) out.FACE_DETECT_SIZE = size;
+  const recognizer = resolvePipelineRecognizer(env);
+  if (recognizer.source !== "default") out.FACE_RECOGNIZER_MODEL = recognizer.file;
   return out;
 }
 
