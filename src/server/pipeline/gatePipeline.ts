@@ -142,16 +142,33 @@ export function resolvePipelineWorkerEntry(): string {
 
 /**
  * Worker environment: the main engine's settings (the worker reads the same
- * FACE_* variables), except that PIPELINE_ORT_THREADS, when set to 1-16,
- * replaces FACE_ORT_THREADS for the pipeline workers only. With 1 there is no
- * ONNX Runtime intra-op pool (no spinning threads), which matters when two
- * gate workers, the legacy engine and two FFmpeg decoders share a CPU quota.
+ * FACE_* variables), except for these pipeline-only overrides, which replace
+ * the FACE_* value for the pipeline workers and leave the legacy engine (the
+ * one that opens the door today) untouched:
+ *   PIPELINE_ORT_THREADS      -> FACE_ORT_THREADS       (1-16; 1 = no ORT intra-op pool, no spinning threads)
+ *   PIPELINE_DETECTOR_VARIANT -> FACE_DETECTOR_VARIANT  (fp32 | int8; the embedding model tag is unaffected)
+ *   PIPELINE_DETECT_SIZE      -> FACE_DETECT_SIZE       (160-2560, multiple of 32; a wide gate area
+ *                                                       letterboxed into 640 shrinks faces ~5x; ignored
+ *                                                       with the INT8 detector, whose input is fixed at 640)
+ * Invalid values are ignored (the FACE_* value stays).
  */
 export function pipelineWorkerEnv(env: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
-  const raw = String(env.PIPELINE_ORT_THREADS ?? "").trim();
-  const n = Number(raw);
-  if (raw === "" || !Number.isInteger(n) || n < 1 || n > 16) return { ...env };
-  return { ...env, FACE_ORT_THREADS: String(n) };
+  const out: NodeJS.ProcessEnv = { ...env };
+  const int = (name: string, min: number, max: number, step = 1): string | null => {
+    const raw = String(env[name] ?? "").trim();
+    const n = Number(raw);
+    return raw !== "" && Number.isInteger(n) && n >= min && n <= max && n % step === 0 ? String(n) : null;
+  };
+  const threads = int("PIPELINE_ORT_THREADS", 1, 16);
+  if (threads) out.FACE_ORT_THREADS = threads;
+  const variant = String(env.PIPELINE_DETECTOR_VARIANT ?? "").trim().toLowerCase();
+  if (variant === "fp32" || variant === "int8") out.FACE_DETECTOR_VARIANT = variant;
+  const size = int("PIPELINE_DETECT_SIZE", 160, 2560, 32);
+  // The shipped INT8 detector has a static 640x640 input: any other size fails
+  // every detection (logged by faceEmbedding, returned as "no face").
+  const int8 = String(out.FACE_DETECTOR_VARIANT ?? "").trim().toLowerCase() === "int8" && !String(out.FACE_DETECTOR_MODEL ?? "").trim();
+  if (size && !(int8 && size !== "640")) out.FACE_DETECT_SIZE = size;
+  return out;
 }
 
 function createDefaultWorker(gate: Gate): PipelineWorkerLike {

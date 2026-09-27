@@ -5511,6 +5511,8 @@ function logPipelineStats(gate: Gate, pipeline: GatePipeline) {
       framesSkippedStill: st.framesSkippedStill,
       framesDroppedBusy: st.framesDroppedBusy,
       framesSkippedNoContext: st.framesSkippedNoContext,
+      detections: st.detections,
+      embeddings: st.embeddings,
       lastLoopMs: st.lastLoopMs,
       decisions: st.decisions,
       contextOk: st.contextOk,

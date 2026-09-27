@@ -83,11 +83,17 @@ describe("pipeline worker entry", () => {
     assert.match(entry.replace(/\\/g, "/"), /src\/server\/pipeline\/pipelineWorker\.ts$|pipelineWorker\.cjs$/);
   });
 
-  it("workers inherit FACE_ORT_THREADS unless PIPELINE_ORT_THREADS (1-16) overrides it", () => {
+  it("workers inherit the FACE_* engine settings unless a PIPELINE_* override is valid", () => {
     assert.equal(pipelineWorkerEnv({ FACE_ORT_THREADS: "2" }).FACE_ORT_THREADS, "2");
     assert.equal(pipelineWorkerEnv({ FACE_ORT_THREADS: "2", PIPELINE_ORT_THREADS: "1" }).FACE_ORT_THREADS, "1");
     assert.equal(pipelineWorkerEnv({ FACE_ORT_THREADS: "2", PIPELINE_ORT_THREADS: "0" }).FACE_ORT_THREADS, "2");
     assert.equal(pipelineWorkerEnv({ PIPELINE_ORT_THREADS: "abc" }).FACE_ORT_THREADS, undefined);
+    assert.equal(pipelineWorkerEnv({ FACE_DETECT_SIZE: "640", PIPELINE_DETECT_SIZE: "1280" }).FACE_DETECT_SIZE, "1280");
+    assert.equal(pipelineWorkerEnv({ FACE_DETECT_SIZE: "640", PIPELINE_DETECT_SIZE: "1000" }).FACE_DETECT_SIZE, "640", "not a multiple of 32");
+    assert.equal(pipelineWorkerEnv({ PIPELINE_DETECTOR_VARIANT: "INT8" }).FACE_DETECTOR_VARIANT, "int8");
+    assert.equal(pipelineWorkerEnv({ PIPELINE_DETECTOR_VARIANT: "int8", PIPELINE_DETECT_SIZE: "1280" }).FACE_DETECT_SIZE, undefined, "INT8 input is fixed at 640");
+    assert.equal(pipelineWorkerEnv({ FACE_DETECTOR_VARIANT: "int8", PIPELINE_DETECTOR_VARIANT: "fp32", PIPELINE_DETECT_SIZE: "1280" }).FACE_DETECT_SIZE, "1280");
+    assert.equal(pipelineWorkerEnv({ FACE_DETECTOR_VARIANT: "fp32", PIPELINE_DETECTOR_VARIANT: "int4" }).FACE_DETECTOR_VARIANT, "fp32");
     const env = { FACE_ORT_THREADS: "4" };
     pipelineWorkerEnv({ ...env, PIPELINE_ORT_THREADS: "1" });
     assert.equal(env.FACE_ORT_THREADS, "4", "the main engine's setting is not touched");
