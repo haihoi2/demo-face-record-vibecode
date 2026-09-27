@@ -99,6 +99,27 @@ describe("pipeline worker entry", () => {
     assert.equal(env.FACE_ORT_THREADS, "4", "the main engine's setting is not touched");
   });
 
+  it("PIPELINE_DETECTOR_MODEL selects a detector FILE for the workers only (no paths)", () => {
+    assert.equal(pipelineWorkerEnv({ PIPELINE_DETECTOR_MODEL: "det_10g_int8_dyn.onnx" }).FACE_DETECTOR_MODEL, "det_10g_int8_dyn.onnx");
+    assert.equal(pipelineWorkerEnv({ FACE_DETECTOR_MODEL: "det_10g.onnx", PIPELINE_DETECTOR_MODEL: "../x.onnx" }).FACE_DETECTOR_MODEL, "det_10g.onnx");
+    assert.equal(pipelineWorkerEnv({ PIPELINE_DETECTOR_MODEL: "/models/det.onnx" }).FACE_DETECTOR_MODEL, undefined);
+    assert.equal(pipelineWorkerEnv({ PIPELINE_DETECTOR_MODEL: "det.bin" }).FACE_DETECTOR_MODEL, undefined);
+    assert.equal(pipelineWorkerEnv({ PIPELINE_DETECTOR_MODEL: ".hidden.onnx" }).FACE_DETECTOR_MODEL, undefined);
+    // An explicit file lifts the "INT8 is fixed at 640" guard (the dims check in the worker covers it).
+    assert.equal(pipelineWorkerEnv({ PIPELINE_DETECTOR_VARIANT: "int8", PIPELINE_DETECTOR_MODEL: "det_10g_int8_dyn.onnx", PIPELINE_DETECT_SIZE: "1280" }).FACE_DETECT_SIZE, "1280");
+  });
+
+  it("PIPELINE_DETECT_INPUT auto/<W>x<H> silence ORT's per-frame shape warnings unless FACE_ORT_LOG_LEVEL is set", () => {
+    assert.equal(pipelineWorkerEnv({ PIPELINE_DETECT_INPUT: "auto" }).FACE_ORT_LOG_LEVEL, "3");
+    assert.equal(pipelineWorkerEnv({ PIPELINE_DETECT_INPUT: "auto:960" }).FACE_ORT_LOG_LEVEL, "3");
+    assert.equal(pipelineWorkerEnv({ PIPELINE_DETECT_INPUT: "1824x224" }).FACE_ORT_LOG_LEVEL, "3");
+    assert.equal(pipelineWorkerEnv({ PIPELINE_DETECT_INPUT: "tiles:4" }).FACE_ORT_LOG_LEVEL, undefined);
+    assert.equal(pipelineWorkerEnv({ PIPELINE_DETECT_INPUT: "" }).FACE_ORT_LOG_LEVEL, undefined);
+    assert.equal(pipelineWorkerEnv({}).FACE_ORT_LOG_LEVEL, undefined);
+    assert.equal(pipelineWorkerEnv({ PIPELINE_DETECT_INPUT: "auto", FACE_ORT_LOG_LEVEL: "1" }).FACE_ORT_LOG_LEVEL, "1");
+    assert.equal(pipelineWorkerEnv({ PIPELINE_DETECT_INPUT: "auto" }).PIPELINE_DETECT_INPUT, "auto", "the worker reads the plan itself");
+  });
+
   it("PIPELINE_WORKER_PATH is strict", () => {
     const prev = process.env.PIPELINE_WORKER_PATH;
     process.env.PIPELINE_WORKER_PATH = "/nonexistent/pipelineWorker.cjs";
