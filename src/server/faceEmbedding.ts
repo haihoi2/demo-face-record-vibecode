@@ -172,7 +172,7 @@ export function faceModelTagFor(recognizerFile: string): string {
  * may run a cheaper recogniser under its OWN template tag.
  *
  *   PIPELINE_RECOGNIZER_MODEL    explicit file name inside FACE_MODEL_DIR (wins)
- *   PIPELINE_RECOGNIZER_VARIANT  r50 | mbf (blank = inherit the legacy recogniser)
+ *   PIPELINE_RECOGNIZER_VARIANT  r50 | r50_int8 | mbf (blank = inherit the legacy recogniser)
  *
  * Both unset -> the worker inherits FACE_RECOGNIZER_MODEL exactly as before
  * (source "default"). The template tag ALWAYS follows the chosen file
@@ -188,12 +188,23 @@ export function faceModelTagFor(recognizerFile: string): string {
  * docs/agent-handoffs/2026-09-27-rt-calib.md); the per-model operating points
  * live in faceFusion.ts PIPELINE_FUSION_THRESHOLDS_BY_TAG.
  */
-export type PipelineRecognizerVariant = "r50" | "mbf";
-export const PIPELINE_RECOGNIZER_VARIANTS: readonly PipelineRecognizerVariant[] = ["r50", "mbf"];
+export type PipelineRecognizerVariant = "r50" | "r50_int8" | "mbf";
+export const PIPELINE_RECOGNIZER_VARIANTS: readonly PipelineRecognizerVariant[] = ["r50", "r50_int8", "mbf"];
 export const PIPELINE_RECOGNIZER_FILES: Readonly<Record<PipelineRecognizerVariant, string>> = {
   /** The legacy FP32 ResNet-50 (buffalo_l), tag arcface_w600k_r50. */
   r50: FACE_RECOGNIZER_FILE,
-  /** InsightFace buffalo_s/sc MobileFaceNet (w600k_mbf.onnx, 13.6 MB), tag arcface_w600k_mbf. */
+  /**
+   * Static INT8 (QDQ U8S8, per-channel, percentile 99.99 on 231 real gate crops, stem and
+   * embedding head FP32; scripts/perf/quantize-rec.py), tag arcface_w600k_r50_int8. Drift vs
+   * FP32 median 0.010 / p95 0.027 cosine, TAR@FAR=1e-3 within 1.4 points of FP32 on this site,
+   * 4.3x faster (157 ms vs 679 ms per face at 1 thread). The cheapest model that met the bar.
+   */
+  r50_int8: "w600k_r50_int8.onnx",
+  /**
+   * InsightFace buffalo_s/sc MobileFaceNet (w600k_mbf.onnx, 13.6 MB), tag arcface_w600k_mbf.
+   * 15x faster than r50 but 7-8 TAR points below it at FAR 0 and 1e-3 on this site: NOT good
+   * enough as the sole decision model here; selectable for shadow measurement only.
+   */
   mbf: "w600k_mbf.onnx",
 };
 /** A bare .onnx file name: no path separators, no traversal, nothing hidden. */

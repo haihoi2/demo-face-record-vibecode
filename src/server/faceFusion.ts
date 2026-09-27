@@ -47,6 +47,18 @@ export const DEFAULT_FUSION_THRESHOLDS: FusionThresholds = {
  */
 export const PIPELINE_FUSION_THRESHOLDS_BY_TAG: Readonly<Record<string, Readonly<FusionThresholds>>> = {
   arcface_w600k_r50: DEFAULT_FUSION_THRESHOLDS,
+  /**
+   * INT8 r50 (w600k_r50_int8.onnx): reproduces r50's operating point at 0.55 / 0.45 on the
+   * site pair set (TAR 49-52 % of genuine pairs, 0 strict false accepts, impostor p95 0.13,
+   * margin to accept 0.43); its cosines sit ~0.01 above/below r50's, hence +0.01 / +0.03.
+   */
+  arcface_w600k_r50_int8: { acceptSingle: 0.56, minEvidence: 0.35, acceptFused: 0.48, minAgreeing: 2, minMargin: 0.08 },
+  /**
+   * MobileFaceNet (shadow only, see faceEmbedding.ts): genuine cosines run ~0.04 lower than
+   * r50's (p50 0.514 vs 0.555), impostor p95 0.14; 0.51 / 0.45 reproduce r50's TAR at 0.55 /
+   * 0.45 with 0 strict false accepts (margin 0.37). minEvidence scaled with the genuine p50.
+   */
+  arcface_w600k_mbf: { acceptSingle: 0.51, minEvidence: 0.32, acceptFused: 0.45, minAgreeing: 2, minMargin: 0.08 },
 };
 
 /** PIPELINE_* threshold overrides (pipeline workers only; the legacy FACE_* ones are untouched). */

@@ -69,6 +69,11 @@ test("PIPELINE_RECOGNIZER_VARIANT=mbf selects w600k_mbf.onnx with its own tag", 
     assert.equal(sel.warning, null);
   }
   assert.notEqual(resolvePipelineRecognizer({ PIPELINE_RECOGNIZER_VARIANT: "mbf" }).modelTag, LEGACY_TAG, "a different model must never share the legacy tag");
+  const int8 = resolvePipelineRecognizer({ PIPELINE_RECOGNIZER_VARIANT: "r50_int8" });
+  assert.equal(int8.file, "w600k_r50_int8.onnx");
+  assert.equal(int8.modelTag, "arcface_w600k_r50_int8");
+  assert.notEqual(int8.modelTag, LEGACY_TAG, "INT8 embeddings drift from FP32 and must never share the legacy tag");
+  assert.equal(int8.variant, "r50_int8");
   const r50 = resolvePipelineRecognizer({ PIPELINE_RECOGNIZER_VARIANT: "r50" });
   assert.equal(r50.file, "w600k_r50.onnx");
   assert.equal(r50.modelTag, LEGACY_TAG);
@@ -81,7 +86,7 @@ test("an unknown variant is ignored with a warning (never a silent pick)", () =>
   assert.equal(sel.modelTag, LEGACY_TAG);
   assert.equal(sel.source, "default");
   assert.match(sel.warning ?? "", /PIPELINE_RECOGNIZER_VARIANT: unknown value "r18"/);
-  assert.match(sel.warning ?? "", /known: r50, mbf/);
+  assert.match(sel.warning ?? "", /known: r50, r50_int8, mbf/);
   // Over-long junk is truncated in the warning and still rejected.
   const long = resolvePipelineRecognizer({ PIPELINE_RECOGNIZER_VARIANT: "x".repeat(200) });
   assert.equal(long.source, "default");
@@ -109,7 +114,7 @@ test("unsafe explicit file names (paths, traversal, hidden, wrong suffix) are re
 });
 
 test("variant table is consistent with the tag function", () => {
-  assert.deepEqual([...PIPELINE_RECOGNIZER_VARIANTS], ["r50", "mbf"]);
+  assert.deepEqual([...PIPELINE_RECOGNIZER_VARIANTS], ["r50", "r50_int8", "mbf"]);
   assert.equal(PIPELINE_RECOGNIZER_FILES.r50, FACE_RECOGNIZER_FILE);
   for (const v of PIPELINE_RECOGNIZER_VARIANTS) {
     assert.equal(pipelineRecognizerVariantOf(PIPELINE_RECOGNIZER_FILES[v]), v);
@@ -204,6 +209,21 @@ test("a worker running mbf refuses a context built for the r50 tag (fail closed)
 });
 
 // ---------------------------------------------------------------- thresholds per tag
+
+test("pipelineFusionThresholds: every selectable variant has a calibrated entry, none of them the legacy object itself except r50", () => {
+  for (const v of PIPELINE_RECOGNIZER_VARIANTS) {
+    const tag = faceModelTagFor(PIPELINE_RECOGNIZER_FILES[v]);
+    const sel = pipelineFusionThresholds(tag, {});
+    assert.equal(sel.source, "calibrated", tag);
+    const th = sel.thresholds;
+    assert.ok(th.acceptSingle > th.acceptFused && th.acceptFused > th.minEvidence && th.minMargin === 0.08 && th.minAgreeing === 2, tag);
+    if (v !== "r50") assert.notDeepEqual(th, DEFAULT_FUSION_THRESHOLDS, `${tag} has its own operating point`);
+  }
+  const int8 = pipelineFusionThresholds("arcface_w600k_r50_int8", {}).thresholds;
+  assert.deepEqual(int8, { acceptSingle: 0.56, minEvidence: 0.35, acceptFused: 0.48, minAgreeing: 2, minMargin: 0.08 });
+  const mbf = pipelineFusionThresholds("arcface_w600k_mbf", {}).thresholds;
+  assert.deepEqual(mbf, { acceptSingle: 0.51, minEvidence: 0.32, acceptFused: 0.45, minAgreeing: 2, minMargin: 0.08 });
+});
 
 test("pipelineFusionThresholds: the legacy tag keeps the legacy numbers; an unknown tag falls back and says so", () => {
   const r50 = pipelineFusionThresholds(LEGACY_TAG, {});
