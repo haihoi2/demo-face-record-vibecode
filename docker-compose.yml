@@ -84,6 +84,13 @@ services:
       - PIPELINE_DETECT_SIZE=${PIPELINE_DETECT_SIZE:-}
       - PIPELINE_WORKER_NICE=${PIPELINE_WORKER_NICE:-}
       - PIPELINE_STATS_LOG_MS=${PIPELINE_STATS_LOG_MS:-}
+      # Detector geometry / file for the gate workers (ENTRY handoff): auto keeps the
+      # gate area's aspect within the 640x640 pixel budget; needs a dynamic-shape detector.
+      - PIPELINE_DETECT_INPUT=${PIPELINE_DETECT_INPUT:-}
+      - PIPELINE_DETECTOR_MODEL=${PIPELINE_DETECTOR_MODEL:-}
+      # Recogniser for the gate workers only (CALIB handoff); own template tag.
+      - PIPELINE_RECOGNIZER_VARIANT=${PIPELINE_RECOGNIZER_VARIANT:-}
+      - PIPELINE_RECOGNIZER_MODEL=${PIPELINE_RECOGNIZER_MODEL:-}
       - CAMERA_ENTRY_RTSP_URL=${CAMERA_ENTRY_RTSP_URL:-}
       - CAMERA_EXIT_RTSP_URL=${CAMERA_EXIT_RTSP_URL:-}
       # Outbound destination guard (SSRF). Comma-separated hosts, *.suffix, IPs or
