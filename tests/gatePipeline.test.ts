@@ -2,6 +2,10 @@
  * GatePipeline orchestration (src/server/pipeline/gatePipeline.ts) with a fake
  * stream and a fake engine: newest-frame processing, motion keep-alive,
  * embeddings only where the tracker asks, one outcome per person, fail closed.
+ *
+ * The engine runs behind the real host/worker protocol through the in-process
+ * transport (createInProcessWorker): same messages, same pipelineCore, no
+ * thread. Thread-specific behaviour is in pipelineHost.test.ts / pipelineWorker.test.ts.
  */
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
@@ -10,7 +14,7 @@ import { EventEmitter } from "node:events";
 import type { Frame, FrameSource, Gate, SourceState } from "../src/server/pipeline/contracts";
 import { DEFAULT_FUSION_THRESHOLDS, FaceGallery } from "../src/server/faceFusion";
 import type { DecisionContext, TrackDecisionResult } from "../src/server/pipeline/trackDecision";
-import { GatePipeline, PipelineEngine } from "../src/server/pipeline/gatePipeline";
+import { GatePipeline, PipelineEngine, createInProcessWorker } from "../src/server/pipeline/gatePipeline";
 import type { FaceBox, RgbImage } from "../src/server/faceEmbedding";
 
 const TAG = "arcface_test";
@@ -58,6 +62,8 @@ class FakeSource extends EventEmitter implements FrameSource {
   private newest: Frame | null = null;
   private seq = 0;
   readonly script = new Map<number, Actor[]>();
+  /** Which frame a picture handed to the engine came from (the worker gets the frame's own rgb). */
+  readonly seqOf = new WeakMap<Uint8Array, number>();
   start() { this.started += 1; }
   stop() { this.stopped += 1; }
   latest() { return this.newest; }
@@ -71,6 +77,7 @@ class FakeSource extends EventEmitter implements FrameSource {
       roi: [0, 0, 1920, 1080], sourceWidth: 1920, sourceHeight: 1080, rgb: new Uint8Array(3),
     };
     this.script.set(f.seq, actors);
+    this.seqOf.set(f.rgb, f.seq);
     this.newest = f;
     this.emit("frame", f);
     return f;
@@ -88,16 +95,15 @@ class FakeEngine implements PipelineEngine {
   async detect(img: RgbImage): Promise<FaceBox[]> {
     this.detectCalls += 1;
     if (this.detectDelayMs) await new Promise((r) => setTimeout(r, this.detectDelayMs));
-    const frame = this.source.latest();
-    const actors = (frame && this.source.script.get(frame.seq)) || [];
-    void img;
+    const seq = this.source.seqOf.get(img.data) ?? -1;
+    const actors = this.source.script.get(seq) || [];
     return actors.map((a, i) => ({
       box: [a.x - a.size / 2, a.y - a.size / 2, a.x + a.size / 2, a.y + a.size / 2],
       score: 0.9,
       landmarks: [[a.x - 0.2 * a.size, a.y - 0.1 * a.size], [a.x + 0.2 * a.size, a.y - 0.1 * a.size], [a.x, a.y + 0.05 * a.size],
         [a.x - 0.15 * a.size, a.y + 0.25 * a.size], [a.x + 0.15 * a.size, a.y + 0.25 * a.size]] as Array<[number, number]>,
       // carried through align -> embed so the fake knows who this is
-      ...( { __who: a.who(frame!.seq * 10 + i) } as object),
+      ...( { __who: a.who(seq * 10 + i) } as object),
     })) as FaceBox[];
   }
   private lastWho = new Map<string, Float32Array>();
@@ -127,8 +133,9 @@ function setup(over: Partial<ConstructorParameters<typeof GatePipeline>[0]> = {}
   };
   const results: TrackDecisionResult[] = [];
   const pipeline = new GatePipeline({
-    gate: "EXIT", source, engine, context: ctx, onResult: (r) => results.push(r),
-    idleWaitMs: 20, tickMs: 50, keepAliveMs: 1000, ...over,
+    gate: "EXIT", source, context: ctx, onResult: (r) => results.push(r),
+    createWorker: () => createInProcessWorker(engine),
+    tickMs: 50, keepAliveMs: 1000, ...over,
   });
   return { source, engine, pipeline, results };
 }

@@ -92,14 +92,8 @@ import {
   getFaceEngineInfo,
   isFaceEngineReady,
   loadImage,
-  detectFaces,
-  alignFace,
-  embedFace,
-  faceQuality,
-  facePose,
-  clearFaceIssue,
 } from "./src/server/faceEmbedding";
-import { GatePipeline, type PipelineEngine } from "./src/server/pipeline/gatePipeline";
+import { GatePipeline } from "./src/server/pipeline/gatePipeline";
 import { createStreamReader, probeStreamSize } from "./src/server/pipeline/streamReader";
 import { gateAreaToPixels, normalizeGateArea } from "./src/server/pipeline/gateArea";
 import type { DecisionContext, TrackDecisionResult } from "./src/server/pipeline/trackDecision";
@@ -5355,19 +5349,36 @@ function syncGateWatchers() {
 // reports what it WOULD decide - SSE `pipeline_shadow_result` plus one log line
 // - and never unlocks, never writes an access log, never stores an image.
 // `live` is not in this build (effectivePipelineMode downgrades it to legacy).
+//
+// Inference runs in one worker thread per gate (src/server/pipeline/
+// pipelineWorker.ts), which loads its own SCRFD/ArcFace sessions from the same
+// FACE_* settings; this thread keeps only the stream reader, the motion gate,
+// the decision context and the reporting (F11: ONNX on the main thread starved
+// the reader, HTTP and the legacy watcher).
 // =========================================================================
 const PIPELINE_FPS = envInt("PIPELINE_FPS", 8, 1, 25);
 const PIPELINE_PROBE_RETRY_MS = 30_000;
+/** One pipeline stats line per gate this often (0 = off); counters only, no ids. */
+const PIPELINE_STATS_LOG_MS = envInt("PIPELINE_STATS_LOG_MS", 60_000, 0, 3_600_000);
+const PIPELINE_ERROR_LOG_MS = 10_000;
 
-const pipelineEngine: PipelineEngine = {
-  ready: () => faceEngineActive(),
-  modelTag: () => faceModelTag(),
-  detect: (img) => detectFaces(img),
-  align: (img, landmarks) => alignFace(img, landmarks),
-  embed: (aligned) => embedFace(aligned),
-  quality: (aligned, sizePx) => faceQuality(aligned, sizePx).quality,
-  clearIssue: (landmarks, sizePx) => clearFaceIssue(facePose(landmarks), CLEAR_FACE_LIMITS, sizePx),
+/** Pipeline error lines, at most one per gate per PIPELINE_ERROR_LOG_MS (the rest are counted). */
+const pipelineErrorLog: Record<Gate, { at: number; suppressed: number }> = {
+  ENTRY: { at: 0, suppressed: 0 },
+  EXIT: { at: 0, suppressed: 0 },
 };
+function logPipelineError(gate: Gate, message: string) {
+  const l = pipelineErrorLog[gate];
+  const now = Date.now();
+  if (now - l.at < PIPELINE_ERROR_LOG_MS) {
+    l.suppressed += 1;
+    return;
+  }
+  const extra = l.suppressed ? ` (+${l.suppressed} lỗi tương tự bị lược)` : "";
+  l.at = now;
+  l.suppressed = 0;
+  console.warn(`[Pipeline ${gate}] ${redactRtsp(message)}${extra}`);
+}
 
 /** Same gallery, thresholds and engine the legacy watcher decides with; null = fail closed. */
 function pipelineContext(): DecisionContext | null {
@@ -5382,12 +5393,13 @@ interface GatePipelineSlot {
   pipeline: GatePipeline | null;
   starting: boolean;
   retry: NodeJS.Timeout | null;
+  statsLog: NodeJS.Timeout | null;
   /** The destination guard refused the stream: not started until the config changes. */
   blocked: { code: string; reason: string; since: string } | null;
 }
 const gatePipelines: Record<Gate, GatePipelineSlot> = {
-  ENTRY: { key: "", pipeline: null, starting: false, retry: null, blocked: null },
-  EXIT: { key: "", pipeline: null, starting: false, retry: null, blocked: null },
+  ENTRY: { key: "", pipeline: null, starting: false, retry: null, statsLog: null, blocked: null },
+  EXIT: { key: "", pipeline: null, starting: false, retry: null, statsLog: null, blocked: null },
 };
 
 interface DesiredPipeline { key: string; url: string; streamId: string; area: ReturnType<typeof normalizeGateArea> }
@@ -5435,17 +5447,25 @@ async function startGatePipeline(gate: Gate, want: DesiredPipeline): Promise<voi
       sourceHeight: size.height,
       roi,
       fps: PIPELINE_FPS,
+      // F12: stale/reconnect/recovery transitions, without URL or host, rate-limited by the reader.
+      log: (line) => console.warn(`[Pipeline ${gate}] ${line}`),
     });
     const pipeline = new GatePipeline({
       gate,
       source,
-      engine: pipelineEngine,
       context: pipelineContext,
       onResult: (r) => reportPipelineResult(gate, r),
-      onError: (m) => console.warn(`[Pipeline ${gate}] ${redactRtsp(m)}`),
+      onError: (m) => logPipelineError(gate, m),
+      // Shadow reports ids and timings only: no face crop is made or sent back.
+      crops: false,
     });
     slot.pipeline = pipeline;
     pipeline.start();
+    if (PIPELINE_STATS_LOG_MS > 0) {
+      if (slot.statsLog) clearInterval(slot.statsLog);
+      slot.statsLog = setInterval(() => logPipelineStats(gate, pipeline), PIPELINE_STATS_LOG_MS);
+      slot.statsLog.unref?.();
+    }
     console.log(
       `[Pipeline ${gate}] Chạy chế độ ${PIPELINE_MODES[gate].mode}: luồng ${want.streamId}, ${size.width}x${size.height}, ` +
         `${roi ? `vùng cổng ${roi.join(",")}` : "toàn khung hình"}, ${PIPELINE_FPS} khung/giây.`
@@ -5468,11 +5488,36 @@ function syncPipelines() {
     slot.blocked = null;
     if (slot.retry) clearTimeout(slot.retry);
     slot.retry = null;
+    if (slot.statsLog) clearInterval(slot.statsLog);
+    slot.statsLog = null;
     const old = slot.pipeline;
     slot.pipeline = null;
     if (old) void old.stop().then(() => console.log(`[Pipeline ${gate}] Đã dừng luồng cũ.`));
     if (want) void startGatePipeline(gate, want);
   }
+}
+
+/** Periodic counters of one gate's pipeline (no ids, no URLs): throughput, drops, worker health. */
+function logPipelineStats(gate: Gate, pipeline: GatePipeline) {
+  if (gatePipelines[gate].pipeline !== pipeline) return;
+  const st = pipeline.stats();
+  const src = pipeline.sourceState();
+  console.log(
+    `[Pipeline ${gate}] stats ${JSON.stringify({
+      status: src.status,
+      fps: src.fps,
+      reconnects: src.reconnects,
+      framesProcessed: st.framesProcessed,
+      framesSkippedStill: st.framesSkippedStill,
+      framesDroppedBusy: st.framesDroppedBusy,
+      framesSkippedNoContext: st.framesSkippedNoContext,
+      lastLoopMs: st.lastLoopMs,
+      decisions: st.decisions,
+      contextOk: st.contextOk,
+      worker: st.worker,
+      loopErrors: st.loopErrors,
+    })}`
+  );
 }
 
 /** Shadow: report only. Ids, timings and bases - never images or embeddings. */
