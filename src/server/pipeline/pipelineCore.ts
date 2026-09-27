@@ -190,7 +190,13 @@ export class PipelineCore {
     }
     if (!engine.ready()) {
       this.contextOk = false;
-      this.contextReason = "pipeline worker: face engine not ready";
+      // The engine's own reason (model file missing, detector input plan the graph
+      // cannot run, ...) travels with it, so the host's stats say WHY it fails closed.
+      let why: string | null = null;
+      try {
+        why = engine.error?.() || null;
+      } catch {}
+      this.contextReason = why ? `pipeline worker: face engine not ready (${why.slice(0, 200)})` : "pipeline worker: face engine not ready";
       return;
     }
     const tag = engine.modelTag();
