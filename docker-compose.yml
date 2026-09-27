@@ -77,6 +77,13 @@ services:
       # Real-time pipeline rollout per gate: legacy | shadow | live (default legacy).
       - PIPELINE_MODE_ENTRY=${PIPELINE_MODE_ENTRY:-}
       - PIPELINE_MODE_EXIT=${PIPELINE_MODE_EXIT:-}
+      # Pipeline worker tuning (pipeline only; the legacy door engine is unaffected).
+      - PIPELINE_FPS=${PIPELINE_FPS:-}
+      - PIPELINE_ORT_THREADS=${PIPELINE_ORT_THREADS:-}
+      - PIPELINE_DETECTOR_VARIANT=${PIPELINE_DETECTOR_VARIANT:-}
+      - PIPELINE_DETECT_SIZE=${PIPELINE_DETECT_SIZE:-}
+      - PIPELINE_WORKER_NICE=${PIPELINE_WORKER_NICE:-}
+      - PIPELINE_STATS_LOG_MS=${PIPELINE_STATS_LOG_MS:-}
       - CAMERA_ENTRY_RTSP_URL=${CAMERA_ENTRY_RTSP_URL:-}
       - CAMERA_EXIT_RTSP_URL=${CAMERA_EXIT_RTSP_URL:-}
       # Outbound destination guard (SSRF). Comma-separated hosts, *.suffix, IPs or
