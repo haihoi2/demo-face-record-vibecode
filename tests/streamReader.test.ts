@@ -10,6 +10,7 @@ import {
   parseStreamSize,
   probeStreamSize,
   redactCredentials,
+  hostFreeReason,
   type SpawnLike,
   type StreamReaderOptions,
 } from "../src/server/pipeline/streamReader";
@@ -325,6 +326,123 @@ describe("StreamReader reconnects", () => {
     assert.equal(fake.children.length, 2);
     assert.equal((source as any).getState().status, "starting");
     source.stop();
+  });
+});
+
+describe("StreamReader under event-loop lag (F11)", () => {
+  /**
+   * A blocked event loop delays the watchdog AND the pipe reads. Timers run
+   * before I/O once the loop is free, so the late watchdog tick sees old data.
+   * `lag` jumps the reader's clock ahead of the (mocked) timers to model that.
+   */
+  function laggyReader(extra: Partial<StreamReaderOptions> = {}) {
+    let lag = 0;
+    const r = reader({ staleMs: 1000, firstFrameTimeoutMs: 5000, now: () => Date.now() + lag, ...extra });
+    return { ...r, stall: (ms: number) => { lag += ms; } };
+  }
+
+  it("does not kill a healthy stream when the watchdog fires late after a stall", () => {
+    const { source, fake, statuses, stall } = laggyReader();
+    source.start();
+    fake.last().write(frameBytes(1));
+    mock.timers.tick(250);
+    stall(1500); // e.g. a 1.5 s synchronous inference call on this thread
+    mock.timers.tick(250); // the watchdog runs first, 1.5 s late: re-arms instead of judging
+    assert.deepEqual(fake.children[0].signals, [], "no kill on the late tick");
+    fake.last().write(frameBytes(2)); // then the queued pipe data is read
+    mock.timers.tick(250);
+    mock.timers.tick(250);
+    assert.deepEqual(fake.children[0].signals, []);
+    assert.equal(fake.children.length, 1);
+    assert.ok(!statuses().includes("stale"), JSON.stringify(statuses()));
+    assert.equal((source as any).getState().reconnects, 0);
+    source.stop();
+  });
+
+  it("repeated stalls with data in between never look stale", () => {
+    const { source, fake, stall } = laggyReader();
+    source.start();
+    for (let i = 0; i < 20; i++) {
+      fake.last().write(frameBytes(i));
+      stall(600); // the measured per-call block of SCRFD/ArcFace on the main thread
+      mock.timers.tick(250);
+    }
+    assert.equal(fake.children.length, 1);
+    assert.equal((source as any).getState().status, "streaming");
+    source.stop();
+  });
+
+  it("a frozen stream is still declared stale, even while the loop lags", () => {
+    const { source, fake, statuses, stall } = laggyReader();
+    source.start();
+    fake.last().write(frameBytes(1));
+    stall(1500);
+    mock.timers.tick(250); // late: re-armed once
+    assert.deepEqual(fake.children[0].signals, []);
+    mock.timers.tick(250); // on time, still no data: stale
+    assert.deepEqual(fake.children[0].signals, ["SIGKILL"]);
+    assert.deepEqual(statuses().slice(0, 4), ["starting", "streaming", "stale", "reconnecting"]);
+    source.stop();
+  });
+
+  it("bytes of a frame still arriving keep a big-frame stream alive", () => {
+    const { source, fake } = reader({ staleMs: 1000 });
+    source.start();
+    const f = frameBytes(9);
+    fake.last().write(f);
+    for (let i = 0; i < 6; i++) {
+      mock.timers.tick(750);
+      fake.last().write(f.slice(0, 4)); // a trickle, no complete frame for > staleMs
+    }
+    assert.equal(fake.children.length, 1);
+    assert.deepEqual(fake.children[0].signals, []);
+    source.stop();
+  });
+});
+
+describe("StreamReader transition log (F12)", () => {
+  it("logs stale -> reconnect and recovery once each, without URL, host or login", () => {
+    const lines: string[] = [];
+    const { source, fake } = reader({ staleMs: 1000, log: (l) => lines.push(l) });
+    source.start();
+    fake.last().write(frameBytes(1));
+    mock.timers.tick(1250); // stale
+    assert.equal(lines.length, 1);
+    assert.match(lines[0], /stream stale \(no frame for \d+ ms\); reconnect 1 in 1 s/);
+    mock.timers.tick(1000); // reconnect
+    fake.last().write(frameBytes(2));
+    assert.equal(lines.length, 2);
+    assert.match(lines[1], /stream back after [\d.]+ s \(1 reconnects so far\)/);
+    for (const l of lines) {
+      assert.ok(!l.includes("192.0.2.10") && !l.includes("S3cr3tPass") && !l.includes("admin") && !/rtsp:/i.test(l), l);
+    }
+    source.stop();
+  });
+
+  it("reduces FFmpeg's stderr to a keyword and rate-limits repeats", () => {
+    const lines: string[] = [];
+    const { source, fake } = reader({ staleMs: 1000, logIntervalMs: 10_000, log: (l) => lines.push(l) });
+    source.start();
+    for (let i = 0; i < 4; i++) {
+      fake.last().stderr.emit("data", Buffer.from(`[rtsp @ 0x5] method DESCRIBE failed: 401 Unauthorized ${SECRET_URL}\n`));
+      fake.last().emit("exit", 1, null);
+      mock.timers.tick(2 ** i * 1000); // wait out each back-off
+    }
+    assert.equal(lines.length, 1, lines.join("\n"));
+    assert.match(lines[0], /stream failed \(ffmpeg exited \(code 1\) \(401 unauthorized\)\); reconnect 1 in 1 s/);
+    mock.timers.tick(10_000);
+    fake.last().emit("exit", 1, null);
+    assert.equal(lines.length, 2);
+    assert.match(lines[1], /\(\+\d+ similar lines suppressed\)$/);
+    for (const l of lines) assert.ok(!/192\.0\.2\.10|S3cr3tPass|rtsp:/.test(l), l);
+    source.stop();
+  });
+
+  it("hostFreeReason drops URLs, addresses and stderr detail", () => {
+    assert.equal(hostFreeReason("ffmpeg error: connect ECONNREFUSED 192.0.2.10:554"), "ffmpeg error (connection refused)");
+    assert.equal(hostFreeReason(`ffmpeg exited (code 1): Could not open ${SECRET_URL}`), "ffmpeg exited (code 1)");
+    assert.equal(hostFreeReason("no frame for 1250 ms"), "no frame for 1250 ms");
+    assert.ok(!hostFreeReason(`bad ${SECRET_URL} at 10.1.2.3`).match(/10\.1\.2\.3|S3cr3t|rtsp:/));
   });
 });
 

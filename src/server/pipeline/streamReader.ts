@@ -15,9 +15,17 @@
  *   one read only the last is copied and emitted, the rest are skipped.
  * - Each frame's `rgb` is a fresh buffer: consumers may keep a frame (e.g. as a
  *   track's best frame) without it being overwritten.
- * - Stale detection: no frame for `staleMs` (or no first frame within
- *   `firstFrameTimeoutMs`) -> SIGKILL, reconnect with back-off (1 s doubling to
- *   30 s, reset after `backoffResetMs` of healthy streaming).
+ * - Stale detection: no data from FFmpeg for `staleMs` (or no first frame
+ *   within `firstFrameTimeoutMs`) -> SIGKILL, reconnect with back-off (1 s
+ *   doubling to 30 s, reset after `backoffResetMs` of healthy streaming).
+ *   Event-loop lag is not mistaken for a dead stream (F11): staleness is
+ *   measured on bytes actually read from the pipe, and a watchdog tick that
+ *   fires more than staleMs/2 late re-arms once instead of judging, so the pipe
+ *   data queued behind the stall is read first. A real stall (server frozen)
+ *   still goes stale within ~staleMs + one tick.
+ * - Every stale/failure -> reconnect and every recovery is logged once through
+ *   `log` (F12): gate-agnostic text without URL, host or credentials,
+ *   rate-limited to one line per `logIntervalMs` (suppressed lines counted).
  * - `stop()` hard-kills FFmpeg (SIGKILL) and stops reconnecting.
  * - The URL stays server-side: it is only passed to FFmpeg. Everything the
  *   reader reports (state, lastError) is redacted of `scheme://user:pass@`.
@@ -85,6 +93,10 @@ export interface StreamReaderOptions {
   };
   /** RTSP socket timeout (FFmpeg `-timeout`). Default 5000 ms. */
   socketTimeoutMs?: number;
+  /** Receives one line per stale/reconnect/recovery transition (no URL, host or credentials). Default: none. */
+  log?: (line: string) => void;
+  /** At most one `log` line per this many ms; the rest are counted into the next line. Default 10000 ms. */
+  logIntervalMs?: number;
   ffmpegPath?: string;
   spawn?: SpawnLike;
   now?: () => number;
@@ -110,6 +122,7 @@ interface ReaderConfig {
   threads: number | null;
   lowDelay: boolean;
   socketTimeoutMs: number;
+  logIntervalMs: number;
   ffmpegPath: string;
   frameBytes: number;
 }
@@ -179,6 +192,7 @@ function buildConfig(opts: StreamReaderOptions): { config: ReaderConfig | null; 
       threads: threads != null && Number.isInteger(threads) && threads >= 0 && threads <= 64 ? threads : null,
       lowDelay: opts.decoder?.lowDelay !== false,
       socketTimeoutMs: num(opts.socketTimeoutMs, 5000, 100, 600_000),
+      logIntervalMs: num(opts.logIntervalMs, 10_000, 0, 3_600_000),
       ffmpegPath: opts.ffmpegPath || "ffmpeg",
       frameBytes: roi[2] * roi[3] * 3,
     },
@@ -225,6 +239,32 @@ export function buildStreamReaderArgs(
 
 type Listener = (...args: any[]) => void;
 
+/**
+ * A reason fit for a log line: no URL, no address, no FFmpeg stderr verbatim
+ * (it can name the host). Known FFmpeg failures are reduced to a keyword.
+ */
+export function hostFreeReason(reason: string, stderrLine = ""): string {
+  const base = String(reason || "")
+    .replace(/:\s.*$/s, "") // drop any ": <detail>" (stderr, error text)
+    .replace(/\b[a-z][a-z0-9+.-]*:\/\/\S*/gi, "<url>")
+    .replace(/\b\d{1,3}(?:\.\d{1,3}){3}(?::\d+)?\b/g, "<host>")
+    .slice(0, 120);
+  const s = String(stderrLine || reason || "");
+  const hints: Array<[RegExp, string]> = [
+    [/\b401\b|unauthori[sz]ed/i, "401 unauthorized"],
+    [/\b403\b|forbidden/i, "403 forbidden"],
+    [/\b404\b|not found/i, "404 not found"],
+    [/connection refused|ECONNREFUSED/i, "connection refused"],
+    [/timed? ?out|ETIMEDOUT/i, "timeout"],
+    [/resolve|ENOTFOUND|EAI_AGAIN/i, "name not resolved"],
+    [/invalid data|could not find codec|decod/i, "invalid stream data"],
+    [/end of file|EOF/i, "end of stream"],
+    [/ENOENT/i, "ffmpeg missing"],
+  ];
+  const hint = hints.find(([re]) => re.test(s))?.[1];
+  return hint && !base.includes(hint) ? `${base} (${hint})` : base;
+}
+
 class StreamReader extends EventEmitter implements FrameSource {
   readonly gate: Gate;
   private readonly cfg: ReaderConfig | null;
@@ -254,8 +294,23 @@ class StreamReader extends EventEmitter implements FrameSource {
   private deliveries: number[] = [];
 
   private watchdog: ReturnType<typeof setInterval> | null = null;
+  private watchdogTickMs = 250;
+  private lastWatchdogAtMs = 0;
+  /** The previous watchdog tick was late and skipped judging: the next one judges. */
+  private lagRearmed = false;
+  private lagSkips = 0;
+  /** Time the last bytes came out of the FFmpeg pipe (frames complete or not). */
+  private lastBytesAtMs: number | null = null;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private lastStateEmitMs = 0;
+  private readonly logFn: ((line: string) => void) | null;
+  /** Rate limiters: failures and recoveries separately, so a recovery is not hidden by its own failure line. */
+  private readonly logLimits = {
+    trouble: { lastAtMs: Number.NEGATIVE_INFINITY, suppressed: 0 },
+    recovery: { lastAtMs: Number.NEGATIVE_INFINITY, suppressed: 0 },
+  };
+  /** A failure was logged and the stream has not recovered since. */
+  private troubleSinceMs: number | null = null;
 
   constructor(opts: StreamReaderOptions) {
     super();
@@ -268,6 +323,7 @@ class StreamReader extends EventEmitter implements FrameSource {
     this.sinceMs = this.now();
     this.ring = new RingBuffer<Frame>(this.cfg?.ringSize ?? 3);
     this.motionDetector = this.cfg && this.cfg.motion !== false ? new MotionDetector(this.cfg.motion) : null;
+    this.logFn = typeof opts?.log === "function" ? opts.log : null;
   }
 
   /** Emits to each listener separately so one throwing listener cannot break the reader or the others. */
@@ -293,6 +349,9 @@ class StreamReader extends EventEmitter implements FrameSource {
     this.running = true;
     this.attempt = 0;
     const tick = Math.max(10, Math.min(250, Math.floor(this.cfg.staleMs / 4)));
+    this.watchdogTickMs = tick;
+    this.lastWatchdogAtMs = this.now();
+    this.lagRearmed = false;
     this.watchdog = setInterval(() => this.onWatchdog(), tick);
     this.spawnProcess();
   }
@@ -307,6 +366,7 @@ class StreamReader extends EventEmitter implements FrameSource {
     this.reconnectTimer = null;
     this.killProcess();
     this.resetStream();
+    this.troubleSinceMs = null;
     if (wasRunning || this.status !== "stopped") this.setStatus("stopped", true);
   }
 
@@ -368,6 +428,7 @@ class StreamReader extends EventEmitter implements FrameSource {
     this.filled = 0;
     this.streamingSinceMs = null;
     this.lastFrameAtMs = null;
+    this.lastBytesAtMs = null;
     this.deliveries = [];
     this.ring.clear();
     this.motionResults = new WeakMap();
@@ -434,14 +495,43 @@ class StreamReader extends EventEmitter implements FrameSource {
     this.generation += 1; // later events of this process are ignored
     this.killProcess();
     this.lastError = redactCredentials(reason);
+    const from = this.status;
     if (stale) this.setStatus("stale");
     this.resetStream();
-    this.scheduleReconnect();
+    const delay = this.scheduleReconnect();
+    if (delay !== null) {
+      const what = stale ? "stale" : from === "streaming" ? "lost" : "failed";
+      this.logLine(
+        `stream ${what} (${hostFreeReason(reason, this.lastStderrLine())}); reconnect ${this.attempt} in ${Math.round(delay / 100) / 10} s` +
+          (this.lagSkips ? `; event-loop lag skips so far ${this.lagSkips}` : ""),
+      );
+      if (this.troubleSinceMs === null) this.troubleSinceMs = this.now();
+    }
   }
 
-  private scheduleReconnect(): void {
+  /** One line per transition, at most one per logIntervalMs (the rest are counted into the next one). */
+  private logLine(text: string, kind: "trouble" | "recovery" = "trouble"): void {
     const cfg = this.cfg;
-    if (!cfg || !this.running) return;
+    if (!this.logFn || !cfg) return;
+    const now = this.now();
+    const limit = this.logLimits[kind];
+    if (now - limit.lastAtMs < cfg.logIntervalMs) {
+      limit.suppressed += 1;
+      return;
+    }
+    limit.lastAtMs = now;
+    const extra = limit.suppressed ? ` (+${limit.suppressed} similar lines suppressed)` : "";
+    limit.suppressed = 0;
+    try {
+      this.logFn(redactCredentials(text) + extra);
+    } catch {
+      // a logger bug must not stop the stream
+    }
+  }
+
+  private scheduleReconnect(): number | null {
+    const cfg = this.cfg;
+    if (!cfg || !this.running) return null;
     const delay = Math.min(cfg.backoffMaxMs, cfg.backoffInitialMs * 2 ** Math.min(this.attempt, 30));
     this.attempt += 1;
     this.setStatus("reconnecting", true);
@@ -452,18 +542,31 @@ class StreamReader extends EventEmitter implements FrameSource {
       this.reconnects += 1;
       this.spawnProcess();
     }, delay);
+    return delay;
   }
 
   private onWatchdog(): void {
     const cfg = this.cfg;
     if (!cfg || !this.running) return;
     const now = this.now();
+    // A tick that fires much later than scheduled means the event loop was
+    // blocked: the pipe data that arrived meanwhile has not been read yet.
+    // Re-arm once (the next tick comes after an I/O phase) instead of judging.
+    const lateBy = now - this.lastWatchdogAtMs - this.watchdogTickMs;
+    this.lastWatchdogAtMs = now;
+    if (lateBy > cfg.staleMs / 2 && !this.lagRearmed) {
+      this.lagRearmed = true;
+      this.lagSkips += 1;
+      return;
+    }
+    this.lagRearmed = false;
     if (this.status === "starting" && now - this.spawnedAtMs > cfg.firstFrameTimeoutMs) {
       this.fail(this.generation, `no frame within ${cfg.firstFrameTimeoutMs} ms of connecting`, true);
       return;
     }
-    if (this.status === "streaming" && this.lastFrameAtMs != null && now - this.lastFrameAtMs > cfg.staleMs) {
-      this.fail(this.generation, `no frame for ${now - this.lastFrameAtMs} ms`, true);
+    const lastData = Math.max(this.lastFrameAtMs ?? Number.NEGATIVE_INFINITY, this.lastBytesAtMs ?? Number.NEGATIVE_INFINITY);
+    if (this.status === "streaming" && Number.isFinite(lastData) && now - lastData > cfg.staleMs) {
+      this.fail(this.generation, `no frame for ${now - lastData} ms`, true);
       return;
     }
     if (this.status === "streaming" && this.streamingSinceMs != null && now - this.streamingSinceMs >= cfg.backoffResetMs) {
@@ -480,6 +583,7 @@ class StreamReader extends EventEmitter implements FrameSource {
   private onData(chunk: Buffer): void {
     const cfg = this.cfg;
     if (!cfg) return;
+    this.lastBytesAtMs = this.now();
     const size = cfg.frameBytes;
     const len = chunk.length;
     let pos = 0;
@@ -531,6 +635,10 @@ class StreamReader extends EventEmitter implements FrameSource {
     if (this.status !== "streaming") {
       this.streamingSinceMs = now;
       this.setStatus("streaming");
+      if (this.troubleSinceMs !== null) {
+        this.logLine(`stream back after ${Math.round((now - this.troubleSinceMs) / 100) / 10} s (${this.reconnects} reconnects so far)`, "recovery");
+        this.troubleSinceMs = null;
+      }
     }
     this.emit("frame", frame);
   }
