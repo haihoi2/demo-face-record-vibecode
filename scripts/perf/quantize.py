@@ -25,6 +25,7 @@ import argparse
 import glob
 import hashlib
 import os
+import re
 import sys
 
 import numpy as np
@@ -40,7 +41,13 @@ from onnxruntime.quantization import (
 from onnxruntime.quantization.shape_inference import quant_pre_process
 
 
+SHAPE_RE = re.compile(r"_(\d+)x(\d+)\.u8$")
+
+
 class U8Reader(CalibrationDataReader):
+    """Calibration tensors: `<name>.u8` is size x size x 3; `<name>_<W>x<H>.u8` carries its
+    own shape (scripts/perf/detect-input-eval.ts --dump-calib), for a dynamic-H/W export."""
+
     def __init__(self, files, input_name, size, mean, std, limit):
         self.files = sorted(files)[:limit]
         self.input_name = input_name
@@ -52,9 +59,12 @@ class U8Reader(CalibrationDataReader):
     def get_next(self):
         if self.i >= len(self.files):
             return None
-        raw = np.fromfile(self.files[self.i], dtype=np.uint8)
+        f = self.files[self.i]
+        raw = np.fromfile(f, dtype=np.uint8)
         self.i += 1
-        img = raw.reshape(self.size, self.size, 3).astype(np.float32)
+        m = SHAPE_RE.search(os.path.basename(f))
+        w, h = (int(m.group(1)), int(m.group(2))) if m else (self.size, self.size)
+        img = raw.reshape(h, w, 3).astype(np.float32)
         x = ((img - self.mean) / self.std).transpose(2, 0, 1)[None, ...]
         return {self.input_name: np.ascontiguousarray(x, dtype=np.float32)}
 
@@ -79,11 +89,14 @@ def input_name(path):
 MIN_OPSET = 13  # per-channel QDQ (DequantizeLinear `axis`) needs opset >= 13
 
 
-def fix_batch(src, dst, size):
+def fix_batch(src, dst, size, dynamic_hw=False):
     """Pin the symbolic batch dim to 1 (shape inference) and lift the opset to >= 13.
 
     buffalo_l's det_10g/w600k_r50 are older opsets; a per-channel QDQ model on
     those loads with "Unrecognized attribute: axis for operator DequantizeLinear".
+    With dynamic_hw the spatial dims stay symbolic ("h", "w"): the export then
+    takes any multiple of 32 per axis, like the FP32 det_10g (the real-time
+    pipeline's aspect-preserving input for wide gate areas needs this).
     """
     m = onnx.load(src)
     opset = next((o.version for o in m.opset_import if o.domain in ("", "ai.onnx")), 0)
@@ -103,6 +116,10 @@ def fix_batch(src, dst, size):
             for d, v in zip(dims[1:], (3, size, size)):
                 d.ClearField("dim_param")
                 d.dim_value = v
+            if dynamic_hw:
+                for d, name in zip(dims[2:], ("h", "w")):
+                    d.ClearField("dim_value")
+                    d.dim_param = name
     onnx.save(m, dst)
 
 
@@ -157,6 +174,7 @@ def main():
     ap.add_argument("--keep-heads-fp32", action="store_true", help="exclude the output heads from quantization")
     ap.add_argument("--percentile", type=float, default=99.999)
     ap.add_argument("--act", choices=["u8", "s8"], default="u8", help="activation type: u8 (U8S8) or s8 (S8S8, symmetric)")
+    ap.add_argument("--dynamic-hw", action="store_true", help="keep the detector's H/W symbolic (calibration files may carry _WxH in their names)")
     args = ap.parse_args()
 
     jobs = {
@@ -170,7 +188,7 @@ def main():
         dst = os.path.join(args.models, f"{base}{args.suffix}.onnx")
         fixed = os.path.join("/tmp", f"{base}_b1.onnx")
         pre = os.path.join("/tmp", f"{base}_pre.onnx")
-        fix_batch(src, fixed, size)
+        fix_batch(src, fixed, size, dynamic_hw=args.dynamic_hw and key == "det")
         quant_pre_process(fixed, pre, skip_symbolic_shape=True)
         if args.mode == "dynamic":
             quantize_dynamic(pre, dst, weight_type=QuantType.QInt8, per_channel=True)
