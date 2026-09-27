@@ -162,6 +162,18 @@ One agent owns one suite; nothing is tagged without its sign-off.
 | Disk at 76% on root | clips and model artifacts on `/data`; test image removed after gates |
 | Shadow mode acting by mistake | MT security suite asserts no unlock/log in shadow; INT code review |
 
+## 8a. Structure rule (owner, 2026-09-27)
+
+The real-time pipeline is a **separate engine flow beside the current recognition workflow, not a
+replacement of it**. Concretely: the legacy watcher / scan / recognize-face path and the door engine
+(`faceEmbedding.ts` defaults, `faceFusion.ts`, `w600k_r50` templates) stay as they are; the pipeline has
+its own workers, its own model selection (`PIPELINE_*`), and - when a cheaper recogniser is calibrated -
+its own recogniser and template tag. The per-gate switch (`legacy | shadow | live`) chooses which flow
+acts at a gate; nothing in the pipeline may change the legacy flow's behaviour.
+
+Compute (owner, 2026-09-27): the VM can get more vCPUs and a GPU, sized after calibration finds the
+smallest model that is good enough on this site's own captures.
+
 ## 9. Owner decisions (2026-09-26)
 
 1. Plan and ownership table: **approved**.
