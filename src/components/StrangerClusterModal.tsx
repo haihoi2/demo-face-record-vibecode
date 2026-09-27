@@ -23,10 +23,12 @@ import {
   Search,
   Link2,
   UserSearch,
+  ZoomIn,
 } from "lucide-react";
 import { StrangerCluster, StrangerPhoto, Employee, AccessLog } from "../types";
 import { operatorJsonFetch } from "../utils/api";
 import { ProtectedImage } from "./ProtectedImage";
+import { FaceImage, FaceThumb, ImageZoomDialog } from "./FaceImage";
 import { orgChoice, orgOptions, useOrgCatalog } from "../utils/orgCatalog";
 import { soundEffects } from "../utils/audio";
 
@@ -614,17 +616,31 @@ export const StrangerClusterModal: React.FC<StrangerClusterModalProps> = ({
                                   setPreviewEnlargedPhoto(photo.photoSnapshot);
                                 }
                               }}
-                              className={`relative group rounded-xl overflow-hidden border cursor-pointer transition-all ${
+                              className={`relative group aspect-square rounded-xl overflow-hidden border bg-slate-900 cursor-pointer transition-all ${
                                 isPrimary
                                   ? "ring-2 ring-indigo-600 border-indigo-600 shadow-md"
                                   : "border-slate-200 hover:border-slate-300 hover:shadow-xs"
                               }`}
                             >
-                              <ProtectedImage
+                              <FaceImage
                                 src={photo.photoSnapshot}
-                                alt={`Snapshot ${pIdx + 1}`}
-                                className="w-full h-28 object-cover group-hover:scale-105 transition-transform duration-200"
+                                alt={`Ảnh khuôn mặt ${pIdx + 1}`}
+                                className="w-full h-full group-hover:scale-105 transition-transform duration-200"
                               />
+
+                              {/* Keyboard-reachable zoom (the card click selects the avatar while registering) */}
+                              <button
+                                type="button"
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  setPreviewEnlargedPhoto(photo.photoSnapshot);
+                                }}
+                                className="absolute top-1.5 left-1.5 p-1 rounded-md bg-black/55 text-white opacity-80 hover:opacity-100 focus:opacity-100 focus:outline-hidden focus-visible:ring-2 focus-visible:ring-white"
+                                aria-label={`Phóng to ảnh khuôn mặt ${pIdx + 1}`}
+                                title="Phóng to"
+                              >
+                                <ZoomIn className="w-3 h-3" />
+                              </button>
 
                               {/* Primary tag badge */}
                               {isPrimary && (
@@ -778,10 +794,10 @@ export const StrangerClusterModal: React.FC<StrangerClusterModalProps> = ({
                             {/* Selected target summary */}
                             {mergeTarget && (
                               <div className="flex items-center gap-3 p-3 rounded-xl bg-emerald-50 border border-emerald-200">
-                                <ProtectedImage
+                                <FaceThumb
                                   src={activePhotoUrl || cluster.primaryPhoto}
                                   alt="Ảnh người lạ"
-                                  className="w-10 h-10 rounded-lg object-cover bg-slate-200"
+                                  className="w-10 h-10 rounded-lg"
                                 />
                                 <ArrowRight className="w-4 h-4 text-emerald-600 shrink-0" />
                                 <ProtectedImage
@@ -1043,30 +1059,13 @@ export const StrangerClusterModal: React.FC<StrangerClusterModalProps> = ({
         </div>
       </div>
 
-      {/* Enlarged Photo Preview Modal */}
+      {/* Enlarged photo: natural size, 2x/3x for small crops, Escape/backdrop closes */}
       {previewEnlargedPhoto && (
-        <div
-          id="photo-enlarge-modal"
-          onClick={() => setPreviewEnlargedPhoto(null)}
-          className="fixed inset-0 z-60 bg-black/80 flex items-center justify-center p-4"
-        >
-          <div className="relative max-w-lg w-full bg-white rounded-2xl overflow-hidden p-2 shadow-2xl">
-            <button
-              onClick={() => setPreviewEnlargedPhoto(null)}
-              className="absolute top-4 right-4 p-1.5 rounded-full bg-black/60 text-white hover:bg-black"
-            >
-              <X className="w-4 h-4" />
-            </button>
-            <ProtectedImage
-              src={previewEnlargedPhoto}
-              alt="Enlarged snapshot"
-              className="w-full h-auto rounded-xl object-contain max-h-[75vh]"
-            />
-            <div className="p-3 text-center">
-              <p className="text-xs text-slate-600 font-medium">Ảnh chụp an ninh người lạ từ camera</p>
-            </div>
-          </div>
-        </div>
+        <ImageZoomDialog
+          src={previewEnlargedPhoto}
+          alt="Ảnh người lạ đã chụp"
+          onClose={() => setPreviewEnlargedPhoto(null)}
+        />
       )}
     </div>
   );

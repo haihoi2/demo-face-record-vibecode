@@ -27,7 +27,7 @@ import {
 } from "lucide-react";
 import { AccessLog } from "../types";
 import { EntryPatternAnalytics } from "./EntryPatternAnalytics";
-import { ProtectedImage } from "./ProtectedImage";
+import { FaceThumb } from "./FaceImage";
 import { RecordingPlayer } from "./RecordingPlayer";
 import { useRecordingGates } from "../utils/recordings";
 import {
@@ -435,10 +435,11 @@ export const AccessLogs: React.FC<AccessLogsProps> = ({
                     >
                       {/* Photo Thumbnail */}
                       <td className="py-3 px-4">
-                        <ProtectedImage
+                        <FaceThumb
                           src={log.photoSnapshot}
-                          alt="Face snapshot"
-                          className="w-10 h-10 rounded-lg object-cover border border-slate-200 shadow-xs"
+                          alt={`Ảnh lượt quét ${log.employeeName || "người lạ"} lúc ${formattedTime}`}
+                          caption={`${log.type === "EXIT" ? "Cổng ra" : "Cổng vào"} · ${formattedTime} ${formattedDate}`}
+                          className="w-12 h-12 rounded-lg"
                         />
                         {recordingGates[log.type === "EXIT" ? "EXIT" : "ENTRY"] && (
                           <button
