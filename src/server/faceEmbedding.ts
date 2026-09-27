@@ -52,6 +52,24 @@ export interface FaceBox {
   landmarks: Array<[number, number]>;
 }
 
+/** Height/width the loaded detector graph accepts; "dynamic" = any multiple of 32. */
+export interface DetectorInputDims {
+  height: number | "dynamic";
+  width: number | "dynamic";
+}
+
+/**
+ * Optional detector input shape (ADDITIVE, 2026-09-27). Without it the
+ * detector runs exactly as before: a FACE_DETECT_SIZE square letterbox. The
+ * real-time pipeline passes a shape that follows its gate area's aspect
+ * (src/server/pipeline/detectInput.ts) so a wide strip is not shrunk ~5x into
+ * a square. Both sides must be multiples of 32 (the coarsest SCRFD stride).
+ * The legacy watcher / scan / recognize-face paths never pass this.
+ */
+export interface DetectOptions {
+  inputShape?: { width: number; height: number };
+}
+
 export interface ExtractedFace extends FaceBox {
   /** 512-D, L2-normalised (‖v‖ === 1). */
   embedding: Float32Array;
@@ -103,6 +121,13 @@ export interface FaceEngineInfo {
   /** How pictures smaller than the detector input are letterboxed (FACE_DETECT_UPSCALE). */
   detectUpscale: DetectUpscaleMode;
   detectorInputSize: number;
+  /**
+   * Spatial input dims of the LOADED detector graph: a number where the ONNX
+   * graph fixes the axis (the static INT8 export is 640x640), "dynamic" where
+   * it is symbolic (FP32 det_10g takes any multiple of 32 per axis). null before
+   * the engine is loaded or when the runtime exposes no input metadata.
+   */
+  detectorInputDims: DetectorInputDims | null;
   embeddingDim: number;
   detectThreshold: number;
   nmsIou: number;
@@ -316,6 +341,16 @@ function nmsIouThreshold(): number {
 }
 function detectorInputSize(): number {
   return envNumberOrDefault("FACE_DETECT_SIZE", 640);
+}
+/**
+ * ONNX Runtime session log severity (0 verbose .. 4 fatal). Default 2 = ORT's
+ * own default (warnings). The pipeline worker sets 3 when it runs the FP32
+ * detector at a non-640 shape: det_10g's output metadata is baked for 640x640,
+ * so ORT would otherwise print nine "Expected shape ... does not match" warnings
+ * per frame. Logging only; inference is unaffected.
+ */
+function ortLogSeverity(): number {
+  return envNumber("FACE_ORT_LOG_LEVEL", 2, { min: 0, max: 4, integer: true });
 }
 
 /**
@@ -724,6 +759,36 @@ interface Engine {
   /** File names actually loaded, so status and the model tag describe the running sessions. */
   detectorFile: string;
   recognizerFile: string;
+  /** Spatial dims the detector graph accepts (from the session's input metadata). */
+  detectorInputDims: DetectorInputDims | null;
+}
+
+/**
+ * Reads the detector's [N, C, H, W] input dims from the session metadata.
+ * Symbolic ("?" / a name) or missing dims are "dynamic"; a runtime without
+ * metadata gives null (unknown), never a throw.
+ */
+export function detectorInputDimsOf(meta: unknown): DetectorInputDims | null {
+  try {
+    const list = Array.isArray(meta) ? meta : null;
+    const first = list && list.length ? (list[0] as { shape?: ReadonlyArray<number | string> }) : null;
+    const shape = first && Array.isArray(first.shape) ? first.shape : null;
+    if (!shape || shape.length !== 4) return null;
+    const dim = (v: number | string): number | "dynamic" =>
+      typeof v === "number" && Number.isInteger(v) && v > 0 ? v : "dynamic";
+    return { height: dim(shape[2]), width: dim(shape[3]) };
+  } catch {
+    return null;
+  }
+}
+
+/** Null when the detector accepts width x height, else why it does not. */
+export function detectorShapeIssue(dims: DetectorInputDims | null, width: number, height: number): string | null {
+  if (!dims) return null;
+  const bad: string[] = [];
+  if (dims.height !== "dynamic" && dims.height !== height) bad.push(`height ${height} (graph fixes ${dims.height})`);
+  if (dims.width !== "dynamic" && dims.width !== width) bad.push(`width ${width} (graph fixes ${dims.width})`);
+  return bad.length ? `detector input ${bad.join(", ")}` : null;
 }
 
 let enginePromise: Promise<Engine> | null = null;
@@ -747,6 +812,7 @@ async function createEngine(): Promise<Engine> {
     // Keep the gateway responsive: the worker pool already provides parallelism
     // across frames, so per-session thread fan-out only fights for the same CPU.
     intraOpNumThreads: envNumberOrDefault("FACE_ORT_THREADS", 2),
+    logSeverityLevel: ortLogSeverity() as 0 | 1 | 2 | 3 | 4,
   };
   const t0 = Date.now();
   const [detector, recognizer] = await Promise.all([
@@ -764,6 +830,7 @@ async function createEngine(): Promise<Engine> {
     loadTimeMs,
     detectorFile,
     recognizerFile,
+    detectorInputDims: detectorInputDimsOf((detector as { inputMetadata?: unknown }).inputMetadata),
   };
 }
 
@@ -782,7 +849,8 @@ export async function getFaceEngine(): Promise<Engine | null> {
       .then((e) => {
         engineRef = e;
         engineError = null;
-        log("info", `engine ready in ${e.loadTimeMs}ms (${e.detectorFile}, ${e.recognizerFile}, tag=${faceModelTagFor(e.recognizerFile)})`);
+        const dims = e.detectorInputDims ? `${e.detectorInputDims.width}x${e.detectorInputDims.height}` : "unknown";
+        log("info", `engine ready in ${e.loadTimeMs}ms (${e.detectorFile} input ${dims}, ${e.recognizerFile}, tag=${faceModelTagFor(e.recognizerFile)})`);
       })
       .catch((err) => {
         engineError = err instanceof Error ? err.message : String(err);
@@ -822,6 +890,7 @@ export function getFaceEngineInfo(): FaceEngineInfo {
     variantWarning: warnings.length ? warnings.join("; ") : null,
     detectUpscale: detectUpscaleMode(),
     detectorInputSize: detectorInputSize(),
+    detectorInputDims: engineRef ? engineRef.detectorInputDims : null,
     embeddingDim: EMBEDDING_DIM,
     detectThreshold: detectThreshold(),
     nmsIou: nmsIouThreshold(),
@@ -844,19 +913,21 @@ export function resetFaceEngine(): void {
 
 interface Letterboxed {
   tensorData: Float32Array;
-  size: number;
+  width: number;
+  height: number;
   /** original -> model scale factor; invert to map detections back. */
   scale: number;
 }
 
 /**
- * Aspect-preserving resize into a `size` x `size` canvas, padded with zeros on
- * the BOTTOM and RIGHT only — this is what InsightFace's SCRFD wrapper does, so
- * un-projecting is a single divide by `scale` with no pad offset.
+ * Aspect-preserving resize into a `width` x `height` canvas (a `size` square
+ * on the legacy path), padded with zeros on the BOTTOM and RIGHT only — this is
+ * what InsightFace's SCRFD wrapper does, so un-projecting is a single divide by
+ * `scale` with no pad offset. Exported for tests and offline tools only.
  */
-function letterboxForDetector(img: RgbImage, size: number): Letterboxed {
+export function letterboxForDetector(img: RgbImage, width: number, height = width): Letterboxed {
   const mode = detectUpscaleMode();
-  const fit = Math.min(size / img.width, size / img.height);
+  const fit = Math.min(width / img.width, height / img.height);
   const scale = fit > 1 && mode === "none" ? 1 : fit;
   const newW = Math.max(1, Math.round(img.width * scale));
   const newH = Math.max(1, Math.round(img.height * scale));
@@ -868,20 +939,20 @@ function letterboxForDetector(img: RgbImage, size: number): Letterboxed {
         : resizeArea(img, newW, newH);
   // NCHW float32, (px - 127.5) / 128.0, zero-padded region stays at the value
   // that a black pixel maps to, exactly as a zeroed uint8 canvas would.
-  const plane = size * size;
+  const plane = width * height;
   const data = new Float32Array(3 * plane);
   const padValue = (0 - 127.5) / 128.0;
   data.fill(padValue);
   for (let y = 0; y < newH; y++) {
     for (let x = 0; x < newW; x++) {
       const s = (y * newW + x) * 3;
-      const d = y * size + x;
+      const d = y * width + x;
       data[d] = (resized.data[s] - 127.5) / 128.0;
       data[plane + d] = (resized.data[s + 1] - 127.5) / 128.0;
       data[2 * plane + d] = (resized.data[s + 2] - 127.5) / 128.0;
     }
   }
-  return { tensorData: data, size, scale: newW / img.width };
+  return { tensorData: data, width, height, scale: newW / img.width };
 }
 
 interface GroupedOutputs {
@@ -926,12 +997,14 @@ function groupDetectorOutputs(outputs: Record<string, Tensor>): GroupedOutputs |
  * repeated `NUM_ANCHORS` times (InsightFace stacks the anchors on axis=1 before
  * reshaping, so it is [c0,c0,c1,c1,...], NOT the whole grid twice). Regression
  * outputs are point-to-edge distances in stride units; multiply by the stride,
- * then subtract/add around the anchor centre.
+ * then subtract/add around the anchor centre. The grid is inputW/stride wide
+ * and inputH/stride high (equal on the legacy square path).
  */
 function decodeLevel(
   strideIndex: number,
   grouped: GroupedOutputs,
-  inputSize: number,
+  inputW: number,
+  inputH: number,
   threshold: number,
   invScale: number,
   outBoxes: Array<[number, number, number, number]>,
@@ -942,8 +1015,8 @@ function decodeLevel(
   const scores = grouped.scores[strideIndex];
   const bboxes = grouped.bboxes[strideIndex];
   const kps = grouped.kps[strideIndex];
-  const gridH = Math.floor(inputSize / stride);
-  const gridW = Math.floor(inputSize / stride);
+  const gridH = Math.floor(inputH / stride);
+  const gridW = Math.floor(inputW / stride);
   const expected = gridH * gridW * NUM_ANCHORS;
   if (scores.length !== expected) {
     log(
@@ -980,24 +1053,49 @@ function decodeLevel(
 /**
  * Detect faces. Coordinates come back in ORIGINAL image pixels.
  * Returns [] on any failure (missing models, undecodable frame, bad output shapes).
+ * `options` is additive (see DetectOptions); without it the legacy square path runs.
  */
-export async function detectFaces(input: ImageInput): Promise<FaceBox[]> {
+export async function detectFaces(input: ImageInput, options?: DetectOptions): Promise<FaceBox[]> {
   try {
     const engine = await getFaceEngine();
     if (!engine) return [];
     const img = await loadImage(input);
     if (!img) return [];
-    return await detectOnRgb(engine, img);
+    return await detectOnRgb(engine, img, options);
   } catch (err) {
     log("error", "detectFaces failed", err);
     return [];
   }
 }
 
-async function detectOnRgb(engine: Engine, img: RgbImage): Promise<FaceBox[]> {
+/** Shapes already reported as incompatible with the loaded detector (one log line each). */
+const shapeIssuesLogged = new Set<string>();
+
+/** The detector input shape a call will use: the explicit one, else the FACE_DETECT_SIZE square. */
+export function resolveDetectShape(options?: DetectOptions): { width: number; height: number } {
+  const s = options?.inputShape;
+  if (s && Number.isInteger(s.width) && Number.isInteger(s.height) && s.width > 0 && s.height > 0) {
+    return { width: s.width, height: s.height };
+  }
   const size = detectorInputSize();
-  const lb = letterboxForDetector(img, size);
-  const tensor = new engine.ort.Tensor("float32", lb.tensorData, [1, 3, size, size]);
+  return { width: size, height: size };
+}
+
+async function detectOnRgb(engine: Engine, img: RgbImage, options?: DetectOptions): Promise<FaceBox[]> {
+  const { width: inW, height: inH } = resolveDetectShape(options);
+  // Fail closed on a graph that cannot take this shape: no run, no exception,
+  // one log line per shape (the pipeline checks this before it starts as well).
+  const issue = detectorShapeIssue(engine.detectorInputDims, inW, inH);
+  if (issue) {
+    const key = `${engine.detectorFile}:${inW}x${inH}`;
+    if (!shapeIssuesLogged.has(key)) {
+      shapeIssuesLogged.add(key);
+      log("error", `detectFaces: ${issue}; ${engine.detectorFile} cannot run at ${inW}x${inH} (no faces returned)`);
+    }
+    return [];
+  }
+  const lb = letterboxForDetector(img, inW, inH);
+  const tensor = new engine.ort.Tensor("float32", lb.tensorData, [1, 3, inH, inW]);
   const outputs = await engine.detector.run({ [engine.detectorInput]: tensor });
   const grouped = groupDetectorOutputs(outputs as unknown as Record<string, Tensor>);
   if (!grouped) return [];
@@ -1008,7 +1106,7 @@ async function detectOnRgb(engine: Engine, img: RgbImage): Promise<FaceBox[]> {
   const scores: number[] = [];
   const kps: Array<Array<[number, number]>> = [];
   for (let i = 0; i < FEAT_STRIDES.length; i++) {
-    decodeLevel(i, grouped, size, threshold, invScale, boxes, scores, kps);
+    decodeLevel(i, grouped, inW, inH, threshold, invScale, boxes, scores, kps);
   }
   if (boxes.length === 0) return [];
   const keep = nms(boxes, scores, nmsIouThreshold());

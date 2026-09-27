@@ -75,6 +75,8 @@ export interface PipelineStats {
     restarts: number;
     engineReady: boolean;
     modelTag?: string;
+    /** Detector input geometry in use (PIPELINE_DETECT_INPUT -> resolved shape). */
+    detectInput?: string;
     openTracks: number;
   };
 }
@@ -150,11 +152,18 @@ export function resolvePipelineWorkerEntry(): string {
  *   PIPELINE_DETECTOR_VARIANT -> FACE_DETECTOR_VARIANT  (fp32 | int8; the embedding model tag is unaffected)
  *   PIPELINE_DETECT_SIZE      -> FACE_DETECT_SIZE       (160-2560, multiple of 32; a wide gate area
  *                                                       letterboxed into 640 shrinks faces ~5x; ignored
- *                                                       with the INT8 detector, whose input is fixed at 640)
+ *                                                       with the STATIC INT8 detector, whose input is fixed at
+ *                                                       640 - the dynamic export accepts any shape)
  *   PIPELINE_RECOGNIZER_MODEL /
  *   PIPELINE_RECOGNIZER_VARIANT -> FACE_RECOGNIZER_MODEL (resolvePipelineRecognizer; the worker's template
  *                                                       tag follows the file, so its gallery must carry
  *                                                       that tag or the worker fails closed)
+ *   PIPELINE_DETECTOR_MODEL   -> FACE_DETECTOR_MODEL    (a detector FILE in FACE_MODEL_DIR, e.g. a dynamic-
+ *                                                       shape INT8 export; the embedding tag is unaffected)
+ *   PIPELINE_DETECT_INPUT     (read by the worker itself, see detectInput.ts) additionally sets
+ *                             FACE_ORT_LOG_LEVEL=3 for `auto` / `<W>x<H>` plans unless FACE_ORT_LOG_LEVEL
+ *                             is set: det_10g's output metadata is baked for 640x640 and ORT would warn
+ *                             nine times per frame at any other shape (logging only).
  * Invalid values are ignored (the FACE_* value stays).
  */
 export function pipelineWorkerEnv(env: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
@@ -168,6 +177,9 @@ export function pipelineWorkerEnv(env: NodeJS.ProcessEnv = process.env): NodeJS.
   if (threads) out.FACE_ORT_THREADS = threads;
   const variant = String(env.PIPELINE_DETECTOR_VARIANT ?? "").trim().toLowerCase();
   if (variant === "fp32" || variant === "int8") out.FACE_DETECTOR_VARIANT = variant;
+  // A file name only (no path separators), so the worker cannot be pointed outside FACE_MODEL_DIR.
+  const model = String(env.PIPELINE_DETECTOR_MODEL ?? "").trim();
+  if (/^[A-Za-z0-9._-]+\.onnx$/.test(model) && !model.startsWith(".")) out.FACE_DETECTOR_MODEL = model;
   const size = int("PIPELINE_DETECT_SIZE", 160, 2560, 32);
   // The shipped INT8 detector has a static 640x640 input: any other size fails
   // every detection (logged by faceEmbedding, returned as "no face").
@@ -175,6 +187,8 @@ export function pipelineWorkerEnv(env: NodeJS.ProcessEnv = process.env): NodeJS.
   if (size && !(int8 && size !== "640")) out.FACE_DETECT_SIZE = size;
   const recognizer = resolvePipelineRecognizer(env);
   if (recognizer.source !== "default") out.FACE_RECOGNIZER_MODEL = recognizer.file;
+  const input = String(env.PIPELINE_DETECT_INPUT ?? "").trim().toLowerCase();
+  if ((input.startsWith("auto") || /^\d+x\d+$/.test(input)) && String(env.FACE_ORT_LOG_LEVEL ?? "").trim() === "") out.FACE_ORT_LOG_LEVEL = "3";
   return out;
 }
 
@@ -346,6 +360,7 @@ export class GatePipeline {
         restarts: this.s.restarts,
         engineReady: Boolean(w?.engineReady),
         ...(w?.modelTag ? { modelTag: w.modelTag } : {}),
+        ...(w?.detectInput ? { detectInput: w.detectInput } : {}),
         openTracks: w?.openTracks ?? 0,
       },
     };

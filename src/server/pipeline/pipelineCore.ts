@@ -38,6 +38,8 @@ export interface PipelineEngine {
   clearIssue(landmarks: Array<[number, number]>, boxSizePx: number): string | null;
   /** Last engine load error, if any (for stats). */
   error?(): string | null;
+  /** How frames are presented to the detector (PIPELINE_DETECT_INPUT), for stats. */
+  detectInput?(): string | undefined;
 }
 
 export type Cropper = (frame: Frame, box: [number, number, number, number]) => Promise<Uint8Array | null>;
@@ -117,6 +119,10 @@ export class PipelineCore {
       modelTag = engineReady ? e.modelTag() : undefined;
     } catch {}
     const engineError = e.error?.() || undefined;
+    let detectInput: string | undefined;
+    try {
+      detectInput = e.detectInput?.() || undefined;
+    } catch {}
     return {
       detections: this.s.detections,
       embeddings: this.s.embeddings,
@@ -125,6 +131,7 @@ export class PipelineCore {
       engineReady,
       ...(engineError ? { engineError: engineError.slice(0, 300) } : {}),
       ...(modelTag ? { modelTag } : {}),
+      ...(detectInput ? { detectInput: detectInput.slice(0, 120) } : {}),
       contextOk: this.contextOk,
       ...(this.contextReason ? { contextReason: this.contextReason } : {}),
       openTracks: this.session ? this.session.tracker.snapshot().length : 0,
@@ -183,7 +190,13 @@ export class PipelineCore {
     }
     if (!engine.ready()) {
       this.contextOk = false;
-      this.contextReason = "pipeline worker: face engine not ready";
+      // The engine's own reason (model file missing, detector input plan the graph
+      // cannot run, ...) travels with it, so the host's stats say WHY it fails closed.
+      let why: string | null = null;
+      try {
+        why = engine.error?.() || null;
+      } catch {}
+      this.contextReason = why ? `pipeline worker: face engine not ready (${why.slice(0, 200)})` : "pipeline worker: face engine not ready";
       return;
     }
     const tag = engine.modelTag();

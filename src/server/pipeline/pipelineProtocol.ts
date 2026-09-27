@@ -52,6 +52,8 @@ export interface WorkerStats {
   engineReady: boolean;
   engineError?: string;
   modelTag?: string;
+  /** Detector input geometry in use (PIPELINE_DETECT_INPUT -> resolved shape). */
+  detectInput?: string;
   contextOk: boolean;
   contextReason?: string;
   openTracks: number;
