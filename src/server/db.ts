@@ -359,6 +359,8 @@ export interface GateStreamSourceRecord {
   fps?: number;
   enabled: boolean;
   priority: number;
+  /** Gate area as picture fractions (pipeline ROI); null/absent = whole picture. */
+  roi?: { x: number; y: number; w: number; h: number } | null;
 }
 
 /**

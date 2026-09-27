@@ -67,6 +67,8 @@ const RULES: readonly Rule[] = [
   { methods: ["POST"], pattern: /^\/api\/camera-streams\/config$/, role: "operator" },
   { methods: ["POST"], pattern: /^\/api\/camera-streams\/(?:entry|exit)\/watch$/, role: "operator" },
   { methods: ["POST"], pattern: /^\/api\/camera-streams\/(?:test-stream|scan-rtsp)$/, role: "operator" },
+  // A snapshot is a full camera frame: operator+ only (owner decision: the app shows faces only).
+  { methods: ["GET", "HEAD"], pattern: /^\/api\/camera-streams\/snapshot$/, role: "operator" },
 
   // --- operator: approving new members
   { methods: ["POST"], pattern: /^\/api\/employees$/, role: "operator" },

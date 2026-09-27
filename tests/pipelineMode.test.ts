@@ -18,6 +18,7 @@ describe("pipeline rollout switch", () => {
 
   it("runs legacy until a mode is implemented, and says it did", () => {
     assert.deepEqual(effectivePipelineMode("legacy"), { mode: "legacy", downgraded: false });
+    assert.deepEqual(effectivePipelineMode("shadow"), { mode: "shadow", downgraded: false });
     assert.deepEqual(effectivePipelineMode("live"), { mode: "legacy", downgraded: true });
   });
 });

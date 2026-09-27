@@ -15,7 +15,7 @@ export function pipelineModeFromEnv(gate: Gate, env: Record<string, string | und
  * Modes this build can actually run. Until the pipeline is wired (W2), a gate
  * configured as shadow/live stays on the legacy watcher and says so.
  */
-export const IMPLEMENTED_MODES: readonly PipelineMode[] = ["legacy"];
+export const IMPLEMENTED_MODES: readonly PipelineMode[] = ["legacy", "shadow"];
 
 export function effectivePipelineMode(requested: PipelineMode): { mode: PipelineMode; downgraded: boolean } {
   return IMPLEMENTED_MODES.includes(requested) ? { mode: requested, downgraded: false } : { mode: "legacy", downgraded: true };

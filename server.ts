@@ -84,7 +84,18 @@ import {
   getFaceEngineInfo,
   isFaceEngineReady,
   loadImage,
+  detectFaces,
+  alignFace,
+  embedFace,
+  faceQuality,
+  facePose,
+  clearFaceIssue,
 } from "./src/server/faceEmbedding";
+import { GatePipeline, type PipelineEngine } from "./src/server/pipeline/gatePipeline";
+import { createStreamReader, probeStreamSize } from "./src/server/pipeline/streamReader";
+import { gateAreaToPixels, normalizeGateArea } from "./src/server/pipeline/gateArea";
+import type { DecisionContext, TrackDecisionResult } from "./src/server/pipeline/trackDecision";
+import type { Gate } from "./src/server/pipeline/contracts";
 import type { ExtractedFace, UnclearReason } from "./src/server/faceEmbedding";
 import {
   buildGallery,
@@ -1175,12 +1186,15 @@ function sanitizeStreamSource(
   const rawId = optionalTrimmedString(raw?.id);
   const id = rawId && STREAM_ID_RE.test(rawId) ? rawId : deriveStreamId(gateKey, media.rtspUrl, `stream-${index + 1}`);
   const priorityNum = Number(raw?.priority);
+  // Gate area (pipeline ROI): fractions of the picture; null = whole picture.
+  const roi = normalizeGateArea(raw?.roi);
   return {
     id,
     label: optionalTrimmedString(raw?.label) || fallbackLabel || id,
     ...media,
     enabled: raw?.enabled !== false && raw?.enabled !== "false" && raw?.enabled !== 0,
     priority: Number.isFinite(priorityNum) ? priorityNum : (index + 1) * 10,
+    ...(roi !== undefined ? { roi } : {}),
   };
 }
 
@@ -3650,6 +3664,12 @@ app.post("/api/camera-streams/test-stream", (req, res) => {
 
 // Capture single JPEG snapshot frame from RTSP/HTTP stream via FFmpeg
 app.get("/api/camera-streams/snapshot", async (req, res) => {
+  // Operator+ (auth table). A full frame is a sensitive read: record who took it.
+  const snapSession = readOperatorSession(req);
+  console.log(
+    `[Snapshot] ${snapSession ? `${snapSession.actor}${snapSession.displayName ? ` (${snapSession.displayName})` : ""}, ${snapSession.role}` : "unknown"} ` +
+      `lấy ảnh toàn khung cổng ${String(req.query.gate || "")} luồng ${String(req.query.stream || "chính")}`
+  );
   if (req.query.url !== undefined) {
     return res.status(400).json({ success: false, code: "URL_OVERRIDE_NOT_ALLOWED", error: "Tham số url không được hỗ trợ; chỉ dùng luồng đã cấu hình." });
   }
@@ -3686,59 +3706,15 @@ app.get("/api/camera-streams/snapshot", async (req, res) => {
 });
 
 // Real-time Live MJPEG Video Stream Proxy for Browsers
-app.get("/api/camera-streams/mjpeg", (req, res) => {
-  if (req.query.url !== undefined) {
-    return res.status(400).send("Tham số url không được hỗ trợ; chỉ dùng luồng đã cấu hình.");
-  }
-  const resolved = resolveGateStream(req.query.gate, req.query.stream);
-  if (resolved.error) {
-    return res.status(400).send(resolved.error);
-  }
-  const stream = resolved.stream;
-  // Only the configured stream: a caller-supplied ?url= let any signed-in
-  // viewer make the gateway dial an arbitrary RTSP destination (SSRF).
-  const streamUrl = String(stream.rtspUrl || "").trim();
-  const transport = stream.rtspTransport === "UDP" ? "udp" : "tcp";
-
-  if (!streamUrl || !streamUrl.toLowerCase().startsWith("rtsp://")) {
-    return res.status(400).send("URL luồng RTSP không hợp lệ");
-  }
-
-  res.writeHead(200, {
-    "Content-Type": "multipart/x-mixed-replace; boundary=ffmpeg",
-    "Cache-Control": "no-cache, no-store, must-revalidate",
-    Pragma: "no-cache",
-    Connection: "close",
+// The live MJPEG proxy streamed full camera pictures to the browser. Removed:
+// the app shows only face crops (owner decision 2026-09-26) and the UI no
+// longer uses it. Answers 410 so an old client gets a clear reason; nothing is dialled.
+app.get("/api/camera-streams/mjpeg", (_req, res) => {
+  res.status(410).json({
+    success: false,
+    code: "MJPEG_REMOVED",
+    error: "Xem trực tiếp khung hình camera đã bị gỡ; ứng dụng chỉ hiển thị ảnh khuôn mặt. Dùng \"Đoạn ghi\" để xem lại.",
   });
-
-  const args = [
-    "-rtsp_transport", transport,
-    "-timeout", "4000000",
-    "-i", streamUrl,
-    "-f", "mpjpeg",
-    "-boundary_tag", "ffmpeg",
-    "-q:v", "4",
-    "-r", "15",
-    "pipe:1",
-  ];
-
-  let proc: any = null;
-  try {
-    proc = spawn("ffmpeg", args);
-    proc.stdout.pipe(res);
-
-    proc.on("error", () => {
-      try { res.end(); } catch {}
-    });
-
-    req.on("close", () => {
-      if (proc) {
-        try { proc.kill("SIGKILL"); } catch {}
-      }
-    });
-  } catch (err) {
-    try { res.end(); } catch {}
-  }
 });
 
 // Scan and recognise faces from one or all RTSP streams of a gate.
@@ -4897,6 +4873,7 @@ function gateWatchRuntime(state: GateWatcherState): GateWatchRuntime & GateWatch
     enabled: state.enabled,
     pipelineMode: pipeline.mode,
     ...(pipeline.requested !== pipeline.mode ? { pipelineModeRequested: pipeline.requested } : {}),
+    ...pipelineRuntime(state.gate),
     intervalSeconds: state.intervalSeconds,
     frames: state.frames,
     running: state.running,
@@ -5158,6 +5135,158 @@ function applyGateWatchConfig(
 function syncGateWatchers() {
   applyGateWatchConfig("entry");
   applyGateWatchConfig("exit");
+  syncPipelines();
+}
+
+// =========================================================================
+// REAL-TIME PIPELINE, per gate (plan: docs/plans/2026-09-26-realtime-pipeline.md)
+//
+// `shadow` runs next to the legacy watcher on its own always-open stream and
+// reports what it WOULD decide - SSE `pipeline_shadow_result` plus one log line
+// - and never unlocks, never writes an access log, never stores an image.
+// `live` is not in this build (effectivePipelineMode downgrades it to legacy).
+// =========================================================================
+const PIPELINE_FPS = envInt("PIPELINE_FPS", 8, 1, 25);
+const PIPELINE_PROBE_RETRY_MS = 30_000;
+
+const pipelineEngine: PipelineEngine = {
+  ready: () => faceEngineActive(),
+  modelTag: () => faceModelTag(),
+  detect: (img) => detectFaces(img),
+  align: (img, landmarks) => alignFace(img, landmarks),
+  embed: (aligned) => embedFace(aligned),
+  quality: (aligned, sizePx) => faceQuality(aligned, sizePx).quality,
+  clearIssue: (landmarks, sizePx) => clearFaceIssue(facePose(landmarks), CLEAR_FACE_LIMITS, sizePx),
+};
+
+/** Same gallery, thresholds and engine the legacy watcher decides with; null = fail closed. */
+function pipelineContext(): DecisionContext | null {
+  if (!faceEngineActive()) return null;
+  const tag = faceModelTag();
+  return { gallery: currentGallery(), galleryModelTag: tag, engineModelTag: tag, thresholds: currentFusionThresholds(), engineReady: true };
+}
+
+interface GatePipelineSlot {
+  /** Identity of the running configuration; holds the URL, so in memory only - never logged. */
+  key: string;
+  pipeline: GatePipeline | null;
+  starting: boolean;
+  retry: NodeJS.Timeout | null;
+}
+const gatePipelines: Record<Gate, GatePipelineSlot> = {
+  ENTRY: { key: "", pipeline: null, starting: false, retry: null },
+  EXIT: { key: "", pipeline: null, starting: false, retry: null },
+};
+
+interface DesiredPipeline { key: string; url: string; streamId: string; area: ReturnType<typeof normalizeGateArea> }
+
+function desiredPipeline(gate: Gate): DesiredPipeline | null {
+  const mode = PIPELINE_MODES[gate].mode;
+  if (mode === "legacy") return null;
+  const { stream } = resolveGateStream(gate === "EXIT" ? "exit" : "entry");
+  const url = String(stream?.rtspUrl || "").trim();
+  if (!stream?.enabled || stream.sourceType !== "RTSP" || !/^rtsps?:\/\//i.test(url)) return null;
+  const area = normalizeGateArea(stream.roi) ?? null;
+  return { key: JSON.stringify([mode, stream.id, url, stream.rtspTransport, area, PIPELINE_FPS]), url, streamId: stream.id, area };
+}
+
+async function startGatePipeline(gate: Gate, want: DesiredPipeline): Promise<void> {
+  const slot = gatePipelines[gate];
+  slot.starting = true;
+  try {
+    const size = await probeStreamSize(want.url, { timeoutMs: 15_000 });
+    if (slot.key !== want.key) return; // reconfigured while probing
+    if (!size) {
+      console.warn(`[Pipeline ${gate}] Không đọc được kích thước khung hình của luồng ${want.streamId}; thử lại sau ${PIPELINE_PROBE_RETRY_MS / 1000}s.`);
+      slot.retry = setTimeout(() => {
+        slot.retry = null;
+        if (slot.key === want.key && !slot.pipeline && !slot.starting) void startGatePipeline(gate, want);
+      }, PIPELINE_PROBE_RETRY_MS);
+      slot.retry.unref?.();
+      return;
+    }
+    const roi = gateAreaToPixels(want.area, size.width, size.height);
+    const source = createStreamReader({
+      gate,
+      streamId: want.streamId,
+      url: want.url,
+      sourceWidth: size.width,
+      sourceHeight: size.height,
+      roi,
+      fps: PIPELINE_FPS,
+    });
+    const pipeline = new GatePipeline({
+      gate,
+      source,
+      engine: pipelineEngine,
+      context: pipelineContext,
+      onResult: (r) => reportPipelineResult(gate, r),
+      onError: (m) => console.warn(`[Pipeline ${gate}] ${redactRtsp(m)}`),
+    });
+    slot.pipeline = pipeline;
+    pipeline.start();
+    console.log(
+      `[Pipeline ${gate}] Chạy chế độ ${PIPELINE_MODES[gate].mode}: luồng ${want.streamId}, ${size.width}x${size.height}, ` +
+        `${roi ? `vùng cổng ${roi.join(",")}` : "toàn khung hình"}, ${PIPELINE_FPS} khung/giây.`
+    );
+  } catch (err: any) {
+    console.warn(`[Pipeline ${gate}] Không khởi động được: ${redactRtsp(String(err?.message || err))}`);
+  } finally {
+    slot.starting = false;
+  }
+}
+
+/** Starts, restarts or stops each gate's pipeline to match mode + camera config. */
+function syncPipelines() {
+  for (const gate of ["ENTRY", "EXIT"] as const) {
+    const slot = gatePipelines[gate];
+    const want = desiredPipeline(gate);
+    const wantKey = want?.key ?? "";
+    if (slot.key === wantKey) continue;
+    slot.key = wantKey;
+    if (slot.retry) clearTimeout(slot.retry);
+    slot.retry = null;
+    const old = slot.pipeline;
+    slot.pipeline = null;
+    if (old) void old.stop().then(() => console.log(`[Pipeline ${gate}] Đã dừng luồng cũ.`));
+    if (want) void startGatePipeline(gate, want);
+  }
+}
+
+/** Shadow: report only. Ids, timings and bases - never images or embeddings. */
+function reportPipelineResult(gate: Gate, r: TrackDecisionResult) {
+  const payload = {
+    ...r.shadow,
+    basis: r.basis,
+    ...(r.fusionBasis ? { fusionBasis: r.fusionBasis } : {}),
+    ...(r.meanCheckRefused ? { meanCheckRefused: true } : {}),
+    mode: PIPELINE_MODES[gate].mode,
+  };
+  broadcastSSE("pipeline_shadow_result", payload);
+  console.log(`[Pipeline ${gate}] shadow ${JSON.stringify(payload)}`);
+}
+
+/** Watcher-runtime fields for the dashboard: stream health + decision counters. */
+function pipelineRuntime(gate: "ENTRY" | "EXIT"): Pick<GateWatchRuntime, "pipelineState" | "pipelineStats"> {
+  const p = gatePipelines[gate].pipeline;
+  if (!p) return {};
+  const { gate: _g, ...state } = p.sourceState();
+  const st = p.stats();
+  return {
+    pipelineState: { ...state, ...(state.lastError ? { lastError: redactRtsp(state.lastError) } : {}) },
+    pipelineStats: {
+      lastDecisionLatencyMs: st.lastDecisionLatencyMs,
+      decisions: st.decisions,
+      employees: st.employees,
+      strangers: st.strangers,
+      insufficient: st.insufficient,
+      framesProcessed: st.framesProcessed,
+      lastLoopMs: st.lastLoopMs,
+      contextOk: st.contextOk,
+      ...(st.contextReason ? { contextReason: st.contextReason } : {}),
+      ...(st.lastError ? { lastError: redactRtsp(st.lastError) } : {}),
+    },
+  };
 }
 
 function listGateWatchRuntimes(): Array<GateWatchRuntime & GateWatchOutcomeRuntime> {

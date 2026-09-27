@@ -16,7 +16,7 @@
 import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
 
-import { api, postJson } from "./helpers";
+import { api, apiAs, authenticateAs, postJson } from "./helpers";
 
 interface StreamSource {
   id: string;
@@ -390,9 +390,16 @@ describe("camera streams: multi-stream gate config", () => {
       assert.match(res.body.error, /exit-nope/);
     });
 
-    it("mjpeg with an unknown stream id -> 400", async () => {
+    it("the live MJPEG proxy is gone (410), whatever the stream", async () => {
       const res = await api("/api/camera-streams/mjpeg?gate=entry&stream=entry-nope");
-      assert.equal(res.status, 400);
+      assert.equal(res.status, 410);
+      assert.equal(res.body?.code, "MJPEG_REMOVED");
+    });
+
+    it("a viewer cannot take a full-frame snapshot (403)", async () => {
+      const viewer = await authenticateAs(process.env.VIEWER_TOKEN || "integration-viewer-token");
+      const res = await apiAs(viewer, "/api/camera-streams/snapshot?gate=exit", { redirect: "manual" });
+      assert.equal(res.status, 403, res.text.slice(0, 200));
     });
 
     it("snapshot of a known stream pointing at an unreachable host falls back to the test frame", async () => {

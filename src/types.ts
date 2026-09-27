@@ -320,6 +320,8 @@ export interface GateStreamSource {
   enabled: boolean;
   /** Lower runs/shows first. The lowest-priority enabled stream is the primary. */
   priority: number;
+  /** Gate area as picture fractions (real-time pipeline ROI); null/absent = whole picture. */
+  roi?: { x: number; y: number; w: number; h: number } | null;
 }
 
 /**
@@ -347,6 +349,28 @@ export interface GateWatchRuntime {
   pipelineMode?: "legacy" | "shadow" | "live";
   /** Set when the configured mode is not available in this build and legacy runs instead. */
   pipelineModeRequested?: "legacy" | "shadow" | "live";
+  /** Real-time pipeline stream health (shadow/live only). */
+  pipelineState?: {
+    status: "starting" | "streaming" | "stale" | "reconnecting" | "stopped";
+    fps: number;
+    newestFrameAgeMs: number | null;
+    reconnects: number;
+    lastError?: string;
+    since: string;
+  };
+  /** Real-time pipeline decisions (shadow/live only). */
+  pipelineStats?: {
+    lastDecisionLatencyMs?: number;
+    decisions?: number;
+    employees?: number;
+    strangers?: number;
+    insufficient?: number;
+    framesProcessed?: number;
+    lastLoopMs?: number;
+    contextOk?: boolean;
+    contextReason?: string;
+    lastError?: string;
+  };
   intervalSeconds: number;
   frames: number;
   /** True while a scan is actually in flight. */

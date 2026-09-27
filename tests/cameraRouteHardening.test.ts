@@ -12,12 +12,21 @@ const source = readFileSync(new URL("../server.ts", import.meta.url), "utf8");
 function routeBody(path: string): string {
   const start = source.indexOf(`app.get("${path}"`);
   assert.ok(start >= 0, `${path} not found`);
-  const next = source.indexOf("\napp.", start + 10);
-  return source.slice(start, next > 0 ? next : undefined);
+  // The route ends at its own closing "});" at column 0 - NOT at the next
+  // "app." line, which can be a thousand lines further down.
+  const end = source.indexOf("\n});\n", start);
+  assert.ok(end > start, `${path} has no closing brace`);
+  return source.slice(start, end + 4);
 }
 
 describe("camera route hardening", () => {
-  for (const path of ["/api/camera-streams/snapshot", "/api/camera-streams/mjpeg"]) {
+  it("the MJPEG proxy is removed: it answers 410 and dials nothing", () => {
+    const body = routeBody("/api/camera-streams/mjpeg");
+    assert.match(body, /status\(410\)/);
+    assert.doesNotMatch(body, /spawn|grabRtspFrame|rtspUrl/);
+  });
+
+  for (const path of ["/api/camera-streams/snapshot"]) {
     it(`${path} refuses a caller-supplied ?url= and never dials it`, () => {
       const body = routeBody(path);
       assert.match(body, /if \(req\.query\.url !== undefined\)[\s\S]{0,80}status\(400\)/);
