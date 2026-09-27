@@ -296,8 +296,9 @@ class StreamReader extends EventEmitter implements FrameSource {
   private watchdog: ReturnType<typeof setInterval> | null = null;
   private watchdogTickMs = 250;
   private lastWatchdogAtMs = 0;
-  /** The previous watchdog tick was late and skipped judging: the next one judges. */
-  private lagRearmed = false;
+  /** A late watchdog tick waits for an I/O phase (setImmediate) before any stale verdict. */
+  private ioCheckpointPending = false;
+  private lastVerdictAtMs = 0;
   private lagSkips = 0;
   /** Time the last bytes came out of the FFmpeg pipe (frames complete or not). */
   private lastBytesAtMs: number | null = null;
@@ -351,7 +352,8 @@ class StreamReader extends EventEmitter implements FrameSource {
     const tick = Math.max(10, Math.min(250, Math.floor(this.cfg.staleMs / 4)));
     this.watchdogTickMs = tick;
     this.lastWatchdogAtMs = this.now();
-    this.lagRearmed = false;
+    this.lastVerdictAtMs = this.lastWatchdogAtMs;
+    this.ioCheckpointPending = false;
     this.watchdog = setInterval(() => this.onWatchdog(), tick);
     this.spawnProcess();
   }
@@ -551,15 +553,27 @@ class StreamReader extends EventEmitter implements FrameSource {
     const now = this.now();
     // A tick that fires much later than scheduled means the event loop was
     // blocked: the pipe data that arrived meanwhile has not been read yet.
-    // Re-arm once (the next tick comes after an I/O phase) instead of judging.
+    // Timers run before I/O, and a blocked caller's next synchronous step can
+    // run right after this tick (a microtask) and push the NEXT tick into the
+    // same timers phase - so "skip one tick" is not enough. Instead a late tick
+    // sets an I/O checkpoint (setImmediate: runs after the poll phase that
+    // reads the pipe) and no verdict is taken until it has passed. Under
+    // continuous lag a verdict is still taken at least every 4 x staleMs.
     const lateBy = now - this.lastWatchdogAtMs - this.watchdogTickMs;
     this.lastWatchdogAtMs = now;
-    if (lateBy > cfg.staleMs / 2 && !this.lagRearmed) {
-      this.lagRearmed = true;
+    if (this.ioCheckpointPending) {
       this.lagSkips += 1;
       return;
     }
-    this.lagRearmed = false;
+    if (lateBy > cfg.staleMs / 2 && now - this.lastVerdictAtMs < 4 * cfg.staleMs) {
+      this.lagSkips += 1;
+      this.ioCheckpointPending = true;
+      setImmediate(() => {
+        this.ioCheckpointPending = false;
+      });
+      return;
+    }
+    this.lastVerdictAtMs = now;
     if (this.status === "starting" && now - this.spawnedAtMs > cfg.firstFrameTimeoutMs) {
       this.fail(this.generation, `no frame within ${cfg.firstFrameTimeoutMs} ms of connecting`, true);
       return;
