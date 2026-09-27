@@ -8,7 +8,8 @@
  *
  * The suite snapshots the camera config in `before` and restores it in
  * `after`, so the gateway is left exactly as it was found. Every stream it
- * adds points at `rtsp://127.0.0.1:1/...` (connection refused instantly) so
+ * adds points at `unreachableRtsp(...)` (port 1 on the test runner: connection refused
+ * instantly; loopback is refused by the destination guard) so
  * no test depends on a reachable camera. One optional positive scan against
  * the site NVR is soft-asserted and skipped when the NVR is unreachable.
  */
@@ -16,7 +17,7 @@
 import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
 
-import { api, apiAs, authenticateAs, postJson } from "./helpers";
+import { api, apiAs, authenticateAs, postJson, unreachableRtsp, UNREACHABLE_HOST } from "./helpers";
 
 interface StreamSource {
   id: string;
@@ -61,7 +62,7 @@ const LEGACY_FIELDS = [
   "backendDevicePath",
 ] as const;
 
-const UNREACHABLE = (suffix: string) => `rtsp://127.0.0.1:1/${suffix}`;
+const UNREACHABLE = (suffix: string) => unreachableRtsp(suffix);
 
 function publicUrl(value: string): string {
   const parsed = new URL(value);
@@ -215,7 +216,7 @@ describe("camera streams: multi-stream gate config", () => {
       const res = await postJson("/api/camera-streams/exit/streams", {
         label: "ITEST derived id",
         sourceType: "RTSP",
-        rtspUrl: `rtsp://127.0.0.1:1/Streaming/Channels/${channel}`,
+        rtspUrl: `rtsp://${UNREACHABLE_HOST}:1/Streaming/Channels/${channel}`,
       });
       assert.equal(res.status, 201, res.text.slice(0, 300));
       assert.equal(res.body.stream.id, `exit-${channel}`);
@@ -326,7 +327,7 @@ describe("camera streams: multi-stream gate config", () => {
       const cfg = await getConfig();
       const primary = primaryOf(cfg.entryGate);
       assert.ok(cfg.entryGate.streams.length >= 2, "precondition: entry gate has 2 streams");
-      const newUrl = `rtsp://127.0.0.1:1/legacy/${Date.now().toString(36)}`;
+      const newUrl = `rtsp://${UNREACHABLE_HOST}:1/legacy/${Date.now().toString(36)}`;
       const res = await postJson("/api/camera-streams/config", {
         entryGate: {
           name: cfg.entryGate.name,
@@ -350,7 +351,7 @@ describe("camera streams: multi-stream gate config", () => {
 
     it("an old dashboard echoing streams[] while editing legacy fields still updates the primary", async () => {
       const cfg = await getConfig();
-      const echoedUrl = `rtsp://127.0.0.1:1/echo/${Date.now().toString(36)}`;
+      const echoedUrl = `rtsp://${UNREACHABLE_HOST}:1/echo/${Date.now().toString(36)}`;
       const res = await postJson("/api/camera-streams/config", {
         ...cfg,
         entryGate: { ...cfg.entryGate, rtspUrl: echoedUrl },
@@ -366,9 +367,9 @@ describe("camera streams: multi-stream gate config", () => {
       const res = await postJson("/api/camera-streams/config", {
         entryGate: {
           streams: [
-            { label: "no id A", sourceType: "RTSP", rtspUrl: "rtsp://127.0.0.1:1/Streaming/Channels/7701" },
-            { label: "no id B", sourceType: "RTSP", rtspUrl: "rtsp://127.0.0.1:1/Streaming/Channels/7702", enabled: false },
-            { id: "entry-7701", label: "duplicate of A", sourceType: "RTSP", rtspUrl: "rtsp://127.0.0.1:1/x" },
+            { label: "no id A", sourceType: "RTSP", rtspUrl: unreachableRtsp("Streaming/Channels/7701") },
+            { label: "no id B", sourceType: "RTSP", rtspUrl: unreachableRtsp("Streaming/Channels/7702"), enabled: false },
+            { id: "entry-7701", label: "duplicate of A", sourceType: "RTSP", rtspUrl: unreachableRtsp("x") },
           ],
         },
       });
@@ -626,7 +627,7 @@ describe("camera streams config durability", () => {
     const created = await postJson("/api/camera-streams/exit/streams", {
       label,
       sourceType: "RTSP",
-      rtspUrl: "rtsp://127.0.0.1:1/Streaming/Channels/4099",
+      rtspUrl: unreachableRtsp("Streaming/Channels/4099"),
       rtspTransport: "TCP",
       enabled: false,
       priority: 90,
@@ -665,7 +666,7 @@ describe("whole-config save does not clobber stream lists", () => {
     const created = await postJson("/api/camera-streams/exit/streams", {
       label: marker,
       sourceType: "RTSP",
-      rtspUrl: "rtsp://127.0.0.1:1/Streaming/Channels/4098",
+      rtspUrl: unreachableRtsp("Streaming/Channels/4098"),
       rtspTransport: "TCP",
       enabled: false,
       priority: 91,

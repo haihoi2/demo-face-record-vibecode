@@ -14,8 +14,10 @@
  *     the alert, with no image bytes in the payload and no door unlock.
  *
  * Nothing is asserted against a live chat server: the webhook URL is pointed at
- * a dead local port, and the exact posted body is read back from
- * GET /api/webhook/logs, which records `payload` verbatim.
+ * a `.invalid` host (RFC 6761: never resolves). The destination guard saves it
+ * with a DEST_UNRESOLVED warning and refuses it at send time, so nothing leaves
+ * the gateway, and the exact body that would have been posted is read back
+ * from GET /api/webhook/logs, which records `payload` verbatim.
  *
  * Start the disposable server per tests/integration/README.md, publishing a
  * free host port (this suite was developed against 3179):
@@ -31,8 +33,12 @@ import assert from "node:assert/strict";
 
 import { api, noFaceJpegDataUrl, postJson, recognize } from "./helpers";
 
-/** Discard port on loopback: the POST fails fast, the payload is still logged. */
-const SINK_URL = "http://127.0.0.1:9/stranger-webhook-sink";
+/**
+ * Never resolves (RFC 6761), so the send-time destination guard refuses it at
+ * once (DEST_UNRESOLVED) and the payload is still logged. The old loopback sink
+ * (http://127.0.0.1:9) is refused on save: see tests/integration/netGuard.test.ts.
+ */
+const SINK_URL = "https://stranger-webhook-sink.invalid/hooks-itest/stranger-webhook-sink";
 const STRANGER_USER_NAME = "Người lạ";
 
 interface WebhookAttachment {
@@ -204,6 +210,9 @@ describe("stranger alert webhook", () => {
     assert.equal(posted.userName, STRANGER_USER_NAME);
     assert.equal(posted.url, SINK_URL);
     assert.equal(posted.method, "POST");
+    // The guard refused the unresolvable sink at send time: nothing was sent.
+    assert.equal(posted.success, false);
+    assert.equal((posted as any).code, "DEST_UNRESOLVED");
     assert.ok(
       posted.payload.text.includes("https://stg-gate-watch.vota.vn/#strangers/LOG-ITEST-BASE"),
       `text did not carry the configured base url: ${posted.payload.text}`

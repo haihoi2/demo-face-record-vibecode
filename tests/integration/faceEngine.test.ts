@@ -39,6 +39,7 @@ import {
   recognize,
   uniqueTestCode,
   type Employee,
+  unreachableRtsp,
 } from "./helpers";
 
 interface EngineStatus {
@@ -79,7 +80,7 @@ interface TemplateList {
 }
 
 /** An RTSP URL that refuses instantly - no test may depend on a real camera. */
-const UNREACHABLE = (suffix: string) => `rtsp://127.0.0.1:1/${suffix}`;
+const UNREACHABLE = (suffix: string) => unreachableRtsp(suffix);
 
 let status: EngineStatus;
 /** An employee that already exists on the roster, or an isolated fixture when production starts empty. */
@@ -267,8 +268,9 @@ describe("face template gallery", () => {
       return;
     }
     // With models loaded the request gets as far as the camera: an unreachable
-    // stream is a 502, a non-RTSP stream a 400, a live one a 200.
-    assert.ok([200, 400, 502].includes(res.status), `unexpected ${res.status}: ${res.text.slice(0, 200)}`);
+    // stream is a 502, a non-RTSP stream a 400, a stored stream the destination
+    // guard refuses a 409 (nothing dialled), a live one a 200.
+    assert.ok([200, 400, 409, 502].includes(res.status), `unexpected ${res.status}: ${res.text.slice(0, 200)}`);
     if (res.status === 200) {
       assert.ok(Array.isArray(res.body.saved));
       assert.ok(Array.isArray(res.body.rejected));

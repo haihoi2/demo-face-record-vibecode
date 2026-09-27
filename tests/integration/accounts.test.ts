@@ -9,7 +9,7 @@
 import { after, before, describe, it } from "node:test";
 import assert from "node:assert/strict";
 
-import { apiAs, authenticateAs, listEmployees, loginWithPassword, rawApi } from "./helpers";
+import { apiAs, authenticateAs, listEmployees, loginWithPassword, rawApi, unreachableRtsp } from "./helpers";
 
 const OPERATOR_TOKEN = process.env.OPERATOR_TOKEN || "integration-operator-token";
 const PASSWORD = "integration pass 1";
@@ -109,7 +109,7 @@ describe("operator accounts", () => {
         method: "POST",
         body: JSON.stringify({
           label: `ITEST operator ${run}`, sourceType: "RTSP",
-          rtspUrl: "rtsp://127.0.0.1:1/Streaming/Channels/4097", rtspTransport: "TCP", enabled: false, priority: 92,
+          rtspUrl: unreachableRtsp("Streaming/Channels/4097"), rtspTransport: "TCP", enabled: false, priority: 92,
         }),
       });
       assert.equal(created.status, 201, created.text.slice(0, 200));

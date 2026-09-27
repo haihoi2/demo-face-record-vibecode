@@ -12,14 +12,15 @@
  *
  * The suite snapshots the camera config (streams + watch of both gates) in
  * `before` and restores it in `after`; the only stream it ever points at is
- * `rtsp://127.0.0.1:1/...` (connection refused instantly), so nothing here
+ * `unreachableRtsp(...)` (port 1 on the test runner: connection refused
+ * instantly; loopback is refused by the destination guard), so nothing here
  * depends on a reachable camera and no scan ever waits on a socket timeout.
  */
 
 import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
 
-import { api, postJson } from "./helpers";
+import { api, postJson, unreachableRtsp } from "./helpers";
 
 interface WatchConfig {
   enabled: boolean;
@@ -63,7 +64,7 @@ const UNREACHABLE_STREAM = {
   sourceType: "RTSP",
   // Port 1 on loopback: ECONNREFUSED in milliseconds, so a "failing scan" is
   // fast and the whole suite stays well inside its time budget.
-  rtspUrl: "rtsp://127.0.0.1:1/watch-itest",
+  rtspUrl: unreachableRtsp("watch-itest"),
   rtspTransport: "TCP",
   enabled: true,
   priority: 1,

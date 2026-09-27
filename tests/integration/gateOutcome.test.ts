@@ -53,6 +53,7 @@ import {
   deleteEmployee,
   uniqueTestCode,
   type Employee,
+  unreachableRtsp,
 } from "./helpers";
 
 interface AccessLog {
@@ -168,7 +169,7 @@ describe("recognition outcome - /api/recognize-face reference behaviour", () => 
 describe("recognition outcome - a gate scan that captured nothing records nothing", () => {
   it("returns 502 and writes no access log", async () => {
     const before = await scanLogs();
-    const res = await scan("rtsp://127.0.0.1:1/gate-outcome-itest");
+    const res = await scan(unreachableRtsp("gate-outcome-itest"));
     assert.equal(res.status, 502, res.text.slice(0, 300));
     assert.equal(res.body?.success, false);
     assert.equal(res.body?.outcome, undefined, "a failed capture must not produce an outcome");

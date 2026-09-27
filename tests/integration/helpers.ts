@@ -5,8 +5,33 @@
  * http://127.0.0.1:3100). Nothing here imports server code, so the suite
  * exercises the real Express stack, CORS middleware, and body parsers.
  */
+import { networkInterfaces } from "node:os";
 
 export const BASE_URL = (process.env.APP_URL || "http://127.0.0.1:3100").replace(/\/+$/, "");
+
+/**
+ * Host for "unreachable camera" fixtures: port 1 on it must refuse INSTANTLY
+ * and the gateway's destination guard (src/server/netGuard.ts) must accept it.
+ * The old `127.0.0.1:1` is loopback, which the guard always refuses. Default:
+ * this test runner's own private IPv4 (the runner shares the Docker network
+ * with the gateway; nothing listens on port 1, so the connect gets an RST).
+ * ITEST_UNREACHABLE_HOST overrides it, e.g. `192.0.2.1` when the gateway runs
+ * with CAMERA_ALLOWED_HOSTS limited to TEST-NET (that address is never routed,
+ * so a grab waits for FFmpeg's ~3.5 s socket timeout instead).
+ */
+export const UNREACHABLE_HOST: string = (() => {
+  const fromEnv = String(process.env.ITEST_UNREACHABLE_HOST || "").trim();
+  if (fromEnv) return fromEnv;
+  for (const list of Object.values(networkInterfaces())) {
+    for (const i of list || []) if (i.family === "IPv4" && !i.internal) return i.address;
+  }
+  return "192.0.2.1";
+})();
+
+/** `rtsp://<UNREACHABLE_HOST>:1/<path>` - a camera URL the guard accepts and that fails at once. */
+export function unreachableRtsp(path: string): string {
+  return `rtsp://${UNREACHABLE_HOST}:1/${path.replace(/^\/+/, "")}`;
+}
 
 export interface ApiResponse<T = any> {
   status: number;
