@@ -115,7 +115,10 @@ export function canonicalApiPath(path: string): string {
 /** The least role allowed to call `method path`. */
 export function requiredRoleFor(method: string, path: string): UserRole {
   const m = String(method || "GET").toUpperCase();
-  const p = canonicalApiPath(path);
+  // Lower-cased for the lookup only (ids keep their case elsewhere): the role
+  // table must see "/api/Door-controller/config" as the admin route it is,
+  // not as an unknown read that defaults to viewer.
+  const p = canonicalApiPath(String(path || "").toLowerCase());
   for (const rule of RULES) {
     if (rule.methods.includes(m) && rule.pattern.test(p)) return rule.role;
   }

@@ -111,6 +111,11 @@ import type { FaceGallery } from "./src/server/faceFusion";
 dotenv.config();
 
 const app = express();
+// Routes match case-sensitively: "/Api/employees" is not "/api/employees".
+// Express's default (case-insensitive) let a differently-cased path reach a
+// handler while the fail-closed boundary below, which compared exact strings,
+// treated it as a public path. Defence in depth next to the lower-cased boundary.
+app.set("case sensitive routing", true);
 // Before any route: a rejected async handler must answer 500, not kill the
 // process (and every gate watcher with it). See src/server/asyncRoutes.ts.
 guardAsyncRoutes(app);
@@ -872,7 +877,9 @@ app.use((_req: Request, res: Response, next: NextFunction) => {
 
 // One fail-closed boundary covers the API surface and every legacy alias.
 app.use((req: Request, res: Response, next: NextFunction) => {
-  const pathName = req.path;
+  // Lower-cased on purpose: every check below is an exact or prefix compare,
+  // and "/API/lock/unlock" must be as sensitive as "/api/lock/unlock".
+  const pathName = req.path.toLowerCase();
   if (pathName === "/api/health" || pathName === "/api/operator/session") return next();
   if (pathName === "/api/system/db-info") return requireInternalToken(req, res, next);
   if (recognitionPath(pathName) && req.method === "POST") return requireRecognitionIngest(req, res, next);
@@ -1532,7 +1539,10 @@ const FACE_ENGINE_SETTING: FaceEngineSetting = (() => {
   const raw = String(process.env.FACE_ENGINE || "").trim().toLowerCase();
   if (raw === "hash") return "hash";
   if (raw === "onnx") return "onnx";
-  return "auto";
+  // Production fails closed. An unset FACE_ENGINE used to mean "auto", which
+  // handed door decisions to the demo hash matcher whenever the ONNX models
+  // failed to load - with nothing but a warning. Demo/dev keeps "auto".
+  return process.env.NODE_ENV === "production" ? "onnx" : "auto";
 })();
 
 function envFloat(name: string, fallback: number, min = 0, max = 1): number {
@@ -1604,11 +1614,12 @@ function faceEngineActive(): boolean {
  * `acceptSingle`; everything else comes from DEFAULT_FUSION_THRESHOLDS unless an
  * env override is set. Nothing new is persisted - there is one config store.
  */
-function currentFusionThresholds(clientConfig?: Partial<ServerAiConfig> | null): FusionThresholds {
+function currentFusionThresholds(_clientConfig?: Partial<ServerAiConfig> | null): FusionThresholds {
   const th: FusionThresholds = { ...DEFAULT_FUSION_THRESHOLDS };
-  const configured = Number(
-    clientConfig?.localModel?.similarityThreshold ?? aiRecognitionConfig.localModel?.similarityThreshold
-  );
+  // Server-owned only. A per-request `config` used to lower acceptSingle: a
+  // device-token holder could post similarityThreshold 0.36 and be granted on
+  // one weak view. The admin-persisted AI config and env are the only sources.
+  const configured = Number(aiRecognitionConfig.localModel?.similarityThreshold);
   if (Number.isFinite(configured) && configured > 0 && configured < 1) th.acceptSingle = configured;
   th.acceptSingle = envFloat("FACE_ACCEPT_SINGLE", th.acceptSingle, 0.01, 0.999);
   th.acceptFused = envFloat("FACE_ACCEPT_FUSED", th.acceptFused, 0.01, 0.999);
@@ -2489,6 +2500,14 @@ async function sendDoorControllerCommand(
   if (maskedHeaders["X-Api-Key"]) maskedHeaders["X-Api-Key"] = "****";
   if (doorControllerConfig.customHeaderName && maskedHeaders[doorControllerConfig.customHeaderName]) {
     maskedHeaders[doorControllerConfig.customHeaderName] = "****";
+  }
+  // Whatever the header is called (a blank custom name falls back to
+  // X-Door-Token), the token itself never reaches the log or the DB row.
+  const secret = String(doorControllerConfig.apiToken || "");
+  if (secret) {
+    for (const key of Object.keys(maskedHeaders)) {
+      if (String(maskedHeaders[key]).includes(secret)) maskedHeaders[key] = "****";
+    }
   }
 
   const logEntry: DoorApiLogRecord = {
@@ -4400,7 +4419,9 @@ async function applyRecognitionOutcome(input: RecognitionOutcomeInput): Promise<
   // ---- Denied / stranger ------------------------------------------------
   summary.status = "DENIED";
   const accessLog: AccessLogRecord = {
-    id: "LOG-" + Date.now(),
+    // Unique per event: two DENIED events in the same millisecond (two gates)
+    // used to share an id, and the second was dropped by ON CONFLICT DO NOTHING.
+    id: `LOG-${Date.now()}-${randomUUID().slice(0, 8)}`,
     timestamp,
     type: actionType,
     status: "DENIED",
@@ -4561,7 +4582,7 @@ async function performGateScan(input: GateScanRequest): Promise<GateScanResult> 
     String(scanType || "").toUpperCase() === "EXIT" || (!scanType && gateParam === "exit") ? "EXIT" : "ENTRY";
 
   const faceEngine = activeFaceEngine();
-  const fusionThresholds = currentFusionThresholds(input?.config);
+  const fusionThresholds = currentFusionThresholds();
   // Multi-frame only helps the real engine (the hash matcher ignores pixels),
   // so the legacy path stays at one frame per stream.
   const requestedFrames = Number(frames);
@@ -5117,6 +5138,11 @@ function gateWatchBlockedReason(gateKey: GateWatchKey): string | null {
   // would be denied anyway, so idle and log once instead of hammering.
   if (activeFaceEngine() === "unavailable") {
     return "Engine nhận diện không khả dụng (FAIL-CLOSED) - watcher tạm dừng";
+  }
+  // The demo hash matcher must never drive a door: it only ever ran the
+  // watcher because FACE_ENGINE was unset (see FACE_ENGINE_SETTING).
+  if (activeFaceEngine() === "hash") {
+    return "Engine demo (hash) không được phép quyết định cửa - watcher tạm dừng (đặt FACE_ENGINE=onnx)";
   }
   return null;
 }
@@ -7819,10 +7845,13 @@ async function recognizeFrame({
   let detectedFaces: DetectedFaceItem[] = [...initialDetectedFaces];
   let overallMessage = initialMessage;
 
-  // Engine Selection and Configuration
-  const activeEngineMode = clientConfig?.engineMode || aiRecognitionConfig.engineMode;
-  const activeLocalArch = clientConfig?.localModel?.modelArchitecture || aiRecognitionConfig.localModel.modelArchitecture;
-  const activeGoogleModel = clientConfig?.googleAi?.model || aiRecognitionConfig.googleAi.model;
+  // Engine selection and thresholds are SERVER-owned (admin-persisted AI
+  // config + env). The request's `config` is accepted for compatibility and
+  // ignored: it used to switch the engine and lower thresholds per request.
+  void clientConfig;
+  const activeEngineMode = aiRecognitionConfig.engineMode;
+  const activeLocalArch = aiRecognitionConfig.localModel.modelArchitecture;
+  const activeGoogleModel = aiRecognitionConfig.googleAi.model;
 
   let engineUsed =
     activeEngineMode === "LOCAL_BIOMETRIC"
@@ -7871,7 +7900,7 @@ async function recognizeFrame({
       streamLabel || streamId || "frame",
       0
     );
-    const thresholds = currentFusionThresholds(clientConfig);
+    const thresholds = currentFusionThresholds();
     fusion = recognizeObservations(capObservations(observed), currentGallery(), thresholds);
     multiThreadInfo = { threadLatencyMs: Date.now() - tEngine };
 
@@ -7908,12 +7937,8 @@ async function recognizeFrame({
             employees: employees as any,
             scanType: scanType === "EXIT" ? "EXIT" : "ENTRY",
             modelArchitecture: activeLocalArch as any,
-            similarityThreshold:
-              clientConfig?.localModel?.similarityThreshold ||
-              aiRecognitionConfig.localModel.similarityThreshold,
-            livenessSensitivity:
-              clientConfig?.localModel?.livenessSensitivity ||
-              aiRecognitionConfig.localModel.livenessSensitivity,
+            similarityThreshold: aiRecognitionConfig.localModel.similarityThreshold,
+            livenessSensitivity: aiRecognitionConfig.localModel.livenessSensitivity,
           });
 
           multiThreadInfo = {
@@ -7952,12 +7977,8 @@ async function recognizeFrame({
           imageBase64: rawImage,
           employees: employees as any,
           modelArchitecture: activeLocalArch as any,
-          similarityThreshold:
-            clientConfig?.localModel?.similarityThreshold ||
-            aiRecognitionConfig.localModel.similarityThreshold,
-          livenessSensitivity:
-            clientConfig?.localModel?.livenessSensitivity ||
-            aiRecognitionConfig.localModel.livenessSensitivity,
+          similarityThreshold: aiRecognitionConfig.localModel.similarityThreshold,
+          livenessSensitivity: aiRecognitionConfig.localModel.livenessSensitivity,
         });
 
         const meetsHybridThreshold =
