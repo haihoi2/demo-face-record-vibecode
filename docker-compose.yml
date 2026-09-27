@@ -79,6 +79,16 @@ services:
       - PIPELINE_MODE_EXIT=${PIPELINE_MODE_EXIT:-}
       - CAMERA_ENTRY_RTSP_URL=${CAMERA_ENTRY_RTSP_URL:-}
       - CAMERA_EXIT_RTSP_URL=${CAMERA_EXIT_RTSP_URL:-}
+      # Outbound destination guard (SSRF). Comma-separated hosts, *.suffix, IPs or
+      # CIDRs; blank = the code default (see .env.example).
+      - CAMERA_ALLOWED_HOSTS=${CAMERA_ALLOWED_HOSTS:-}
+      - CAMERA_DENIED_HOSTS=${CAMERA_DENIED_HOSTS:-}
+      - WEBHOOK_ALLOWED_HOSTS=${WEBHOOK_ALLOWED_HOSTS:-}
+      - WEBHOOK_DENIED_HOSTS=${WEBHOOK_DENIED_HOSTS:-}
+      - WEBHOOK_ALLOW_HTTP=${WEBHOOK_ALLOW_HTTP:-}
+      - DOOR_ALLOWED_HOSTS=${DOOR_ALLOWED_HOSTS:-}
+      - DOOR_DENIED_HOSTS=${DOOR_DENIED_HOSTS:-}
+      - NET_DENIED_HOSTS=${NET_DENIED_HOSTS:-}
 
       # Eton Webhook thông báo kết quả chấm công
       - ETON_WEBHOOK_URL=${ETON_WEBHOOK_URL:-https://chat-room.eton.vn/hooks/YOUR_WEBHOOK_TOKEN}
