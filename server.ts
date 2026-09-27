@@ -44,6 +44,14 @@ import {
   redactRtsp,
 } from "./src/server/recording";
 import {
+  checkDestination,
+  classifyAddress,
+  invalidPolicyEntries,
+  policyFromEnv,
+  type DestinationPolicy,
+  type DestinationResult,
+} from "./src/server/netGuard";
+import {
   UserRole,
   isUserRole,
   roleAtLeast,
@@ -113,6 +121,71 @@ const app = express();
 // process (and every gate watcher with it). See src/server/asyncRoutes.ts.
 guardAsyncRoutes(app);
 const PORT = 3000;
+
+// =========================================================================
+// OUTBOUND DESTINATION GUARD (SSRF) - src/server/netGuard.ts
+//
+// Every destination an operator/admin configures (camera streams, the
+// test-stream probe, webhook, door controller) and RECORDING_NVR_URL is
+// checked on save AND before each dial. Allowlists: CAMERA_ALLOWED_HOSTS,
+// WEBHOOK_ALLOWED_HOSTS, DOOR_ALLOWED_HOSTS (+ *_DENIED_HOSTS,
+// NET_DENIED_HOSTS, WEBHOOK_ALLOW_HTTP). Read once at startup.
+// =========================================================================
+const NET_POLICY: Record<"camera" | "probe" | "webhook" | "door", DestinationPolicy> = {
+  camera: policyFromEnv("camera"),
+  probe: policyFromEnv("tcp-probe"),
+  webhook: policyFromEnv("webhook"),
+  door: policyFromEnv("door"),
+};
+for (const [kind, policy] of Object.entries(NET_POLICY)) {
+  if (kind === "probe") continue; // same variables as camera
+  const bad = invalidPolicyEntries(policy);
+  if (bad.length) console.warn(`[NetGuard] ${kind}: bỏ qua mục không hợp lệ trong danh sách: ${bad.join(", ")}`);
+  console.log(
+    `[NetGuard] ${kind}: ${policy.allow ? `chỉ cho phép theo ${policy.allowEnvVar}` : policy.privateByDefault ? `${policy.allowEnvVar} chưa đặt - cho phép địa chỉ nội bộ và công khai` : `${policy.allowEnvVar} chưa đặt - chỉ địa chỉ công khai`}`
+  );
+}
+
+type DestinationRefusal = Extract<DestinationResult, { ok: false }>;
+
+/** Thrown inside a send path when the guard refuses the destination; message = "CODE: reason" (no URL). */
+class DestinationRefusedError extends Error {
+  readonly code: string;
+  constructor(refusal: DestinationRefusal) {
+    super(`${refusal.code}: ${refusal.reason}`);
+    this.code = refusal.code;
+  }
+}
+
+const REDIRECT_NOT_FOLLOWED = "Đích trả về chuyển hướng (3xx); máy chủ không theo chuyển hướng (chống SSRF).";
+
+/** Refusal of a destination, or null when it may be dialled. Never throws. */
+async function destinationRefusal(url: unknown, policy: DestinationPolicy): Promise<DestinationRefusal | null> {
+  try {
+    const r = await checkDestination(url, policy);
+    return r.ok === true ? null : (r as DestinationRefusal);
+  } catch {
+    return { ok: false, code: "DEST_BAD_URL", reason: "Không kiểm tra được địa chỉ đích." };
+  }
+}
+
+/**
+ * Save-time check of a changed destination: refusal -> 400 body, DEST_UNRESOLVED
+ * -> saved with a warning (the dial-time check still refuses it), OK -> null.
+ */
+async function destinationSaveCheck(
+  url: unknown,
+  policy: DestinationPolicy,
+  field: string,
+  extra: Record<string, unknown> = {}
+): Promise<{ refused?: Record<string, unknown>; warning?: Record<string, unknown> }> {
+  if (typeof url !== "string" || !url.trim()) return {};
+  const r = await destinationRefusal(url, policy);
+  if (!r) return {};
+  const body = { code: r.code, error: r.reason, field, ...extra };
+  if (r.code === "DEST_UNRESOLVED") return { warning: body };
+  return { refused: { success: false, ...body } };
+}
 
 // =========================================================================
 // 1. CORS & PREFLIGHT MIDDLEWARE (MUST BE VERY FIRST)
@@ -1065,6 +1138,8 @@ export interface WebhookLogRecord {
   responseBody?: string;
   success: boolean;
   error?: string;
+  /** DEST_* code when the destination guard refused the webhook URL (nothing was sent). */
+  code?: string;
   scanType: "ENTRY" | "EXIT";
   userName: string;
 }
@@ -1415,6 +1490,7 @@ db.onCameraStreamsConfigLoaded(() => {
     .map((k) => `${k}=${cameraStreamsConfig[k].streams.length} luồng`)
     .join(", ");
   console.log(`[Camera Config] Đã khôi phục cấu hình luồng camera từ PostgreSQL: ${gates}`);
+  void auditStoredDestinations().catch(() => {});
 });
 
 // Listen to Postgres sync events to refresh memory models
@@ -1981,6 +2057,11 @@ async function sendEtonWebhook({
   };
 
   try {
+    // Destination guard at send time: a stored URL the current policy refuses
+    // is not contacted; the log entry says why.
+    const refusal = await destinationRefusal(webhookConfig.url, NET_POLICY.webhook);
+    if (refusal) throw new DestinationRefusedError(refusal);
+
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), 7000);
 
@@ -1992,6 +2073,8 @@ async function sendEtonWebhook({
       },
       body: JSON.stringify(payload),
       signal: controller.signal,
+      // Never follow a redirect: an allowed host could bounce the POST to an internal address.
+      redirect: "manual",
     });
     clearTimeout(timeoutId);
 
@@ -2000,12 +2083,14 @@ async function sendEtonWebhook({
     const resText = await response.text();
     logEntry.responseBody = resText.substring(0, 500);
     logEntry.success = response.ok;
+    if (response.status >= 300 && response.status < 400) logEntry.error = REDIRECT_NOT_FOLLOWED;
 
     console.log(
       `[Webhook] Dispatched to Eton Chat Room (${scanType}): status=${response.status} user="${userText}"`
     );
   } catch (err: any) {
     logEntry.error = err?.message || String(err);
+    if (err instanceof DestinationRefusedError) logEntry.code = err.code;
     console.error("[Webhook] Failed to dispatch Eton Webhook:", err?.message);
   }
 
@@ -2246,6 +2331,11 @@ async function sendStrangerWebhook({
   };
 
   try {
+    // Destination guard at send time: a stored URL the current policy refuses
+    // is not contacted; the log entry says why.
+    const refusal = await destinationRefusal(webhookConfig.url, NET_POLICY.webhook);
+    if (refusal) throw new DestinationRefusedError(refusal);
+
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), 7000);
 
@@ -2257,6 +2347,8 @@ async function sendStrangerWebhook({
       },
       body: JSON.stringify(payload),
       signal: controller.signal,
+      // Never follow a redirect: an allowed host could bounce the POST to an internal address.
+      redirect: "manual",
     });
     clearTimeout(timeoutId);
 
@@ -2265,12 +2357,14 @@ async function sendStrangerWebhook({
     const resText = await response.text();
     logEntry.responseBody = resText.substring(0, 500);
     logEntry.success = response.ok;
+    if (response.status >= 300 && response.status < 400) logEntry.error = REDIRECT_NOT_FOLLOWED;
 
     console.log(
       `[Webhook] Dispatched stranger alert (${logEntry.scanType}): status=${response.status} link="${link || "(không có)"}"`
     );
   } catch (err: any) {
     logEntry.error = err?.message || String(err);
+    if (err instanceof DestinationRefusedError) logEntry.code = err.code;
     console.error("[Webhook] Failed to dispatch stranger alert:", err?.message);
   }
 
@@ -2336,7 +2430,12 @@ async function sendDoorControllerCommand(
   }
 
   const startTime = Date.now();
-  let targetUrl = doorControllerConfig.apiUrl.trim();
+  const baseUrl = doorControllerConfig.apiUrl.trim();
+  let targetUrl = baseUrl;
+  // What logs, the door_api_logs row and SSE see: never the token (N1). The
+  // token may be appended as ?token= below (QUERY_PARAM auth) or be part of the
+  // configured URL itself; redactedUrl masks both and drops userinfo.
+  const logUrl = redactedUrl(baseUrl);
 
   // If QUERY_PARAM auth is chosen
   if (doorControllerConfig.authHeaderType === "QUERY_PARAM" && doorControllerConfig.apiToken) {
@@ -2402,7 +2501,7 @@ async function sendDoorControllerCommand(
     id: "DOOR-API-" + Date.now() + "-" + Math.floor(Math.random() * 1000),
     timestamp: new Date().toISOString(),
     action,
-    url: targetUrl,
+    url: logUrl,
     method,
     requestHeaders: maskedHeaders,
     requestBody,
@@ -2424,6 +2523,11 @@ async function sendDoorControllerCommand(
   }
 
   try {
+    // Destination guard at send time (the base URL; the token parameter does
+    // not change the host). Refused: nothing is sent, the lock stays as it is.
+    const refusal = await destinationRefusal(baseUrl, NET_POLICY.door);
+    if (refusal) throw new DestinationRefusedError(refusal);
+
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 7000);
 
@@ -2432,6 +2536,8 @@ async function sendDoorControllerCommand(
       headers,
       body: method !== "GET" ? requestBody : undefined,
       signal: controller.signal,
+      // Never follow a redirect (a bounce to an internal address would carry the token).
+      redirect: "manual",
     });
     clearTimeout(timeout);
 
@@ -2441,14 +2547,17 @@ async function sendDoorControllerCommand(
     const resText = await response.text();
     logEntry.responseBody = resText.substring(0, 500);
     logEntry.success = response.ok;
+    if (response.status >= 300 && response.status < 400) logEntry.error = REDIRECT_NOT_FOLLOWED;
 
     console.log(
-      `[Door API] Đã gửi lệnh ${action} tới ${targetUrl} (Status: ${response.status}) trong ${logEntry.durationMs}ms`
+      `[Door API] Đã gửi lệnh ${action} tới ${logUrl} (Status: ${response.status}) trong ${logEntry.durationMs}ms`
     );
   } catch (err: any) {
     logEntry.durationMs = Date.now() - startTime;
-    logEntry.error = err?.message || String(err);
-    console.error(`[Door API] Lỗi gửi lệnh ${action} tới ${targetUrl}:`, err?.message);
+    // An error message may quote the request URL (token included): mask it.
+    const message = String(err?.message || err).split(targetUrl).join(logUrl);
+    logEntry.error = message;
+    console.error(`[Door API] Lỗi gửi lệnh ${action} tới ${logUrl}:`, message);
   }
 
   doorApiLogs.unshift(logEntry);
@@ -2683,17 +2792,26 @@ app.get(WEBHOOK_CONFIG_ROUTES, (_req, res) => {
   res.json(webhookConfig);
 });
 
-app.post(WEBHOOK_CONFIG_ROUTES, (req, res) => {
+app.post(WEBHOOK_CONFIG_ROUTES, async (req, res) => {
   const body = req.body || {};
   const { enabled, url, gateInTitle, gateOutTitle, includeEmployeeCode } = body;
-  if (typeof enabled === "boolean") webhookConfig.enabled = enabled;
+  // Destination guard on a NEW webhook URL, before anything is changed: a
+  // refused URL rejects the whole patch (400) and nothing is saved.
+  let cleanUrl: string | undefined;
+  let destWarning: Record<string, unknown> | undefined;
   if (typeof url === "string") {
-    let cleanUrl = url.trim();
+    cleanUrl = url.trim();
     if (cleanUrl && (cleanUrl.includes("...") || cleanUrl.endsWith("/hooks/") || cleanUrl.endsWith("/hooks"))) {
       cleanUrl = DEFAULT_WEBHOOK_CONFIG.url;
     }
-    webhookConfig.url = cleanUrl;
+    if (cleanUrl && cleanUrl !== db.getWebhookConfig(DEFAULT_WEBHOOK_CONFIG).url) {
+      const check = await destinationSaveCheck(cleanUrl, NET_POLICY.webhook, "url");
+      if (check.refused) return res.status(400).json(check.refused);
+      destWarning = check.warning;
+    }
   }
+  if (typeof enabled === "boolean") webhookConfig.enabled = enabled;
+  if (cleanUrl !== undefined) webhookConfig.url = cleanUrl;
   if (gateInTitle && typeof gateInTitle === "string") webhookConfig.gateInTitle = gateInTitle.trim();
   if (gateOutTitle && typeof gateOutTitle === "string") webhookConfig.gateOutTitle = gateOutTitle.trim();
   if (typeof includeEmployeeCode === "boolean") webhookConfig.includeEmployeeCode = includeEmployeeCode;
@@ -2718,7 +2836,7 @@ app.post(WEBHOOK_CONFIG_ROUTES, (req, res) => {
   }
 
   db.saveWebhookConfig(webhookConfig);
-  res.json({ success: true, config: webhookConfig });
+  res.json({ success: true, config: webhookConfig, ...(destWarning ? { warnings: [destWarning] } : {}) });
 });
 
 app.get("/api/system/db-info", (_req, res) => {
@@ -3029,8 +3147,15 @@ app.get(DOOR_CONFIG_ROUTES, (_req, res) => {
   res.json(doorControllerConfig);
 });
 
-app.post(DOOR_CONFIG_ROUTES, (req, res) => {
+app.post(DOOR_CONFIG_ROUTES, async (req, res) => {
   const body = req.body || {};
+  // Destination guard on a NEW controller URL: refused -> 400, nothing saved.
+  let destWarning: Record<string, unknown> | undefined;
+  if (typeof body.apiUrl === "string" && body.apiUrl.trim() && body.apiUrl.trim() !== db.getDoorControllerConfig(DEFAULT_DOOR_CONTROLLER_CONFIG).apiUrl) {
+    const check = await destinationSaveCheck(body.apiUrl.trim(), NET_POLICY.door, "apiUrl");
+    if (check.refused) return res.status(400).json(check.refused);
+    destWarning = check.warning;
+  }
   const current = db.getDoorControllerConfig(DEFAULT_DOOR_CONTROLLER_CONFIG);
 
   const updated: DoorControllerConfigRecord = {
@@ -3052,7 +3177,7 @@ app.post(DOOR_CONFIG_ROUTES, (req, res) => {
   db.saveDoorControllerConfig(updated);
   broadcastSSE("door_config_updated", updated);
 
-  res.json({ success: true, config: updated });
+  res.json({ success: true, config: updated, ...(destWarning ? { warnings: [destWarning] } : {}) });
 });
 
 app.post(DOOR_TEST_ROUTES, async (req, res) => {
@@ -3161,7 +3286,45 @@ app.get(CAMERA_CONFIG_ROUTES, (_req, res) => {
   });
 });
 
-app.post(CAMERA_CONFIG_ROUTES, (req, res) => {
+const CAMERA_URL_FIELDS = ["rtspUrl", "httpUrl"] as const;
+
+/**
+ * The URL fields of a stream that name its destination: `rtspUrl` always,
+ * `httpUrl` only for an HTTP_MJPEG source (on an RTSP stream it is an inert
+ * leftover of the form, and the default config carries one).
+ */
+function guardedUrlFields(stream: { sourceType?: string }): ReadonlyArray<(typeof CAMERA_URL_FIELDS)[number]> {
+  return stream.sourceType === "HTTP_MJPEG" ? CAMERA_URL_FIELDS : ["rtspUrl"];
+}
+
+/**
+ * Save-time destination check for camera streams: only URLs that are NEW
+ * (not already stored on either gate) are checked, so a stored destination the
+ * current policy refuses can still be relabelled/disabled - it is refused at
+ * dial time instead. Returns the first refusal (400 body) or the warnings.
+ */
+async function cameraStreamsSaveCheck(
+  current: CameraStreamsConfigRecord,
+  candidates: Array<{ gate: "entry" | "exit"; stream: GateStreamSourceRecord }>
+): Promise<{ refused?: Record<string, unknown>; warnings: Record<string, unknown>[] }> {
+  const known = new Set<string>();
+  for (const g of [current.entryGate, current.exitGate]) {
+    for (const st of g?.streams || []) for (const f of CAMERA_URL_FIELDS) if (st[f]) known.add(String(st[f]));
+  }
+  const warnings: Record<string, unknown>[] = [];
+  for (const { gate, stream } of candidates) {
+    for (const field of guardedUrlFields(stream)) {
+      const value = stream[field];
+      if (!value || known.has(value)) continue;
+      const r = await destinationSaveCheck(value, NET_POLICY.camera, field, { gate, streamId: stream.id });
+      if (r.refused) return { refused: r.refused, warnings };
+      if (r.warning) warnings.push(r.warning);
+    }
+  }
+  return { warnings };
+}
+
+app.post(CAMERA_CONFIG_ROUTES, async (req, res) => {
   let body = req.body || {};
   if (typeof body === "string") {
     try {
@@ -3177,6 +3340,12 @@ app.post(CAMERA_CONFIG_ROUTES, (req, res) => {
     exitGate: applyGateConfigPatch(current.exitGate, exitPatch),
   });
 
+  const destCheck = await cameraStreamsSaveCheck(current, [
+    ...(updated.entryGate.streams || []).map((stream) => ({ gate: "entry" as const, stream })),
+    ...(updated.exitGate.streams || []).map((stream) => ({ gate: "exit" as const, stream })),
+  ]);
+  if (destCheck.refused) return res.status(400).json(destCheck.refused);
+
   if (typeof body.workerThreadsCount === "number" && body.workerThreadsCount !== current.workerThreadsCount) {
     faceWorkerPool.scaleWorkerPool(body.workerThreadsCount);
   }
@@ -3190,6 +3359,7 @@ app.post(CAMERA_CONFIG_ROUTES, (req, res) => {
     success: true,
     config: updated,
     telemetry: faceWorkerPool.getPoolTelemetry(),
+    ...(destCheck.warnings.length ? { warnings: destCheck.warnings } : {}),
   });
 });
 
@@ -3242,10 +3412,31 @@ app.get(STREAM_ROUTE, (req, res) => {
   res.json({ success: true, gate, streams: gate.streams, primaryStreamId: pickPrimaryStream(gate.streams!).id });
 });
 
-app.post(STREAM_ROUTE, (req, res) => {
+/**
+ * Destination guard for the URL fields of a stream create/update. Runs BEFORE
+ * the gate is loaded so the (possibly DNS-bound) await never sits between a
+ * load and the commit that follows it.
+ */
+async function streamUrlSaveCheck(
+  fields: Partial<Record<(typeof CAMERA_URL_FIELDS)[number], string | undefined>> & { sourceType?: string },
+  gate: "entry" | "exit",
+  streamId?: string
+): Promise<{ refused?: Record<string, unknown>; warnings: Record<string, unknown>[] }> {
+  const warnings: Record<string, unknown>[] = [];
+  for (const field of guardedUrlFields(fields)) {
+    const r = await destinationSaveCheck(fields[field], NET_POLICY.camera, field, { gate, ...(streamId ? { streamId } : {}) });
+    if (r.refused) return { refused: r.refused, warnings };
+    if (r.warning) warnings.push(r.warning);
+  }
+  return { warnings };
+}
+
+app.post(STREAM_ROUTE, async (req, res) => {
   const gateKey = gateConfigKeyFromParam(req.params.gate);
   if (!gateKey) return res.status(400).json({ success: false, error: "Cổng không hợp lệ: chỉ chấp nhận entry hoặc exit" });
   const body = req.body && typeof req.body === "object" ? req.body : {};
+  const destCheck = await streamUrlSaveCheck(sanitizeStreamMediaFields(body), gateKey === "exitGate" ? "exit" : "entry");
+  if (destCheck.refused) return res.status(400).json(destCheck.refused);
   const gate = loadCameraStreamsConfig()[gateKey];
   const existing = gate.streams!;
   if (existing.length >= MAX_STREAMS_PER_GATE) {
@@ -3292,13 +3483,30 @@ app.post(STREAM_ROUTE, (req, res) => {
     gate: updatedGate,
     stream: updatedGate.streams!.find((s) => s.id === candidate.id) || candidate,
     primaryStreamId: pickPrimaryStream(updatedGate.streams!).id,
+    ...(destCheck.warnings.length ? { warnings: destCheck.warnings } : {}),
   });
 });
 
-app.put(STREAM_ITEM_ROUTE, (req, res) => {
+app.put(STREAM_ITEM_ROUTE, async (req, res) => {
   const gateKey = gateConfigKeyFromParam(req.params.gate);
   if (!gateKey) return res.status(400).json({ success: false, error: "Cổng không hợp lệ: chỉ chấp nhận entry hoặc exit" });
   const streamId = String(req.params.streamId || "");
+  // Destination guard on the URL fields this request CHANGES only: a stored
+  // stream the policy now refuses can still be disabled or relabelled.
+  const before = loadCameraStreamsConfig()[gateKey].streams!.find((s) => s.id === streamId);
+  let destCheck: { refused?: Record<string, unknown>; warnings: Record<string, unknown>[] } = { warnings: [] };
+  if (before && req.body && typeof req.body === "object") {
+    const next = sanitizeStreamMediaFields({ ...before, ...req.body });
+    const changed: Partial<Record<(typeof CAMERA_URL_FIELDS)[number], string | undefined>> & { sourceType?: string } = {
+      sourceType: next.sourceType,
+    };
+    for (const f of CAMERA_URL_FIELDS) {
+      // A source-type switch to HTTP_MJPEG makes an old httpUrl the destination: check it too.
+      if (next[f] !== before[f] || (f === "httpUrl" && next.sourceType !== before.sourceType)) changed[f] = next[f];
+    }
+    destCheck = await streamUrlSaveCheck(changed, gateKey === "exitGate" ? "exit" : "entry", streamId);
+    if (destCheck.refused) return res.status(400).json(destCheck.refused);
+  }
   const gate = loadCameraStreamsConfig()[gateKey];
   const existing = gate.streams!;
   const index = existing.findIndex((s) => s.id === streamId);
@@ -3328,6 +3536,7 @@ app.put(STREAM_ITEM_ROUTE, (req, res) => {
     gate: updatedGate,
     stream: updatedGate.streams!.find((s) => s.id === streamId) || updatedStream,
     primaryStreamId: pickPrimaryStream(updatedGate.streams!).id,
+    ...(destCheck.warnings.length ? { warnings: destCheck.warnings } : {}),
   });
 });
 
@@ -3414,10 +3623,27 @@ interface RtspFrameGrab {
   durationMs: number;
   exitCode: number | null;
   errorLog: string;
+  /** Set when the destination guard refused the URL: no FFmpeg process was started. */
+  blocked?: { code: string; reason: string; host?: string };
 }
 
-/** Grabs one JPEG from an RTSP stream (ffmpeg, hard-killed after 9 s). Never rejects. */
-function grabRtspFrame(streamUrl: string, transport: "tcp" | "udp"): Promise<RtspFrameGrab> {
+/**
+ * Grabs one JPEG from an RTSP stream (ffmpeg, hard-killed after 9 s). Never rejects.
+ * Every RTSP single-frame dial goes through here (snapshot, scan-rtsp incl. its
+ * body `url`, the gate watchers, template capture), so the destination guard
+ * sits here: a refused URL starts no process.
+ */
+async function grabRtspFrame(streamUrl: string, transport: "tcp" | "udp"): Promise<RtspFrameGrab> {
+  const refusal = await destinationRefusal(streamUrl, NET_POLICY.camera);
+  if (refusal) {
+    return {
+      ok: false,
+      durationMs: 0,
+      exitCode: null,
+      errorLog: `${refusal.code}: ${refusal.reason}`,
+      blocked: { code: refusal.code, reason: refusal.reason, host: refusal.host },
+    };
+  }
   return new Promise((resolve) => {
     const tStart = Date.now();
     const chunks: Buffer[] = [];
@@ -3528,15 +3754,14 @@ app.post("/api/camera-streams/benchmark", async (req, res) => {
   }
 });
 
-app.post("/api/camera-streams/test-stream", (req, res) => {
+app.post("/api/camera-streams/test-stream", async (req, res) => {
   const { url, sourceType, transport } = req.body || {};
-  if (!url) {
+  if (!url || typeof url !== "string") {
     return res.status(400).json({ success: false, error: "Vui lòng nhập URL luồng RTSP hoặc HTTP" });
   }
-
-  const isRtsp = String(url).toLowerCase().startsWith("rtsp://");
-  const isHttp = String(url).toLowerCase().startsWith("http://") || String(url).toLowerCase().startsWith("https://");
-
+  const lower = url.trim().toLowerCase();
+  const isRtsp = lower.startsWith("rtsp://") || lower.startsWith("rtsps://");
+  const isHttp = lower.startsWith("http://") || lower.startsWith("https://");
   if (!isRtsp && !isHttp) {
     return res.status(400).json({
       success: false,
@@ -3544,121 +3769,72 @@ app.post("/api/camera-streams/test-stream", (req, res) => {
     });
   }
 
-  let host = "";
-  let port = isRtsp ? 554 : 80;
-  try {
-    const clean = url.replace(/^[a-zA-Z]+:\/\//, "");
-    const atIdx = clean.indexOf("@");
-    const hostPortPart = atIdx !== -1 ? clean.substring(atIdx + 1).split("/")[0] : clean.split("/")[0];
-    const parts = hostPortPart.split(":");
-    host = parts[0];
-    if (parts[1]) port = parseInt(parts[1], 10);
-  } catch {}
-
-  const isPrivateIp = /^(192\.168\.|10\.|172\.(1[6-9]|2[0-9]|3[0-1])\.|127\.|localhost)/.test(host);
+  // Destination guard (tcp-probe policy = the camera allowlist): this route
+  // must not work as a port scanner for internal hosts. The socket connects
+  // to the CHECKED address, so a second DNS answer cannot redirect it.
+  const checked = await checkDestination(url, NET_POLICY.probe);
+  if (checked.ok === false) {
+    const refusal = checked as DestinationRefusal;
+    return res.status(400).json({ success: false, tcpConnected: false, code: refusal.code, error: refusal.reason });
+  }
+  const dest = checked as Extract<DestinationResult, { ok: true }>;
+  const host = dest.host;
+  const port = dest.port;
+  const address = dest.addresses[0];
+  const isPrivateIp = classifyAddress(address) === "private";
+  const kind = sourceType || (isRtsp ? "RTSP" : "HTTP_MJPEG");
   const tStart = Date.now();
-
-  // Test real TCP socket connection
   const socket = new net.Socket();
-  let resolved = false;
+  let settled = false;
+  const finish = (status: number, body: Record<string, unknown>) => {
+    if (settled) return;
+    settled = true;
+    clearTimeout(timer);
+    socket.destroy();
+    res.status(status).json(body);
+  };
 
   const timer = setTimeout(() => {
-    if (!resolved) {
-      resolved = true;
-      socket.destroy();
-      const latencyMs = Date.now() - tStart;
-      if (isPrivateIp) {
-        return res.json({
-          success: false,
-          tcpConnected: false,
-          isPrivateLan: true,
-          error: `Không thể kết nối trực tiếp đến IP mạng LAN nội bộ (${host}:${port}) từ môi trường máy chủ hiện tại (${latencyMs}ms).`,
-          message: `IP ${host} là dải mạng nội bộ (LAN). Nếu hệ thống đang chạy trên máy chủ Cloud (Render/Cloud Run), Cloud không thể tự vào mạng LAN của bạn. Vui lòng chạy backend cục bộ on-premise (Docker / npm run dev trên máy cùng mạng 192.168.60.x) hoặc cấu hình VPN/Tailscale/RTSP Bridge.`,
-          details: {
-            url,
-            sourceType: sourceType || (isRtsp ? "RTSP" : "HTTP_MJPEG"),
-            host,
-            port,
-            isPrivateIp: true,
-            transport: transport || "TCP",
-            latencyMs,
-            status: "LAN_UNREACHABLE_FROM_CLOUD",
-          },
-        });
-      }
-
-      return res.json({
-        success: false,
-        tcpConnected: false,
-        error: `Hết thời gian kết nối (Timeout sau 2.5s) tới ${host}:${port}.`,
-        details: { url, host, port, status: "TIMEOUT" },
-      });
-    }
+    finish(200, {
+      success: false,
+      tcpConnected: false,
+      isPrivateLan: isPrivateIp,
+      error: `Hết thời gian kết nối (Timeout sau 2.5s) tới ${host}:${port}.`,
+      details: { sourceType: kind, host, port, isPrivateIp, latencyMs: Date.now() - tStart, status: "TIMEOUT" },
+    });
   }, 2500);
 
-  socket.connect(port, host, () => {
-    if (!resolved) {
-      resolved = true;
-      clearTimeout(timer);
-      const latencyMs = Date.now() - tStart;
-      socket.destroy();
-      return res.json({
-        success: true,
-        tcpConnected: true,
-        isPrivateLan: isPrivateIp,
-        message: isRtsp
-          ? `Kết nối TCP tới cổng ${port} của camera ${host} THÀNH CÔNG (${latencyMs}ms, ${transport || "TCP"}). Luồng RTSP sẵn sàng giải mã đa luồng!`
-          : `Đã kết nối luồng HTTP/MJPEG tới ${host}:${port} (${latencyMs}ms).`,
-        details: {
-          url,
-          sourceType: sourceType || (isRtsp ? "RTSP" : "HTTP_MJPEG"),
-          host,
-          port,
-          isPrivateIp,
-          transport: transport || "TCP",
-          latencyMs,
-          status: "ONLINE_READY",
-          fpsEstimated: 25,
-          resolutionEstimated: "1920x1080",
-        },
-      });
-    }
+  socket.connect(port, address, () => {
+    const latencyMs = Date.now() - tStart;
+    finish(200, {
+      success: true,
+      tcpConnected: true,
+      isPrivateLan: isPrivateIp,
+      message: isRtsp
+        ? `Kết nối TCP tới cổng ${port} của camera ${host} THÀNH CÔNG (${latencyMs}ms, ${transport || "TCP"}). Luồng RTSP sẵn sàng giải mã đa luồng!`
+        : `Đã kết nối luồng HTTP/MJPEG tới ${host}:${port} (${latencyMs}ms).`,
+      details: {
+        sourceType: kind,
+        host,
+        port,
+        isPrivateIp,
+        transport: transport || "TCP",
+        latencyMs,
+        status: "ONLINE_READY",
+        fpsEstimated: 25,
+        resolutionEstimated: "1920x1080",
+      },
+    });
   });
 
   socket.on("error", (err) => {
-    if (!resolved) {
-      resolved = true;
-      clearTimeout(timer);
-      socket.destroy();
-      const latencyMs = Date.now() - tStart;
-
-      if (isPrivateIp) {
-        return res.json({
-          success: false,
-          tcpConnected: false,
-          isPrivateLan: true,
-          error: `Mạng nội bộ không thể truy cập (${err.message}).`,
-          message: `IP ${host} thuộc mạng LAN nội bộ. Hãy đảm bảo Backend chạy cục bộ (on-prem) trên cùng router/switch với camera (192.168.60.x) hoặc sử dụng VPN/RTSP Gateway.`,
-          details: {
-            url,
-            sourceType: sourceType || (isRtsp ? "RTSP" : "HTTP_MJPEG"),
-            host,
-            port,
-            isPrivateIp: true,
-            transport: transport || "TCP",
-            latencyMs,
-            status: "LAN_UNREACHABLE",
-          },
-        });
-      }
-
-      return res.json({
-        success: false,
-        tcpConnected: false,
-        error: `Không thể kết nối socket tới ${host}:${port}: ${err.message}`,
-        details: { url, host, port, status: "CONNECTION_FAILED" },
-      });
-    }
+    finish(200, {
+      success: false,
+      tcpConnected: false,
+      isPrivateLan: isPrivateIp,
+      error: `Không thể kết nối socket tới ${host}:${port}: ${err.message}`,
+      details: { sourceType: kind, host, port, isPrivateIp, latencyMs: Date.now() - tStart, status: "CONNECTION_FAILED" },
+    });
   });
 });
 
@@ -3699,6 +3875,11 @@ app.get("/api/camera-streams/snapshot", async (req, res) => {
     }
 
     // If FFmpeg fails or cannot reach camera, return clean fallback SVG with diagnostic message
+    if (grab.blocked) {
+      // Destination guard: nothing was dialled. The <img> still gets a picture.
+      res.setHeader("X-Dest-Code", grab.blocked.code);
+      return res.redirect(`/api/camera-streams/test-frame?gate=${gateParam}&source=RTSP%20Blocked`);
+    }
     return res.redirect(`/api/camera-streams/test-frame?gate=${gateParam}&source=RTSP%20Offline`);
   } catch (err: any) {
     return res.redirect(`/api/camera-streams/test-frame?gate=${gateParam}&source=RTSP%20Error`);
@@ -3739,6 +3920,8 @@ const SCAN_RTSP_MAX_CONCURRENT_STREAMS = 4;
 interface ScanStreamOutcome {
   stream: GateStreamSourceRecord;
   url: string;
+  /** DEST_* code when the destination guard refused this stream (nothing was dialled). */
+  blockedCode?: string;
   /** One grab per requested frame, in capture order. */
   grabs: RtspFrameGrab[];
   /** True once at least one frame was captured. */
@@ -3771,7 +3954,9 @@ async function grabRtspFrames(
   const out: RtspFrameGrab[] = [];
   for (let i = 0; i < frames; i++) {
     if (i > 0 && intervalMs > 0) await new Promise((r) => setTimeout(r, intervalMs));
-    out.push(await grabRtspFrame(streamUrl, transport));
+    const grab = await grabRtspFrame(streamUrl, transport);
+    out.push(grab);
+    if (grab.blocked) break; // refused destination: the next frame would be refused too
   }
   return out;
 }
@@ -4413,6 +4598,12 @@ async function performGateScan(input: GateScanRequest): Promise<GateScanResult> 
         faces: [],
       };
       if (!outcome.ok) {
+        const blocked = grabs.find((g) => g.blocked)?.blocked;
+        if (blocked) {
+          outcome.blockedCode = blocked.code;
+          outcome.error = blocked.reason;
+          return outcome;
+        }
         outcome.error =
           "Không thể lấy khung hình từ luồng RTSP. Hãy kiểm tra địa chỉ IP, tài khoản/mật khẩu hoặc kết nối mạng LAN.";
         return outcome;
@@ -4500,6 +4691,7 @@ async function performGateScan(input: GateScanRequest): Promise<GateScanResult> 
     totalFacesDetected: o.faces.length,
     detectedFaces: o.faces,
     error: o.error,
+    ...(o.blockedCode ? { code: o.blockedCode } : {}),
   }));
   const successful = outcomes.filter((o) => o.ok);
   const fusionSummary = {
@@ -4543,6 +4735,24 @@ async function performGateScan(input: GateScanRequest): Promise<GateScanResult> 
           frameCaptureDurationMs,
           streams: streamResults,
           fusion: fusionSummary,
+        },
+      };
+    }
+    const blockedOutcome = outcomes.find((o) => o.blockedCode);
+    if (blockedOutcome && outcomes.every((o) => o.blockedCode)) {
+      // The destination guard refused every target: nothing was dialled. A
+      // caller-supplied `url` is bad input (400); a stored stream that the
+      // current policy refuses is a configuration conflict (409).
+      return {
+        status: optionalTrimmedString(url) ? 400 : 409,
+        body: {
+          success: false,
+          recognized: false,
+          gate: gateParam,
+          code: blockedOutcome.blockedCode,
+          error: blockedOutcome.error,
+          streamId: blockedOutcome.stream.id,
+          streams: streamResults,
         },
       };
     }
@@ -5172,10 +5382,12 @@ interface GatePipelineSlot {
   pipeline: GatePipeline | null;
   starting: boolean;
   retry: NodeJS.Timeout | null;
+  /** The destination guard refused the stream: not started until the config changes. */
+  blocked: { code: string; reason: string; since: string } | null;
 }
 const gatePipelines: Record<Gate, GatePipelineSlot> = {
-  ENTRY: { key: "", pipeline: null, starting: false, retry: null },
-  EXIT: { key: "", pipeline: null, starting: false, retry: null },
+  ENTRY: { key: "", pipeline: null, starting: false, retry: null, blocked: null },
+  EXIT: { key: "", pipeline: null, starting: false, retry: null, blocked: null },
 };
 
 interface DesiredPipeline { key: string; url: string; streamId: string; area: ReturnType<typeof normalizeGateArea> }
@@ -5194,6 +5406,15 @@ async function startGatePipeline(gate: Gate, want: DesiredPipeline): Promise<voi
   const slot = gatePipelines[gate];
   slot.starting = true;
   try {
+    // Destination guard before any FFmpeg/ffprobe process touches the URL.
+    const refusal = await destinationRefusal(want.url, NET_POLICY.camera);
+    if (slot.key !== want.key) return; // reconfigured while checking
+    if (refusal) {
+      slot.blocked = { code: refusal.code, reason: refusal.reason, since: new Date().toISOString() };
+      console.warn(`[Pipeline ${gate}] Luồng ${want.streamId} bị chặn (${refusal.code}) host=${refusal.host || "?"}: không khởi động.`);
+      return;
+    }
+    slot.blocked = null;
     const size = await probeStreamSize(want.url, { timeoutMs: 15_000 });
     if (slot.key !== want.key) return; // reconfigured while probing
     if (!size) {
@@ -5244,6 +5465,7 @@ function syncPipelines() {
     const wantKey = want?.key ?? "";
     if (slot.key === wantKey) continue;
     slot.key = wantKey;
+    slot.blocked = null;
     if (slot.retry) clearTimeout(slot.retry);
     slot.retry = null;
     const old = slot.pipeline;
@@ -5269,6 +5491,12 @@ function reportPipelineResult(gate: Gate, r: TrackDecisionResult) {
 /** Watcher-runtime fields for the dashboard: stream health + decision counters. */
 function pipelineRuntime(gate: "ENTRY" | "EXIT"): Pick<GateWatchRuntime, "pipelineState" | "pipelineStats"> {
   const p = gatePipelines[gate].pipeline;
+  const blocked = gatePipelines[gate].blocked;
+  if (!p && blocked) {
+    return {
+      pipelineState: { status: "stopped", fps: 0, newestFrameAgeMs: null, reconnects: 0, lastError: `${blocked.code}: ${blocked.reason}`, since: blocked.since },
+    };
+  }
   if (!p) return {};
   const { gate: _g, ...state } = p.sourceState();
   const st = p.stats();
@@ -6181,6 +6409,12 @@ app.post(EMPLOYEE_TEMPLATE_CAPTURE_ROUTES, requireOperatorRole("operator"), requ
   const transport = target.rtspTransport === "UDP" ? "udp" : "tcp";
   const tStart = Date.now();
   const grabs = await grabRtspFrames(streamUrl, transport, framesRequested, intervalMs);
+  const blocked = grabs.find((g) => g.blocked)?.blocked;
+  if (blocked) {
+    // Destination guard: the stored stream is refused by the current policy; nothing was dialled.
+    res.status(409).json({ success: false, code: blocked.code, error: blocked.reason, streamId: target.id });
+    return;
+  }
 
   const saved: Array<Record<string, unknown>> = [];
   const rejected: Array<Record<string, unknown>> = [];
@@ -6596,13 +6830,27 @@ app.get(LOG_ROUTES, requireOperatorRole("viewer"), async (req, res) => {
 // ---------------------------------------------------------------------------
 // NVR playback around an access event (see src/server/recording.ts).
 // ---------------------------------------------------------------------------
-const recordingConfig = recordingConfigFromEnv(process.env);
+let nvrRecordingConfig = recordingConfigFromEnv(process.env);
+/**
+ * Destination guard for RECORDING_NVR_URL (deployer env, camera policy), once
+ * at startup: refused -> recording off, with one log line (host + code only).
+ * The recording routes await it, so nothing is played before it settles.
+ */
+const recordingGuard: Promise<void> = nvrRecordingConfig
+  ? destinationRefusal(nvrRecordingConfig.baseUrl, NET_POLICY.camera).then((r) => {
+      if (!r) return;
+      console.warn(`[NetGuard] RECORDING_NVR_URL bị chặn (${r.code}) host=${r.host || "?"}: tắt xem lại đoạn ghi.`);
+      nvrRecordingConfig = null;
+    })
+  : Promise.resolve();
 /** Each playback holds one NVR session and ~1 core (HEVC decode + H.264 encode). */
 const RECORDING_MAX_CONCURRENT = envInt("RECORDING_MAX_CONCURRENT", 2, 1, 8);
 let activeRecordings = 0;
 
 // Whether the "view recording" button has anything to play; never the address.
-app.get("/api/recordings/config", (_req, res) => {
+app.get("/api/recordings/config", async (_req, res) => {
+  await recordingGuard;
+  const recordingConfig = nvrRecordingConfig;
   res.json({
     success: true,
     enabled: Boolean(recordingConfig),
@@ -6644,6 +6892,8 @@ app.get("/api/logs/:id/recording", requireOperatorRole("viewer"), async (req, re
     return;
   }
   const { startMs, endMs } = win as { startMs: number; endMs: number };
+  await recordingGuard;
+  const recordingConfig = nvrRecordingConfig;
   if (!recordingConfig) {
     res.status(503).json({ success: false, code: "RECORDING_NOT_CONFIGURED", error: "Chưa cấu hình đầu ghi để xem lại (RECORDING_NVR_URL)." });
     return;
@@ -8285,6 +8535,34 @@ app.use((err: any, req: Request, res: Response, next: any) => {
 });
 
 // --- Mount Vite in dev or static files in production ---
+// Startup audit of STORED destinations: each camera stream, the webhook and the
+// door controller URL that the current guard policy would refuse is logged once,
+// by host and code only. Nothing is deleted or rewritten; every dial site
+// refuses them on its own.
+const auditedRefusals = new Set<string>();
+async function auditStoredDestinations(): Promise<void> {
+  const items: Array<{ label: string; url: unknown; policy: DestinationPolicy }> = [];
+  for (const gateKey of ["entryGate", "exitGate"] as const) {
+    for (const st of cameraStreamsConfig[gateKey]?.streams || []) {
+      for (const f of guardedUrlFields(st)) {
+        if (st[f]) items.push({ label: `camera ${gateKey === "exitGate" ? "exit" : "entry"}/${st.id} ${f}`, url: st[f], policy: NET_POLICY.camera });
+      }
+    }
+  }
+  const wh = db.getWebhookConfig(DEFAULT_WEBHOOK_CONFIG);
+  if (wh.url) items.push({ label: `webhook${wh.enabled ? "" : " (đang tắt)"}`, url: wh.url, policy: NET_POLICY.webhook });
+  const door = db.getDoorControllerConfig(DEFAULT_DOOR_CONTROLLER_CONFIG);
+  if (door.apiUrl) items.push({ label: `door${door.enabled ? "" : " (đang tắt)"}`, url: door.apiUrl, policy: NET_POLICY.door });
+  for (const item of items) {
+    const r = await destinationRefusal(item.url, item.policy);
+    if (!r) continue;
+    const key = `${item.label}|${r.code}|${r.host || ""}`;
+    if (auditedRefusals.has(key)) continue;
+    auditedRefusals.add(key);
+    console.warn(`[NetGuard] Đích đã lưu bị chặn: ${item.label} ${r.code} host=${r.host || "?"} (không gọi tới; sửa cấu hình hoặc danh sách cho phép).`);
+  }
+}
+
 async function startServer() {
   const isProduction =
     process.env.NODE_ENV === "production" ||
@@ -8310,6 +8588,7 @@ async function startServer() {
     // Backend gate watchers start here, AFTER the camera config is loaded and
     // only for gates whose persisted `watch.enabled` is true.
     syncGateWatchers();
+    void auditStoredDestinations().catch(() => {});
   });
 }
 
