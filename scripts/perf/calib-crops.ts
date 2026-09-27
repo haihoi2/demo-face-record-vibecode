@@ -175,6 +175,16 @@ async function main() {
     console.log(`appending to ${entries.length} existing crops (next n = ${n})`);
   }
 
+  const writeIndex = () =>
+    fs.writeFileSync(indexFile, JSON.stringify({ createdAt: new Date().toISOString(), minFacePx: MIN_PX, detectSize: info.detectorInputSize, skipped, entries }, null, 1), { mode: 0o600 });
+  const readPicture = async (file: string): Promise<RgbImage | null> => {
+    try {
+      return await loadImage(fs.readFileSync(file));
+    } catch {
+      return null;
+    }
+  };
+
   const store = async (img: RgbImage, p: Picked, base: Omit<Entry, "n" | "boxSize" | "score" | "quality" | "sharpness" | "picture" | "viaCrop">, sized: number) => {
     const e: Entry = {
       n,
@@ -204,7 +214,7 @@ async function main() {
     );
     let done = 0;
     for (const row of rows) {
-      const img = await loadImage(fs.readFileSync(path.join(logsDir, row.file)));
+      const img = await readPicture(path.join(logsDir, row.file));
       if (!img) {
         skipped.decode++;
         continue;
@@ -221,7 +231,10 @@ async function main() {
           await store(img, p, { source: "log", groupId: row.logId, identity: null, labelQuality: "none", status: "DENIED", gate: row.gate, ts: row.ts, facesInPicture: sized }, sized);
         }
       }
-      if (++done % 50 === 0) console.log(`logs: ${done}/${rows.length} pictures, ${n} crops`);
+      if (++done % 50 === 0) {
+        console.log(`logs: ${done}/${rows.length} pictures, ${n} crops`);
+        writeIndex();
+      }
     }
   }
 
@@ -237,7 +250,7 @@ async function main() {
       const frames = fs.readdirSync(dir).filter((f) => f.endsWith(".jpg")).sort();
       let kept = 0;
       for (const f of frames) {
-        const img = await loadImage(fs.readFileSync(path.join(dir, f)));
+        const img = await readPicture(path.join(dir, f));
         if (!img) {
           skipped.decode++;
           continue;
@@ -253,10 +266,11 @@ async function main() {
         kept++;
       }
       console.log(`clip ${pid} (${gate}, ${path.basename(file)}): ${frames.length} frames, ${kept} single-face crops -> ${identity.startsWith("stranger") ? "stranger" : identity}`);
+      writeIndex();
     }
   }
 
-  fs.writeFileSync(indexFile, JSON.stringify({ createdAt: new Date().toISOString(), minFacePx: MIN_PX, detectSize: info.detectorInputSize, skipped, entries }, null, 1), { mode: 0o600 });
+  writeIndex();
   const byIdentity = new Map<string, number>();
   for (const e of entries) byIdentity.set(e.identity ?? "(none)", (byIdentity.get(e.identity ?? "(none)") ?? 0) + 1);
   console.log(`crops: ${entries.length}; skipped ${JSON.stringify(skipped)}`);

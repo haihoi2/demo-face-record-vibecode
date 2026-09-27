@@ -71,6 +71,8 @@ const BENCH_ITERS = Number(opt("--bench-iters", "60"));
 const VIA_CROP = args.includes("--via-crop");
 const NO_BENCH = args.includes("--no-bench");
 const OUT = opt("--out");
+/** Identities excluded from scoring (declared in the report), e.g. a suspected duplicate employee id. */
+const EXCLUDE = new Set((opt("--exclude", "") || "").split(",").filter(Boolean));
 const SIZE = 112;
 const PLANE = SIZE * SIZE;
 const LEGACY = { acceptSingle: 0.55, acceptFused: 0.45, minMargin: 0.08 };
@@ -141,12 +143,13 @@ async function embedAll(model: { name: string; file: string }, entries: Entry[],
       return out;
     }
   }
+  const missing = wanted.filter((n) => !out.has(n));
   const { s, loadMs } = await session(model.file, THREADS);
   const input = s.inputNames[0];
   const output = s.outputNames[0];
   const t0 = Date.now();
   let dim = 0;
-  for (const n of wanted) {
+  for (const n of missing) {
     const u8 = fs.readFileSync(path.join(cropsDir, `${prefix}_${n}.u8`));
     const res = await s.run({ [input]: toTensor(u8) });
     const raw = res[output].data as Float32Array;
@@ -159,14 +162,14 @@ async function embedAll(model: { name: string; file: string }, entries: Entry[],
   idx.forEach((n, i) => Buffer.from(out.get(n)!.buffer).copy(buf, i * 512 * 4));
   fs.writeFileSync(cache, buf, { mode: 0o600 });
   fs.writeFileSync(cache + ".idx", JSON.stringify(idx), { mode: 0o600 });
-  console.log(`${model.name}/${prefix}: ${idx.length} crops embedded in ${((Date.now() - t0) / 1000).toFixed(0)} s (load ${loadMs} ms, ${THREADS} threads)`);
+  console.log(`${model.name}/${prefix}: ${missing.length} crops embedded in ${((Date.now() - t0) / 1000).toFixed(0)} s (load ${loadMs} ms, ${THREADS} threads); ${idx.length} cached`);
   await s.release();
   return out;
 }
 
 // ---------------------------------------------------------------- pairs
 
-type PairKind = "genuineSameGate" | "genuineCrossGate" | "withinTrack" | "impostorStrict" | "impostorProbable";
+type PairKind = "genuineSameGate" | "genuineCrossGate" | "withinTrack" | "impostorStrict" | "impostorProbable" | "genuineEntry" | "genuineExit";
 interface Pair {
   a: number;
   b: number;
@@ -184,7 +187,10 @@ function buildPairs(entries: Entry[]): Pair[] {
       if (a.groupId === b.groupId) continue;
       if (a.identity && a.identity === b.identity) {
         if (a.source === "clip" && b.source === "clip" && passageOf(a) === passageOf(b)) pairs.push({ a: a.n, b: b.n, kind: "withinTrack" });
-        else pairs.push({ a: a.n, b: b.n, kind: a.gate === b.gate ? "genuineSameGate" : "genuineCrossGate" });
+        else {
+          pairs.push({ a: a.n, b: b.n, kind: a.gate === b.gate ? "genuineSameGate" : "genuineCrossGate" });
+          if (a.gate === b.gate) pairs.push({ a: a.n, b: b.n, kind: a.gate === "ENTRY" ? "genuineEntry" : "genuineExit" });
+        }
       } else if (isEmployee(a.identity) && isEmployee(b.identity)) pairs.push({ a: a.n, b: b.n, kind: "impostorStrict" });
       else if (isEmployee(a.identity) !== isEmployee(b.identity)) pairs.push({ a: a.n, b: b.n, kind: "impostorProbable" });
       // stranger vs stranger / denied vs denied: unknown relation, not a pair
@@ -194,7 +200,7 @@ function buildPairs(entries: Entry[]): Pair[] {
 }
 
 function scoreSets(emb: Map<number, Float32Array>, pairs: Pair[]): Record<PairKind, number[]> {
-  const sets: Record<PairKind, number[]> = { genuineSameGate: [], genuineCrossGate: [], withinTrack: [], impostorStrict: [], impostorProbable: [] };
+  const sets: Record<PairKind, number[]> = { genuineSameGate: [], genuineCrossGate: [], withinTrack: [], impostorStrict: [], impostorProbable: [], genuineEntry: [], genuineExit: [] };
   for (const p of pairs) {
     const a = emb.get(p.a);
     const b = emb.get(p.b);
@@ -249,12 +255,14 @@ function summarize(sets: Record<PairKind, number[]>) {
   return {
     genuine: dist(gen),
     genuineSameGate: dist(sets.genuineSameGate),
+    genuineEntry: dist(sets.genuineEntry),
+    genuineExit: dist(sets.genuineExit),
     genuineCrossGate: dist(sets.genuineCrossGate),
     withinTrack: dist(sets.withinTrack),
     impostorStrict: dist(imp),
     impostorProbable: dist(prob),
     dPrime: r3((mean(gen) - mean(imp)) / Math.sqrt((varr(gen) + varr(imp)) / 2)),
-    tarAtFar0: { threshold: r3(tFar0), tar: r4(frac(gen, (v) => v >= tFar0)), tarSameGate: r4(frac(sets.genuineSameGate, (v) => v >= tFar0)), tarCrossGate: r4(frac(sets.genuineCrossGate, (v) => v >= tFar0)), farProbable: r4(frac(prob, (v) => v >= tFar0)) },
+    tarAtFar0: { threshold: r3(tFar0), tar: r4(frac(gen, (v) => v >= tFar0)), tarEntry: r4(frac(sets.genuineEntry, (v) => v >= tFar0)), tarExit: r4(frac(sets.genuineExit, (v) => v >= tFar0)), tarCrossGate: r4(frac(sets.genuineCrossGate, (v) => v >= tFar0)), farProbable: r4(frac(prob, (v) => v >= tFar0)) },
     tarAtFar1e3: { threshold: r3(tFar3), tar: r4(frac(gen, (v) => v >= tFar3)), farProbable: r4(frac(prob, (v) => v >= tFar3)) },
     legacySingle: atThreshold(gen, imp, prob, LEGACY.acceptSingle),
     legacyFused: atThreshold(gen, imp, prob, LEGACY.acceptFused),
@@ -318,6 +326,54 @@ function fusion(entries: Entry[], emb: Map<number, Float32Array>) {
   return out;
 }
 
+// ---------------------------------------------------------------- gallery size per person (templates cap)
+
+/**
+ * Fewer templates per person: for each employee with enough crops, the gallery is
+ * the k best-quality crops (ties by n) and every other crop of that employee is a
+ * probe; impostor probes are all other-identity crops (employees and DENIED).
+ * Scores are max cosine to the gallery, i.e. what scoreAgainstTemplates does.
+ */
+function galleryCap(entries: Entry[], emb: Map<number, Float32Array>) {
+  const byId = new Map<string, Entry[]>();
+  for (const e of entries) if (isEmployee(e.identity) && emb.has(e.n)) byId.set(e.identity!, [...(byId.get(e.identity!) ?? []), e]);
+  const others = entries.filter((e) => emb.has(e.n));
+  const out: Record<string, any> = {};
+  for (const k of [1, 2, 3, 5, 10]) {
+    const gen: number[] = [];
+    const impS: number[] = [];
+    const impP: number[] = [];
+    let employees = 0;
+    for (const [id, crops] of byId) {
+      if (crops.length < k + 3) continue;
+      employees++;
+      const sorted = [...crops].sort((a, b) => b.quality - a.quality || a.n - b.n);
+      const gallery = sorted.slice(0, k);
+      const gallerySet = new Set(gallery.map((g) => g.n));
+      const score = (n: number) => Math.max(...gallery.map((g) => dot(emb.get(n)!, emb.get(g.n)!)));
+      for (const p of sorted) if (!gallerySet.has(p.n) && !gallery.some((g) => g.groupId === p.groupId)) gen.push(score(p.n));
+      for (const o of others) {
+        if (o.identity === id) continue;
+        if (isEmployee(o.identity)) impS.push(score(o.n));
+        else if (!o.identity) impP.push(score(o.n));
+      }
+    }
+    gen.sort((a, b) => a - b);
+    impS.sort((a, b) => a - b);
+    impP.sort((a, b) => a - b);
+    const t0 = thresholdAtFar(impS, 0);
+    out[`k${k}`] = {
+      employees,
+      genuine: dist(gen),
+      impostorStrict: dist(impS),
+      impostorProbable: dist(impP),
+      tarAtFar0: { threshold: r3(t0), tar: r4(frac(gen, (v) => v >= t0)), farProbable: r4(frac(impP, (v) => v >= t0)) },
+      legacySingle: atThreshold(gen, impS, impP, LEGACY.acceptSingle),
+    };
+  }
+  return out;
+}
+
 // ---------------------------------------------------------------- latency
 
 async function bench(model: { name: string; file: string }, sample: Buffer[]) {
@@ -348,7 +404,7 @@ async function main() {
   const calibSet = new Set<number>(
     fs.existsSync(path.join(cropsDir, "calib")) ? fs.readdirSync(path.join(cropsDir, "calib")).map((f) => Number(f.replace(/^rec_|\.u8$/g, ""))) : [],
   );
-  const entries = all.filter((e) => !calibSet.has(e.n));
+  const entries = all.filter((e) => !calibSet.has(e.n) && !(e.identity && EXCLUDE.has(e.identity)));
   const identities = new Map<string, number>();
   for (const e of entries) identities.set(e.identity ?? "(none)", (identities.get(e.identity ?? "(none)") ?? 0) + 1);
   const pairs = buildPairs(entries);
@@ -362,6 +418,7 @@ async function main() {
     host: { cpus: os.cpus().length, loadavg: os.loadavg().map(r3), ort: "onnxruntime-node" },
     minFacePx: index.minFacePx,
     detectSize: index.detectSize,
+    excludedIdentities: [...EXCLUDE],
     crops: { total: all.length, scored: entries.length, calibrationExcluded: calibSet.size, byIdentity: Object.fromEntries(identities), employeesWithLabels: [...identities.keys()].filter(isEmployee).length },
     pairs: counts,
     legacyThresholds: LEGACY,
@@ -376,7 +433,7 @@ async function main() {
     const sum = summarize(scoreSets(emb, pairs));
     sums.set(m.name, sum);
     const { _gen, _imp, _prob, ...pub } = sum;
-    report.models[m.name] = { file: path.basename(m.file), ...pub, fusion: fusion(entries, emb) };
+    report.models[m.name] = { file: path.basename(m.file), ...pub, fusion: fusion(entries, emb), galleryCap: galleryCap(entries, emb) };
     if (VIA_CROP) {
       const embC = await embedAll(m, entries, "crop");
       // Same-face agreement between the full-frame path and the stored-crop path (what a derived gallery would embed).
@@ -385,7 +442,7 @@ async function main() {
       agree.sort((a, b) => a - b);
       const { _gen: g2, _imp: i2, _prob: p2, ...pubC } = summarize(scoreSets(embC, pairs));
       // Cross path: probe from the frame (pipeline), gallery from the crop (derived template).
-      const cross: Record<PairKind, number[]> = { genuineSameGate: [], genuineCrossGate: [], withinTrack: [], impostorStrict: [], impostorProbable: [] };
+      const cross: Record<PairKind, number[]> = { genuineSameGate: [], genuineCrossGate: [], withinTrack: [], impostorStrict: [], impostorProbable: [], genuineEntry: [], genuineExit: [] };
       for (const p of pairs) {
         const a = emb.get(p.a);
         const b = embC.get(p.b);
@@ -452,15 +509,22 @@ async function main() {
     const r = report.models[m.name];
     const mr = r.matchReference;
     const lat = r.latency ? `${r.latency.threads1?.medianMs ?? "-"} / ${r.latency.threads2?.medianMs ?? "-"}` : "-";
-    return `| ${m.name} | ${r.genuine.p5} / ${r.genuine.p50} / ${r.genuine.p95} | ${r.impostorStrict.p5} / ${r.impostorStrict.p50} / ${r.impostorStrict.p95} (max ${r.impostorStrict.max}) | ${r.impostorProbable.p95} / ${r.impostorProbable.max} | ${(r.tarAtFar0.tar * 100).toFixed(1)}% @ ${r.tarAtFar0.threshold} | ${(r.tarAtFar1e3.tar * 100).toFixed(1)}% @ ${r.tarAtFar1e3.threshold} | ${(r.legacySingle.tar * 100).toFixed(1)}% / ${(r.legacySingle.farStrict * 100).toFixed(2)}% | ${mr.acceptSingle.recommended.threshold} (TAR ${(mr.acceptSingle.recommended.tar * 100).toFixed(1)}%, FAR ${(mr.acceptSingle.recommended.farStrict * 100).toFixed(2)}%, margin ${mr.acceptSingle.recommended.marginToImpostorP95}) | ${mr.acceptFused.recommended} | ${r.driftVsParent ? `${r.driftVsParent.median} / ${r.driftVsParent.p95}` : "-"} | ${lat} | ${mr.goodEnough.verdict ? "yes" : "no"} |`;
+    return `| ${m.name} | ${r.genuine.p5} / ${r.genuine.p50} / ${r.genuine.p95} | ${r.impostorStrict.p5} / ${r.impostorStrict.p50} / ${r.impostorStrict.p95} (max ${r.impostorStrict.max}) | ${r.impostorProbable.p95} / ${r.impostorProbable.max} | ${(r.tarAtFar0.tar * 100).toFixed(1)}% @ ${r.tarAtFar0.threshold} (entry ${(r.tarAtFar0.tarEntry * 100).toFixed(0)} / exit ${(r.tarAtFar0.tarExit * 100).toFixed(0)} / cross ${(r.tarAtFar0.tarCrossGate * 100).toFixed(0)}) | ${(r.tarAtFar1e3.tar * 100).toFixed(1)}% @ ${r.tarAtFar1e3.threshold} | ${(r.legacySingle.tar * 100).toFixed(1)}% / ${(r.legacySingle.farStrict * 100).toFixed(2)}% | ${mr.acceptSingle.recommended.threshold} (TAR ${(mr.acceptSingle.recommended.tar * 100).toFixed(1)}%, FAR ${(mr.acceptSingle.recommended.farStrict * 100).toFixed(2)}%, margin ${mr.acceptSingle.recommended.marginToImpostorP95}) | ${mr.acceptFused.recommended} | ${r.driftVsParent ? `${r.driftVsParent.median} / ${r.driftVsParent.p95}` : "-"} | ${lat} | ${mr.goodEnough.verdict ? "yes" : "no"} |`;
   });
   console.log("\n| model | genuine p5/p50/p95 | impostor strict p5/p50/p95 | probable p95/max | TAR@FAR=0 | TAR@FAR=1e-3 | TAR/FAR @0.55 | acceptSingle (reproduces ref) | acceptFused | drift med/p95 | ms 1t / 2t | good enough |");
   console.log("|---|---|---|---|---|---|---|---|---|---|---|---|");
   for (const r of rows) console.log(r);
+  const line = (v: any, extra: string) =>
+    v.genuine.n ? `gen n ${v.genuine.n} p5 ${v.genuine.p5} p50 ${v.genuine.p50} | imp strict max ${v.impostorStrict.max} p95 ${v.impostorStrict.p95} | probable p95 ${v.impostorProbable.p95} max ${v.impostorProbable.max} | TAR@FAR0 ${(v.tarAtFar0.tar * 100).toFixed(1)}% @ ${v.tarAtFar0.threshold}${extra}` : "n/a (no data)";
   console.log("\nk-best fusion (clip passages, leave-one-passage-out gallery):");
   for (const m of MODELS) {
     const f = report.models[m.name].fusion;
-    console.log(`  ${m.name}: ` + Object.entries(f).map(([k, v]: [string, any]) => `${k}: gen p5 ${v.genuine.p5} min ${v.genuine.min} | imp max ${v.impostorStrict.max} p95 ${v.impostorStrict.p95} | TAR@FAR0 ${(v.tarAtFar0.tar * 100).toFixed(0)}% @ ${v.tarAtFar0.threshold} | @0.45 TAR ${(v.legacyFused.tar * 100).toFixed(0)}% FAR ${(v.legacyFused.farStrict * 100).toFixed(1)}%`).join("\n     "));
+    console.log(`  ${m.name}: ` + Object.entries(f).map(([k, v]: [string, any]) => `${k} (${v.employeePassages} passages): ` + line(v, v.genuine.n ? ` | @0.45 TAR ${(v.legacyFused.tar * 100).toFixed(0)}% FAR ${(v.legacyFused.farStrict * 100).toFixed(1)}%` : "")).join("\n     "));
+  }
+  console.log("\ntemplates per person (gallery = k best-quality crops, probes = the rest):");
+  for (const m of MODELS) {
+    const g = report.models[m.name].galleryCap;
+    console.log(`  ${m.name}: ` + Object.entries(g).map(([k, v]: [string, any]) => `${k} (${v.employees} employees): ` + line(v, v.genuine.n ? ` | @0.55 TAR ${(v.legacySingle.tar * 100).toFixed(1)}% FAR ${(v.legacySingle.farStrict * 100).toFixed(2)}%` : "")).join("\n     "));
   }
 }
 
