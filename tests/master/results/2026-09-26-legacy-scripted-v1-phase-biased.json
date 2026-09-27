@@ -1,0 +1,852 @@
+{
+  "name": "legacy",
+  "generatedAt": "2026-09-26T18:52:44.636Z",
+  "gateway": "http://smartface-verify-rt-mt:3000",
+  "ready": {
+    "ENTRY": "2026-09-26T18:35:36.391Z",
+    "EXIT": "2026-09-26T18:35:36.982Z"
+  },
+  "perGate": {
+    "ENTRY": {
+      "passages": 40,
+      "passagesWithPeople": 24,
+      "persons": 36,
+      "decided": 5,
+      "missed": 31,
+      "missedPct": 86.1,
+      "latencyMs": {
+        "n": 5,
+        "p50": 6217,
+        "p95": 7167,
+        "mean": 6183,
+        "max": 7167
+      },
+      "latencyEmployeeMs": {
+        "n": 0,
+        "p50": null,
+        "p95": null,
+        "mean": null,
+        "max": null
+      },
+      "latencyStrangerMs": {
+        "n": 5,
+        "p50": 6217,
+        "p95": 7167,
+        "mean": 6183,
+        "max": 7167
+      },
+      "logsPerPersonPerPassage": 0.08,
+      "exactlyOneLogPct": 13.9,
+      "duplicateLogs": 0,
+      "falseAccepts": 0,
+      "falseRejects": 0,
+      "logsInEmptyPassages": 0
+    },
+    "EXIT": {
+      "passages": 40,
+      "passagesWithPeople": 24,
+      "persons": 36,
+      "decided": 14,
+      "missed": 22,
+      "missedPct": 61.1,
+      "latencyMs": {
+        "n": 14,
+        "p50": 3200,
+        "p95": 6449,
+        "mean": 3656,
+        "max": 6449
+      },
+      "latencyEmployeeMs": {
+        "n": 7,
+        "p50": 2785,
+        "p95": 3723,
+        "mean": 2890,
+        "max": 3723
+      },
+      "latencyStrangerMs": {
+        "n": 7,
+        "p50": 4516,
+        "p95": 6449,
+        "mean": 4422,
+        "max": 6449
+      },
+      "logsPerPersonPerPassage": 0.41,
+      "exactlyOneLogPct": 38.9,
+      "duplicateLogs": 0,
+      "falseAccepts": 0,
+      "falseRejects": 3,
+      "logsInEmptyPassages": 0
+    }
+  },
+  "overall": {
+    "passages": 80,
+    "passagesWithPeople": 48,
+    "persons": 72,
+    "decided": 19,
+    "missed": 53,
+    "missedPct": 73.6,
+    "latencyMs": {
+      "n": 19,
+      "p50": 3876,
+      "p95": 7167,
+      "mean": 4321,
+      "max": 7167
+    },
+    "latencyEmployeeMs": {
+      "n": 7,
+      "p50": 2785,
+      "p95": 3723,
+      "mean": 2890,
+      "max": 3723
+    },
+    "latencyStrangerMs": {
+      "n": 12,
+      "p50": 5364,
+      "p95": 7167,
+      "mean": 5155,
+      "max": 7167
+    },
+    "logsPerPersonPerPassage": 0.25,
+    "exactlyOneLogPct": 26.4,
+    "duplicateLogs": 0,
+    "falseAccepts": 0,
+    "falseRejects": 3,
+    "logsInEmptyPassages": 0
+  },
+  "looks": {
+    "ENTRY": {
+      "looks": 138,
+      "failed": 3,
+      "startToStartMs": {
+        "n": 137,
+        "p50": 8069,
+        "p95": 10005,
+        "mean": 8133,
+        "max": 19109
+      },
+      "durationMs": {
+        "n": 138,
+        "p50": 5037,
+        "p95": 6798,
+        "mean": 4908,
+        "max": 8400
+      },
+      "captureMs": {
+        "n": 138,
+        "p50": 3914,
+        "p95": 4932,
+        "mean": 3680,
+        "max": 5898
+      },
+      "processingMs": {
+        "n": 135,
+        "p50": 5047,
+        "p95": 6447,
+        "mean": 4972,
+        "max": 7965
+      }
+    },
+    "EXIT": {
+      "looks": 186,
+      "failed": 3,
+      "startToStartMs": {
+        "n": 185,
+        "p50": 5970,
+        "p95": 7179,
+        "mean": 5995,
+        "max": 15205
+      },
+      "durationMs": {
+        "n": 186,
+        "p50": 2956,
+        "p95": 3925,
+        "mean": 2856,
+        "max": 6099
+      },
+      "captureMs": {
+        "n": 186,
+        "p50": 2063,
+        "p95": 2331,
+        "mean": 1813,
+        "max": 2507
+      },
+      "processingMs": {
+        "n": 183,
+        "p50": 2957,
+        "p95": 3891,
+        "mean": 2885,
+        "max": 5922
+      }
+    }
+  },
+  "cpu": {
+    "off": {
+      "n": 20,
+      "meanCores": 0.02,
+      "p95Cores": 0.05
+    },
+    "idle": {
+      "n": 39,
+      "meanCores": 0.74,
+      "p95Cores": 1.5
+    },
+    "busy": {
+      "n": 440,
+      "meanCores": 0.55,
+      "p95Cores": 1.49
+    }
+  },
+  "phases": [
+    {
+      "name": "off",
+      "startMs": 1790447588951280000,
+      "endMs": 1790447633967434200
+    },
+    {
+      "name": "idle",
+      "startMs": 1790447640146150700,
+      "endMs": 1790447730785817900
+    },
+    {
+      "name": "busy",
+      "startMs": 1790447741393114600,
+      "endMs": 1790448761815982800
+    }
+  ],
+  "persons": [
+    {
+      "passageId": "scripted-entry/entry-001-A1",
+      "gate": "ENTRY",
+      "label": "A",
+      "kind": "employee",
+      "decided": false,
+      "logs": 0
+    },
+    {
+      "passageId": "scripted-entry/entry-002-B1",
+      "gate": "ENTRY",
+      "label": "B",
+      "kind": "stranger",
+      "decided": false,
+      "logs": 0
+    },
+    {
+      "passageId": "scripted-entry/entry-003-C1",
+      "gate": "ENTRY",
+      "label": "C",
+      "kind": "stranger",
+      "decided": false,
+      "logs": 0
+    },
+    {
+      "passageId": "scripted-entry/entry-005-AB",
+      "gate": "ENTRY",
+      "label": "A",
+      "kind": "employee",
+      "decided": false,
+      "logs": 0
+    },
+    {
+      "passageId": "scripted-entry/entry-005-AB",
+      "gate": "ENTRY",
+      "label": "B",
+      "kind": "stranger",
+      "decided": true,
+      "outcome": "DENIED",
+      "correct": true,
+      "latencyMs": 5116,
+      "logs": 1
+    },
+    {
+      "passageId": "scripted-entry/entry-007-A1h",
+      "gate": "ENTRY",
+      "label": "Ah",
+      "kind": "employee",
+      "decided": false,
+      "logs": 0
+    },
+    {
+      "passageId": "scripted-entry/entry-009-ABC",
+      "gate": "ENTRY",
+      "label": "A",
+      "kind": "employee",
+      "decided": false,
+      "logs": 0
+    },
+    {
+      "passageId": "scripted-entry/entry-009-ABC",
+      "gate": "ENTRY",
+      "label": "B",
+      "kind": "stranger",
+      "decided": true,
+      "outcome": "DENIED",
+      "correct": true,
+      "latencyMs": 6217,
+      "logs": 1
+    },
+    {
+      "passageId": "scripted-entry/entry-009-ABC",
+      "gate": "ENTRY",
+      "label": "C",
+      "kind": "stranger",
+      "decided": false,
+      "logs": 0
+    },
+    {
+      "passageId": "scripted-entry/entry-011-A1",
+      "gate": "ENTRY",
+      "label": "A",
+      "kind": "employee",
+      "decided": false,
+      "logs": 0
+    },
+    {
+      "passageId": "scripted-entry/entry-012-B1",
+      "gate": "ENTRY",
+      "label": "B",
+      "kind": "stranger",
+      "decided": false,
+      "logs": 0
+    },
+    {
+      "passageId": "scripted-entry/entry-013-C1",
+      "gate": "ENTRY",
+      "label": "C",
+      "kind": "stranger",
+      "decided": false,
+      "logs": 0
+    },
+    {
+      "passageId": "scripted-entry/entry-015-AB",
+      "gate": "ENTRY",
+      "label": "A",
+      "kind": "employee",
+      "decided": false,
+      "logs": 0
+    },
+    {
+      "passageId": "scripted-entry/entry-015-AB",
+      "gate": "ENTRY",
+      "label": "B",
+      "kind": "stranger",
+      "decided": false,
+      "logs": 0
+    },
+    {
+      "passageId": "scripted-entry/entry-017-A1h",
+      "gate": "ENTRY",
+      "label": "Ah",
+      "kind": "employee",
+      "decided": false,
+      "logs": 0
+    },
+    {
+      "passageId": "scripted-entry/entry-019-ABC",
+      "gate": "ENTRY",
+      "label": "A",
+      "kind": "employee",
+      "decided": false,
+      "logs": 0
+    },
+    {
+      "passageId": "scripted-entry/entry-019-ABC",
+      "gate": "ENTRY",
+      "label": "B",
+      "kind": "stranger",
+      "decided": true,
+      "outcome": "DENIED",
+      "correct": true,
+      "latencyMs": 6528,
+      "logs": 1
+    },
+    {
+      "passageId": "scripted-entry/entry-019-ABC",
+      "gate": "ENTRY",
+      "label": "C",
+      "kind": "stranger",
+      "decided": false,
+      "logs": 0
+    },
+    {
+      "passageId": "scripted-entry/entry-021-A1",
+      "gate": "ENTRY",
+      "label": "A",
+      "kind": "employee",
+      "decided": false,
+      "logs": 0
+    },
+    {
+      "passageId": "scripted-entry/entry-022-B1",
+      "gate": "ENTRY",
+      "label": "B",
+      "kind": "stranger",
+      "decided": false,
+      "logs": 0
+    },
+    {
+      "passageId": "scripted-entry/entry-023-C1",
+      "gate": "ENTRY",
+      "label": "C",
+      "kind": "stranger",
+      "decided": false,
+      "logs": 0
+    },
+    {
+      "passageId": "scripted-entry/entry-025-AB",
+      "gate": "ENTRY",
+      "label": "A",
+      "kind": "employee",
+      "decided": false,
+      "logs": 0
+    },
+    {
+      "passageId": "scripted-entry/entry-025-AB",
+      "gate": "ENTRY",
+      "label": "B",
+      "kind": "stranger",
+      "decided": false,
+      "logs": 0
+    },
+    {
+      "passageId": "scripted-entry/entry-027-A1h",
+      "gate": "ENTRY",
+      "label": "Ah",
+      "kind": "employee",
+      "decided": false,
+      "logs": 0
+    },
+    {
+      "passageId": "scripted-entry/entry-029-ABC",
+      "gate": "ENTRY",
+      "label": "A",
+      "kind": "employee",
+      "decided": false,
+      "logs": 0
+    },
+    {
+      "passageId": "scripted-entry/entry-029-ABC",
+      "gate": "ENTRY",
+      "label": "B",
+      "kind": "stranger",
+      "decided": true,
+      "outcome": "DENIED",
+      "correct": true,
+      "latencyMs": 7167,
+      "logs": 1
+    },
+    {
+      "passageId": "scripted-entry/entry-029-ABC",
+      "gate": "ENTRY",
+      "label": "C",
+      "kind": "stranger",
+      "decided": false,
+      "logs": 0
+    },
+    {
+      "passageId": "scripted-entry/entry-031-A1",
+      "gate": "ENTRY",
+      "label": "A",
+      "kind": "employee",
+      "decided": false,
+      "logs": 0
+    },
+    {
+      "passageId": "scripted-entry/entry-032-B1",
+      "gate": "ENTRY",
+      "label": "B",
+      "kind": "stranger",
+      "decided": false,
+      "logs": 0
+    },
+    {
+      "passageId": "scripted-entry/entry-033-C1",
+      "gate": "ENTRY",
+      "label": "C",
+      "kind": "stranger",
+      "decided": false,
+      "logs": 0
+    },
+    {
+      "passageId": "scripted-entry/entry-035-AB",
+      "gate": "ENTRY",
+      "label": "A",
+      "kind": "employee",
+      "decided": false,
+      "logs": 0
+    },
+    {
+      "passageId": "scripted-entry/entry-035-AB",
+      "gate": "ENTRY",
+      "label": "B",
+      "kind": "stranger",
+      "decided": true,
+      "outcome": "DENIED",
+      "correct": true,
+      "latencyMs": 5885,
+      "logs": 1
+    },
+    {
+      "passageId": "scripted-entry/entry-037-A1h",
+      "gate": "ENTRY",
+      "label": "Ah",
+      "kind": "employee",
+      "decided": false,
+      "logs": 0
+    },
+    {
+      "passageId": "scripted-entry/entry-039-ABC",
+      "gate": "ENTRY",
+      "label": "A",
+      "kind": "employee",
+      "decided": false,
+      "logs": 0
+    },
+    {
+      "passageId": "scripted-entry/entry-039-ABC",
+      "gate": "ENTRY",
+      "label": "B",
+      "kind": "stranger",
+      "decided": false,
+      "logs": 0
+    },
+    {
+      "passageId": "scripted-entry/entry-039-ABC",
+      "gate": "ENTRY",
+      "label": "C",
+      "kind": "stranger",
+      "decided": false,
+      "logs": 0
+    },
+    {
+      "passageId": "scripted-exit/exit-001-A1",
+      "gate": "EXIT",
+      "label": "A",
+      "kind": "employee",
+      "decided": true,
+      "outcome": "GRANTED",
+      "correct": true,
+      "latencyMs": 3200,
+      "logs": 1
+    },
+    {
+      "passageId": "scripted-exit/exit-002-B1",
+      "gate": "EXIT",
+      "label": "B",
+      "kind": "stranger",
+      "decided": false,
+      "logs": 0
+    },
+    {
+      "passageId": "scripted-exit/exit-003-C1",
+      "gate": "EXIT",
+      "label": "C",
+      "kind": "stranger",
+      "decided": false,
+      "logs": 0
+    },
+    {
+      "passageId": "scripted-exit/exit-005-AB",
+      "gate": "EXIT",
+      "label": "A",
+      "kind": "employee",
+      "decided": true,
+      "outcome": "GRANTED",
+      "correct": true,
+      "latencyMs": 3229,
+      "logs": 1
+    },
+    {
+      "passageId": "scripted-exit/exit-005-AB",
+      "gate": "EXIT",
+      "label": "B",
+      "kind": "stranger",
+      "decided": false,
+      "logs": 0
+    },
+    {
+      "passageId": "scripted-exit/exit-007-A1h",
+      "gate": "EXIT",
+      "label": "Ah",
+      "kind": "employee",
+      "decided": false,
+      "logs": 0
+    },
+    {
+      "passageId": "scripted-exit/exit-009-ABC",
+      "gate": "EXIT",
+      "label": "A",
+      "kind": "employee",
+      "decided": true,
+      "outcome": "GRANTED",
+      "correct": true,
+      "latencyMs": 3723,
+      "logs": 1
+    },
+    {
+      "passageId": "scripted-exit/exit-009-ABC",
+      "gate": "EXIT",
+      "label": "B",
+      "kind": "stranger",
+      "decided": false,
+      "logs": 0
+    },
+    {
+      "passageId": "scripted-exit/exit-009-ABC",
+      "gate": "EXIT",
+      "label": "C",
+      "kind": "stranger",
+      "decided": false,
+      "logs": 0
+    },
+    {
+      "passageId": "scripted-exit/exit-011-A1",
+      "gate": "EXIT",
+      "label": "A",
+      "kind": "employee",
+      "decided": true,
+      "outcome": "GRANTED",
+      "correct": true,
+      "latencyMs": 2522,
+      "logs": 1
+    },
+    {
+      "passageId": "scripted-exit/exit-012-B1",
+      "gate": "EXIT",
+      "label": "B",
+      "kind": "stranger",
+      "decided": false,
+      "logs": 0
+    },
+    {
+      "passageId": "scripted-exit/exit-013-C1",
+      "gate": "EXIT",
+      "label": "C",
+      "kind": "stranger",
+      "decided": false,
+      "logs": 0
+    },
+    {
+      "passageId": "scripted-exit/exit-015-AB",
+      "gate": "EXIT",
+      "label": "A",
+      "kind": "employee",
+      "decided": false,
+      "logs": 0
+    },
+    {
+      "passageId": "scripted-exit/exit-015-AB",
+      "gate": "EXIT",
+      "label": "B",
+      "kind": "stranger",
+      "decided": false,
+      "logs": 0
+    },
+    {
+      "passageId": "scripted-exit/exit-017-A1h",
+      "gate": "EXIT",
+      "label": "Ah",
+      "kind": "employee",
+      "decided": true,
+      "outcome": "DENIED",
+      "correct": false,
+      "latencyMs": 2326,
+      "logs": 1
+    },
+    {
+      "passageId": "scripted-exit/exit-019-ABC",
+      "gate": "EXIT",
+      "label": "A",
+      "kind": "employee",
+      "decided": false,
+      "logs": 0
+    },
+    {
+      "passageId": "scripted-exit/exit-019-ABC",
+      "gate": "EXIT",
+      "label": "B",
+      "kind": "stranger",
+      "decided": true,
+      "outcome": "DENIED",
+      "correct": true,
+      "latencyMs": 5855,
+      "logs": 1
+    },
+    {
+      "passageId": "scripted-exit/exit-019-ABC",
+      "gate": "EXIT",
+      "label": "C",
+      "kind": "stranger",
+      "decided": false,
+      "logs": 0
+    },
+    {
+      "passageId": "scripted-exit/exit-021-A1",
+      "gate": "EXIT",
+      "label": "A",
+      "kind": "employee",
+      "decided": false,
+      "logs": 0
+    },
+    {
+      "passageId": "scripted-exit/exit-022-B1",
+      "gate": "EXIT",
+      "label": "B",
+      "kind": "stranger",
+      "decided": true,
+      "outcome": "DENIED",
+      "correct": true,
+      "latencyMs": 2428,
+      "logs": 1
+    },
+    {
+      "passageId": "scripted-exit/exit-023-C1",
+      "gate": "EXIT",
+      "label": "C",
+      "kind": "stranger",
+      "decided": false,
+      "logs": 0
+    },
+    {
+      "passageId": "scripted-exit/exit-025-AB",
+      "gate": "EXIT",
+      "label": "A",
+      "kind": "employee",
+      "decided": false,
+      "logs": 0
+    },
+    {
+      "passageId": "scripted-exit/exit-025-AB",
+      "gate": "EXIT",
+      "label": "B",
+      "kind": "stranger",
+      "decided": true,
+      "outcome": "DENIED",
+      "correct": true,
+      "latencyMs": 3876,
+      "logs": 1
+    },
+    {
+      "passageId": "scripted-exit/exit-027-A1h",
+      "gate": "EXIT",
+      "label": "Ah",
+      "kind": "employee",
+      "decided": true,
+      "outcome": "DENIED",
+      "correct": false,
+      "latencyMs": 2785,
+      "logs": 1
+    },
+    {
+      "passageId": "scripted-exit/exit-029-ABC",
+      "gate": "EXIT",
+      "label": "A",
+      "kind": "employee",
+      "decided": false,
+      "logs": 0
+    },
+    {
+      "passageId": "scripted-exit/exit-029-ABC",
+      "gate": "EXIT",
+      "label": "B",
+      "kind": "stranger",
+      "decided": true,
+      "outcome": "DENIED",
+      "correct": true,
+      "latencyMs": 6449,
+      "logs": 1
+    },
+    {
+      "passageId": "scripted-exit/exit-029-ABC",
+      "gate": "EXIT",
+      "label": "C",
+      "kind": "stranger",
+      "decided": false,
+      "logs": 0
+    },
+    {
+      "passageId": "scripted-exit/exit-031-A1",
+      "gate": "EXIT",
+      "label": "A",
+      "kind": "employee",
+      "decided": false,
+      "logs": 0
+    },
+    {
+      "passageId": "scripted-exit/exit-032-B1",
+      "gate": "EXIT",
+      "label": "B",
+      "kind": "stranger",
+      "decided": false,
+      "logs": 0
+    },
+    {
+      "passageId": "scripted-exit/exit-033-C1",
+      "gate": "EXIT",
+      "label": "C",
+      "kind": "stranger",
+      "decided": true,
+      "outcome": "DENIED",
+      "correct": true,
+      "latencyMs": 2463,
+      "logs": 1
+    },
+    {
+      "passageId": "scripted-exit/exit-035-AB",
+      "gate": "EXIT",
+      "label": "A",
+      "kind": "employee",
+      "decided": false,
+      "logs": 0
+    },
+    {
+      "passageId": "scripted-exit/exit-035-AB",
+      "gate": "EXIT",
+      "label": "B",
+      "kind": "stranger",
+      "decided": true,
+      "outcome": "DENIED",
+      "correct": true,
+      "latencyMs": 5364,
+      "logs": 1
+    },
+    {
+      "passageId": "scripted-exit/exit-037-A1h",
+      "gate": "EXIT",
+      "label": "Ah",
+      "kind": "employee",
+      "decided": true,
+      "outcome": "DENIED",
+      "correct": false,
+      "latencyMs": 2443,
+      "logs": 1
+    },
+    {
+      "passageId": "scripted-exit/exit-039-ABC",
+      "gate": "EXIT",
+      "label": "A",
+      "kind": "employee",
+      "decided": false,
+      "logs": 0
+    },
+    {
+      "passageId": "scripted-exit/exit-039-ABC",
+      "gate": "EXIT",
+      "label": "B",
+      "kind": "stranger",
+      "decided": true,
+      "outcome": "DENIED",
+      "correct": true,
+      "latencyMs": 4516,
+      "logs": 1
+    },
+    {
+      "passageId": "scripted-exit/exit-039-ABC",
+      "gate": "EXIT",
+      "label": "C",
+      "kind": "stranger",
+      "decided": false,
+      "logs": 0
+    }
+  ],
+  "logsOutsidePassages": 0
+}

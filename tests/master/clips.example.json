@@ -1,0 +1,61 @@
+{
+  "schemaVersion": 1,
+  "createdAt": "2026-09-26T00:00:00.000Z",
+  "deleteAfter": "2026-10-26",
+  "fixtures": {
+    "A": { "enrolImage": "faces/synthetic-a.png", "role": "employee" },
+    "B": { "enrolImage": "faces/synthetic-b.png", "role": "stranger" }
+  },
+  "clips": [
+    {
+      "id": "example-nvr-entry-1",
+      "file": "nvr/example-entry-20260920T011500Z.mp4",
+      "gate": "ENTRY",
+      "source": "nvr",
+      "recordedStartUtc": "2026-09-20T01:15:00.000Z",
+      "nvrChannel": "2201",
+      "durationS": 18,
+      "fps": 15,
+      "gop": 60,
+      "width": 3840,
+      "height": 2160,
+      "codec": "hevc",
+      "passages": [
+        {
+          "id": "p1",
+          "startS": 0,
+          "endS": 18,
+          "tags": ["day", "single"],
+          "people": [
+            { "label": "p1", "who": { "employeeId": "EMP-EXAMPLE-1" }, "firstUsableS": 7.5, "expected": "GRANTED", "labelQuality": "weak" }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "example-scripted-exit",
+      "file": "scripted/exit-sequence.mp4",
+      "gate": "EXIT",
+      "source": "scripted",
+      "durationS": 50,
+      "fps": 25,
+      "gop": 50,
+      "width": 1920,
+      "height": 1080,
+      "codec": "hevc",
+      "passages": [
+        {
+          "id": "s1-AB",
+          "startS": 0,
+          "endS": 25,
+          "tags": ["two"],
+          "people": [
+            { "label": "A", "who": { "fixture": "A" }, "firstUsableS": 5.0, "lastUsableS": 8.0, "expected": "GRANTED", "labelQuality": "exact" },
+            { "label": "B", "who": "stranger", "firstUsableS": 5.5, "lastUsableS": 8.5, "expected": "DENIED", "labelQuality": "exact" }
+          ]
+        },
+        { "id": "s2-E", "startS": 25, "endS": 50, "tags": ["empty"], "people": [] }
+      ]
+    }
+  ]
+}

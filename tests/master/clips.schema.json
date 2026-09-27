@@ -1,0 +1,82 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "smartface/tests/master/clips.schema.json",
+  "title": "MT replay ground truth",
+  "description": "Ground truth for the replay clips. The real document lives in /data/test-clips/clips.json (0700, never committed). Validated in code by tests/master/lib/groundTruth.ts (validateGroundTruth).",
+  "type": "object",
+  "required": ["schemaVersion", "createdAt", "deleteAfter", "clips"],
+  "additionalProperties": false,
+  "properties": {
+    "schemaVersion": { "const": 1 },
+    "createdAt": { "type": "string", "format": "date-time" },
+    "deleteAfter": { "type": "string", "description": "Owner decision: real clips are deleted 30 days after export." },
+    "fixtures": {
+      "type": "object",
+      "description": "Scripted clips only: identities the run enrols itself. Paths are local to the test host.",
+      "additionalProperties": {
+        "type": "object",
+        "required": ["enrolImage", "role"],
+        "properties": {
+          "enrolImage": { "type": "string" },
+          "role": { "enum": ["employee", "stranger"] }
+        }
+      }
+    },
+    "clips": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "file", "gate", "source", "durationS", "fps", "width", "height", "codec", "passages"],
+        "properties": {
+          "id": { "type": "string" },
+          "file": { "type": "string", "description": "Relative to the clips directory; never a URL." },
+          "gate": { "enum": ["ENTRY", "EXIT"] },
+          "source": { "enum": ["nvr", "scripted"] },
+          "recordedStartUtc": { "type": "string", "format": "date-time" },
+          "nvrChannel": { "type": "string", "pattern": "^[0-9]{1,5}$" },
+          "durationS": { "type": "number", "exclusiveMinimum": 0 },
+          "fps": { "type": "number", "exclusiveMinimum": 0 },
+          "gop": { "type": "integer", "minimum": 1 },
+          "width": { "type": "integer" },
+          "height": { "type": "integer" },
+          "codec": { "type": "string" },
+          "passages": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": ["id", "startS", "endS", "people"],
+              "properties": {
+                "id": { "type": "string" },
+                "startS": { "type": "number", "minimum": 0 },
+                "endS": { "type": "number" },
+                "tags": { "type": "array", "items": { "type": "string" } },
+                "people": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "required": ["label", "who", "firstUsableS", "expected", "labelQuality"],
+                    "properties": {
+                      "label": { "type": "string" },
+                      "who": {
+                        "oneOf": [
+                          { "const": "stranger" },
+                          { "type": "object", "required": ["employeeId"], "properties": { "employeeId": { "type": "string" } } },
+                          { "type": "object", "required": ["fixture"], "properties": { "fixture": { "type": "string" } } }
+                        ]
+                      },
+                      "firstUsableS": { "type": ["number", "null"], "description": "First moment the face is >= 60 px and clear, seconds from clip start." },
+                      "lastUsableS": { "type": ["number", "null"] },
+                      "expected": { "enum": ["GRANTED", "DENIED"] },
+                      "labelQuality": { "enum": ["exact", "verified", "weak"] },
+                      "impostor": { "type": "boolean" }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

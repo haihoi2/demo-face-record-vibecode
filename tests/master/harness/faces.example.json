@@ -1,0 +1,6 @@
+{
+  "A": { "image": "/clips/scripted/src/synthetic-employee-a.jpg", "box": [900, 250, 962, 326], "role": "employee" },
+  "Ah": { "image": "/clips/scripted/src/synthetic-employee-a-other-view.jpg", "box": [870, 60, 920, 118], "role": "employee", "identity": "A", "enrol": "/clips/scripted/src/synthetic-employee-a.jpg" },
+  "B": { "image": "/clips/scripted/src/synthetic-stranger-b.jpg", "box": [760, 430, 852, 525], "role": "stranger" },
+  "C": { "image": "/clips/scripted/src/synthetic-stranger-c.jpg", "box": [180, 100, 255, 197], "role": "stranger" }
+}
