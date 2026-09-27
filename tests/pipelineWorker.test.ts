@@ -10,16 +10,18 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
+import fs from "node:fs";
 import path from "node:path";
 import { Worker } from "node:worker_threads";
 
 import type { Frame, FrameSource, Gate, SourceState } from "../src/server/pipeline/contracts";
 import { DEFAULT_FUSION_THRESHOLDS, FaceGallery } from "../src/server/faceFusion";
 import type { DecisionContext, TrackDecisionResult } from "../src/server/pipeline/trackDecision";
-import { GatePipeline, resolvePipelineWorkerEntry, type PipelineWorkerLike } from "../src/server/pipeline/gatePipeline";
+import { GatePipeline, pipelineWorkerEnv, resolvePipelineWorkerEntry, type PipelineWorkerLike } from "../src/server/pipeline/gatePipeline";
 import { PipelineCore, type PipelineEngine } from "../src/server/pipeline/pipelineCore";
 import type { WorkerToHost } from "../src/server/pipeline/pipelineProtocol";
 import type { FaceBox } from "../src/server/faceEmbedding";
+import { lowerThreadPriority } from "../src/server/pipeline/pipelineWorker";
 
 const TAG = "arcface_test";
 const DIMS = 512;
@@ -70,9 +72,25 @@ const ctx = (): DecisionContext => ({
 });
 
 describe("pipeline worker entry", () => {
+  it("PIPELINE_WORKER_NICE: default 10, 0 = unchanged, out of range is refused", () => {
+    assert.equal(lowerThreadPriority("0"), null);
+    assert.match(lowerThreadPriority("25") || "", /0-19/);
+    assert.match(lowerThreadPriority("-5") || "", /0-19/);
+  });
+
   it("resolves the .ts source under tsx", () => {
     const entry = resolvePipelineWorkerEntry();
     assert.match(entry.replace(/\\/g, "/"), /src\/server\/pipeline\/pipelineWorker\.ts$|pipelineWorker\.cjs$/);
+  });
+
+  it("workers inherit FACE_ORT_THREADS unless PIPELINE_ORT_THREADS (1-16) overrides it", () => {
+    assert.equal(pipelineWorkerEnv({ FACE_ORT_THREADS: "2" }).FACE_ORT_THREADS, "2");
+    assert.equal(pipelineWorkerEnv({ FACE_ORT_THREADS: "2", PIPELINE_ORT_THREADS: "1" }).FACE_ORT_THREADS, "1");
+    assert.equal(pipelineWorkerEnv({ FACE_ORT_THREADS: "2", PIPELINE_ORT_THREADS: "0" }).FACE_ORT_THREADS, "2");
+    assert.equal(pipelineWorkerEnv({ PIPELINE_ORT_THREADS: "abc" }).FACE_ORT_THREADS, undefined);
+    const env = { FACE_ORT_THREADS: "4" };
+    pipelineWorkerEnv({ ...env, PIPELINE_ORT_THREADS: "1" });
+    assert.equal(env.FACE_ORT_THREADS, "4", "the main engine's setting is not touched");
   });
 
   it("PIPELINE_WORKER_PATH is strict", () => {
@@ -137,6 +155,15 @@ describe("pipeline worker thread", () => {
       const st = pipeline.stats();
       assert.equal(st.contextOk, false);
       assert.equal(st.framesProcessed, 0, "no frame is processed without the engine");
+      if (fs.existsSync("/proc/thread-self")) {
+        // The worker thread lowered its own priority (PIPELINE_WORKER_NICE default 10); this thread did not.
+        const nices = fs.readdirSync("/proc/self/task").map((t) => {
+          const stat = fs.readFileSync(`/proc/self/task/${t}/stat`, "utf8");
+          return { tid: Number(t), nice: Number(stat.slice(stat.lastIndexOf(")") + 2).split(" ")[16]) };
+        });
+        assert.equal(nices.find((n) => n.tid === process.pid)?.nice, 0, "main thread untouched");
+        assert.ok(nices.some((n) => n.nice === 10), `a thread at nice 10: ${JSON.stringify(nices)}`);
+      }
       assert.equal(st.worker.engineReady, false);
       assert.equal(results.length, 0);
     } finally {

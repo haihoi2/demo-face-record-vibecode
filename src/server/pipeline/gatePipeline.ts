@@ -140,8 +140,22 @@ export function resolvePipelineWorkerEntry(): string {
   throw new Error(`Pipeline worker entry not found. Tried: ${candidates.join(", ")}. Run \`npm run build\` or set PIPELINE_WORKER_PATH.`);
 }
 
+/**
+ * Worker environment: the main engine's settings (the worker reads the same
+ * FACE_* variables), except that PIPELINE_ORT_THREADS, when set to 1-16,
+ * replaces FACE_ORT_THREADS for the pipeline workers only. With 1 there is no
+ * ONNX Runtime intra-op pool (no spinning threads), which matters when two
+ * gate workers, the legacy engine and two FFmpeg decoders share a CPU quota.
+ */
+export function pipelineWorkerEnv(env: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+  const raw = String(env.PIPELINE_ORT_THREADS ?? "").trim();
+  const n = Number(raw);
+  if (raw === "" || !Number.isInteger(n) || n < 1 || n > 16) return { ...env };
+  return { ...env, FACE_ORT_THREADS: String(n) };
+}
+
 function createDefaultWorker(gate: Gate): PipelineWorkerLike {
-  return new Worker(resolvePipelineWorkerEntry(), { name: `pipeline-${gate.toLowerCase()}` }) as unknown as PipelineWorkerLike;
+  return new Worker(resolvePipelineWorkerEntry(), { name: `pipeline-${gate.toLowerCase()}`, env: pipelineWorkerEnv() }) as unknown as PipelineWorkerLike;
 }
 
 /** The frame and the buffer to transfer: its own backing store, or a copy when that is shared/pooled. */
