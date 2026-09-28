@@ -63,6 +63,9 @@ services:
 
       # Camera credentials belong in the uncommitted environment, never source.
       # Storage-only floor for stranger snapshots; never affects access decisions.
+      # Recognition engine for door decisions. onnx = real models only, fail
+      # closed when they do not load. Never leave the demo hash matcher in charge.
+      - FACE_ENGINE=${FACE_ENGINE:-onnx}
       - FACE_STRANGER_MIN_QUALITY=${FACE_STRANGER_MIN_QUALITY:-}
       # Face size floors in pixels: any face (default 60), stored strangers (default 60).
       - FACE_MIN_SIZE_PX=${FACE_MIN_SIZE_PX:-}

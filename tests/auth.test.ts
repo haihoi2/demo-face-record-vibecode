@@ -168,3 +168,13 @@ describe("validation and lockout", () => {
     assert.equal(lockRemainingMs("not a date", now), 0);
   });
 });
+
+describe("canonicalApiPath ignores spelling", () => {
+  it("lower-cases the path so the role table matches", () => {
+    assert.equal(canonicalApiPath("/api/employee/EMP-1"), "/api/employees/EMP-1", "ids keep their case");
+    assert.equal(requiredRoleFor("GET", "/api/Door-controller/config"), "admin");
+    assert.equal(requiredRoleFor("GET", "/api/System/db-info"), requiredRoleFor("GET", "/api/system/db-info"));
+    assert.equal(requiredRoleFor("POST", "/API/lock/unlock"), requiredRoleFor("POST", "/api/lock/unlock"));
+    assert.equal(requiredRoleFor("POST", "/API/lock/unlock"), "admin");
+  });
+});
