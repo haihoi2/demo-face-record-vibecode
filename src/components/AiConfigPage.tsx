@@ -39,6 +39,7 @@ import {
   getStoredEmployees,
 } from "../utils/offlineEngine";
 import { runLocalFaceRecognition } from "../utils/localBiometrics";
+import { RealtimeEngineCard } from "./RealtimeEngineCard";
 
 interface AiConfigPageProps {
   employees: Employee[];
@@ -932,11 +933,18 @@ export const AiConfigPage: React.FC<AiConfigPageProps> = ({
             </div>
           </div>
 
+          {/*
+            Card 4: the real-time pipeline engine. A SEPARATE flow beside the
+            three modes above, switched per gate by an admin; it is not an
+            `engineMode` value and the card never writes that setting.
+          */}
+          <RealtimeEngineCard />
+
           {/* Quick Guidance Box */}
           <div className="bg-slate-50 p-4 rounded-xl border border-slate-200 flex items-start gap-3 text-xs text-slate-600">
             <Info className="w-4 h-4 text-indigo-600 shrink-0 mt-0.5" />
             <div>
-              <strong className="text-slate-800">Lưu ý triển khai:</strong> Cả hai động cơ đều tích hợp đầy đủ với hệ thống Điều khiển Cửa thông minh (Smart Lock) và Webhook thông báo thời gian thực đến phòng chat Eton. Bạn có thể thay đổi chế độ bất kỳ lúc nào mà không làm gián đoạn vận hành cổng kiểm soát.
+              <strong className="text-slate-800">Lưu ý triển khai:</strong> Ba chế độ động cơ ở trên đều tích hợp đầy đủ với hệ thống Điều khiển Cửa thông minh (Smart Lock) và Webhook thông báo thời gian thực đến phòng chat Eton; bạn có thể thay đổi chế độ bất kỳ lúc nào mà không làm gián đoạn vận hành cổng kiểm soát. Động cơ thời gian thực là luồng riêng, không thuộc ba chế độ này: Quản trị bật/tắt cho từng cổng ngay trong thẻ "Động cơ thời gian thực" (legacy / chạy thử / đang áp dụng), không qua nút Lưu của trang.
             </div>
           </div>
         </div>

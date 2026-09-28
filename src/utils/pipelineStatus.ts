@@ -22,9 +22,34 @@ export interface PipelineSourceState {
   since?: string;
 }
 
+/** The gate worker as the pipeline host reports it (`pipelineStats.worker`). */
+export interface PipelineWorkerStats {
+  state: string | null;
+  restarts: number | null;
+  engineReady: boolean | null;
+  openTracks: number | null;
+  /** Detector input geometry in use, e.g. "640x640". */
+  detectInput?: string;
+}
+
+/**
+ * `pipelineStats` as far as the browser needs it. Every field is optional: an
+ * older server sends only the first two, and nothing here is ever invented.
+ */
 export interface PipelineStats {
   lastDecisionLatencyMs?: number;
   decisions?: number;
+  employees?: number;
+  strangers?: number;
+  insufficient?: number;
+  framesProcessed?: number;
+  /** Newest frames not processed because the gate worker was still busy. */
+  framesDroppedBusy?: number;
+  lastLoopMs?: number;
+  contextOk?: boolean;
+  contextReason?: string;
+  worker?: PipelineWorkerStats;
+  lastError?: string;
 }
 
 export interface PipelineRuntimeView {
@@ -80,12 +105,70 @@ export function normalizePipelineState(raw: unknown): PipelineSourceState | null
 export function normalizePipelineStats(raw: unknown): PipelineStats | null {
   if (!raw || typeof raw !== "object") return null;
   const r = raw as Record<string, unknown>;
-  const latency = num(r.lastDecisionLatencyMs);
-  const decisions = num(r.decisions);
   const out: PipelineStats = {};
-  if (latency !== null && latency >= 0) out.lastDecisionLatencyMs = latency;
-  if (decisions !== null && decisions >= 0) out.decisions = Math.floor(decisions);
+  const duration = (key: "lastDecisionLatencyMs" | "lastLoopMs") => {
+    const v = num(r[key]);
+    if (v !== null && v >= 0) out[key] = v;
+  };
+  const count = (key: "decisions" | "employees" | "strangers" | "insufficient" | "framesProcessed" | "framesDroppedBusy") => {
+    const v = num(r[key]);
+    if (v !== null && v >= 0) out[key] = Math.floor(v);
+  };
+  duration("lastDecisionLatencyMs");
+  duration("lastLoopMs");
+  count("decisions");
+  count("employees");
+  count("strangers");
+  count("insufficient");
+  count("framesProcessed");
+  count("framesDroppedBusy");
+  if (typeof r.contextOk === "boolean") out.contextOk = r.contextOk;
+  if (typeof r.contextReason === "string" && r.contextReason.trim()) out.contextReason = redactCredentialUrls(r.contextReason.trim());
+  if (typeof r.lastError === "string" && r.lastError.trim()) out.lastError = redactCredentialUrls(r.lastError.trim());
+  const worker = normalizePipelineWorker(r.worker);
+  if (worker) out.worker = worker;
   return Object.keys(out).length > 0 ? out : null;
+}
+
+/** `pipelineStats.worker`, or null when absent or empty. */
+export function normalizePipelineWorker(raw: unknown): PipelineWorkerStats | null {
+  if (!raw || typeof raw !== "object") return null;
+  const r = raw as Record<string, unknown>;
+  const state = typeof r.state === "string" && r.state.trim() ? r.state.trim() : null;
+  const restarts = num(r.restarts);
+  const openTracks = num(r.openTracks);
+  const engineReady = typeof r.engineReady === "boolean" ? r.engineReady : null;
+  const detectInput = typeof r.detectInput === "string" && r.detectInput.trim() ? r.detectInput.trim() : undefined;
+  if (state === null && restarts === null && openTracks === null && engineReady === null && !detectInput) return null;
+  return {
+    state,
+    restarts: restarts !== null && restarts >= 0 ? Math.floor(restarts) : null,
+    engineReady,
+    openTracks: openTracks !== null && openTracks >= 0 ? Math.floor(openTracks) : null,
+    ...(detectInput ? { detectInput } : {}),
+  };
+}
+
+/** Vietnamese for the worker state strings the host sends; unknown strings pass through. */
+export function workerStateLabel(state: string | null): string {
+  switch ((state || "").toLowerCase()) {
+    case "running":
+    case "ready":
+      return "đang chạy";
+    case "starting":
+      return "đang khởi động";
+    case "restarting":
+      return "đang khởi động lại";
+    case "stopped":
+      return "đã dừng";
+    case "failed":
+    case "crashed":
+      return "lỗi";
+    case "":
+      return "—";
+    default:
+      return state as string;
+  }
 }
 
 /** Everything the panel needs from one raw watcher runtime object. */
