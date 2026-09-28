@@ -80,6 +80,7 @@ describe("permission table", () => {
     ["POST", "/api/strangers/quick-register", "operator"],
     ["POST", "/api/strangers/merge", "operator"],
     ["POST", "/api/strangers/dismiss", "operator"],
+    ["POST", "/api/strangers/retire-non-faces", "admin"],
     ["POST", "/api/strangers/restore", "operator"],
     // operator: register faces
     ["POST", "/api/employees/EMP-1/templates", "operator"],

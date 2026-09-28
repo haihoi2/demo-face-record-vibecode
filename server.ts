@@ -7597,6 +7597,63 @@ app.post(["/api/strangers/dismiss", "/api/strangers/reject"], requireOperatorRol
   }
 });
 
+/**
+ * Admin: retire stored stranger captures that are not (usable) faces - found
+ * by re-scoring the stored photos (scripts/strangers/score-captures.ts). The
+ * access events stay as they are (immutable history); the captures leave the
+ * stranger panel through the same append-only DISMISS adjudication an operator
+ * uses, one resolution per batch with clusterId NOTFACE-<uuid>, restorable with
+ * POST /api/strangers/restore { clusterId, clusterLogIds }.
+ */
+app.post("/api/strangers/retire-non-faces", requireOperatorRole("admin"), requireCsrf, async (req, res) => {
+  try {
+    const body = req.body && typeof req.body === "object" ? req.body : {};
+    const ids = Array.isArray(body.logIds) ? body.logIds : [];
+    if (ids.length === 0 || ids.length > 500) {
+      res.status(400).json({ success: false, error: "logIds phải có từ 1 đến 500 phần tử" });
+      return;
+    }
+    const reason = typeof body.reason === "string" && body.reason.trim() ? body.reason.trim().slice(0, 120) : "không phải khuôn mặt rõ";
+    const retired = new Set(db.getRetiredStrangerObservationIds().map((x) => x.replace(/^log:/, "")));
+    const accepted: string[] = [];
+    let invalid = 0, notCandidate = 0, alreadyRetired = 0;
+    for (const raw of ids) {
+      const id = typeof raw === "string" ? raw : "";
+      if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(id)) { invalid += 1; continue; }
+      if (retired.has(id) || accepted.includes(id)) { alreadyRetired += 1; continue; }
+      if (!(await db.getStrangerCandidateLogById(id))) { notCandidate += 1; continue; }
+      accepted.push(id);
+    }
+    const skipped = { invalid, notCandidate, alreadyRetired };
+    if (body.dryRun === true || accepted.length === 0) {
+      res.json({ success: true, dryRun: body.dryRun === true, wouldRetire: accepted.length, skipped });
+      return;
+    }
+    const clusterId = `NOTFACE-${randomUUID()}`;
+    const commit = await db.commitStrangerResolution({
+      resolution: {
+        id: resolutionId(clusterId),
+        clusterId,
+        action: "DISMISS",
+        actor: operatorActor(req),
+        resolvedAt: new Date().toISOString(),
+        logIds: accepted,
+        metadata: { intent: { reason }, reason, kind: "not-a-face" },
+      },
+    });
+    if (commit.status === "conflict") {
+      res.status(409).json({ success: false, error: "Không ghi được quyết định ẩn ảnh" });
+      return;
+    }
+    console.log(`[Strangers] ${operatorActor(req)} ẩn ${accepted.length} ảnh người lạ không phải khuôn mặt rõ (${clusterId}); bỏ qua ${JSON.stringify(skipped)}`);
+    broadcastSSE("stranger_dismissed", { clusterId, clusterLogIds: accepted });
+    res.json({ success: true, clusterId, retired: accepted.length, skipped, resolution: commit.resolution });
+  } catch (err: any) {
+    console.error("[Strangers] Lỗi ẩn ảnh không phải khuôn mặt:", err);
+    res.status(500).json({ success: false, error: err?.message || "Lỗi ẩn ảnh người lạ" });
+  }
+});
+
 app.post("/api/strangers/restore", requireOperatorRole("operator"), requireCsrf, async (req, res) => {
   try {
     const clusterId = String(req.body?.clusterId || "").trim();

@@ -79,6 +79,8 @@ const RULES: readonly Rule[] = [
     pattern: /^\/api\/strangers\/(?:quick-register|register|merge|assign|dismiss|reject|restore)$/,
     role: "operator",
   },
+  // Bulk "not a face" retirement of stored captures (restorable): admin only.
+  { methods: ["POST"], pattern: /^\/api\/strangers\/retire-non-faces$/, role: "admin" },
 
   // --- operator: the department and position catalog
   { methods: WRITE, pattern: /^\/api\/org\/(?:departments|positions)(?:\/[^/]+)?$/, role: "operator" },
