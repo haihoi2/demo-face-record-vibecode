@@ -32,7 +32,7 @@ import {
 import { envNumber } from "./src/server/env";
 import { guardAsyncRoutes, jsonErrorHandler } from "./src/server/asyncRoutes";
 import { accessLogExportName, csvCell } from "./src/server/csv";
-import { effectivePipelineMode, pipelineModeFromEnv } from "./src/server/pipeline/mode";
+import { effectivePipelineMode, parsePipelineMode, pipelineModeFromEnv } from "./src/server/pipeline/mode";
 import {
   DEFAULT_RECORDING_WINDOW,
   playbackFailure,
@@ -97,7 +97,7 @@ import { GatePipeline } from "./src/server/pipeline/gatePipeline";
 import { createStreamReader, probeStreamSize } from "./src/server/pipeline/streamReader";
 import { gateAreaToPixels, normalizeGateArea } from "./src/server/pipeline/gateArea";
 import type { DecisionContext, TrackDecisionResult } from "./src/server/pipeline/trackDecision";
-import type { Gate } from "./src/server/pipeline/contracts";
+import type { Gate, PipelineMode } from "./src/server/pipeline/contracts";
 import type { ExtractedFace, UnclearReason } from "./src/server/faceEmbedding";
 import {
   buildGallery,
@@ -1379,13 +1379,18 @@ function normalizeGateConfig(gate: GateStreamConfigRecord): GateStreamConfigReco
   streams.sort((a, b) => a.priority - b.priority); // Array.prototype.sort is stable
 
   const primary = pickPrimaryStream(streams);
-  return {
+  const normalized: GateStreamConfigRecord = {
     ...gate,
     gateType,
     watch: normalizeGateWatchConfig(gate.watch),
     streams,
     ...legacyFieldsFromStream(primary),
   };
+  // Real-time pipeline mode set in the app: kept only when it is a known mode.
+  const pipelineMode = parsePipelineMode(gate.pipelineMode);
+  if (pipelineMode) normalized.pipelineMode = pipelineMode;
+  else delete normalized.pipelineMode;
+  return normalized;
 }
 
 /** Normalises both gates of a (possibly older / partial) persisted config. */
@@ -5080,24 +5085,31 @@ interface GateWatchOutcomeRuntime {
 }
 
 /** The public runtime view (src/types.ts `GateWatchRuntime`) + outcome telemetry. */
-/** Per-gate pipeline rollout (plan W0): only `legacy` runs until the pipeline is wired. */
-const PIPELINE_MODES = (["ENTRY", "EXIT"] as const).reduce((acc, gate) => {
-  const requested = pipelineModeFromEnv(gate);
+/**
+ * Per-gate pipeline rollout. The camera config's `pipelineMode` (set by an
+ * admin in the app) wins over PIPELINE_MODE_<GATE> from the environment; a
+ * mode this build cannot run is downgraded to legacy and reported as such.
+ */
+const pipelineDowngradeWarned = new Set<string>();
+function pipelineModeFor(gate: "ENTRY" | "EXIT"): { mode: PipelineMode; requested: PipelineMode; source: "config" | "env" } {
+  const configured = parsePipelineMode(cameraStreamsConfig[gate === "EXIT" ? "exitGate" : "entryGate"]?.pipelineMode);
+  const requested = configured ?? pipelineModeFromEnv(gate);
   const effective = effectivePipelineMode(requested);
-  if (effective.downgraded) {
-    console.warn(`[Pipeline ${gate}] PIPELINE_MODE_${gate}=${requested} chưa có trong bản này; cổng chạy chế độ legacy.`);
+  if (effective.downgraded && !pipelineDowngradeWarned.has(`${gate}:${requested}`)) {
+    pipelineDowngradeWarned.add(`${gate}:${requested}`);
+    console.warn(`[Pipeline ${gate}] Chế độ ${requested} chưa có trong bản này; cổng chạy chế độ legacy.`);
   }
-  acc[gate] = { mode: effective.mode, requested };
-  return acc;
-}, {} as Record<"ENTRY" | "EXIT", { mode: "legacy" | "shadow" | "live"; requested: "legacy" | "shadow" | "live" }>);
+  return { mode: effective.mode, requested, source: configured ? "config" : "env" };
+}
 
 function gateWatchRuntime(state: GateWatcherState): GateWatchRuntime & GateWatchOutcomeRuntime {
-  const pipeline = PIPELINE_MODES[state.gate];
+  const pipeline = pipelineModeFor(state.gate);
   return {
     gate: state.gate,
     enabled: state.enabled,
     pipelineMode: pipeline.mode,
     ...(pipeline.requested !== pipeline.mode ? { pipelineModeRequested: pipeline.requested } : {}),
+    pipelineModeSource: pipeline.source,
     ...pipelineRuntime(state.gate),
     intervalSeconds: state.intervalSeconds,
     frames: state.frames,
@@ -5431,7 +5443,7 @@ const gatePipelines: Record<Gate, GatePipelineSlot> = {
 interface DesiredPipeline { key: string; url: string; streamId: string; area: ReturnType<typeof normalizeGateArea> }
 
 function desiredPipeline(gate: Gate): DesiredPipeline | null {
-  const mode = PIPELINE_MODES[gate].mode;
+  const mode = pipelineModeFor(gate).mode;
   if (mode === "legacy") return null;
   const { gate: gateConfig, stream } = resolveGateStream(gate === "EXIT" ? "exit" : "entry");
   // A disabled gate runs nothing - same rule as the legacy watcher (review item 8).
@@ -5495,7 +5507,7 @@ async function startGatePipeline(gate: Gate, want: DesiredPipeline): Promise<voi
       slot.statsLog.unref?.();
     }
     console.log(
-      `[Pipeline ${gate}] Chạy chế độ ${PIPELINE_MODES[gate].mode}: luồng ${want.streamId}, ${size.width}x${size.height}, ` +
+      `[Pipeline ${gate}] Chạy chế độ ${pipelineModeFor(gate).mode}: luồng ${want.streamId}, ${size.width}x${size.height}, ` +
         `${roi ? `vùng cổng ${roi.join(",")}` : "toàn khung hình"}, ${PIPELINE_FPS} khung/giây.`
     );
   } catch (err: any) {
@@ -5557,7 +5569,7 @@ function reportPipelineResult(gate: Gate, r: TrackDecisionResult) {
     basis: r.basis,
     ...(r.fusionBasis ? { fusionBasis: r.fusionBasis } : {}),
     ...(r.meanCheckRefused ? { meanCheckRefused: true } : {}),
-    mode: PIPELINE_MODES[gate].mode,
+    mode: pipelineModeFor(gate).mode,
   };
   broadcastSSE("pipeline_shadow_result", payload);
   console.log(`[Pipeline ${gate}] shadow ${JSON.stringify(payload)}`);
@@ -5653,6 +5665,55 @@ app.post(["/api/camera-streams/:gate/watch", "/api/camera-streams/:gate/watch/"]
 
   const runtime = applyGateWatchConfig(gateKey);
   res.json({ success: true, gate: runtime.gate, watch: updated[configKey].watch, watcher: runtime });
+});
+
+// Admin switch for a gate's real-time pipeline mode (the separate engine
+// flow). Saved in the camera config, applied at once, audited; the
+// environment's PIPELINE_MODE_<GATE> stays the default when the field is cleared.
+app.post(["/api/camera-streams/:gate/pipeline-mode", "/api/camera-streams/:gate/pipeline-mode/"], (req, res) => {
+  const configKey = gateConfigKeyFromParam(req.params.gate);
+  if (!configKey) {
+    return res.status(400).json({ success: false, error: `Cổng không hợp lệ: "${req.params.gate}". Chỉ chấp nhận entry hoặc exit.` });
+  }
+  const gateKey: GateWatchKey = configKey === "exitGate" ? "exit" : "entry";
+  const gate: "ENTRY" | "EXIT" = configKey === "exitGate" ? "EXIT" : "ENTRY";
+  const body = req.body && typeof req.body === "object" ? req.body : {};
+  let mode: PipelineMode | null = null;
+  if (body.mode !== null && body.mode !== undefined && body.mode !== "") {
+    const parsed = parsePipelineMode(body.mode);
+    if (!parsed) {
+      return res.status(400).json({ success: false, error: "mode phải là legacy, shadow hoặc live (null = dùng mặc định máy chủ)" });
+    }
+    mode = parsed;
+  }
+  if (mode && effectivePipelineMode(mode).downgraded) {
+    return res.status(409).json({ success: false, code: "PIPELINE_MODE_NOT_AVAILABLE", error: `Chế độ ${mode} chưa có trong bản này.` });
+  }
+
+  const current = loadCameraStreamsConfig();
+  const gateConfig: GateStreamConfigRecord = { ...current[configKey] };
+  if (mode) gateConfig.pipelineMode = mode;
+  else delete gateConfig.pipelineMode;
+  const updated = normalizeCameraStreamsConfig({ ...current, [configKey]: normalizeGateConfig(gateConfig) });
+  cameraStreamsConfig = updated;
+  db.saveCameraStreamsConfig(updated);
+  broadcastSSE("camera_config_updated", updated);
+
+  const session = readOperatorSession(req);
+  const actor = session ? `${session.actor}${session.displayName ? ` (${session.displayName})` : ""}, ${session.role}` : "unknown";
+  const resolved = pipelineModeFor(gate);
+  console.log(`[Pipeline ${gate}] ${actor} đặt chế độ pipeline: ${mode ?? "mặc định máy chủ"} -> hiệu lực ${resolved.mode} (nguồn: ${resolved.source})`);
+  syncPipelines();
+
+  const runtime = gateWatchRuntime(gateWatchers[gateKey]);
+  res.json({
+    success: true,
+    gate,
+    pipelineMode: runtime.pipelineMode,
+    ...(runtime.pipelineModeRequested ? { pipelineModeRequested: runtime.pipelineModeRequested } : {}),
+    pipelineModeSource: runtime.pipelineModeSource,
+    watcher: runtime,
+  });
 });
 
 // Simulated RTSP/HTTP live test frame generator (SVG/JPEG)

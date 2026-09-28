@@ -22,3 +22,13 @@ describe("pipeline rollout switch", () => {
     assert.deepEqual(effectivePipelineMode("live"), { mode: "legacy", downgraded: true });
   });
 });
+
+describe("parsePipelineMode (config or request values)", () => {
+  it("accepts the three modes in any case and rejects the rest", async () => {
+    const { parsePipelineMode } = await import("../src/server/pipeline/mode");
+    assert.equal(parsePipelineMode("shadow"), "shadow");
+    assert.equal(parsePipelineMode(" LIVE "), "live");
+    assert.equal(parsePipelineMode("legacy"), "legacy");
+    for (const bad of ["", null, undefined, "on", "shadow;", 1, {}]) assert.equal(parsePipelineMode(bad), undefined, String(bad));
+  });
+});

@@ -7,8 +7,13 @@ const MODES: readonly PipelineMode[] = ["legacy", "shadow", "live"];
  * `legacy`: the new pipeline only runs when asked for by name.
  */
 export function pipelineModeFromEnv(gate: Gate, env: Record<string, string | undefined> = process.env): PipelineMode {
-  const raw = String(env[`PIPELINE_MODE_${gate}`] || "").trim().toLowerCase();
-  return (MODES as readonly string[]).includes(raw) ? (raw as PipelineMode) : "legacy";
+  return parsePipelineMode(env[`PIPELINE_MODE_${gate}`]) ?? "legacy";
+}
+
+/** A mode name from config or a request body; undefined for anything else. */
+export function parsePipelineMode(raw: unknown): PipelineMode | undefined {
+  const v = String(raw ?? "").trim().toLowerCase();
+  return (MODES as readonly string[]).includes(v) ? (v as PipelineMode) : undefined;
 }
 
 /**

@@ -66,6 +66,8 @@ const RULES: readonly Rule[] = [
   { methods: WRITE, pattern: /^\/api\/camera-streams\/(?:entry|exit)\/streams(?:\/[^/]+)?$/, role: "operator" },
   { methods: ["POST"], pattern: /^\/api\/camera-streams\/config$/, role: "operator" },
   { methods: ["POST"], pattern: /^\/api\/camera-streams\/(?:entry|exit)\/watch$/, role: "operator" },
+  // Switching a gate's real-time pipeline mode is a rollout decision: admin only.
+  { methods: ["POST"], pattern: /^\/api\/camera-streams\/(?:entry|exit)\/pipeline-mode$/, role: "admin" },
   { methods: ["POST"], pattern: /^\/api\/camera-streams\/(?:test-stream|scan-rtsp)$/, role: "operator" },
   // A snapshot is a full camera frame: operator+ only (owner decision: the app shows faces only).
   { methods: ["GET", "HEAD"], pattern: /^\/api\/camera-streams\/snapshot$/, role: "operator" },

@@ -349,6 +349,8 @@ export interface GateWatchRuntime {
   pipelineMode?: "legacy" | "shadow" | "live";
   /** Set when the configured mode is not available in this build and legacy runs instead. */
   pipelineModeRequested?: "legacy" | "shadow" | "live";
+  /** Where the requested mode came from: the camera config (set in the app) or the environment. */
+  pipelineModeSource?: "config" | "env";
   /** Real-time pipeline stream health (shadow/live only). */
   pipelineState?: {
     status: "starting" | "streaming" | "stale" | "reconnecting" | "stopped";
@@ -406,6 +408,8 @@ export interface GateStreamConfig {
   enabled: boolean;
   /** Backend auto-scan for this gate. Absent means disabled. */
   watch?: GateWatchConfig;
+  /** Real-time pipeline mode configured in the app; absent = server default. */
+  pipelineMode?: "legacy" | "shadow" | "live";
   /**
    * All video sources for this gate. Optional for backward compatibility:
    * when absent or empty, the server derives a single stream from the legacy
