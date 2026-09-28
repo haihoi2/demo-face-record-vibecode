@@ -32,6 +32,7 @@
  * Pure logic: no I/O, no timers; time from an injectable clock.
  */
 
+import { envNumber } from "../env";
 import type { FaceObservation, FusionDecision, FusionThresholds, ObservationMatch } from "../../types";
 import { EMBEDDING_DIM } from "../faceEmbedding";
 import { FaceGallery, fuseDecision, matchObservations } from "../faceFusion";
@@ -65,6 +66,12 @@ export interface DecisionConfig {
   minStrangerFrames: number;
   /** Mirrors FACE_STRANGER_MIN_QUALITY: a poorer best frame is "insufficient", not a stranger. */
   strangerMinBestQuality: number;
+  /**
+   * Mirrors FACE_STRANGER_MIN_DETECTOR_SCORE: a best frame the detector is less
+   * sure of (bowed heads, hands over faces, heavy blur, non-faces) is
+   * "insufficient", not a stranger.
+   */
+  strangerMinDetectorScore: number;
   /** Expected embedding length (gallery templates of another length are dropped). */
   embeddingDims: number;
 }
@@ -73,6 +80,7 @@ export const DEFAULT_DECISION_CONFIG: Readonly<DecisionConfig> = Object.freeze({
   keepBestFrames: 5,
   minStrangerFrames: 2,
   strangerMinBestQuality: 0.25,
+  strangerMinDetectorScore: envNumber("FACE_STRANGER_MIN_DETECTOR_SCORE", 0.8, { min: 0, max: 1 }),
   embeddingDims: EMBEDDING_DIM,
 });
 
@@ -238,6 +246,7 @@ export class TrackDecider {
     if (!Number.isInteger(config.minStrangerFrames) || config.minStrangerFrames < 1) throw new RangeError("minStrangerFrames must be a positive integer");
     if (!Number.isInteger(config.embeddingDims) || config.embeddingDims < 1) throw new RangeError("embeddingDims must be a positive integer");
     if (!isNum(config.strangerMinBestQuality)) throw new RangeError("strangerMinBestQuality must be finite");
+    if (!isNum(config.strangerMinDetectorScore)) throw new RangeError("strangerMinDetectorScore must be finite");
     this.gate = opts.gate;
     this.config = Object.freeze(config);
     this.clock = opts.clock ?? Date.now;
@@ -450,7 +459,7 @@ export class TrackDecider {
     if (evidence.length < this.config.minStrangerFrames || !st.best) {
       return this.emit(st, { kind: "insufficient", gate: this.gate, trackId: st.trackId, decidedAtMs }, "insufficient-evidence");
     }
-    if (st.best.quality < this.config.strangerMinBestQuality) {
+    if (st.best.quality < this.config.strangerMinBestQuality || st.best.detection.score < this.config.strangerMinDetectorScore) {
       return this.emit(st, { kind: "insufficient", gate: this.gate, trackId: st.trackId, decidedAtMs }, "insufficient-quality");
     }
     const mean = qualityWeightedMean(evidence);

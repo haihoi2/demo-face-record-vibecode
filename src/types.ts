@@ -464,6 +464,8 @@ export interface FaceObservation {
   /** 0-1 capture quality; weights this observation in fusion. */
   quality: number;
   detectorScore: number;
+  /** Edge energy of the aligned face (faceEdgeEnergy); storage floors only. */
+  edgeEnergy?: number;
   /** Face box in source-frame pixels [x1, y1, x2, y2]. */
   box?: [number, number, number, number];
 }

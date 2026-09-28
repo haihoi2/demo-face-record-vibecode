@@ -26,6 +26,7 @@ import {
   alignFace,
   laplacianVariance,
   faceQuality,
+  faceEdgeEnergy,
   resizeArea,
   decodeToRgb,
   loadImage,
@@ -628,4 +629,51 @@ test("extractFaces: a face-free frame yields [] even with models loaded", async 
   );
   assert.equal(gen.status, 0);
   assert.deepEqual(await extractFaces(gen.stdout), []);
+});
+
+// ---------------------------------------------------------------------------
+// faceEdgeEnergy (storage-only heavy-blur measure)
+// ---------------------------------------------------------------------------
+
+function faceLike(n: number, blurPasses: number): RgbImage {
+  // Blocks with hard edges, roughly the scale of eyes, brows and mouth on an aligned face.
+  let g = new Float64Array(n * n);
+  for (let y = 0; y < n; y++) for (let x = 0; x < n; x++) g[y * n + x] = ((Math.floor(x / 14) + Math.floor(y / 21)) % 2) * 160 + 40;
+  for (let k = 0; k < blurPasses; k++) {
+    const o = new Float64Array(n * n);
+    for (let y = 0; y < n; y++) for (let x = 0; x < n; x++) {
+      let a = 0, c = 0;
+      for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {
+        const yy = y + dy, xx = x + dx;
+        if (yy >= 0 && yy < n && xx >= 0 && xx < n) { a += g[yy * n + xx]; c++; }
+      }
+      o[y * n + x] = a / c;
+    }
+    g = o;
+  }
+  const data = new Uint8Array(n * n * 3);
+  for (let i = 0; i < n * n; i++) data[i * 3] = data[i * 3 + 1] = data[i * 3 + 2] = Math.round(g[i]);
+  return { width: n, height: n, data };
+}
+
+test("faceEdgeEnergy: a blurred face scores lower than the same face sharp", () => {
+  const sharp = faceEdgeEnergy(faceLike(112, 0));
+  const soft = faceEdgeEnergy(faceLike(112, 2));
+  const blurred = faceEdgeEnergy(faceLike(112, 8));
+  assert.ok(sharp > 0.16, `sharp ${sharp}`);
+  assert.ok(sharp > soft && soft > blurred, `${sharp} > ${soft} > ${blurred}`);
+  assert.ok(blurred < sharp / 2, `blurred ${blurred} vs sharp ${sharp}`);
+});
+
+test("faceEdgeEnergy: brightness and contrast do not change it", () => {
+  const a = faceLike(112, 2);
+  const b: RgbImage = { ...a, data: a.data.map((v) => Math.round(v * 0.5 + 20)) };
+  assert.ok(Math.abs(faceEdgeEnergy(a) - faceEdgeEnergy(b)) < 0.02);
+});
+
+test("faceEdgeEnergy: flat or malformed input is 0, never NaN", () => {
+  const flat: RgbImage = { width: 112, height: 112, data: new Uint8Array(112 * 112 * 3).fill(128) };
+  assert.equal(faceEdgeEnergy(flat), 0);
+  assert.equal(faceEdgeEnergy({ width: 112, height: 100, data: new Uint8Array(112 * 100 * 3) }), 0);
+  assert.equal(faceEdgeEnergy({ width: 0, height: 0, data: new Uint8Array(0) }), 0);
 });

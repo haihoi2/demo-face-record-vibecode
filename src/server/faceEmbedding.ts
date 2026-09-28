@@ -75,6 +75,11 @@ export interface ExtractedFace extends FaceBox {
   embedding: Float32Array;
   /** 0..1 capture-quality gate: blends sharpness and face size. */
   quality: number;
+  /**
+   * Edge energy of the central face area relative to its contrast (faceEdgeEnergy).
+   * Heavy blur flattens it; used only by storage floors, never by decisions.
+   */
+  edgeEnergy: number;
   /** Variance of the Laplacian over the aligned 112x112 crop (higher = sharper). */
   sharpness: number;
   /** Shorter side of the detected box, in original-image pixels. */
@@ -1338,6 +1343,37 @@ export function clearFaceIssue(
   return null;
 }
 
+/**
+ * Mean squared central-difference gradient over the central 70% of an aligned
+ * face, divided by that area's intensity variance. Hair, background and any
+ * annotation box stay outside the window, and dividing by contrast keeps dark
+ * and bright faces comparable. Heavily smeared faces fall low (calibrated on
+ * the site's captures 2026-09-28: < 0.16 caught 6/19 visibly blurred faces
+ * while dropping 2/45 clear ones - it only catches HEAVY blur).
+ */
+export function faceEdgeEnergy(aligned: RgbImage): number {
+  const n = aligned.width;
+  if (!n || aligned.height !== n || aligned.data.length < n * n * 3) return 0;
+  const lo = Math.max(1, Math.round(n * 0.15)), hi = Math.min(n - 1, Math.round(n * 0.85));
+  const lum = (i: number) => 0.299 * aligned.data[i * 3] + 0.587 * aligned.data[i * 3 + 1] + 0.114 * aligned.data[i * 3 + 2];
+  let energy = 0, count = 0, mean = 0, m2 = 0;
+  for (let y = lo; y < hi; y++) {
+    for (let x = lo; x < hi; x++) {
+      const p = lum(y * n + x);
+      const dx = lum(y * n + x + 1) - lum(y * n + x - 1);
+      const dy = lum((y + 1) * n + x) - lum((y - 1) * n + x);
+      energy += dx * dx + dy * dy;
+      count += 1;
+      mean += p;
+      m2 += p * p;
+    }
+  }
+  if (!count) return 0;
+  mean /= count;
+  const variance = Math.max(1, m2 / count - mean * mean);
+  return energy / count / variance;
+}
+
 export function faceQuality(aligned: RgbImage, boxSize: number): { quality: number; sharpness: number } {
   const sharpness = laplacianVariance(aligned);
   const sizeScore = Math.max(0, Math.min(1, (boxSize - 24) / (112 - 24)));
@@ -1369,9 +1405,10 @@ export async function extractFaces(input: ImageInput): Promise<ExtractedFace[]> 
       if (!embedding) continue;
       const boxSize = Math.min(f.box[2] - f.box[0], f.box[3] - f.box[1]);
       const { quality, sharpness } = faceQuality(aligned, boxSize);
+      const edgeEnergy = faceEdgeEnergy(aligned);
       const pose = facePose(f.landmarks);
       const issue = clearFaceIssue(pose, CLEAR_FACE_LIMITS, boxSize);
-      out.push({ ...f, embedding, quality, sharpness, boxSize, pose, clear: issue === null, ...(issue ? { unclearReason: issue } : {}) });
+      out.push({ ...f, embedding, quality, sharpness, edgeEnergy, boxSize, pose, clear: issue === null, ...(issue ? { unclearReason: issue } : {}) });
     }
     out.sort((a, b) => b.score - a.score);
     return out;

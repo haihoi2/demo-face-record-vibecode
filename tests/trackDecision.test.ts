@@ -356,6 +356,24 @@ describe("trackDecision: strangers and insufficient evidence", () => {
     assert.equal(r[0].basis, "insufficient-quality");
   });
 
+  it("a stranger the detector is unsure of (score < 0.80) is insufficient, not stored", () => {
+    const h = new Harness();
+    const walk = passage(randUnit(4321), 0.9, 17);
+    for (let i = 0; i < 6; i++) h.frame(i, [{ d: { ...det(900, 500, 80), score: 0.72 }, q: 0.6, who: walk }]);
+    const r = h.tick(T0 + 5 * DT + 2000);
+    assert.equal(r[0].outcome.kind, "insufficient");
+    assert.equal(r[0].basis, "insufficient-quality");
+  });
+
+  it("the detector-score floor is storage only: an employee is still recognised at a low score", () => {
+    const h = new Harness();
+    const walk = passage(E1, 0.52, 18);
+    h.frame(0, [{ d: { ...det(900, 500, 70), score: 0.6 }, who: walk }]);
+    const r = h.frame(1, [{ d: { ...det(905, 510, 72), score: 0.6 }, who: walk }]);
+    assert.equal(r.length, 1);
+    assert.equal(r[0].outcome.kind, "employee");
+  });
+
   it("detector flicker (a single-frame track) produces no outcome", () => {
     const h = new Harness();
     h.frame(0, [{ d: det(900, 500, 80), who: passage(E1, 0.9, 14) }]);

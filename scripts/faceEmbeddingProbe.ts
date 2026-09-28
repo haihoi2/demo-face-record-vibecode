@@ -26,6 +26,7 @@ import {
   alignFace,
   loadImage,
   faceQuality,
+  faceEdgeEnergy,
   facePose,
   clearFaceIssue,
   cosineSimilarity,
@@ -155,9 +156,10 @@ async function main(): Promise<void> {
       if (!embedding) continue;
       const boxSize = Math.min(boxes[i].box[2] - boxes[i].box[0], boxes[i].box[3] - boxes[i].box[1]);
       const { quality, sharpness } = faceQuality(aligned, boxSize);
+      const edgeEnergy = faceEdgeEnergy(aligned);
       const pose = facePose(boxes[i].landmarks);
       const issue = clearFaceIssue(pose);
-      faces.push({ ...boxes[i], embedding, quality, sharpness, boxSize, pose, clear: issue === null, ...(issue ? { unclearReason: issue } : {}) });
+      faces.push({ ...boxes[i], embedding, quality, sharpness, edgeEnergy, boxSize, pose, clear: issue === null, ...(issue ? { unclearReason: issue } : {}) });
       if (dumpDir) {
         await writePng(
           aligned,

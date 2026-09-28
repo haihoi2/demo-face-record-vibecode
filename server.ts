@@ -1577,6 +1577,17 @@ const FACE_STRANGER_MIN_QUALITY = envFloat("FACE_STRANGER_MIN_QUALITY", 0.25);
  * matters when FACE_MIN_SIZE_PX is lowered to recognise from further away.
  */
 const FACE_STRANGER_MIN_SIZE_PX = envInt("FACE_STRANGER_MIN_SIZE_PX", 60, 0, 2000);
+/**
+ * A stranger photo is stored only when the detector is this sure it is a face.
+ * Calibrated on 264 of the site's captures (2026-09-28, owner: "remove all this,
+ * not face"): below 0.75 almost nothing was a usable face (bowed heads seen from
+ * above, hands over faces, profiles, masks, motion blur, a cardboard box);
+ * 0.77-0.80 was ~40% usable; above 0.80 mostly real faces. Storage only -
+ * recognition and door decisions never read it.
+ */
+const FACE_STRANGER_MIN_DETECTOR_SCORE = envFloat("FACE_STRANGER_MIN_DETECTOR_SCORE", 0.8, 0, 1);
+/** Heavy-blur floor for stored stranger photos (faceEdgeEnergy); 0 disables. Storage only. */
+const FACE_STRANGER_MIN_EDGE_ENERGY = envFloat("FACE_STRANGER_MIN_EDGE_ENERGY", 0.16, 0, 10);
 /** Maximum templates kept per employee; the lowest-quality one is evicted when full. */
 const FACE_TEMPLATE_MAX = envInt("FACE_TEMPLATE_MAX", 12, 1, 200);
 /**
@@ -1716,6 +1727,7 @@ async function observeFrame(
         embedding: Array.from(f.embedding),
         quality: f.quality,
         detectorScore: f.score,
+        edgeEnergy: f.edgeEnergy,
         box: [f.box[0], f.box[1], f.box[2], f.box[3]] as [number, number, number, number],
       },
       face: f,
@@ -4004,7 +4016,7 @@ async function grabRtspFrames(
 type RecognitionTrigger = "api" | "manual" | "watcher";
 
 /** Why a scan that DID decide something deliberately recorded nothing. */
-type OutcomeSuppression = "grant-cooldown" | "stranger-cooldown" | "stranger-quality" | "stranger-small";
+type OutcomeSuppression = "grant-cooldown" | "stranger-cooldown" | "stranger-quality" | "stranger-small" | "stranger-not-face" | "stranger-blur";
 
 /**
  * Re-unlock / re-log dedupe for ONE employee at ONE gate.
@@ -4264,6 +4276,27 @@ async function applyRecognitionOutcome(input: RecognitionOutcomeInput): Promise<
       stats.lastSuppressed = "stranger-quality";
       stats.lastSuppressedAt = new Date(nowMs).toISOString();
       summary.suppressed = "stranger-quality";
+      return result;
+    }
+    // Not (clearly) a face: bowed head, hand over the face, profile, heavy blur.
+    const strangerObs = input.strangerObservation;
+    if (strangerObs && FACE_STRANGER_MIN_DETECTOR_SCORE > 0 && Number(strangerObs.detectorScore) < FACE_STRANGER_MIN_DETECTOR_SCORE) {
+      stats.strangersSuppressed += 1;
+      stats.lastSuppressed = "stranger-not-face";
+      stats.lastSuppressedAt = new Date(nowMs).toISOString();
+      summary.suppressed = "stranger-not-face";
+      return result;
+    }
+    if (
+      strangerObs &&
+      FACE_STRANGER_MIN_EDGE_ENERGY > 0 &&
+      typeof strangerObs.edgeEnergy === "number" &&
+      strangerObs.edgeEnergy < FACE_STRANGER_MIN_EDGE_ENERGY
+    ) {
+      stats.strangersSuppressed += 1;
+      stats.lastSuppressed = "stranger-blur";
+      stats.lastSuppressedAt = new Date(nowMs).toISOString();
+      summary.suppressed = "stranger-blur";
       return result;
     }
     // Too far away to identify: same treatment.
