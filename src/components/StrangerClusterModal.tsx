@@ -29,7 +29,7 @@ import { StrangerCluster, StrangerPhoto, Employee, AccessLog } from "../types";
 import { operatorJsonFetch } from "../utils/api";
 import { ProtectedImage } from "./ProtectedImage";
 import { FaceImage, FaceThumb, ImageZoomDialog } from "./FaceImage";
-import { orgChoice, orgOptions, useOrgCatalog } from "../utils/orgCatalog";
+import { orgChoice, orgOptions, orgPlaceholder, useOrgCatalog } from "../utils/orgCatalog";
 import { soundEffects } from "../utils/audio";
 
 interface StrangerClusterModalProps {
@@ -93,6 +93,13 @@ export const StrangerClusterModal: React.FC<StrangerClusterModalProps> = ({
     setPosition((current) => orgChoice(positionOptions, current));
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [departmentOptions.join("\n"), positionOptions.join("\n")]);
+  // The modal stays mounted while closed: fetch the catalog again on every open,
+  // so a failed first load (signed out at page load) or a newly added entry
+  // never leaves the lists stale.
+  useEffect(() => {
+    if (isOpen) void orgCatalog.reload();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isOpen]);
 
   /**
    * Selects the cluster addressed by the caller: either by photo (in-app click)
@@ -928,6 +935,11 @@ export const StrangerClusterModal: React.FC<StrangerClusterModalProps> = ({
                               onChange={(e) => setDepartment(e.target.value)}
                               className="w-full px-3 py-2 text-xs rounded-xl border border-slate-200 focus:outline-hidden focus:ring-2 focus:ring-indigo-500 bg-white"
                             >
+                              {departmentOptions.length === 0 && (
+                                <option value="" disabled>
+                                  {orgPlaceholder(orgCatalog.loading, orgCatalog.error)}
+                                </option>
+                              )}
                               {departmentOptions.map((d) => (
                                 <option key={d} value={d}>
                                   {d}
@@ -947,6 +959,11 @@ export const StrangerClusterModal: React.FC<StrangerClusterModalProps> = ({
                               onChange={(e) => setPosition(e.target.value)}
                               className="w-full px-3 py-2 text-xs rounded-xl border border-slate-200 focus:outline-hidden focus:ring-2 focus:ring-indigo-500 bg-white"
                             >
+                              {positionOptions.length === 0 && (
+                                <option value="" disabled>
+                                  {orgPlaceholder(orgCatalog.loading, orgCatalog.error)}
+                                </option>
+                              )}
                               {positionOptions.map((pos) => (
                                 <option key={pos} value={pos}>
                                   {pos}
@@ -954,6 +971,15 @@ export const StrangerClusterModal: React.FC<StrangerClusterModalProps> = ({
                               ))}
                             </select>
                           </div>
+
+                          {orgCatalog.error && (
+                            <p className="col-span-full text-xs text-rose-600">
+                              {orgCatalog.error}{" "}
+                              <button type="button" className="underline font-semibold" onClick={() => void orgCatalog.reload()}>
+                                Thử lại
+                              </button>
+                            </p>
+                          )}
 
                           {/* Access Level */}
                           <div>

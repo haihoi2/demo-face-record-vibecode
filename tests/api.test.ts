@@ -17,6 +17,7 @@ import {
   STORAGE_KEY_CUSTOM_BACKEND,
   clearSessionCsrfToken,
   operatorJsonFetch,
+  setOperatorLoginResolver,
 } from "../src/utils/api";
 
 describe("getCustomBackendUrl", () => {
@@ -127,6 +128,55 @@ describe("operatorJsonFetch CSRF recovery", () => {
       assert.equal(result.status, 403);
       assert.equal(calls, 1);
     } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+});
+
+describe("operatorJsonFetch sign-in on 401", () => {
+  it("requests refused together share ONE sign-in and all retry after it", async () => {
+    const originalFetch = globalThis.fetch;
+    let signedIn = false;
+    globalThis.fetch = (async (input: string | URL | Request) => {
+      const url = String(input);
+      if (!signedIn) return new Response(JSON.stringify({ success: false }), { status: 401, headers: { "Content-Type": "application/json" } });
+      return new Response(JSON.stringify({ success: true, url }), { status: 200, headers: { "Content-Type": "application/json" } });
+    }) as typeof fetch;
+    let prompts = 0;
+    let finishSignIn: (ok: boolean) => void = () => {};
+    setOperatorLoginResolver(() => {
+      prompts += 1;
+      return new Promise<boolean>((resolve) => { finishSignIn = resolve; });
+    });
+    try {
+      const pending = ["/api/org", "/api/employees", "/api/logs"].map((u) => operatorJsonFetch<any>(u));
+      await new Promise((r) => setTimeout(r, 10));
+      assert.equal(prompts, 1, "one dialog for the whole wave");
+      signedIn = true;
+      finishSignIn(true);
+      const results = await Promise.all(pending);
+      assert.deepEqual(results.map((r) => r.status), [200, 200, 200]);
+      assert.equal(results[0].data.url, "/api/org");
+    } finally {
+      setOperatorLoginResolver(null);
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it("a cancelled sign-in returns the 401 to every waiting caller, and a later 401 asks again", async () => {
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async () =>
+      new Response(JSON.stringify({ success: false }), { status: 401, headers: { "Content-Type": "application/json" } })) as typeof fetch;
+    let prompts = 0;
+    setOperatorLoginResolver(async () => { prompts += 1; return false; });
+    try {
+      const results = await Promise.all([operatorJsonFetch("/api/org"), operatorJsonFetch("/api/logs")]);
+      assert.deepEqual(results.map((r) => r.status), [401, 401]);
+      assert.equal(prompts, 1);
+      await operatorJsonFetch("/api/org");
+      assert.equal(prompts, 2);
+    } finally {
+      setOperatorLoginResolver(null);
       globalThis.fetch = originalFetch;
     }
   });

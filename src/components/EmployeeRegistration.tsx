@@ -29,7 +29,7 @@ import {
 } from "../types";
 import { safeJsonFetch, compressImage } from "../utils/api";
 import { ProtectedImage } from "./ProtectedImage";
-import { orgChoice, orgOptions, useOrgCatalog } from "../utils/orgCatalog";
+import { orgChoice, orgOptions, orgPlaceholder, useOrgCatalog } from "../utils/orgCatalog";
 
 /** One enrolled template as returned by GET /api/employees/:id/templates.
  *  Raw embeddings are never sent to the browser, so every field is optional. */
@@ -794,7 +794,7 @@ export const EmployeeRegistration: React.FC<EmployeeRegistrationProps> = ({
                   disabled={departmentOptions.length === 0}
                   className="w-full px-3.5 py-2.5 bg-slate-50 border border-slate-200 rounded-xl text-sm focus:outline-hidden focus:ring-2 focus:ring-indigo-500/30 focus:border-indigo-500 transition"
                 >
-                  {departmentOptions.length === 0 && <option value="">Đang tải danh mục...</option>}
+                  {departmentOptions.length === 0 && <option value="">{orgPlaceholder(orgCatalog.loading, orgCatalog.error)}</option>}
                   {departmentOptions.map((name) => (
                     <option key={name} value={name}>{name}</option>
                   ))}
@@ -813,7 +813,7 @@ export const EmployeeRegistration: React.FC<EmployeeRegistrationProps> = ({
                   disabled={positionOptions.length === 0}
                   className="w-full px-3.5 py-2.5 bg-slate-50 border border-slate-200 rounded-xl text-sm focus:outline-hidden focus:ring-2 focus:ring-indigo-500/30 focus:border-indigo-500 transition"
                 >
-                  {positionOptions.length === 0 && <option value="">Đang tải danh mục...</option>}
+                  {positionOptions.length === 0 && <option value="">{orgPlaceholder(orgCatalog.loading, orgCatalog.error)}</option>}
                   {positionOptions.map((name) => (
                     <option key={name} value={name}>{name}</option>
                   ))}

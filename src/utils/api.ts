@@ -289,9 +289,26 @@ export async function operatorJsonFetch<T = any>(
 ): Promise<{ ok: boolean; status: number; data: T; error?: string }> {
   const response = await safeJsonFetch<T>(url, options, fallback);
   if (response.status !== 401 || !operatorLoginResolver) return response;
-  const signedIn = await operatorLoginResolver();
+  const signedIn = await signInOnce();
   if (!signedIn) return response;
   return safeJsonFetch<T>(url, options, fallback);
+}
+
+/**
+ * One sign-in for every request refused at the same time. On page load with an
+ * expired session several panels get 401 together; each used to ask the dialog
+ * again, the dialog kept only the last caller, and every earlier request waited
+ * forever (the stranger form's department/position lists stayed empty).
+ */
+let signInInFlight: Promise<boolean> | null = null;
+function signInOnce(): Promise<boolean> {
+  if (!operatorLoginResolver) return Promise.resolve(false);
+  if (!signInInFlight) {
+    signInInFlight = operatorLoginResolver().finally(() => {
+      signInInFlight = null;
+    });
+  }
+  return signInInFlight;
 }
 
 /**

@@ -59,6 +59,13 @@ export function orgOptions(entries: OrgEntry[]): string[] {
   return entries.filter((e) => e.active).map((e) => e.name);
 }
 
+/** What an empty department/position select says instead of staying blank. */
+export function orgPlaceholder(loading: boolean, error: string | null): string {
+  if (loading) return "Đang tải danh mục…";
+  if (error) return "Không tải được danh mục";
+  return "Danh mục trống - thêm ở trang Danh mục";
+}
+
 /** `current` if it is still offered, otherwise the first offered value (or "" while loading). */
 export function orgChoice(options: string[], current: string): string {
   return options.includes(current) ? current : options[0] || "";
