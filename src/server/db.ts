@@ -12,6 +12,7 @@ import {
   storageStatus,
   StorageTrackerState,
 } from "./dbStatus";
+import type { StrangerFacePage, StrangerFaceRecord, StrangerFaceStore } from "./strangerFaces";
 
 // Safe dynamic loader for Node 22 native sqlite DatabaseSync
 function getDatabaseSyncClass(): any {
@@ -548,6 +549,11 @@ export interface StrangerResolutionRecord {
   actor: string;
   resolvedAt: string;
   logIds: string[];
+  /**
+   * stranger_faces ids this adjudication covers (per-face wave). Stored sorted
+   * like logIds; rows written before the column existed read back as [].
+   */
+  faceIds?: string[];
   sourceLogId?: string;
   metadata?: Record<string, unknown>;
 }
@@ -618,8 +624,24 @@ function rowToStrangerResolution(r: any): StrangerResolutionRecord {
     actor: r.actor || "operator",
     resolvedAt: r.resolvedAt,
     logIds: parse(r.logIds, []) as string[],
+    faceIds: resolutionFaceIds(parse(r.faceIds, [])),
     sourceLogId: r.sourceLogId || undefined,
     metadata: parse(r.metadata, {}) as Record<string, unknown>,
+  };
+}
+
+/** faceIds of a resolution: sorted strings; absent (rows older than the column) or malformed -> []. */
+function resolutionFaceIds(value: unknown): string[] {
+  return Array.isArray(value) ? value.filter((id): id is string => typeof id === "string").sort() : [];
+}
+
+/** A resolution as held in memory and returned to callers: own arrays, faceIds always present. */
+function copyResolution(record: StrangerResolutionRecord): StrangerResolutionRecord {
+  return {
+    ...record,
+    logIds: [...record.logIds],
+    faceIds: resolutionFaceIds(record.faceIds),
+    metadata: { ...(record.metadata || {}) },
   };
 }
 
@@ -633,15 +655,287 @@ function stableJson(value: unknown): string {
   return JSON.stringify(value);
 }
 
+const sameSortedIds = (a: readonly string[] | undefined, b: readonly string[] | undefined): boolean => {
+  const left = [...(a || [])].sort();
+  const right = [...(b || [])].sort();
+  return left.length === right.length && left.every((id, index) => id === right[index]);
+};
+
+/**
+ * Same adjudication request? logIds and faceIds are compared as sets in sorted
+ * order (a missing faceIds is []), so a replay naming other members - logs or
+ * faces - is a conflict, never a replay.
+ */
 export function sameResolutionIntent(a: StrangerResolutionRecord, b: StrangerResolutionRecord): boolean {
-  const aIds = [...a.logIds].sort();
-  const bIds = [...b.logIds].sort();
   return a.clusterId === b.clusterId && a.action === b.action &&
     (a.employeeId || "") === (b.employeeId || "") &&
     (a.sourceLogId || "") === (b.sourceLogId || "") &&
-    aIds.length === bIds.length && aIds.every((id, index) => id === bIds[index]) &&
+    sameSortedIds(a.logIds, b.logIds) &&
+    sameSortedIds(a.faceIds, b.faceIds) &&
     stableJson(a.metadata?.intent ?? null) === stableJson(b.metadata?.intent ?? null);
 }
+
+// ================= STRANGER FACES (per-face wave) =================
+// One row per unrecognised face of an access event (src/server/strangerFaces.ts).
+// Limits mirror the PostgreSQL columns so SQLite and JSON reject what
+// PostgreSQL would, instead of storing a row PostgreSQL could never hold.
+
+const STRANGER_FACE_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$/;
+/** access_logs.id is VARCHAR(64); printable ASCII, no spaces. */
+const ACCESS_LOG_ID_RE = /^[\x21-\x7E]{1,64}$/;
+const STREAM_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$/;
+const MODEL_TAG_RE = /^[A-Za-z0-9][A-Za-z0-9._:+-]{0,127}$/;
+const STRANGER_FACE_MAX_DIMS = 4096;
+/** A face crop is 20-40 KB (faceCrop.ts); anything near this is not a face crop. */
+export const STRANGER_FACE_MAX_CROP_BYTES = 2 * 1024 * 1024;
+const STRANGER_FACE_MAX_INDEX = 1000;
+
+/** A validated face as the stores hold it (crop as bytes, embedding as float32 LE bytes). */
+interface StrangerFaceRow {
+  id: string;
+  logId: string;
+  faceIndex: number;
+  capturedAt: string;
+  gate: "ENTRY" | "EXIT";
+  streamId: string | null;
+  engine: "legacy" | "pipeline";
+  trackId: string | null;
+  box: [number, number, number, number];
+  sourceWidth: number | null;
+  sourceHeight: number | null;
+  detectorScore: number;
+  quality: number;
+  edgeEnergy: number | null;
+  sizePx: number;
+  embedding: Buffer | null;
+  dims: number | null;
+  modelTag: string | null;
+  crop: Buffer | null;
+  createdAt: string;
+}
+
+/** JSON-fallback shape: embedding as numbers, crop as base64 (a Buffer would serialise as a byte list). */
+interface StrangerFaceJson extends Omit<StrangerFaceRecord, "crop"> {
+  crop?: string;
+}
+
+const normIso = (value: unknown): string | undefined => {
+  if (typeof value !== "string") return undefined;
+  return normalizeAccessLogTrace({ capturedAt: value }).capturedAt;
+};
+const finite = (v: unknown): v is number => typeof v === "number" && Number.isFinite(v);
+/** Within what a PostgreSQL REAL holds comfortably (scores are 0..1; this only stops overflow errors). */
+const realValue = (v: unknown): v is number => finite(v) && Math.abs(v) <= 1e6;
+const MAX_PIXELS = 100_000;
+const optionalInt = (v: unknown, max: number): number | null =>
+  finite(v) && v >= 0 && v <= max ? Math.round(v) : null;
+
+/**
+ * Validate one face for storage. Identity, time, gate, engine, box and scores
+ * are required: without them the row cannot be paged, grouped or audited, so
+ * the batch is refused. Descriptive fields (streamId, trackId, frame size,
+ * edge energy) that are malformed are stored as NULL, never truncated.
+ * `purgedAt` on input is ignored: a new face is never born purged.
+ */
+export function normalizeStrangerFace(face: StrangerFaceRecord): { row?: StrangerFaceRow; error?: string } {
+  if (!face || typeof face !== "object") return { error: "not-an-object" };
+  if (typeof face.id !== "string" || !STRANGER_FACE_ID_RE.test(face.id)) return { error: "id" };
+  if (typeof face.logId !== "string" || !ACCESS_LOG_ID_RE.test(face.logId)) return { error: "logId" };
+  if (!Number.isSafeInteger(face.faceIndex) || face.faceIndex < 0 || face.faceIndex > STRANGER_FACE_MAX_INDEX) return { error: "faceIndex" };
+  const capturedAt = normIso(face.capturedAt);
+  if (!capturedAt) return { error: "capturedAt" };
+  if (face.gate !== "ENTRY" && face.gate !== "EXIT") return { error: "gate" };
+  if (face.engine !== "legacy" && face.engine !== "pipeline") return { error: "engine" };
+  if (!Array.isArray(face.box) || face.box.length !== 4 || !face.box.every(finite)) return { error: "box" };
+  if (!realValue(face.detectorScore) || !realValue(face.quality) || !finite(face.sizePx) || face.sizePx < 0 || face.sizePx > MAX_PIXELS) {
+    return { error: "scores" };
+  }
+  let embedding: Buffer | null = null;
+  let dims: number | null = null;
+  if (face.embedding !== undefined && face.embedding !== null) {
+    if (!Array.isArray(face.embedding) || face.embedding.length > STRANGER_FACE_MAX_DIMS || !face.embedding.every(realValue)) {
+      return { error: "embedding" };
+    }
+    if (face.embedding.length) {
+      embedding = embeddingToBuffer(face.embedding);
+      dims = face.embedding.length;
+    }
+  }
+  let modelTag: string | null = null;
+  if (face.modelTag !== undefined && face.modelTag !== null && face.modelTag !== "") {
+    if (typeof face.modelTag !== "string" || !MODEL_TAG_RE.test(face.modelTag)) return { error: "modelTag" };
+    modelTag = face.modelTag;
+  }
+  let crop: Buffer | null = null;
+  if (face.crop !== undefined && face.crop !== null) {
+    if (!Buffer.isBuffer(face.crop) || face.crop.length > STRANGER_FACE_MAX_CROP_BYTES) return { error: "crop" };
+    if (face.crop.length) crop = Buffer.from(face.crop);
+  }
+  return {
+    row: {
+      id: face.id,
+      logId: face.logId,
+      faceIndex: face.faceIndex,
+      capturedAt,
+      gate: face.gate,
+      streamId: typeof face.streamId === "string" && STREAM_ID_RE.test(face.streamId) ? face.streamId : null,
+      engine: face.engine,
+      trackId: typeof face.trackId === "string" && TRACK_ID_RE.test(face.trackId) ? face.trackId : null,
+      box: [face.box[0], face.box[1], face.box[2], face.box[3]],
+      sourceWidth: optionalInt(face.sourceWidth, MAX_PIXELS),
+      sourceHeight: optionalInt(face.sourceHeight, MAX_PIXELS),
+      detectorScore: face.detectorScore,
+      quality: face.quality,
+      edgeEnergy: realValue(face.edgeEnergy) ? face.edgeEnergy : null,
+      sizePx: Math.round(face.sizePx),
+      embedding,
+      dims,
+      modelTag,
+      crop,
+      createdAt: normIso(face.createdAt) || new Date().toISOString(),
+    },
+  };
+}
+
+const optionalNumber = (v: unknown): number | undefined => (v == null || v === "" ? undefined : Number(v));
+
+function parseBox(value: unknown): [number, number, number, number] {
+  let raw: unknown = value;
+  if (typeof raw === "string") {
+    try { raw = JSON.parse(raw); } catch { raw = null; }
+  }
+  return Array.isArray(raw) && raw.length === 4 ? (raw.map(Number) as [number, number, number, number]) : [0, 0, 0, 0];
+}
+
+/** A PostgreSQL/SQLite stranger_faces row -> record. Never carries the crop. */
+function rowToStrangerFace(r: any): StrangerFaceRecord {
+  const embedding = r.embedding ? bufferToEmbedding(r.embedding, r.dims == null ? undefined : Number(r.dims)) : [];
+  const out: StrangerFaceRecord = {
+    id: String(r.id),
+    logId: String(r.logId),
+    faceIndex: Number(r.faceIndex),
+    capturedAt: String(r.capturedAt),
+    gate: r.gate,
+    streamId: optionalText(r.streamId),
+    engine: r.engine,
+    trackId: optionalText(r.trackId),
+    box: parseBox(r.box),
+    sourceWidth: optionalNumber(r.sourceWidth),
+    sourceHeight: optionalNumber(r.sourceHeight),
+    detectorScore: Number(r.detectorScore),
+    quality: Number(r.quality),
+    edgeEnergy: optionalNumber(r.edgeEnergy),
+    sizePx: Number(r.sizePx),
+    embedding: embedding.length ? embedding : undefined,
+    dims: optionalNumber(r.dims),
+    modelTag: optionalText(r.modelTag),
+    createdAt: String(r.createdAt),
+    purgedAt: optionalText(r.purgedAt),
+  };
+  for (const key of Object.keys(out) as Array<keyof StrangerFaceRecord>) {
+    if (out[key] === undefined) delete out[key];
+  }
+  return out;
+}
+
+function strangerFaceRowToJson(row: StrangerFaceRow): StrangerFaceJson {
+  const out: StrangerFaceJson = {
+    ...rowToStrangerFace({ ...row, box: row.box, purgedAt: null }),
+    crop: row.crop ? row.crop.toString("base64") : undefined,
+  };
+  if (out.crop === undefined) delete out.crop;
+  return out;
+}
+
+/** JSON-fallback face -> record, without the crop. */
+function jsonToStrangerFace(face: StrangerFaceJson): StrangerFaceRecord {
+  const { crop: _crop, embedding, ...rest } = face;
+  const out: StrangerFaceRecord = { ...rest, box: [...face.box] as [number, number, number, number] };
+  if (embedding?.length) out.embedding = [...embedding];
+  return out;
+}
+
+const STRANGER_FACE_COLUMNS_PG = `id, "logId", "faceIndex", "capturedAt", gate, "streamId", engine, "trackId", box,
+  "sourceWidth", "sourceHeight", "detectorScore", quality, "edgeEnergy", "sizePx", embedding, dims, "modelTag",
+  "createdAt", "purgedAt"`;
+const STRANGER_FACE_COLUMNS_SQLITE = `id, logId, faceIndex, capturedAt, gate, streamId, engine, trackId, box,
+  sourceWidth, sourceHeight, detectorScore, quality, edgeEnergy, sizePx, embedding, dims, modelTag,
+  createdAt, purgedAt`;
+
+const strangerFaceInsertParams = (f: StrangerFaceRow, box: unknown): unknown[] => [
+  f.id, f.logId, f.faceIndex, f.capturedAt, f.gate, f.streamId, f.engine, f.trackId, box,
+  f.sourceWidth, f.sourceHeight, f.detectorScore, f.quality, f.edgeEnergy, f.sizePx,
+  f.embedding, f.dims, f.modelTag, f.crop, f.createdAt,
+];
+
+/**
+ * stranger_faces on PostgreSQL. Additive: a new table, run as its own statement
+ * after the main schema batch so a failure here can never roll back the
+ * existing tables' migration. id and capturedAt sort bytewise (COLLATE "C") so
+ * keyset paging orders exactly like SQLite and the JSON fallback; the paging
+ * index is partial (unpurged rows), which is also what the purge scans. The unique
+ * (logId, faceIndex) index is the (logId) lookup index and makes a writer's
+ * retry of the same frame idempotent even with fresh ids. The foreign key keeps
+ * every face tied to its immutable access event; clearing the access history
+ * removes the faces with it (ON DELETE CASCADE).
+ */
+const PG_STRANGER_FACES_DDL = `
+  CREATE TABLE IF NOT EXISTS stranger_faces (
+    id VARCHAR(64) COLLATE "C" PRIMARY KEY,
+    "logId" VARCHAR(64) NOT NULL REFERENCES access_logs (id) ON DELETE CASCADE,
+    "faceIndex" INTEGER NOT NULL,
+    "capturedAt" VARCHAR(64) COLLATE "C" NOT NULL,
+    gate VARCHAR(16) NOT NULL,
+    "streamId" VARCHAR(64),
+    engine VARCHAR(16) NOT NULL,
+    "trackId" VARCHAR(64),
+    box JSONB NOT NULL,
+    "sourceWidth" INTEGER,
+    "sourceHeight" INTEGER,
+    "detectorScore" REAL NOT NULL,
+    quality REAL NOT NULL,
+    "edgeEnergy" REAL,
+    "sizePx" INTEGER NOT NULL,
+    embedding BYTEA,
+    dims INTEGER,
+    "modelTag" VARCHAR(128),
+    crop BYTEA,
+    "createdAt" VARCHAR(64) NOT NULL,
+    "purgedAt" VARCHAR(64)
+  );
+  CREATE INDEX IF NOT EXISTS idx_stranger_faces_captured ON stranger_faces ("capturedAt" DESC, id DESC)
+    WHERE "purgedAt" IS NULL;
+  CREATE UNIQUE INDEX IF NOT EXISTS idx_stranger_faces_log ON stranger_faces ("logId", "faceIndex");
+`;
+
+const SQLITE_STRANGER_FACES_DDL = `
+  CREATE TABLE IF NOT EXISTS stranger_faces (
+    id TEXT PRIMARY KEY,
+    logId TEXT NOT NULL,
+    faceIndex INTEGER NOT NULL,
+    capturedAt TEXT NOT NULL,
+    gate TEXT NOT NULL,
+    streamId TEXT,
+    engine TEXT NOT NULL,
+    trackId TEXT,
+    box TEXT NOT NULL,
+    sourceWidth INTEGER,
+    sourceHeight INTEGER,
+    detectorScore REAL NOT NULL,
+    quality REAL NOT NULL,
+    edgeEnergy REAL,
+    sizePx INTEGER NOT NULL,
+    embedding BLOB,
+    dims INTEGER,
+    modelTag TEXT,
+    crop BLOB,
+    createdAt TEXT NOT NULL,
+    purgedAt TEXT
+  );
+  CREATE INDEX IF NOT EXISTS idx_stranger_faces_captured ON stranger_faces (capturedAt DESC, id DESC)
+    WHERE purgedAt IS NULL;
+  CREATE UNIQUE INDEX IF NOT EXISTS idx_stranger_faces_log ON stranger_faces (logId, faceIndex);
+`;
 
 export interface CameraStreamsConfigRecord {
   entryGate: GateStreamConfigRecord;
@@ -786,7 +1080,7 @@ export function mergeAiRecognitionConfig(
 }
 
 // Database wrapper supporting PostgreSQL (via DATABASE_URL), native Node 22 SQLite, and fallback JSON
-class SQLiteStorage {
+class SQLiteStorage implements StrangerFaceStore {
   private db: any = null;
   private isNativeSqlite = false;
   private pgPool: Pool | null = null;
@@ -805,6 +1099,13 @@ class SQLiteStorage {
    * these first, bounded by ACCESS_LOG_READ_YOUR_WRITES_MS.
    */
   private pendingAccessLogWrites = new Map<string, Promise<boolean>>();
+  /**
+   * stranger_faces exists on PostgreSQL. Until then (startup, or a failed
+   * migration, which is logged) face writes are refused and the stranger
+   * candidate page does not reference the table, so the existing panel keeps
+   * working exactly as before.
+   */
+  private pgStrangerFacesReady = false;
 
   constructor() {
     this.init();
@@ -1310,7 +1611,8 @@ class SQLiteStorage {
           "resolvedAt" VARCHAR(64) NOT NULL,
           "logIds" JSONB NOT NULL,
           "sourceLogId" VARCHAR(64),
-          metadata JSONB NOT NULL DEFAULT '{}'::jsonb
+          metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+          "faceIds" JSONB NOT NULL DEFAULT '[]'::jsonb
         );
 
         CREATE TABLE IF NOT EXISTS stranger_resolution_events (
@@ -1322,7 +1624,8 @@ class SQLiteStorage {
           "resolvedAt" VARCHAR(64) NOT NULL,
           "logIds" JSONB NOT NULL,
           "sourceLogId" VARCHAR(64),
-          metadata JSONB NOT NULL DEFAULT '{}'::jsonb
+          metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+          "faceIds" JSONB NOT NULL DEFAULT '[]'::jsonb
         );
         CREATE INDEX IF NOT EXISTS idx_stranger_resolution_events_cluster
           ON stranger_resolution_events ("clusterId", "resolvedAt");
@@ -1389,7 +1692,19 @@ class SQLiteStorage {
         -- Matches the history ordering (newest first, id as tie-break) so a page
         -- is an index range scan instead of a sort of the whole table.
         CREATE INDEX IF NOT EXISTS idx_access_logs_ts_id ON access_logs ("timestamp" DESC, id DESC);
+        -- Per-face stranger records (2026-09-29): the faces an adjudication
+        -- covers. A constant default makes the NOT NULL column catalog-only
+        -- (no rewrite); old rows read '[]' and old code never names it.
+        ALTER TABLE stranger_resolutions ADD COLUMN IF NOT EXISTS "faceIds" JSONB NOT NULL DEFAULT '[]'::jsonb;
+        ALTER TABLE stranger_resolution_events ADD COLUMN IF NOT EXISTS "faceIds" JSONB NOT NULL DEFAULT '[]'::jsonb;
       `);
+      try {
+        await this.pgPool.query(PG_STRANGER_FACES_DDL);
+        this.pgStrangerFacesReady = true;
+      } catch (err) {
+        console.error("[PostgreSQL] Lỗi khởi tạo bảng stranger_faces:", err);
+      }
+      this.warnStrandedLocalStrangerFaces();
       await this.loadResolvedStrangerClusters();
       await this.loadStrangerResolutions();
       await this.loadStrangerResolutionEvents();
@@ -1570,7 +1885,8 @@ class SQLiteStorage {
         resolvedAt TEXT NOT NULL,
         logIds TEXT NOT NULL,
         sourceLogId TEXT,
-        metadata TEXT NOT NULL DEFAULT '{}'
+        metadata TEXT NOT NULL DEFAULT '{}',
+        faceIds TEXT NOT NULL DEFAULT '[]'
       );
 
       CREATE TABLE IF NOT EXISTS stranger_resolution_events (
@@ -1582,7 +1898,8 @@ class SQLiteStorage {
         resolvedAt TEXT NOT NULL,
         logIds TEXT NOT NULL,
         sourceLogId TEXT,
-        metadata TEXT NOT NULL DEFAULT '{}'
+        metadata TEXT NOT NULL DEFAULT '{}',
+        faceIds TEXT NOT NULL DEFAULT '[]'
       );
       CREATE INDEX IF NOT EXISTS idx_stranger_resolution_events_cluster
         ON stranger_resolution_events (clusterId, resolvedAt);
@@ -1604,8 +1921,15 @@ class SQLiteStorage {
       "ALTER TABLE access_logs ADD COLUMN capturedAt TEXT",
       "ALTER TABLE access_logs ADD COLUMN trackId TEXT",
       "ALTER TABLE access_logs ADD COLUMN recordingChannel TEXT",
+      "ALTER TABLE stranger_resolutions ADD COLUMN faceIds TEXT NOT NULL DEFAULT '[]'",
+      "ALTER TABLE stranger_resolution_events ADD COLUMN faceIds TEXT NOT NULL DEFAULT '[]'",
     ]) {
       try { this.db.exec(migration); } catch { /* column already present */ }
+    }
+    try {
+      this.db.exec(SQLITE_STRANGER_FACES_DDL);
+    } catch (err) {
+      console.error("[SQLite] Lỗi khởi tạo bảng stranger_faces:", err);
     }
   }
 
@@ -1627,6 +1951,7 @@ class SQLiteStorage {
     ai_recognition_config?: AiRecognitionConfigRecord;
     app_users?: UserRecord[];
     org_catalog?: OrgCatalogRecord;
+    stranger_faces?: StrangerFaceJson[];
   } = {
     employees: [],
     access_logs: [],
@@ -1652,12 +1977,16 @@ class SQLiteStorage {
     this.fallbackStrangerNodes.set(log.id, node);
   }
 
+  /** JSON fallback: access logs that have stranger_faces rows (represented by their faces, not as a log). */
+  private fallbackFaceLogIds = new Set<string>();
+
   private rebuildFallbackStrangerIndex(): void {
     this.fallbackStrangerHead = null;
     this.fallbackStrangerNodes.clear();
     for (let index = this.fallbackData.access_logs.length - 1; index >= 0; index -= 1) {
       this.prependFallbackStrangerCandidate(this.fallbackData.access_logs[index]);
     }
+    this.fallbackFaceLogIds = new Set((this.fallbackData.stranger_faces || []).map((face) => face.logId));
   }
 
   private initFallbackStorage() {
@@ -2107,7 +2436,9 @@ class SQLiteStorage {
   /**
    * Bounded keyset page of authoritative stranger candidates. The cursor is the
    * last `(timestamp,id)` pair returned by the previous page; no request loads
-   * or reclusters the complete access-log history.
+   * or reclusters the complete access-log history. Access logs that have at
+   * least one stranger_faces row (purged or not) are excluded: they are
+   * represented by their faces (`face:<id>`), never as a whole-frame `log:<id>`.
    */
   async getStrangerCandidateLogsPage(
     cursor: { timestamp: string; id: string } | null,
@@ -2133,6 +2464,7 @@ class SQLiteStorage {
              FROM access_logs
             WHERE "photoSnapshot" IS NOT NULL AND "photoSnapshot" <> ''
               AND (status = 'DENIED' OR "employeeId" IS NULL OR "employeeName" = 'Không xác định')${cursorWhere}
+              ${this.pgStrangerFacesReady ? `AND NOT EXISTS (SELECT 1 FROM stranger_faces sf WHERE sf."logId" = access_logs.id)` : ""}
             ORDER BY timestamp DESC, id DESC LIMIT ${limitParam}`,
           params,
         );
@@ -2150,6 +2482,7 @@ class SQLiteStorage {
                 capturedAt, trackId, recordingChannel FROM access_logs
           WHERE photoSnapshot IS NOT NULL AND photoSnapshot <> ''
             AND (status = 'DENIED' OR employeeId IS NULL OR employeeName = 'Không xác định')${cursorWhere}
+            AND NOT EXISTS (SELECT 1 FROM stranger_faces sf WHERE sf.logId = access_logs.id)
           ORDER BY timestamp DESC, id DESC LIMIT ?`,
       ).all(...params) as any[];
       return { logs: rows.slice(0, boundedLimit).map(rowToAccessLog), hasMore: rows.length > boundedLimit };
@@ -2157,7 +2490,7 @@ class SQLiteStorage {
     let node = cursor ? this.fallbackStrangerNodes.get(cursor.id)?.next || null : this.fallbackStrangerHead;
     const rows: AccessLogRecord[] = [];
     while (node && rows.length < fetchLimit) {
-      rows.push(node.log);
+      if (!this.fallbackFaceLogIds.has(node.log.id)) rows.push(node.log);
       node = node.next;
     }
     return {
@@ -2176,8 +2509,339 @@ class SQLiteStorage {
     return { ...log, photoSnapshot: "stored", faceEmbedding: log.faceEmbedding ? [...log.faceEmbedding] : undefined };
   }
 
+  /** Observation ids covered by a current adjudication: `log:<id>` per logId, `face:<id>` per faceId. */
   getRetiredStrangerObservationIds(): string[] {
-    return this.getStrangerResolutions().flatMap((resolution) => resolution.logIds.map((id) => `log:${id}`));
+    return this.getStrangerResolutions().flatMap((resolution) => [
+      ...resolution.logIds.map((id) => `log:${id}`),
+      ...(resolution.faceIds || []).map((id) => `face:${id}`),
+    ]);
+  }
+
+  // ================= STRANGER FACES =================
+  // Exactly one store holds stranger faces at a time: PostgreSQL when it is
+  // the active authority, else native SQLite, else the JSON file. Unlike access
+  // logs there is no local mirror while PostgreSQL is active - these are
+  // biometric crops and embeddings, and a second copy would escape retention.
+  // While PostgreSQL is configured but still connecting (or its stranger_faces
+  // migration failed) writes are refused (false) and reads are empty, rather
+  // than landing in a local store the gateway stops reading once connected.
+
+  /**
+   * Faces written to the local store during an earlier fallback period are not
+   * read once PostgreSQL is active. Say so at startup instead of hiding them;
+   * the retention purge still clears their crops and embeddings.
+   */
+  private warnStrandedLocalStrangerFaces(): void {
+    let count = 0;
+    try {
+      if (this.isNativeSqlite && this.db) {
+        count = Number((this.db.prepare("SELECT count(*) AS n FROM stranger_faces WHERE purgedAt IS NULL").get() as any)?.n || 0);
+      } else {
+        count = (this.fallbackData.stranger_faces || []).filter((face) => !face.purgedAt).length;
+      }
+    } catch {}
+    if (count) {
+      console.warn(`[StrangerFaces] ${count} khuôn mặt người lạ chỉ nằm trong kho cục bộ (ghi khi PostgreSQL không khả dụng); bảng người lạ không hiển thị chúng.`);
+    }
+  }
+
+  private strangerFaceMode(): "postgresql" | "sqlite" | "json" | null {
+    if (this.pgPool && this.isPostgres) return this.pgStrangerFacesReady ? "postgresql" : null;
+    if (this.storage.connecting) return null;
+    if (this.isNativeSqlite && this.db) return "sqlite";
+    return "json";
+  }
+
+  /**
+   * Insert faces of access events (StrangerFaceStore.saveStrangerFaces).
+   *
+   * All-or-nothing per call: a malformed face, or a face whose access event is
+   * not stored, refuses the whole batch (false, nothing written). Replays are
+   * no-ops by id, and by (logId, faceIndex) so a writer retrying a frame with
+   * fresh ids does not duplicate its faces: the first row for a slot wins.
+   * Resolves true once the authoritative store has a row for every face slot.
+   * Never rejects.
+   */
+  async saveStrangerFaces(faces: StrangerFaceRecord[]): Promise<boolean> {
+    if (!Array.isArray(faces)) return false;
+    const rows: StrangerFaceRow[] = [];
+    const ids = new Set<string>();
+    const slots = new Set<string>();
+    for (const face of faces) {
+      const { row, error } = normalizeStrangerFace(face);
+      if (!row) {
+        console.warn(`[StrangerFaces] Từ chối lưu ${faces.length} khuôn mặt: trường không hợp lệ (${error}).`);
+        return false;
+      }
+      const slot = `${row.logId}\u0000${row.faceIndex}`;
+      if (ids.has(row.id) || slots.has(slot)) continue;
+      ids.add(row.id);
+      slots.add(slot);
+      rows.push(row);
+    }
+    if (!rows.length) return true;
+    const logIds = [...new Set(rows.map((row) => row.logId))];
+    const mode = this.strangerFaceMode();
+    if (!mode) {
+      console.warn(`[StrangerFaces] PostgreSQL chưa sẵn sàng; chưa lưu ${rows.length} khuôn mặt.`);
+      return false;
+    }
+
+    if (mode === "postgresql") {
+      // The access event may still be in flight (saveAccessLog is often not
+      // awaited); the foreign key needs it first.
+      await Promise.all(logIds.map((id) => this.settleAccessLogWrites(id)));
+      const params: unknown[] = [];
+      const values = rows.map((row) => {
+        const start = params.length;
+        params.push(...strangerFaceInsertParams(row, JSON.stringify(row.box)));
+        const p = (i: number) => `$${start + i}`;
+        return `(${p(1)},${p(2)},${p(3)},${p(4)},${p(5)},${p(6)},${p(7)},${p(8)},${p(9)}::jsonb,${p(10)},${p(11)},${p(12)},${p(13)},${p(14)},${p(15)},${p(16)},${p(17)},${p(18)},${p(19)},${p(20)})`;
+      });
+      try {
+        await this.pgPool!.query(
+          `INSERT INTO stranger_faces (id, "logId", "faceIndex", "capturedAt", gate, "streamId", engine, "trackId", box,
+             "sourceWidth", "sourceHeight", "detectorScore", quality, "edgeEnergy", "sizePx", embedding, dims, "modelTag",
+             crop, "createdAt")
+           VALUES ${values.join(",")}
+           ON CONFLICT DO NOTHING`,
+          params,
+        );
+        return true;
+      } catch (err: any) {
+        console.error(`[PostgreSQL] Lỗi saveStrangerFaces (${err?.code || "?"}): ${err?.message}`);
+        return false;
+      }
+    }
+
+    if (mode === "sqlite") {
+      try {
+        this.db.exec("BEGIN IMMEDIATE");
+      } catch (err: any) {
+        console.error("[SQLite] Lỗi saveStrangerFaces:", err?.message);
+        return false;
+      }
+      try {
+        const exists = this.db.prepare("SELECT 1 AS ok FROM access_logs WHERE id = ?");
+        const missing = logIds.find((id) => !exists.get(id));
+        if (missing) {
+          this.db.exec("ROLLBACK");
+          console.warn("[StrangerFaces] Từ chối lưu khuôn mặt: sự kiện truy cập chưa tồn tại.");
+          return false;
+        }
+        const insert = this.db.prepare(
+          `INSERT INTO stranger_faces (id, logId, faceIndex, capturedAt, gate, streamId, engine, trackId, box,
+             sourceWidth, sourceHeight, detectorScore, quality, edgeEnergy, sizePx, embedding, dims, modelTag, crop, createdAt)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+           ON CONFLICT DO NOTHING`,
+        );
+        for (const row of rows) insert.run(...strangerFaceInsertParams(row, JSON.stringify(row.box)));
+        this.db.exec("COMMIT");
+        return true;
+      } catch (err: any) {
+        try { this.db.exec("ROLLBACK"); } catch {}
+        console.error("[SQLite] Lỗi saveStrangerFaces:", err?.message);
+        return false;
+      }
+    }
+
+    const known = new Set(this.fallbackData.access_logs.map((log) => log.id));
+    if (logIds.some((id) => !known.has(id))) {
+      console.warn("[StrangerFaces] Từ chối lưu khuôn mặt: sự kiện truy cập chưa tồn tại.");
+      return false;
+    }
+    const existing = this.fallbackData.stranger_faces || [];
+    const storedIds = new Set(existing.map((face) => face.id));
+    const storedSlots = new Set(existing.map((face) => `${face.logId}\u0000${face.faceIndex}`));
+    const fresh = rows
+      .filter((row) => !storedIds.has(row.id) && !storedSlots.has(`${row.logId}\u0000${row.faceIndex}`))
+      .map(strangerFaceRowToJson);
+    if (!fresh.length) return true;
+    const staged = [...fresh, ...existing];
+    try {
+      this.writeFallback({ ...this.fallbackData, stranger_faces: staged });
+    } catch (err: any) {
+      console.error("[JSON] Lỗi saveStrangerFaces:", err?.message);
+      return false;
+    }
+    this.fallbackData.stranger_faces = staged;
+    for (const face of fresh) this.fallbackFaceLogIds.add(face.logId);
+    return true;
+  }
+
+  /** StrangerFaceStore.getStrangerFacesPage: newest first, purged rows excluded, never the crop. */
+  async getStrangerFacesPage(cursor: { capturedAt: string; id: string } | null, limit: number): Promise<StrangerFacePage> {
+    const n = Math.min(100, Math.max(1, Number.isFinite(limit) ? Math.trunc(limit) : 1));
+    const after = cursor ? { capturedAt: String(cursor.capturedAt), id: String(cursor.id) } : null;
+    const mode = this.strangerFaceMode();
+    let rows: StrangerFaceRecord[] = [];
+    if (mode === "postgresql") {
+      const params: unknown[] = [];
+      let where = `"purgedAt" IS NULL`;
+      if (after) {
+        params.push(after.capturedAt, after.id);
+        where += ` AND ("capturedAt", id) < ($1, $2)`;
+      }
+      params.push(n + 1);
+      const result = await this.pgPool!.query(
+        `SELECT ${STRANGER_FACE_COLUMNS_PG} FROM stranger_faces WHERE ${where}
+          ORDER BY "capturedAt" DESC, id DESC LIMIT $${params.length}`,
+        params,
+      );
+      rows = result.rows.map(rowToStrangerFace);
+    } else if (mode === "sqlite") {
+      const params: unknown[] = [];
+      let where = "purgedAt IS NULL";
+      if (after) {
+        where += " AND (capturedAt < ? OR (capturedAt = ? AND id < ?))";
+        params.push(after.capturedAt, after.capturedAt, after.id);
+      }
+      rows = (this.db.prepare(
+        `SELECT ${STRANGER_FACE_COLUMNS_SQLITE} FROM stranger_faces WHERE ${where}
+          ORDER BY capturedAt DESC, id DESC LIMIT ?`,
+      ).all(...params, n + 1) as any[]).map(rowToStrangerFace);
+    } else if (mode === "json") {
+      rows = (this.fallbackData.stranger_faces || [])
+        .filter((face) => !face.purgedAt)
+        .filter((face) => !after || face.capturedAt < after.capturedAt || (face.capturedAt === after.capturedAt && face.id < after.id))
+        .sort((a, b) => (a.capturedAt < b.capturedAt ? 1 : a.capturedAt > b.capturedAt ? -1 : a.id < b.id ? 1 : a.id > b.id ? -1 : 0))
+        .slice(0, n + 1)
+        .map(jsonToStrangerFace);
+    }
+    return { faces: rows.slice(0, n), hasMore: rows.length > n };
+  }
+
+  /** StrangerFaceStore.getStrangerFacesByIds: purged rows included, never the crop. */
+  async getStrangerFacesByIds(ids: string[]): Promise<StrangerFaceRecord[]> {
+    const wanted = [...new Set((Array.isArray(ids) ? ids : []).filter((id): id is string => typeof id === "string" && id.length <= 64))];
+    if (!wanted.length) return [];
+    const mode = this.strangerFaceMode();
+    if (mode === "postgresql") {
+      const result = await this.pgPool!.query(
+        `SELECT ${STRANGER_FACE_COLUMNS_PG} FROM stranger_faces WHERE id = ANY($1::varchar[])`,
+        [wanted],
+      );
+      return result.rows.map(rowToStrangerFace);
+    }
+    if (mode === "sqlite") {
+      return (this.db.prepare(
+        `SELECT ${STRANGER_FACE_COLUMNS_SQLITE} FROM stranger_faces WHERE id IN (SELECT value FROM json_each(?))`,
+      ).all(JSON.stringify(wanted)) as any[]).map(rowToStrangerFace);
+    }
+    if (mode === "json") {
+      const set = new Set(wanted);
+      return (this.fallbackData.stranger_faces || []).filter((face) => set.has(face.id)).map(jsonToStrangerFace);
+    }
+    return [];
+  }
+
+  /**
+   * Faces of the given access events, ordered by logId then faceIndex; purged
+   * rows included, never the crop. Not part of StrangerFaceStore: serves the
+   * `#strangers/<logId>` lookup and lets a writer re-read the ids a retried
+   * frame actually kept.
+   */
+  async getStrangerFacesByLogIds(logIds: string[]): Promise<StrangerFaceRecord[]> {
+    const wanted = [...new Set((Array.isArray(logIds) ? logIds : []).filter((id): id is string => typeof id === "string" && id.length <= 64))];
+    if (!wanted.length) return [];
+    const mode = this.strangerFaceMode();
+    if (mode === "postgresql") {
+      const result = await this.pgPool!.query(
+        `SELECT ${STRANGER_FACE_COLUMNS_PG} FROM stranger_faces WHERE "logId" = ANY($1::varchar[]) ORDER BY "logId", "faceIndex"`,
+        [wanted],
+      );
+      return result.rows.map(rowToStrangerFace);
+    }
+    if (mode === "sqlite") {
+      return (this.db.prepare(
+        `SELECT ${STRANGER_FACE_COLUMNS_SQLITE} FROM stranger_faces WHERE logId IN (SELECT value FROM json_each(?)) ORDER BY logId, faceIndex`,
+      ).all(JSON.stringify(wanted)) as any[]).map(rowToStrangerFace);
+    }
+    if (mode === "json") {
+      const set = new Set(wanted);
+      return (this.fallbackData.stranger_faces || [])
+        .filter((face) => set.has(face.logId))
+        .sort((a, b) => (a.logId < b.logId ? -1 : a.logId > b.logId ? 1 : a.faceIndex - b.faceIndex))
+        .map(jsonToStrangerFace);
+    }
+    return [];
+  }
+
+  /** StrangerFaceStore.getStrangerFaceCrop: the JPEG bytes, or undefined (unknown, purged, or stored without a crop). */
+  async getStrangerFaceCrop(id: string): Promise<Buffer | undefined> {
+    if (typeof id !== "string" || !id || id.length > 64) return undefined;
+    const mode = this.strangerFaceMode();
+    let crop: unknown = null;
+    if (mode === "postgresql") {
+      const result = await this.pgPool!.query(`SELECT crop FROM stranger_faces WHERE id = $1 AND "purgedAt" IS NULL`, [id]);
+      crop = result.rows[0]?.crop;
+    } else if (mode === "sqlite") {
+      crop = (this.db.prepare("SELECT crop FROM stranger_faces WHERE id = ? AND purgedAt IS NULL").get(id) as any)?.crop;
+    } else if (mode === "json") {
+      const face = (this.fallbackData.stranger_faces || []).find((item) => item.id === id);
+      crop = face && !face.purgedAt && face.crop ? Buffer.from(face.crop, "base64") : null;
+    }
+    if (!crop || !(crop instanceof Uint8Array) || crop.length === 0) return undefined;
+    return Buffer.isBuffer(crop) ? crop : Buffer.from(crop);
+  }
+
+  /**
+   * StrangerFaceStore.purgeStrangerFaces: clear crop + embedding and set
+   * purgedAt on every non-purged face captured before `cutoffIso` that is not
+   * in keepIds. The row (box, scores, dims, modelTag, logId) stays as an audit
+   * tombstone and keeps its access event out of the log-level candidates.
+   * Returns the rows purged in the authoritative store. An unparseable cutoff
+   * throws (a retention job must not silently purge nothing).
+   *
+   * With PostgreSQL active, faces left in the local SQLite/JSON store by an
+   * earlier fallback period are purged on the same clock (logged, not counted).
+   */
+  async purgeStrangerFaces(cutoffIso: string, keepIds: ReadonlySet<string>): Promise<number> {
+    const cutoff = normIso(cutoffIso);
+    if (!cutoff) throw new RangeError("purgeStrangerFaces: invalid cutoff");
+    const keep = [...(keepIds || new Set<string>())].filter((id) => typeof id === "string");
+    const now = new Date().toISOString();
+    const mode = this.strangerFaceMode();
+    if (mode === "postgresql") {
+      const result = await this.pgPool!.query(
+        `UPDATE stranger_faces SET crop = NULL, embedding = NULL, "purgedAt" = $1
+          WHERE "purgedAt" IS NULL AND "capturedAt" < $2 AND NOT (id = ANY($3::varchar[]))`,
+        [now, cutoff, keep],
+      );
+      let stranded = 0;
+      try {
+        stranded = this.purgeLocalStrangerFaces(cutoff, keep, now);
+      } catch (err: any) {
+        console.error("[StrangerFaces] Lỗi xoá khuôn mặt trong kho cục bộ:", err?.message);
+      }
+      if (stranded) console.warn(`[StrangerFaces] Đã xoá ảnh/embedding của ${stranded} khuôn mặt chỉ còn trong kho cục bộ.`);
+      return result.rowCount || 0;
+    }
+    if (mode === "sqlite" || mode === "json") return this.purgeLocalStrangerFaces(cutoff, keep, now);
+    return 0;
+  }
+
+  private purgeLocalStrangerFaces(cutoff: string, keep: string[], now: string): number {
+    if (this.isNativeSqlite && this.db) {
+      const result = this.db.prepare(
+        `UPDATE stranger_faces SET crop = NULL, embedding = NULL, purgedAt = ?
+          WHERE purgedAt IS NULL AND capturedAt < ? AND id NOT IN (SELECT value FROM json_each(?))`,
+      ).run(now, cutoff, JSON.stringify(keep));
+      return Number(result?.changes || 0);
+    }
+    const current = this.fallbackData.stranger_faces || [];
+    const keepSet = new Set(keep);
+    let purged = 0;
+    const staged = current.map((face) => {
+      if (face.purgedAt || !(face.capturedAt < cutoff) || keepSet.has(face.id)) return face;
+      purged += 1;
+      const { crop: _crop, embedding: _embedding, ...rest } = face;
+      return { ...rest, purgedAt: now };
+    });
+    if (!purged) return 0;
+    this.writeFallback({ ...this.fallbackData, stranger_faces: staged });
+    this.fallbackData.stranger_faces = staged;
+    return purged;
   }
 
   /**
@@ -2286,6 +2950,11 @@ class SQLiteStorage {
     return authoritative ?? Promise.resolve(localOk);
   }
 
+  /**
+   * Admin wipe of the access history. The stranger faces of those events go
+   * with them (ON DELETE CASCADE on PostgreSQL, explicitly here for SQLite and
+   * JSON): a face without its access event is biometric data with no purpose.
+   */
   clearAccessLogs() {
     if (this.pgPool && this.isPostgres) {
       this.pgPool.query("DELETE FROM access_logs")
@@ -2294,13 +2963,14 @@ class SQLiteStorage {
 
     if (this.isNativeSqlite && this.db) {
       try {
-        this.db.exec("DELETE FROM access_logs");
+        this.db.exec("DELETE FROM stranger_faces; DELETE FROM access_logs;");
         return;
       } catch (err) {
         console.error("[SQLite] Lỗi clearAccessLogs:", err);
       }
     }
     this.fallbackData.access_logs = [];
+    this.fallbackData.stranger_faces = [];
     this.rebuildFallbackStrangerIndex();
     this.saveFallback();
   }
@@ -3153,7 +3823,7 @@ class SQLiteStorage {
     if (!this.pgPool) return;
     try {
       const result = await this.pgPool.query(
-        'SELECT id, "clusterId", action, "employeeId", actor, "resolvedAt", "logIds", "sourceLogId", metadata FROM stranger_resolution_events ORDER BY "resolvedAt", id'
+        'SELECT id, "clusterId", action, "employeeId", actor, "resolvedAt", "logIds", "faceIds", "sourceLogId", metadata FROM stranger_resolution_events ORDER BY "resolvedAt", id'
       );
       this.strangerResolutionEventsCache = result.rows.map(rowToStrangerResolution);
       this.strangerResolutionEventsHydrated = true;
@@ -3172,20 +3842,20 @@ class SQLiteStorage {
           this.strangerResolutionEventsCache = [];
         }
       } else {
-        this.strangerResolutionEventsCache = [...(this.fallbackData.stranger_resolution_events || [])];
+        this.strangerResolutionEventsCache = (this.fallbackData.stranger_resolution_events || []).map(copyResolution);
       }
       this.strangerResolutionEventsHydrated = true;
     }
     return this.strangerResolutionEventsCache
       .filter((record) => !clusterId || record.clusterId === clusterId)
-      .map((record) => ({ ...record, logIds: [...record.logIds], metadata: { ...(record.metadata || {}) } }));
+      .map(copyResolution);
   }
 
   private async loadStrangerResolutions(): Promise<void> {
     if (!this.pgPool) return;
     try {
       const result = await this.pgPool.query(
-        'SELECT id, "clusterId", action, "employeeId", actor, "resolvedAt", "logIds", "sourceLogId", metadata FROM stranger_resolutions'
+        'SELECT id, "clusterId", action, "employeeId", actor, "resolvedAt", "logIds", "faceIds", "sourceLogId", metadata FROM stranger_resolutions'
       );
       this.strangerResolutionsCache = result.rows.map(rowToStrangerResolution);
       this.strangerResolutionsHydrated = true;
@@ -3196,7 +3866,7 @@ class SQLiteStorage {
 
   getStrangerResolutions(): StrangerResolutionRecord[] {
     if (this.strangerResolutionsHydrated || this.strangerResolutionsCache.length > 0) {
-      return this.strangerResolutionsCache.map((record) => ({ ...record, logIds: [...record.logIds] }));
+      return this.strangerResolutionsCache.map(copyResolution);
     }
     if (this.isNativeSqlite && this.db) {
       try {
@@ -3206,7 +3876,7 @@ class SQLiteStorage {
         return this.getStrangerResolutions();
       } catch {}
     }
-    this.strangerResolutionsCache = [...(this.fallbackData.stranger_resolutions || [])];
+    this.strangerResolutionsCache = (this.fallbackData.stranger_resolutions || []).map(copyResolution);
     this.strangerResolutionsHydrated = true;
     return this.getStrangerResolutions();
   }
@@ -3219,6 +3889,7 @@ class SQLiteStorage {
     const resolution: StrangerResolutionRecord = {
       ...input.resolution,
       logIds: [...input.resolution.logIds].sort(),
+      faceIds: [...(input.resolution.faceIds || [])].sort(),
       metadata: { ...(input.resolution.metadata || {}) },
     };
     const classify = (existing: StrangerResolutionRecord): StrangerResolutionCommitResult => ({
@@ -3231,7 +3902,7 @@ class SQLiteStorage {
       try {
         await client.query("BEGIN");
         const found = await client.query(
-          'SELECT id, "clusterId", action, "employeeId", actor, "resolvedAt", "logIds", "sourceLogId", metadata FROM stranger_resolutions WHERE "clusterId"=$1 FOR UPDATE',
+          'SELECT id, "clusterId", action, "employeeId", actor, "resolvedAt", "logIds", "faceIds", "sourceLogId", metadata FROM stranger_resolutions WHERE "clusterId"=$1 FOR UPDATE',
           [resolution.clusterId],
         );
         if (found.rows[0]) {
@@ -3256,14 +3927,16 @@ class SQLiteStorage {
           );
         }
         await client.query(
-          'INSERT INTO stranger_resolutions (id,"clusterId",action,"employeeId",actor,"resolvedAt","logIds","sourceLogId",metadata) VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb,$8,$9::jsonb)',
+          'INSERT INTO stranger_resolutions (id,"clusterId",action,"employeeId",actor,"resolvedAt","logIds","sourceLogId",metadata,"faceIds") VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb,$8,$9::jsonb,$10::jsonb)',
           [resolution.id, resolution.clusterId, resolution.action, resolution.employeeId || null, resolution.actor,
-            resolution.resolvedAt, JSON.stringify(resolution.logIds), resolution.sourceLogId || null, JSON.stringify(resolution.metadata || {})],
+            resolution.resolvedAt, JSON.stringify(resolution.logIds), resolution.sourceLogId || null, JSON.stringify(resolution.metadata || {}),
+            JSON.stringify(resolution.faceIds)],
         );
         await client.query(
-          'INSERT INTO stranger_resolution_events (id,"clusterId",action,"employeeId",actor,"resolvedAt","logIds","sourceLogId",metadata) VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb,$8,$9::jsonb)',
+          'INSERT INTO stranger_resolution_events (id,"clusterId",action,"employeeId",actor,"resolvedAt","logIds","sourceLogId",metadata,"faceIds") VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb,$8,$9::jsonb,$10::jsonb)',
           [resolution.id, resolution.clusterId, resolution.action, resolution.employeeId || null, resolution.actor,
-            resolution.resolvedAt, JSON.stringify(resolution.logIds), resolution.sourceLogId || null, JSON.stringify(resolution.metadata || {})],
+            resolution.resolvedAt, JSON.stringify(resolution.logIds), resolution.sourceLogId || null, JSON.stringify(resolution.metadata || {}),
+            JSON.stringify(resolution.faceIds)],
         );
         await client.query(
           'INSERT INTO resolved_stranger_clusters ("clusterId","resolvedAt","resolvedBy") VALUES ($1,$2,$3)',
@@ -3274,7 +3947,7 @@ class SQLiteStorage {
         await client.query("ROLLBACK");
         if (error?.code === "23505") {
           const found = await this.pgPool.query(
-            'SELECT id, "clusterId", action, "employeeId", actor, "resolvedAt", "logIds", "sourceLogId", metadata FROM stranger_resolutions WHERE "clusterId"=$1',
+            'SELECT id, "clusterId", action, "employeeId", actor, "resolvedAt", "logIds", "faceIds", "sourceLogId", metadata FROM stranger_resolutions WHERE "clusterId"=$1',
             [resolution.clusterId],
           );
           if (found.rows[0]) return classify(rowToStrangerResolution(found.rows[0]));
@@ -3305,12 +3978,14 @@ class SQLiteStorage {
           this.db.prepare("INSERT INTO face_templates (id,employeeId,embedding,dims,modelTag,source,quality,capturedAt,sourceLogId,streamId) VALUES (?,?,?,?,?,?,?,?,?,?)")
             .run(t.id, t.employeeId, embeddingToBuffer(t.embedding), t.dims, t.modelTag, t.source, t.quality, t.capturedAt, t.sourceLogId || null, t.streamId || null);
         }
-        this.db.prepare("INSERT INTO stranger_resolutions (id,clusterId,action,employeeId,actor,resolvedAt,logIds,sourceLogId,metadata) VALUES (?,?,?,?,?,?,?,?,?)")
+        this.db.prepare("INSERT INTO stranger_resolutions (id,clusterId,action,employeeId,actor,resolvedAt,logIds,sourceLogId,metadata,faceIds) VALUES (?,?,?,?,?,?,?,?,?,?)")
           .run(resolution.id, resolution.clusterId, resolution.action, resolution.employeeId || null, resolution.actor,
-            resolution.resolvedAt, JSON.stringify(resolution.logIds), resolution.sourceLogId || null, JSON.stringify(resolution.metadata || {}));
-        this.db.prepare("INSERT INTO stranger_resolution_events (id,clusterId,action,employeeId,actor,resolvedAt,logIds,sourceLogId,metadata) VALUES (?,?,?,?,?,?,?,?,?)")
+            resolution.resolvedAt, JSON.stringify(resolution.logIds), resolution.sourceLogId || null, JSON.stringify(resolution.metadata || {}),
+            JSON.stringify(resolution.faceIds));
+        this.db.prepare("INSERT INTO stranger_resolution_events (id,clusterId,action,employeeId,actor,resolvedAt,logIds,sourceLogId,metadata,faceIds) VALUES (?,?,?,?,?,?,?,?,?,?)")
           .run(resolution.id, resolution.clusterId, resolution.action, resolution.employeeId || null, resolution.actor,
-            resolution.resolvedAt, JSON.stringify(resolution.logIds), resolution.sourceLogId || null, JSON.stringify(resolution.metadata || {}));
+            resolution.resolvedAt, JSON.stringify(resolution.logIds), resolution.sourceLogId || null, JSON.stringify(resolution.metadata || {}),
+            JSON.stringify(resolution.faceIds));
         this.db.prepare("INSERT INTO resolved_stranger_clusters (clusterId,resolvedAt,resolvedBy) VALUES (?,?,?)")
           .run(resolution.clusterId, resolution.resolvedAt, resolution.actor);
         this.db.exec("COMMIT");
@@ -3322,7 +3997,7 @@ class SQLiteStorage {
       }
     } else {
       const found = (this.fallbackData.stranger_resolutions || []).find((item) => item.clusterId === resolution.clusterId);
-      if (found) return classify(found);
+      if (found) return classify(copyResolution(found));
       const staged = JSON.parse(JSON.stringify(this.fallbackData)) as typeof this.fallbackData;
       if (input.employee) {
         if (staged.employees.some((item) => item.id === input.employee!.id || item.employeeCode.toUpperCase() === input.employee!.employeeCode.toUpperCase())) {
@@ -3364,27 +4039,28 @@ class SQLiteStorage {
     const snapshot: StrangerResolutionRecord = {
       ...record,
       logIds: [...record.logIds].sort(),
+      faceIds: [...(record.faceIds || [])].sort(),
       metadata: { ...(record.metadata || {}) },
     };
     if (this.pgPool && this.isPostgres) {
       await this.pgPool.query(
         `INSERT INTO stranger_resolutions
-          (id, "clusterId", action, "employeeId", actor, "resolvedAt", "logIds", "sourceLogId", metadata)
-         VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb,$8,$9::jsonb)
+          (id, "clusterId", action, "employeeId", actor, "resolvedAt", "logIds", "sourceLogId", metadata, "faceIds")
+         VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb,$8,$9::jsonb,$10::jsonb)
          ON CONFLICT ("clusterId") DO NOTHING`,
         [snapshot.id, snapshot.clusterId, snapshot.action, snapshot.employeeId || null, snapshot.actor,
           snapshot.resolvedAt, JSON.stringify(snapshot.logIds), snapshot.sourceLogId || null,
-          JSON.stringify(snapshot.metadata || {})]
+          JSON.stringify(snapshot.metadata || {}), JSON.stringify(snapshot.faceIds)]
       );
     }
     if (this.isNativeSqlite && this.db) {
       this.db.prepare(
         `INSERT OR IGNORE INTO stranger_resolutions
-          (id, clusterId, action, employeeId, actor, resolvedAt, logIds, sourceLogId, metadata)
-         VALUES (?,?,?,?,?,?,?,?,?)`
+          (id, clusterId, action, employeeId, actor, resolvedAt, logIds, sourceLogId, metadata, faceIds)
+         VALUES (?,?,?,?,?,?,?,?,?,?)`
       ).run(snapshot.id, snapshot.clusterId, snapshot.action, snapshot.employeeId || null, snapshot.actor,
         snapshot.resolvedAt, JSON.stringify(snapshot.logIds), snapshot.sourceLogId || null,
-        JSON.stringify(snapshot.metadata || {}));
+        JSON.stringify(snapshot.metadata || {}), JSON.stringify(snapshot.faceIds));
     }
     this.strangerResolutionsCache.push(snapshot);
     const fallback = this.fallbackData.stranger_resolutions || [];
@@ -3400,12 +4076,13 @@ class SQLiteStorage {
       ...record,
       action: "RESTORE",
       logIds: [...record.logIds].sort(),
+      faceIds: [...(record.faceIds || [])].sort(),
       metadata: { ...(record.metadata || {}) },
     };
     const existing = this.getStrangerResolution(restore.clusterId);
     if (!existing || existing.action !== "DISMISS" || !sameResolutionIntent(
       existing,
-      { ...existing, logIds: restore.logIds },
+      { ...existing, logIds: restore.logIds, faceIds: restore.faceIds },
     )) throw new Error("restore-conflict");
 
     if (this.pgPool && this.isPostgres) {
@@ -3413,18 +4090,19 @@ class SQLiteStorage {
       try {
         await client.query("BEGIN");
         const found = await client.query(
-          'SELECT id, "clusterId", action, "employeeId", actor, "resolvedAt", "logIds", "sourceLogId", metadata FROM stranger_resolutions WHERE "clusterId"=$1 FOR UPDATE',
+          'SELECT id, "clusterId", action, "employeeId", actor, "resolvedAt", "logIds", "faceIds", "sourceLogId", metadata FROM stranger_resolutions WHERE "clusterId"=$1 FOR UPDATE',
           [restore.clusterId],
         );
         const current = found.rows[0] ? rowToStrangerResolution(found.rows[0]) : undefined;
-        if (!current || current.action !== "DISMISS" || !sameResolutionIntent(current, { ...current, logIds: restore.logIds })) {
+        if (!current || current.action !== "DISMISS" || !sameResolutionIntent(current, { ...current, logIds: restore.logIds, faceIds: restore.faceIds })) {
           await client.query("ROLLBACK");
           throw new Error("restore-conflict");
         }
         await client.query(
-          'INSERT INTO stranger_resolution_events (id,"clusterId",action,"employeeId",actor,"resolvedAt","logIds","sourceLogId",metadata) VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb,$8,$9::jsonb)',
+          'INSERT INTO stranger_resolution_events (id,"clusterId",action,"employeeId",actor,"resolvedAt","logIds","sourceLogId",metadata,"faceIds") VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb,$8,$9::jsonb,$10::jsonb)',
           [restore.id, restore.clusterId, restore.action, null, restore.actor, restore.resolvedAt,
-            JSON.stringify(restore.logIds), restore.sourceLogId || null, JSON.stringify(restore.metadata || {})],
+            JSON.stringify(restore.logIds), restore.sourceLogId || null, JSON.stringify(restore.metadata || {}),
+            JSON.stringify(restore.faceIds)],
         );
         await client.query('DELETE FROM stranger_resolutions WHERE "clusterId"=$1', [restore.clusterId]);
         await client.query('DELETE FROM resolved_stranger_clusters WHERE "clusterId"=$1', [restore.clusterId]);
@@ -3440,12 +4118,13 @@ class SQLiteStorage {
       try {
         const found = this.db.prepare("SELECT * FROM stranger_resolutions WHERE clusterId=?").get(restore.clusterId) as any;
         const current = found ? rowToStrangerResolution(found) : undefined;
-        if (!current || current.action !== "DISMISS" || !sameResolutionIntent(current, { ...current, logIds: restore.logIds })) {
+        if (!current || current.action !== "DISMISS" || !sameResolutionIntent(current, { ...current, logIds: restore.logIds, faceIds: restore.faceIds })) {
           throw new Error("restore-conflict");
         }
-        this.db.prepare("INSERT INTO stranger_resolution_events (id,clusterId,action,employeeId,actor,resolvedAt,logIds,sourceLogId,metadata) VALUES (?,?,?,?,?,?,?,?,?)")
+        this.db.prepare("INSERT INTO stranger_resolution_events (id,clusterId,action,employeeId,actor,resolvedAt,logIds,sourceLogId,metadata,faceIds) VALUES (?,?,?,?,?,?,?,?,?,?)")
           .run(restore.id, restore.clusterId, restore.action, null, restore.actor, restore.resolvedAt,
-            JSON.stringify(restore.logIds), restore.sourceLogId || null, JSON.stringify(restore.metadata || {}));
+            JSON.stringify(restore.logIds), restore.sourceLogId || null, JSON.stringify(restore.metadata || {}),
+            JSON.stringify(restore.faceIds));
         this.db.prepare("DELETE FROM stranger_resolutions WHERE clusterId=?").run(restore.clusterId);
         this.db.prepare("DELETE FROM resolved_stranger_clusters WHERE clusterId=?").run(restore.clusterId);
         this.db.exec("COMMIT");
@@ -3456,7 +4135,7 @@ class SQLiteStorage {
     } else {
       const staged = JSON.parse(JSON.stringify(this.fallbackData)) as typeof this.fallbackData;
       const current = (staged.stranger_resolutions || []).find((item) => item.clusterId === restore.clusterId);
-      if (!current || current.action !== "DISMISS" || !sameResolutionIntent(current, { ...current, logIds: restore.logIds })) {
+      if (!current || current.action !== "DISMISS" || !sameResolutionIntent(current, { ...current, logIds: restore.logIds, faceIds: restore.faceIds })) {
         throw new Error("restore-conflict");
       }
       (staged.stranger_resolution_events ||= []).push(restore);
