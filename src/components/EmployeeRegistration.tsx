@@ -30,6 +30,18 @@ import {
 import { safeJsonFetch, compressImage } from "../utils/api";
 import { ProtectedImage } from "./ProtectedImage";
 import { orgChoice, orgOptions, orgPlaceholder, useOrgCatalog } from "../utils/orgCatalog";
+import {
+  ADAPTATION_TAG,
+  cameraShortLabel,
+  coverageCount,
+  coverageIndicatorText,
+  deriveCoverage,
+  isAdaptationTemplate,
+  missingCameras,
+  passesCoverageFilter,
+  type CoverageEntry,
+  type CoverageFilter,
+} from "../utils/accuracyUi";
 
 /** One enrolled template as returned by GET /api/employees/:id/templates.
  *  Raw embeddings are never sent to the browser, so every field is optional. */
@@ -68,7 +80,14 @@ interface TemplatesResponse {
   max?: number;
   usableCount?: number;
   modelTag?: string;
+  /** `{ streamId: count }` (every server). */
+  byStream?: Record<string, number>;
+  /** Per-camera coverage with the adaptation split (accuracy wave); absent on older servers. */
+  coverage?: CoverageEntry[];
 }
+
+/** How many coverage reads run at once when the employee list loads. */
+const COVERAGE_FETCH_CONCURRENCY = 4;
 
 /** A camera stream flattened with the gate it belongs to. */
 interface FlatStream {
@@ -202,9 +221,18 @@ export const EmployeeRegistration: React.FC<EmployeeRegistrationProps> = ({
   const [templatesError, setTemplatesError] = useState<string | null>(null);
   const [deletingTemplateId, setDeletingTemplateId] = useState<string | null>(null);
 
+  // Per-camera coverage of EVERY employee for the list below (plan C2). Missing
+  // key = not read yet; null = the read failed (never shown as "no templates").
+  const [coverageByEmployee, setCoverageByEmployee] = useState<Record<string, CoverageEntry[] | null>>({});
+  const [coverageFilter, setCoverageFilter] = useState<CoverageFilter>("");
+  const coverageRequested = useRef<Set<string>>(new Set());
+  const [coverageReload, setCoverageReload] = useState<number>(0);
+
   const entryStreams = flattenGateStreams(streamsConfig?.entryGate, "entry");
   const exitStreams = flattenGateStreams(streamsConfig?.exitGate, "exit");
   const allStreams: FlatStream[] = [...entryStreams, ...exitStreams];
+  /** Cameras the coverage indicator and filter speak of: configured and enabled. */
+  const activeStreams: FlatStream[] = allStreams.filter((st) => st.enabled);
   const gateStreams = (enrollGate === "entry" ? entryStreams : exitStreams).filter((st) => st.enabled);
   const selectedEmployee = employees.find((emp) => emp.id === enrollEmployeeId) || null;
   /** The server's accept floor when it reports one; otherwise its documented default. */
@@ -287,6 +315,10 @@ export const EmployeeRegistration: React.FC<EmployeeRegistrationProps> = ({
       setTemplates(res.data.templates);
       setTemplatesMeta(res.data);
       setTemplatesError(null);
+      // The same body carries this employee's coverage; keep the list in step.
+      const coverage = deriveCoverage(res.data);
+      setCoverageByEmployee((prev) => ({ ...prev, [empId]: coverage }));
+      coverageRequested.current.add(empId);
     } else {
       setTemplates(null);
       setTemplatesMeta(null);
@@ -305,6 +337,41 @@ export const EmployeeRegistration: React.FC<EmployeeRegistrationProps> = ({
     setCaptureNotice(null);
     fetchTemplates(enrollEmployeeId);
   }, [enrollEmployeeId, fetchTemplates]);
+
+  // Coverage for the employee list: one bounded read per employee not read yet.
+  // A failed read is retried on the next list change; an unmount or list change
+  // releases the ids still queued so they are read again later.
+  useEffect(() => {
+    const queue = employees.map((emp) => emp.id).filter((id) => !coverageRequested.current.has(id));
+    if (queue.length === 0) return;
+    queue.forEach((id) => coverageRequested.current.add(id));
+    let cancelled = false;
+    const worker = async () => {
+      while (!cancelled) {
+        const id = queue.shift();
+        if (!id) return;
+        const res = await safeJsonFetch<TemplatesResponse>(`/api/employees/${encodeURIComponent(id)}/templates`);
+        if (cancelled) {
+          coverageRequested.current.delete(id);
+          return;
+        }
+        const ok = res.ok && !!res.data && (Array.isArray(res.data.templates) || Array.isArray(res.data.coverage));
+        if (!ok) coverageRequested.current.delete(id);
+        setCoverageByEmployee((prev) => ({ ...prev, [id]: ok ? deriveCoverage(res.data) : null }));
+      }
+    };
+    void Promise.all(Array.from({ length: COVERAGE_FETCH_CONCURRENCY }, worker));
+    return () => {
+      cancelled = true;
+      queue.forEach((id) => coverageRequested.current.delete(id));
+    };
+  }, [employees, coverageReload]);
+
+  const reloadCoverage = () => {
+    coverageRequested.current.clear();
+    setCoverageByEmployee({});
+    setCoverageReload((n) => n + 1);
+  };
 
   /** Grab `frames` live frames from the chosen gate camera and enrol them. */
   const handleCaptureFromGate = async () => {
@@ -572,6 +639,13 @@ export const EmployeeRegistration: React.FC<EmployeeRegistrationProps> = ({
     });
     return rows;
   })();
+
+  /** Employees shown in the list once the coverage filter is applied. */
+  const visibleEmployees = employees.filter((emp) =>
+    passesCoverageFilter(coverageFilter, coverageByEmployee[emp.id], activeStreams)
+  );
+  /** Employees whose coverage is not known yet (never claimed as a gap). */
+  const coverageUnread = employees.filter((emp) => !coverageByEmployee[emp.id]).length;
 
   return (
     <div className="space-y-6">
@@ -1222,6 +1296,9 @@ export const EmployeeRegistration: React.FC<EmployeeRegistrationProps> = ({
                           }`}
                         >
                           {group.items.length > 0 ? `${group.items.length} mẫu` : "Chưa đăng ký"}
+                          {group.items.some(isAdaptationTemplate)
+                            ? ` · ${group.items.filter(isAdaptationTemplate).length} ${ADAPTATION_TAG}`
+                            : ""}
                         </span>
                       </div>
 
@@ -1263,11 +1340,22 @@ export const EmployeeRegistration: React.FC<EmployeeRegistrationProps> = ({
                                       {typeof tpl.quality === "number" ? tpl.quality.toFixed(2) : "—"}
                                     </span>
                                   </div>
-                                  <div className="text-[10px] text-slate-500 font-mono truncate mt-0.5">
-                                    {formatCapturedAt(tpl.capturedAt)}
-                                    {tpl.source ? ` • ${tpl.source}` : ""}
-                                    {typeof tpl.dims === "number" ? ` • ${tpl.dims}-D` : ""}
-                                    {tpl.modelTag ? ` • ${tpl.modelTag}` : ""}
+                                  <div className="text-[10px] text-slate-500 font-mono truncate mt-0.5 flex items-center gap-1.5">
+                                    <span className="truncate">
+                                      {formatCapturedAt(tpl.capturedAt)}
+                                      {tpl.source ? ` • ${tpl.source}` : ""}
+                                      {typeof tpl.dims === "number" ? ` • ${tpl.dims}-D` : ""}
+                                      {tpl.modelTag ? ` • ${tpl.modelTag}` : ""}
+                                    </span>
+                                    {isAdaptationTemplate(tpl) && (
+                                      <span
+                                        className="shrink-0 px-1.5 py-px rounded-full border border-sky-200 bg-sky-50 text-sky-800 font-sans font-semibold"
+                                        title="Mẫu do máy chủ tự tạo từ một lượt nhận diện chắc chắn trên camera này (camera adaptation); có thể xóa như mẫu khác."
+                                        data-testid={`template-adaptation-tag-${tpl.id}`}
+                                      >
+                                        {ADAPTATION_TAG}
+                                      </span>
+                                    )}
                                   </div>
                                 </div>
                                 <button
@@ -1330,7 +1418,7 @@ export const EmployeeRegistration: React.FC<EmployeeRegistrationProps> = ({
 
       {/* List of Registered Employees */}
       <div className="bg-white rounded-2xl border border-slate-200 p-6 shadow-xs">
-        <div className="flex items-center justify-between mb-4">
+        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 mb-4">
           <div className="flex items-center gap-2">
             <Building className="w-5 h-5 text-indigo-600" />
             <h3 className="font-bold text-slate-900 text-sm">
@@ -1342,8 +1430,58 @@ export const EmployeeRegistration: React.FC<EmployeeRegistrationProps> = ({
           </span>
         </div>
 
+        {/* Coverage filter: which employees still lack a template on a camera (plan C2) */}
+        {activeStreams.length > 0 && employees.length > 0 && (
+          <div className="mb-4 flex flex-col sm:flex-row sm:items-center gap-2 sm:gap-3">
+            <label htmlFor="select-coverage-filter" className="text-[11px] font-bold text-slate-700 shrink-0">
+              Thiếu mẫu trên camera…
+            </label>
+            <select
+              id="select-coverage-filter"
+              value={coverageFilter}
+              onChange={(e) => setCoverageFilter(e.target.value)}
+              className="px-3 py-1.5 bg-slate-50 border border-slate-200 rounded-xl text-xs focus:outline-hidden focus:ring-2 focus:ring-indigo-500/30 focus:border-indigo-500 transition"
+            >
+              <option value="">Tất cả nhân viên</option>
+              <option value="__any__">Thiếu mẫu ở camera bất kỳ</option>
+              {activeStreams.map((st) => (
+                <option key={`${st.gateKey}-${st.id}`} value={st.id}>
+                  Thiếu mẫu ở {cameraShortLabel(st, activeStreams)}
+                </option>
+              ))}
+            </select>
+            <span className="text-[11px] text-slate-500" role="status" aria-live="polite">
+              {coverageFilter
+                ? `${visibleEmployees.length}/${employees.length} nhân viên`
+                : `${employees.filter((emp) => coverageByEmployee[emp.id] === undefined).length === 0 ? "Đã đọc mẫu của mọi nhân viên" : "Đang đọc mẫu theo camera..."}`}
+              {coverageFilter && coverageUnread > 0 ? ` · chưa đọc được ${coverageUnread}` : ""}
+            </span>
+            <button
+              type="button"
+              id="btn-reload-coverage"
+              onClick={reloadCoverage}
+              className="inline-flex items-center gap-1 px-2 py-1 text-[11px] font-semibold rounded-lg bg-slate-100 hover:bg-slate-200 text-slate-700 transition sm:ml-auto"
+              title="Đọc lại số mẫu theo camera của mọi nhân viên"
+            >
+              <RefreshCw className="w-3 h-3" /> Đọc lại mẫu
+            </button>
+          </div>
+        )}
+
+        {coverageFilter && visibleEmployees.length === 0 && (
+          <div className="p-3 rounded-xl bg-slate-50 border border-slate-200 text-[11px] text-slate-600 mb-4">
+            {coverageUnread > 0
+              ? "Chưa đọc xong mẫu của mọi nhân viên; danh sách chỉ liệt kê những người đã đọc được."
+              : "Không có nhân viên nào thiếu mẫu theo điều kiện này."}
+          </div>
+        )}
+
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-          {employees.map((emp) => (
+          {visibleEmployees.map((emp) => {
+            const cov = coverageByEmployee[emp.id];
+            const summary = cov ? coverageIndicatorText(cov, activeStreams) : null;
+            const gaps = cov ? missingCameras(cov, activeStreams).length : 0;
+            return (
             <div
               key={emp.id}
               className="p-4 rounded-xl border border-slate-200 hover:border-indigo-300 transition-all bg-slate-50/50 hover:bg-white hover:shadow-sm group flex flex-col justify-between"
@@ -1371,6 +1509,48 @@ export const EmployeeRegistration: React.FC<EmployeeRegistrationProps> = ({
                   </p>
                 </div>
               </div>
+
+              {/* Per-camera template coverage (plan C2): "thiếu mẫu ở Cổng ra" */}
+              {activeStreams.length > 0 && (
+                <div className="mt-2.5" data-testid={`coverage-${emp.id}`}>
+                  {cov === undefined ? (
+                    <p className="text-[10px] text-slate-400 inline-flex items-center gap-1">
+                      <RefreshCw className="w-3 h-3 animate-spin" /> đang đọc mẫu theo camera...
+                    </p>
+                  ) : cov === null ? (
+                    <p className="text-[10px] text-amber-800 inline-flex items-center gap-1">
+                      <AlertTriangle className="w-3 h-3" /> không đọc được số mẫu của nhân viên này
+                    </p>
+                  ) : (
+                    <>
+                      <p className={`text-[10px] font-semibold ${gaps > 0 ? "text-amber-800" : "text-emerald-700"}`}>
+                        {summary}
+                      </p>
+                      <ul className="mt-1 flex flex-wrap gap-1" aria-label={`Mẫu khuôn mặt của ${emp.name} theo camera`}>
+                        {activeStreams.map((st) => {
+                          const n = coverageCount(cov, st.id);
+                          const auto = cov.find((c) => c.streamId === st.id)?.adaptation ?? 0;
+                          return (
+                            <li
+                              key={`${st.gateKey}-${st.id}`}
+                              className={`inline-flex items-center gap-1 px-1.5 py-px rounded-full border text-[10px] ${
+                                n > 0
+                                  ? "bg-emerald-50 text-emerald-800 border-emerald-200"
+                                  : "bg-amber-50 text-amber-800 border-amber-200 border-dashed"
+                              }`}
+                              title={`${st.gateName} • ${st.id}`}
+                            >
+                              <span>{cameraShortLabel(st, activeStreams)}</span>
+                              <span className="font-mono font-bold">{n > 0 ? n : "thiếu"}</span>
+                              {auto > 0 && <span className="opacity-80">({auto} {ADAPTATION_TAG})</span>}
+                            </li>
+                          );
+                        })}
+                      </ul>
+                    </>
+                  )}
+                </div>
+              )}
 
               <div className="mt-4 pt-3 border-t border-slate-200/60 flex items-center justify-between">
                 <button
@@ -1404,7 +1584,8 @@ export const EmployeeRegistration: React.FC<EmployeeRegistrationProps> = ({
                 </button>
               </div>
             </div>
-          ))}
+            );
+          })}
         </div>
       </div>
     </div>

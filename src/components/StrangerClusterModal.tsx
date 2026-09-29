@@ -25,8 +25,10 @@ import {
   UserSearch,
   ZoomIn,
   ExternalLink,
+  Lightbulb,
 } from "lucide-react";
-import { StrangerCluster, Employee, AccessLog } from "../types";
+import { StrangerCluster, StrangerClusterSuggestion, Employee, AccessLog } from "../types";
+import { readSuggestion, suggestionAsEmployee, suggestionMergeLabel, suggestionText } from "../utils/accuracyUi";
 import { normalizeApiAssetUrl, operatorJsonFetch } from "../utils/api";
 import { ProtectedImage } from "./ProtectedImage";
 import { FaceImage, FaceThumb, ImageZoomDialog } from "./FaceImage";
@@ -78,6 +80,52 @@ export function templateRejectHint(reason?: string | null): string {
       return "";
   }
 }
+
+/**
+ * The best-matching employee for a group (plan 2026-09-29 C1/C2). A hint for the
+ * operator's merge, worded as a possibility and never as a result: the operator
+ * still picks "Gộp vào ..." and confirms in the merge form. Nothing here decides
+ * anything.
+ */
+const SuggestionBox: React.FC<{
+  clusterId: string;
+  suggestion: StrangerClusterSuggestion;
+  onMerge: () => void;
+  /** Already pre-selected in the merge form: show the hint without the button. */
+  selected?: boolean;
+  compact?: boolean;
+}> = ({ clusterId, suggestion, onMerge, selected = false, compact = false }) => (
+  <div
+    className={`flex flex-col sm:flex-row sm:items-center gap-2 rounded-xl border border-sky-200 bg-sky-50/70 ${compact ? "p-2.5" : "p-3"}`}
+    data-testid={`stranger-suggestion-${clusterId}`}
+  >
+    <Lightbulb className="w-4 h-4 text-sky-600 shrink-0" aria-hidden="true" />
+    <div className="min-w-0 flex-1">
+      <p className="text-xs text-sky-900">
+        <span className="font-semibold">Gợi ý:</span> {suggestionText(suggestion)}
+      </p>
+      <p className="text-[10px] text-sky-800/80">
+        Chỉ là gợi ý từ độ giống với mẫu đã có, không phải kết luận - bạn xem ảnh và xác nhận trước khi gộp.
+      </p>
+    </div>
+    {selected ? (
+      <span className="inline-flex items-center gap-1 text-[11px] font-semibold text-emerald-700 shrink-0">
+        <CheckCircle2 className="w-3.5 h-3.5" /> đã chọn trong biểu mẫu gộp
+      </span>
+    ) : (
+      <button
+        type="button"
+        id={`btn-merge-suggestion-${clusterId}`}
+        onClick={onMerge}
+        className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold border border-emerald-300 bg-white text-emerald-700 hover:bg-emerald-50 transition-colors shrink-0 focus:outline-hidden focus-visible:ring-2 focus-visible:ring-emerald-500"
+        title="Mở biểu mẫu gộp với nhân viên này đã được chọn sẵn; bạn vẫn phải xác nhận."
+      >
+        <Link2 className="w-3.5 h-3.5" />
+        <span>{suggestionMergeLabel(suggestion)}</span>
+      </button>
+    )}
+  </div>
+);
 
 export const StrangerClusterModal: React.FC<StrangerClusterModalProps> = ({
   isOpen,
@@ -252,6 +300,18 @@ export const StrangerClusterModal: React.FC<StrangerClusterModalProps> = ({
     setAdoptPhoto(false);
   };
 
+  /**
+   * "Gộp vào <name>": open the resolve panel in merge mode with the suggested
+   * employee pre-selected. The roster search runs on the code so the real record
+   * (photo, department) replaces the placeholder; the operator still confirms.
+   */
+  const handleOpenMergeSuggestion = (cluster: StrangerCluster, suggestion: StrangerClusterSuggestion) => {
+    handleOpenRegister(cluster);
+    setFormMode("MERGE");
+    setMergeTarget(suggestionAsEmployee(suggestion));
+    setEmployeeQuery(suggestion.employeeCode || suggestion.name);
+  };
+
   // Search the authoritative server roster; failures stay failures rather than local success.
   const searchEmployees = async (q: string) => {
     setSearchingEmployees(true);
@@ -260,7 +320,10 @@ export const StrangerClusterModal: React.FC<StrangerClusterModalProps> = ({
         `/api/strangers/search-employees?q=${encodeURIComponent(q)}`
       );
       if (res.ok && res.data?.employees) {
-        setEmployeeResults(res.data.employees);
+        const found = res.data.employees;
+        setEmployeeResults(found);
+        // A suggestion pre-selects a placeholder; swap in the roster's record when it turns up.
+        setMergeTarget((current) => (current ? found.find((emp) => emp.id === current.id) ?? current : current));
       } else {
         throw new Error(res.data?.error || "Không thể tải danh sách nhân viên");
       }
@@ -572,6 +635,8 @@ export const StrangerClusterModal: React.FC<StrangerClusterModalProps> = ({
                   ? findPhotoByObservationId(cluster.photos, activeObservationId)
                   : undefined;
                 const activeFramePath = activePhoto ? frameLinkPath(activePhoto) : null;
+                const suggestion = readSuggestion(cluster.suggestion);
+                const suggestionSelected = !!suggestion && isSelected && formMode === "MERGE" && mergeTarget?.id === suggestion.employeeId;
 
                 return (
                   <div
@@ -635,6 +700,18 @@ export const StrangerClusterModal: React.FC<StrangerClusterModalProps> = ({
                         </button>
                       </div>
                     </div>
+
+                    {/* Best-matching employee, if the server found one (a hint, not a decision) */}
+                    {suggestion && (
+                      <div className="mt-3">
+                        <SuggestionBox
+                          clusterId={cluster.clusterId}
+                          suggestion={suggestion}
+                          selected={suggestionSelected}
+                          onMerge={() => handleOpenMergeSuggestion(cluster, suggestion)}
+                        />
+                      </div>
+                    )}
 
                     {/* Photos Gallery of the Same Stranger */}
                     <div className="mt-4">
@@ -839,6 +916,19 @@ export const StrangerClusterModal: React.FC<StrangerClusterModalProps> = ({
                               được gán lại cho nhân viên bạn chọn.
                             </p>
 
+                            {suggestion && (
+                              <SuggestionBox
+                                clusterId={`${cluster.clusterId}-merge`}
+                                suggestion={suggestion}
+                                selected={suggestionSelected}
+                                compact
+                                onMerge={() => {
+                                  setMergeTarget(suggestionAsEmployee(suggestion));
+                                  setEmployeeQuery(suggestion.employeeCode || suggestion.name);
+                                }}
+                              />
+                            )}
+
                             {/* Roster search */}
                             <div>
                               <label className="block text-xs font-semibold text-slate-700 mb-1">
@@ -1001,6 +1091,16 @@ export const StrangerClusterModal: React.FC<StrangerClusterModalProps> = ({
                             Biểu Mẫu Thêm Nhanh Nhân Viên Từ Cụm Ảnh
                           </h4>
                         </div>
+
+                        {/* Creating a new record for someone who may already exist would duplicate them */}
+                        {suggestion && (
+                          <SuggestionBox
+                            clusterId={`${cluster.clusterId}-create`}
+                            suggestion={suggestion}
+                            compact
+                            onMerge={() => handleOpenMergeSuggestion(cluster, suggestion)}
+                          />
+                        )}
 
                         <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-4">
                           {/* Full Name */}
