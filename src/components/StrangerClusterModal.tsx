@@ -24,13 +24,24 @@ import {
   Link2,
   UserSearch,
   ZoomIn,
+  ExternalLink,
 } from "lucide-react";
-import { StrangerCluster, StrangerPhoto, Employee, AccessLog } from "../types";
-import { operatorJsonFetch } from "../utils/api";
+import { StrangerCluster, Employee, AccessLog } from "../types";
+import { normalizeApiAssetUrl, operatorJsonFetch } from "../utils/api";
 import { ProtectedImage } from "./ProtectedImage";
 import { FaceImage, FaceThumb, ImageZoomDialog } from "./FaceImage";
 import { orgChoice, orgOptions, orgPlaceholder, useOrgCatalog } from "../utils/orgCatalog";
 import { soundEffects } from "../utils/audio";
+import {
+  defaultActiveObservationId,
+  findPhotoByObservationId,
+  frameLinkPath,
+  observationIdOf,
+  photoForSnapshot,
+  photoMatchesTarget,
+  preselectTarget,
+  resolvePayloadIds,
+} from "../utils/strangerPhotos";
 
 interface StrangerClusterModalProps {
   isOpen: boolean;
@@ -43,6 +54,13 @@ interface StrangerClusterModalProps {
    * the cluster containing that sighting. A URL cannot carry a data-URL photo.
    */
   initialPreselectedLogId?: string | null;
+  /**
+   * Optional per-face deep link (`#strangers/face/<faceId>`, plan section 4).
+   * Takes precedence over `initialPreselectedLogId`; resolved through
+   * `/api/strangers/lookup?faceId=` when the face is not on the loaded page.
+   * App does not pass it yet.
+   */
+  initialPreselectedFaceId?: string | null;
 }
 
 /** Why no template was made from the chosen photo, for the reasons an operator can act on. */
@@ -68,12 +86,15 @@ export const StrangerClusterModal: React.FC<StrangerClusterModalProps> = ({
   onLogsUpdated,
   initialPreselectedPhoto,
   initialPreselectedLogId,
+  initialPreselectedFaceId,
 }) => {
   const [clusters, setClusters] = useState<StrangerCluster[]>([]);
   const [loading, setLoading] = useState<boolean>(true);
   const [error, setError] = useState<string | null>(null);
   const [selectedCluster, setSelectedCluster] = useState<StrangerCluster | null>(null);
-  const [activePhotoUrl, setActivePhotoUrl] = useState<string>("");
+  // The chosen tile, by observation id: two face tiles of one frame share a logId
+  // and must stay distinguishable.
+  const [activeObservationId, setActiveObservationId] = useState<string>("");
   const [currentCursor, setCurrentCursor] = useState<string>("");
   const [nextCursor, setNextCursor] = useState<string | null>(null);
   const [cursorHistory, setCursorHistory] = useState<string[]>([]);
@@ -117,44 +138,42 @@ export const StrangerClusterModal: React.FC<StrangerClusterModalProps> = ({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isOpen]);
 
+  // Deep-link target: a face id (per-face records) or an access-log id.
+  const target = preselectTarget(initialPreselectedFaceId, initialPreselectedLogId);
+  const targetLabel = (t: NonNullable<typeof target>) =>
+    t.kind === "face" ? `khuôn mặt ${t.id}` : `lượt quét ${t.id}`;
+
   /**
-   * Selects the cluster addressed by the caller: either by photo (in-app click)
-   * or by access-log id (deep link from a chat webhook alert).
+   * Selects the cluster addressed by the caller: either by photo (in-app click),
+   * by face id, or by access-log id (deep link from a chat webhook alert).
+   * A log can hold several face tiles; the first one found is selected.
    */
   const applyPreselection = (list: StrangerCluster[]) => {
     if (initialPreselectedPhoto) {
-      const match = list.find((c) =>
-        c.photos.some((p) => p.photoSnapshot === initialPreselectedPhoto)
-      );
-      if (match) {
+      for (const cluster of list) {
+        const photo = photoForSnapshot(cluster.photos, initialPreselectedPhoto);
+        if (photo) {
+          setPreselectMissNotice(null);
+          handleOpenRegister(cluster, observationIdOf(photo));
+          return;
+        }
+      }
+    }
+
+    if (!target) return;
+
+    for (const cluster of list) {
+      const photo = cluster.photos.find((p) => photoMatchesTarget(p, target));
+      if (photo) {
         setPreselectMissNotice(null);
-        handleOpenRegister(match, initialPreselectedPhoto);
+        handleOpenRegister(cluster, observationIdOf(photo));
         return;
       }
     }
 
-    const targetLogId = (initialPreselectedLogId || "").trim();
-    if (!targetLogId) return;
-
-    let matchedPhoto: StrangerPhoto | undefined;
-    const match = list.find((c) => {
-      const photo = c.photos.find((p) => p.logId === targetLogId);
-      if (photo) {
-        matchedPhoto = photo;
-        return true;
-      }
-      return false;
-    });
-
-    if (match) {
-      setPreselectMissNotice(null);
-      handleOpenRegister(match, matchedPhoto?.photoSnapshot);
-      return;
-    }
-
     // Already registered, merged or dismissed: keep listing the rest, just say so.
     setPreselectMissNotice(
-      `Không tìm thấy cụm ảnh cho lượt quét ${targetLogId} (có thể đã được xử lý hoặc từ chối).`
+      `Không tìm thấy cụm ảnh cho ${targetLabel(target)} (có thể đã được xử lý hoặc từ chối).`
     );
   };
 
@@ -179,20 +198,21 @@ export const StrangerClusterModal: React.FC<StrangerClusterModalProps> = ({
       setCursorHistory(history);
       setNextCursor(res.data.nextCursor || null);
 
-      const targetLogId = (initialPreselectedLogId || "").trim();
-      const localMatch = targetLogId && res.data.clusters.some((cluster) =>
-        cluster.photos.some((photo) => photo.logId === targetLogId));
-      if (targetLogId && !localMatch) {
-        const lookup = await operatorJsonFetch<{ success: boolean; cluster?: StrangerCluster; status?: string; error?: string }>(
-          `/api/strangers/lookup?logId=${encodeURIComponent(targetLogId)}`,
-        );
+      const localMatch = target && res.data.clusters.some((cluster) =>
+        cluster.photos.some((photo) => photoMatchesTarget(photo, target)));
+      if (target && !localMatch) {
+        const lookupUrl = target.kind === "face"
+          ? `/api/strangers/lookup?faceId=${encodeURIComponent(target.id)}`
+          : `/api/strangers/lookup?logId=${encodeURIComponent(target.id)}`;
+        const lookup = await operatorJsonFetch<{ success: boolean; cluster?: StrangerCluster; status?: string; error?: string }>(lookupUrl);
         if (lookup.ok && lookup.data?.cluster) {
           const cluster = lookup.data.cluster;
           setClusters((items: StrangerCluster[]) => items.some((item: StrangerCluster) => item.clusterId === cluster.clusterId) ? items : [cluster, ...items]);
           setPreselectMissNotice(null);
-          handleOpenRegister(cluster, cluster.photos.find((photo) => photo.logId === targetLogId)?.photoSnapshot);
+          const photo = cluster.photos.find((p) => photoMatchesTarget(p, target));
+          handleOpenRegister(cluster, photo ? observationIdOf(photo) : undefined);
         } else if (lookup.status === 404 || lookup.status === 410) {
-          setPreselectMissNotice(lookup.data?.error || `Không tìm thấy lượt quét ${targetLogId}.`);
+          setPreselectMissNotice(lookup.data?.error || `Không tìm thấy ${targetLabel(target)}.`);
         } else {
           throw new Error(lookup.data?.error || `HTTP ${lookup.status}`);
         }
@@ -213,11 +233,11 @@ export const StrangerClusterModal: React.FC<StrangerClusterModalProps> = ({
     if (isOpen) {
       loadClusters();
     }
-  }, [isOpen, initialPreselectedLogId]);
+  }, [isOpen, initialPreselectedLogId, initialPreselectedFaceId]);
 
-  const handleOpenRegister = (cluster: StrangerCluster, defaultPhoto?: string) => {
+  const handleOpenRegister = (cluster: StrangerCluster, preferredObservationId?: string) => {
     setSelectedCluster(cluster);
-    setActivePhotoUrl(defaultPhoto || cluster.primaryPhoto || cluster.photos[0]?.photoSnapshot || "");
+    setActiveObservationId(defaultActiveObservationId(cluster, preferredObservationId));
     // Auto-suggest next employee code
     const nextNum = Math.floor(4000 + Math.random() * 900);
     setEmployeeCode(`NV-${nextNum}`);
@@ -269,16 +289,16 @@ export const StrangerClusterModal: React.FC<StrangerClusterModalProps> = ({
 
     setSubmitting(true);
     try {
-      const clusterLogIds = selectedCluster.photos.map((p) => p.logId);
+      const activePhoto = findPhotoByObservationId(selectedCluster.photos, activeObservationId);
       const payload = {
         employeeId: mergeTarget.id,
         employeeCode: mergeTarget.employeeCode,
         clusterId: selectedCluster.clusterId,
         clusterVersion: selectedCluster.clusterVersion,
-        clusterLogIds,
         adoptPhoto,
-        photoUrl: activePhotoUrl || selectedCluster.primaryPhoto,
-        sourceLogId: selectedCluster.photos.find((photo: StrangerPhoto) => photo.photoSnapshot === activePhotoUrl)?.logId,
+        photoUrl: activePhoto?.photoSnapshot || selectedCluster.primaryPhoto,
+        // clusterLogIds + clusterObservationIds, sourceLogId + sourceObservationId
+        ...resolvePayloadIds(selectedCluster.photos, activePhoto),
       };
 
       const res = await operatorJsonFetch<{
@@ -346,7 +366,7 @@ export const StrangerClusterModal: React.FC<StrangerClusterModalProps> = ({
         body: JSON.stringify({
           clusterId: cluster.clusterId,
           clusterVersion: cluster.clusterVersion,
-          clusterLogIds: cluster.photos.map((p) => p.logId),
+          ...resolvePayloadIds(cluster.photos),
           reason: "Từ chối thủ công từ bảng người lạ",
         }),
       });
@@ -373,17 +393,18 @@ export const StrangerClusterModal: React.FC<StrangerClusterModalProps> = ({
 
     setSubmitting(true);
     try {
+      const activePhoto = findPhotoByObservationId(selectedCluster.photos, activeObservationId);
       const payload = {
         name: name.trim(),
         employeeCode: employeeCode.trim() || `NV-${Math.floor(1000 + Math.random() * 9000)}`,
         department: department.trim(),
         position: position.trim(),
         accessLevel,
-        photoUrl: activePhotoUrl || selectedCluster.primaryPhoto,
+        photoUrl: activePhoto?.photoSnapshot || selectedCluster.primaryPhoto,
         clusterId: selectedCluster.clusterId,
         clusterVersion: selectedCluster.clusterVersion,
-        clusterLogIds: selectedCluster.photos.map((p) => p.logId),
-        sourceLogId: selectedCluster.photos.find((photo: StrangerPhoto) => photo.photoSnapshot === activePhotoUrl)?.logId,
+        // clusterLogIds + clusterObservationIds, sourceLogId + sourceObservationId
+        ...resolvePayloadIds(selectedCluster.photos, activePhoto),
       };
 
       const res = await operatorJsonFetch<{
@@ -547,6 +568,10 @@ export const StrangerClusterModal: React.FC<StrangerClusterModalProps> = ({
             <div className="space-y-4">
               {clusters.map((cluster, idx) => {
                 const isSelected = selectedCluster?.clusterId === cluster.clusterId;
+                const activePhoto = isSelected
+                  ? findPhotoByObservationId(cluster.photos, activeObservationId)
+                  : undefined;
+                const activeFramePath = activePhoto ? frameLinkPath(activePhoto) : null;
 
                 return (
                   <div
@@ -625,21 +650,18 @@ export const StrangerClusterModal: React.FC<StrangerClusterModalProps> = ({
 
                       <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-6 gap-3">
                         {cluster.photos.map((photo, pIdx) => {
-                          const isPrimary =
-                            isSelected && activePhotoUrl === photo.photoSnapshot;
+                          // Several tiles can share one logId (two people in one frame):
+                          // the observation id is the only per-tile identity.
+                          const tileId = observationIdOf(photo);
+                          const isPrimary = isSelected && activeObservationId === tileId;
+                          const framePath = frameLinkPath(photo);
 
                           return (
                             <div
-                              key={photo.logId || pIdx}
+                              key={tileId}
                               id={`photo-card-${cluster.clusterId}-${pIdx}`}
-                              onClick={() => {
-                                if (isSelected) {
-                                  setActivePhotoUrl(photo.photoSnapshot);
-                                } else {
-                                  setPreviewEnlargedPhoto(photo.photoSnapshot);
-                                }
-                              }}
-                              className={`relative group aspect-square rounded-xl overflow-hidden border bg-slate-900 cursor-pointer transition-all ${
+                              data-observation-id={tileId}
+                              className={`relative group aspect-square rounded-xl overflow-hidden border bg-slate-900 transition-all ${
                                 isPrimary
                                   ? "ring-2 ring-indigo-600 border-indigo-600 shadow-md"
                                   : "border-slate-200 hover:border-slate-300 hover:shadow-xs"
@@ -651,29 +673,62 @@ export const StrangerClusterModal: React.FC<StrangerClusterModalProps> = ({
                                 className="w-full h-full group-hover:scale-105 transition-transform duration-200"
                               />
 
-                              {/* Keyboard-reachable zoom (the card click selects the avatar while registering) */}
+                              {/* Whole tile: selects the avatar while registering, otherwise enlarges */}
                               <button
                                 type="button"
-                                onClick={(e) => {
-                                  e.stopPropagation();
-                                  setPreviewEnlargedPhoto(photo.photoSnapshot);
+                                onClick={() => {
+                                  if (isSelected) {
+                                    setActiveObservationId(tileId);
+                                  } else {
+                                    setPreviewEnlargedPhoto(photo.photoSnapshot);
+                                  }
                                 }}
-                                className="absolute top-1.5 left-1.5 p-1 rounded-md bg-black/55 text-white opacity-80 hover:opacity-100 focus:opacity-100 focus:outline-hidden focus-visible:ring-2 focus-visible:ring-white"
+                                aria-pressed={isSelected ? isPrimary : undefined}
+                                // Not registering: the zoom button below is the keyboard path; skip this duplicate.
+                                tabIndex={isSelected ? 0 : -1}
+                                aria-hidden={isSelected ? undefined : true}
+                                aria-label={
+                                  isSelected
+                                    ? `Chọn ảnh khuôn mặt ${pIdx + 1} làm ảnh chính`
+                                    : `Phóng to ảnh khuôn mặt ${pIdx + 1}`
+                                }
+                                className="absolute inset-0 w-full h-full cursor-pointer focus:outline-hidden focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-indigo-400"
+                              />
+
+                              {/* Keyboard-reachable zoom (the tile click selects the avatar while registering) */}
+                              <button
+                                type="button"
+                                onClick={() => setPreviewEnlargedPhoto(photo.photoSnapshot)}
+                                className="absolute top-1.5 left-1.5 z-10 p-1 rounded-md bg-black/55 text-white opacity-80 hover:opacity-100 focus:opacity-100 focus:outline-hidden focus-visible:ring-2 focus-visible:ring-white"
                                 aria-label={`Phóng to ảnh khuôn mặt ${pIdx + 1}`}
                                 title="Phóng to"
                               >
                                 <ZoomIn className="w-3 h-3" />
                               </button>
 
+                              {/* A face tile is only the crop: the whole frame opens in a new tab */}
+                              {framePath && (
+                                <a
+                                  href={normalizeApiAssetUrl(framePath)}
+                                  target="_blank"
+                                  rel="noopener noreferrer"
+                                  className="absolute top-1.5 left-8 z-10 p-1 rounded-md bg-black/55 text-white opacity-80 hover:opacity-100 focus:opacity-100 focus:outline-hidden focus-visible:ring-2 focus-visible:ring-white"
+                                  aria-label={`Xem khung hình của ảnh ${pIdx + 1} (mở tab mới)`}
+                                  title="Xem khung hình"
+                                >
+                                  <ExternalLink className="w-3 h-3" />
+                                </a>
+                              )}
+
                               {/* Primary tag badge */}
                               {isPrimary && (
-                                <div className="absolute top-1.5 right-1.5 px-1.5 py-0.5 rounded-md bg-indigo-600 text-white text-[10px] font-bold shadow-xs">
+                                <div className="pointer-events-none absolute top-1.5 right-1.5 px-1.5 py-0.5 rounded-md bg-indigo-600 text-white text-[10px] font-bold shadow-xs">
                                   Avatar chính
                                 </div>
                               )}
 
                               {/* Time & Door metadata overlay */}
-                              <div className="absolute inset-x-0 bottom-0 bg-gradient-to-t from-black/80 via-black/40 to-transparent p-1.5 text-white">
+                              <div className="pointer-events-none absolute inset-x-0 bottom-0 bg-gradient-to-t from-black/80 via-black/40 to-transparent p-1.5 text-white">
                                 <p className="text-[10px] font-medium truncate flex items-center gap-1">
                                   <Clock className="w-2.5 h-2.5 shrink-0" />
                                   {new Date(photo.timestamp).toLocaleTimeString("vi-VN", {
@@ -694,6 +749,47 @@ export const StrangerClusterModal: React.FC<StrangerClusterModalProps> = ({
                     {/* Inline panel: create a new employee, or merge into an existing one */}
                     {isSelected && (
                       <div className="mt-5 space-y-4 animate-in slide-in-from-top duration-200">
+                        {/* Chosen photo: the face crop at thumbnail size (never blown up), plus its frame */}
+                        {activePhoto && (
+                          <div
+                            id={`active-photo-${cluster.clusterId}`}
+                            className="flex items-center gap-3 p-3 rounded-2xl border border-indigo-100 bg-indigo-50/40"
+                          >
+                            <FaceThumb
+                              src={activePhoto.photoSnapshot}
+                              alt="Ảnh đã chọn làm ảnh chính"
+                              className="w-24 h-24 max-w-[96px] rounded-xl"
+                              caption={activePhoto.doorName}
+                            />
+                            <div className="min-w-0 space-y-1">
+                              <p className="text-xs font-semibold text-slate-900" aria-live="polite">
+                                Ảnh chính: ảnh {cluster.photos.indexOf(activePhoto) + 1}/{cluster.photos.length}
+                              </p>
+                              <p className="text-[11px] text-slate-600">
+                                {new Date(activePhoto.timestamp).toLocaleString("vi-VN")} · {activePhoto.doorName}
+                              </p>
+                              <p className="text-[11px] text-slate-500">
+                                {activePhoto.faceId
+                                  ? "Ảnh cắt khuôn mặt của người này; khung hình đầy đủ có thể có người khác."
+                                  : "Ảnh toàn khung hình (bản ghi cũ)."}
+                              </p>
+                              {activeFramePath && (
+                                <a
+                                  id={`link-active-frame-${cluster.clusterId}`}
+                                  href={normalizeApiAssetUrl(activeFramePath)}
+                                  target="_blank"
+                                  rel="noopener noreferrer"
+                                  className="inline-flex items-center gap-1.5 text-xs font-semibold text-indigo-700 hover:text-indigo-900 underline underline-offset-2 focus:outline-hidden focus-visible:ring-2 focus-visible:ring-indigo-500 rounded"
+                                >
+                                  <ExternalLink className="w-3.5 h-3.5" />
+                                  <span>Xem khung hình</span>
+                                  <span className="sr-only">(mở tab mới)</span>
+                                </a>
+                              )}
+                            </div>
+                          </div>
+                        )}
+
                         {/* Mode switch */}
                         <div className="flex items-center gap-2 p-1 bg-slate-100 rounded-xl">
                           <button
@@ -818,7 +914,7 @@ export const StrangerClusterModal: React.FC<StrangerClusterModalProps> = ({
                             {mergeTarget && (
                               <div className="flex items-center gap-3 p-3 rounded-xl bg-emerald-50 border border-emerald-200">
                                 <FaceThumb
-                                  src={activePhotoUrl || cluster.primaryPhoto}
+                                  src={activePhoto?.photoSnapshot || cluster.primaryPhoto}
                                   alt="Ảnh người lạ"
                                   className="w-10 h-10 rounded-lg"
                                 />
