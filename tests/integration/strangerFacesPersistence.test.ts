@@ -176,6 +176,9 @@ describe("PostgreSQL: per-face stranger records", () => {
       crop: ["bytea", null, "YES", null],
       createdAt: ["character varying", 64, "NO", null],
       purgedAt: ["character varying", 64, "YES", null],
+      employeeId: ["character varying", 64, "YES", null],
+      matchCosine: ["real", null, "YES", null],
+      matchMargin: ["real", null, "YES", null],
     });
     const idx = (await client!.query(
       `SELECT indexname, indexdef FROM pg_indexes WHERE tablename = 'stranger_faces' ORDER BY indexname`,
@@ -183,6 +186,7 @@ describe("PostgreSQL: per-face stranger records", () => {
     assert.deepEqual(idx, [
       ["idx_stranger_faces_captured", `("capturedAt" DESC, id DESC) WHERE ("purgedAt" IS NULL)`],
       ["idx_stranger_faces_log", `("logId", "faceIndex")`],
+      ["idx_stranger_faces_recognised", `("employeeId", "capturedAt" DESC, id DESC) WHERE (("employeeId" IS NOT NULL) AND ("purgedAt" IS NULL))`],
       ["stranger_faces_pkey", "(id)"],
     ]);
     const fk = (await client!.query(
