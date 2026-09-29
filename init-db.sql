@@ -157,11 +157,52 @@ CREATE TABLE IF NOT EXISTS stranger_faces (
   "modelTag" VARCHAR(128),
   crop BYTEA,                      -- JPEG face crop
   "createdAt" VARCHAR(64) NOT NULL,
-  "purgedAt" VARCHAR(64)
+  "purgedAt" VARCHAR(64),
+  -- Recognised-face observation (accuracy wave): set when the door engine
+  -- granted this face. Such rows are not strangers (grouping skips them) but
+  -- feed camera adaptation. NULL on every stranger face.
+  "employeeId" VARCHAR(64),
+  "matchCosine" REAL,
+  "matchMargin" REAL
 );
 CREATE INDEX IF NOT EXISTS idx_stranger_faces_captured ON stranger_faces ("capturedAt" DESC, id DESC)
   WHERE "purgedAt" IS NULL;
 CREATE UNIQUE INDEX IF NOT EXISTS idx_stranger_faces_log ON stranger_faces ("logId", "faceIndex");
+CREATE INDEX IF NOT EXISTS idx_stranger_faces_recognised ON stranger_faces ("employeeId", "capturedAt" DESC, id DESC)
+  WHERE "employeeId" IS NOT NULL AND "purgedAt" IS NULL;
+
+-- One row per shadow-engine outcome next to the nearest door-engine event
+-- (src/server/shadowResults.ts). No images, no embeddings; retention is a
+-- DELETE by "decidedAt" (SHADOW_RESULT_RETENTION_DAYS, owner: 30 days). No
+-- foreign key to access_logs on purpose: the event may not be durable yet when
+-- the shadow decides, and clearing the history must not erase the comparison.
+-- Same DDL as PG_SHADOW_RESULTS_DDL in src/server/db.ts.
+CREATE TABLE IF NOT EXISTS pipeline_shadow_results (
+  id VARCHAR(64) COLLATE "C" PRIMARY KEY,
+  gate VARCHAR(64) NOT NULL,
+  "trackId" VARCHAR(64) NOT NULL,
+  outcome VARCHAR(16) NOT NULL,          -- employee | stranger | insufficient
+  "employeeId" VARCHAR(64),
+  "fusedCosine" REAL,
+  margin REAL,
+  "runnerUpEmployeeId" VARCHAR(64),
+  "runnerUpCosine" REAL,
+  basis VARCHAR(128) NOT NULL,
+  "fusionBasis" VARCHAR(128),
+  "meanCheckRefused" BOOLEAN,
+  "framesSeen" INTEGER NOT NULL,
+  "framesUsed" INTEGER NOT NULL,
+  "firstSeenAt" VARCHAR(64) NOT NULL,
+  "firstUsableAt" VARCHAR(64),
+  "decidedAt" VARCHAR(64) COLLATE "C" NOT NULL,
+  "legacyLogId" VARCHAR(64),             -- nearest door-engine event on the gate, if any
+  "legacyStatus" VARCHAR(16),            -- GRANTED | DENIED
+  "legacyEmployeeId" VARCHAR(64),
+  agreement VARCHAR(32) NOT NULL,        -- agree | shadow-only | legacy-only | identity-mismatch | none
+  "createdAt" VARCHAR(64) NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_shadow_results_decided ON pipeline_shadow_results ("decidedAt" DESC, id DESC);
+CREATE INDEX IF NOT EXISTS idx_shadow_results_gate ON pipeline_shadow_results (gate, "decidedAt" DESC);
 
 -- AI recognition engine settings (engine mode, Gemini model, thresholds).
 -- Single row id = 'default'; the server hydrates it into memory at startup.
@@ -193,7 +234,7 @@ CREATE TABLE IF NOT EXISTS face_templates (
   embedding BYTEA NOT NULL,        -- float32 little-endian, `dims` values, L2-normalised
   dims INTEGER NOT NULL,
   "modelTag" VARCHAR(64) NOT NULL, -- e.g. arcface_w600k_r50; never compare across tags
-  source VARCHAR(32) NOT NULL,     -- enrollment | merge | manual | auto
+  source VARCHAR(32) NOT NULL,     -- enrollment | merge | manual | auto | adaptation
   quality REAL,
   "capturedAt" VARCHAR(64),
   "sourceLogId" VARCHAR(64),

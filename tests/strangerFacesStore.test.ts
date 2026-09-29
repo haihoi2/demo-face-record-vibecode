@@ -134,7 +134,7 @@ describe("SQLite: per-face stranger store", () => {
       assert.deepEqual(cols, [
         "id", "logId", "faceIndex", "capturedAt", "gate", "streamId", "engine", "trackId", "box",
         "sourceWidth", "sourceHeight", "detectorScore", "quality", "edgeEnergy", "sizePx", "embedding", "dims", "modelTag",
-        "crop", "createdAt", "purgedAt",
+        "crop", "createdAt", "purgedAt", "employeeId", "matchCosine", "matchMargin",
       ]);
       const idx = (inspect.prepare("PRAGMA index_list(stranger_faces)").all() as Array<{ name: string; unique: number; partial: number }>)
         .filter((i) => i.name.startsWith("idx_")).map((i) => ({ name: i.name, unique: i.unique, partial: i.partial }))
@@ -142,6 +142,7 @@ describe("SQLite: per-face stranger store", () => {
       assert.deepEqual(idx, [
         { name: "idx_stranger_faces_captured", unique: 0, partial: 1 },
         { name: "idx_stranger_faces_log", unique: 1, partial: 0 },
+        { name: "idx_stranger_faces_recognised", unique: 0, partial: 1 },
       ]);
       const purged = inspect.prepare("SELECT crop, embedding, purgedAt FROM stranger_faces WHERE purgedAt IS NOT NULL").all() as any[];
       assert.equal(purged.length, 2);

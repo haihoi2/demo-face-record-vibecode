@@ -13,6 +13,8 @@ import {
   StorageTrackerState,
 } from "./dbStatus";
 import type { StrangerFacePage, StrangerFaceRecord, StrangerFaceStore } from "./strangerFaces";
+import type { ShadowAccuracySummary, ShadowAgreement, ShadowResultRecord, ShadowResultStore } from "./shadowResults";
+import type { FaceTemplate } from "../types";
 
 // Safe dynamic loader for Node 22 native sqlite DatabaseSync
 function getDatabaseSyncClass(): any {
@@ -411,11 +413,34 @@ export interface FaceTemplateRecord {
   embedding: number[];
   dims: number;
   modelTag: string;
-  source: "enrollment" | "merge" | "manual" | "auto";
+  /**
+   * "adaptation" (accuracy wave): derived automatically from a confident
+   * door-engine grant on one camera (galleryAdaptation.ts); listed and
+   * deletable like any other template.
+   */
+  source: FaceTemplateSource;
   quality: number;
   capturedAt: string;
   sourceLogId?: string;
   streamId?: string;
+}
+
+/**
+ * The source union is defined once, in src/types.ts (FaceTemplate.source), so
+ * the gallery (`buildGallery(db.getFaceTemplates())` in server.ts) and the
+ * store agree. Adding "adaptation" there widens this type too. Nothing in the
+ * stores validates or constrains the value (VARCHAR(32) / TEXT, no CHECK), so
+ * "adaptation" templates round-trip on every store already.
+ */
+export type FaceTemplateSource = FaceTemplate["source"];
+
+/** Templates per employee per camera per source (coverage indicator, adaptation cap). */
+export interface FaceTemplateCount {
+  employeeId: string;
+  /** null for templates without a camera (photo enrolment). */
+  streamId: string | null;
+  source: FaceTemplateSource;
+  count: number;
 }
 
 /**
@@ -689,6 +714,8 @@ const STRANGER_FACE_MAX_DIMS = 4096;
 /** A face crop is 20-40 KB (faceCrop.ts); anything near this is not a face crop. */
 export const STRANGER_FACE_MAX_CROP_BYTES = 2 * 1024 * 1024;
 const STRANGER_FACE_MAX_INDEX = 1000;
+/** employees.id is VARCHAR(64); printable ASCII, no spaces (EMP-<uuid> today, imported ids tolerated). */
+const EMPLOYEE_ID_RE = /^[\x21-\x7E]{1,64}$/;
 
 /** A validated face as the stores hold it (crop as bytes, embedding as float32 LE bytes). */
 interface StrangerFaceRow {
@@ -712,6 +739,10 @@ interface StrangerFaceRow {
   modelTag: string | null;
   crop: Buffer | null;
   createdAt: string;
+  /** Recognised-face observation (accuracy wave): the employee the door engine granted, with its match scores. */
+  employeeId: string | null;
+  matchCosine: number | null;
+  matchMargin: number | null;
 }
 
 /** JSON-fallback shape: embedding as numbers, crop as base64 (a Buffer would serialise as a byte list). */
@@ -771,6 +802,20 @@ export function normalizeStrangerFace(face: StrangerFaceRecord): { row?: Strange
     if (!Buffer.isBuffer(face.crop) || face.crop.length > STRANGER_FACE_MAX_CROP_BYTES) return { error: "crop" };
     if (face.crop.length) crop = Buffer.from(face.crop);
   }
+  // A recognised-face observation names the granted employee and carries the
+  // scores camera adaptation filters on; without both scores it could never be
+  // used, so it is refused rather than stored half-described. A stranger face
+  // (no employeeId) stores no match scores.
+  let employeeId: string | null = null;
+  let matchCosine: number | null = null;
+  let matchMargin: number | null = null;
+  if (face.employeeId !== undefined && face.employeeId !== null && face.employeeId !== "") {
+    if (typeof face.employeeId !== "string" || !EMPLOYEE_ID_RE.test(face.employeeId)) return { error: "employeeId" };
+    if (!realValue(face.matchCosine) || !realValue(face.matchMargin)) return { error: "matchScores" };
+    employeeId = face.employeeId;
+    matchCosine = face.matchCosine;
+    matchMargin = face.matchMargin;
+  }
   return {
     row: {
       id: face.id,
@@ -793,6 +838,9 @@ export function normalizeStrangerFace(face: StrangerFaceRecord): { row?: Strange
       modelTag,
       crop,
       createdAt: normIso(face.createdAt) || new Date().toISOString(),
+      employeeId,
+      matchCosine,
+      matchMargin,
     },
   };
 }
@@ -831,6 +879,9 @@ function rowToStrangerFace(r: any): StrangerFaceRecord {
     modelTag: optionalText(r.modelTag),
     createdAt: String(r.createdAt),
     purgedAt: optionalText(r.purgedAt),
+    employeeId: optionalText(r.employeeId),
+    matchCosine: optionalNumber(r.matchCosine),
+    matchMargin: optionalNumber(r.matchMargin),
   };
   for (const key of Object.keys(out) as Array<keyof StrangerFaceRecord>) {
     if (out[key] === undefined) delete out[key];
@@ -857,15 +908,24 @@ function jsonToStrangerFace(face: StrangerFaceJson): StrangerFaceRecord {
 
 const STRANGER_FACE_COLUMNS_PG = `id, "logId", "faceIndex", "capturedAt", gate, "streamId", engine, "trackId", box,
   "sourceWidth", "sourceHeight", "detectorScore", quality, "edgeEnergy", "sizePx", embedding, dims, "modelTag",
-  "createdAt", "purgedAt"`;
+  "createdAt", "purgedAt", "employeeId", "matchCosine", "matchMargin"`;
 const STRANGER_FACE_COLUMNS_SQLITE = `id, logId, faceIndex, capturedAt, gate, streamId, engine, trackId, box,
   sourceWidth, sourceHeight, detectorScore, quality, edgeEnergy, sizePx, embedding, dims, modelTag,
-  createdAt, purgedAt`;
+  createdAt, purgedAt, employeeId, matchCosine, matchMargin`;
+
+/** Insert column lists (no purgedAt: a new face is never born purged). 23 parameters. */
+const STRANGER_FACE_INSERT_COLUMNS_PG = `id, "logId", "faceIndex", "capturedAt", gate, "streamId", engine, "trackId", box,
+  "sourceWidth", "sourceHeight", "detectorScore", quality, "edgeEnergy", "sizePx", embedding, dims, "modelTag",
+  crop, "createdAt", "employeeId", "matchCosine", "matchMargin"`;
+const STRANGER_FACE_INSERT_COLUMNS_SQLITE = `id, logId, faceIndex, capturedAt, gate, streamId, engine, trackId, box,
+  sourceWidth, sourceHeight, detectorScore, quality, edgeEnergy, sizePx, embedding, dims, modelTag,
+  crop, createdAt, employeeId, matchCosine, matchMargin`;
+const STRANGER_FACE_INSERT_PARAM_COUNT = 23;
 
 const strangerFaceInsertParams = (f: StrangerFaceRow, box: unknown): unknown[] => [
   f.id, f.logId, f.faceIndex, f.capturedAt, f.gate, f.streamId, f.engine, f.trackId, box,
   f.sourceWidth, f.sourceHeight, f.detectorScore, f.quality, f.edgeEnergy, f.sizePx,
-  f.embedding, f.dims, f.modelTag, f.crop, f.createdAt,
+  f.embedding, f.dims, f.modelTag, f.crop, f.createdAt, f.employeeId, f.matchCosine, f.matchMargin,
 ];
 
 /**
@@ -901,12 +961,297 @@ const PG_STRANGER_FACES_DDL = `
     "modelTag" VARCHAR(128),
     crop BYTEA,
     "createdAt" VARCHAR(64) NOT NULL,
-    "purgedAt" VARCHAR(64)
+    "purgedAt" VARCHAR(64),
+    "employeeId" VARCHAR(64),
+    "matchCosine" REAL,
+    "matchMargin" REAL
   );
   CREATE INDEX IF NOT EXISTS idx_stranger_faces_captured ON stranger_faces ("capturedAt" DESC, id DESC)
     WHERE "purgedAt" IS NULL;
   CREATE UNIQUE INDEX IF NOT EXISTS idx_stranger_faces_log ON stranger_faces ("logId", "faceIndex");
+  -- Recognised-face observations (accuracy wave, 2026-09-29): additive,
+  -- nullable, no default (catalog-only ALTER). Old rows read NULL = a stranger
+  -- face, exactly what they were. Rollback: DROP COLUMN x3 + DROP INDEX.
+  ALTER TABLE stranger_faces ADD COLUMN IF NOT EXISTS "employeeId" VARCHAR(64);
+  ALTER TABLE stranger_faces ADD COLUMN IF NOT EXISTS "matchCosine" REAL;
+  ALTER TABLE stranger_faces ADD COLUMN IF NOT EXISTS "matchMargin" REAL;
+  CREATE INDEX IF NOT EXISTS idx_stranger_faces_recognised ON stranger_faces ("employeeId", "capturedAt" DESC, id DESC)
+    WHERE "employeeId" IS NOT NULL AND "purgedAt" IS NULL;
 `;
+
+/**
+ * pipeline_shadow_results on PostgreSQL (src/server/shadowResults.ts). One row
+ * per shadow-engine outcome; no images, no embeddings, so nothing biometric
+ * lives here (retention is a plain DELETE by decidedAt). No foreign key to
+ * access_logs: the door-engine event may not be durable yet when the shadow
+ * decides, and an admin wipe of the history must not erase the comparison.
+ * id and decidedAt sort bytewise (COLLATE "C") like stranger_faces so keyset
+ * paging orders exactly as SQLite and JSON do.
+ */
+const PG_SHADOW_RESULTS_DDL = `
+  CREATE TABLE IF NOT EXISTS pipeline_shadow_results (
+    id VARCHAR(64) COLLATE "C" PRIMARY KEY,
+    gate VARCHAR(64) NOT NULL,
+    "trackId" VARCHAR(64) NOT NULL,
+    outcome VARCHAR(16) NOT NULL,
+    "employeeId" VARCHAR(64),
+    "fusedCosine" REAL,
+    margin REAL,
+    "runnerUpEmployeeId" VARCHAR(64),
+    "runnerUpCosine" REAL,
+    basis VARCHAR(128) NOT NULL,
+    "fusionBasis" VARCHAR(128),
+    "meanCheckRefused" BOOLEAN,
+    "framesSeen" INTEGER NOT NULL,
+    "framesUsed" INTEGER NOT NULL,
+    "firstSeenAt" VARCHAR(64) NOT NULL,
+    "firstUsableAt" VARCHAR(64),
+    "decidedAt" VARCHAR(64) COLLATE "C" NOT NULL,
+    "legacyLogId" VARCHAR(64),
+    "legacyStatus" VARCHAR(16),
+    "legacyEmployeeId" VARCHAR(64),
+    agreement VARCHAR(32) NOT NULL,
+    "createdAt" VARCHAR(64) NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS idx_shadow_results_decided ON pipeline_shadow_results ("decidedAt" DESC, id DESC);
+  CREATE INDEX IF NOT EXISTS idx_shadow_results_gate ON pipeline_shadow_results (gate, "decidedAt" DESC);
+`;
+
+const SQLITE_SHADOW_RESULTS_DDL = `
+  CREATE TABLE IF NOT EXISTS pipeline_shadow_results (
+    id TEXT PRIMARY KEY,
+    gate TEXT NOT NULL,
+    trackId TEXT NOT NULL,
+    outcome TEXT NOT NULL,
+    employeeId TEXT,
+    fusedCosine REAL,
+    margin REAL,
+    runnerUpEmployeeId TEXT,
+    runnerUpCosine REAL,
+    basis TEXT NOT NULL,
+    fusionBasis TEXT,
+    meanCheckRefused INTEGER,
+    framesSeen INTEGER NOT NULL,
+    framesUsed INTEGER NOT NULL,
+    firstSeenAt TEXT NOT NULL,
+    firstUsableAt TEXT,
+    decidedAt TEXT NOT NULL,
+    legacyLogId TEXT,
+    legacyStatus TEXT,
+    legacyEmployeeId TEXT,
+    agreement TEXT NOT NULL,
+    createdAt TEXT NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS idx_shadow_results_decided ON pipeline_shadow_results (decidedAt DESC, id DESC);
+  CREATE INDEX IF NOT EXISTS idx_shadow_results_gate ON pipeline_shadow_results (gate, decidedAt DESC);
+`;
+
+// ================= SHADOW RESULTS (accuracy wave) =================
+// Limits mirror the PostgreSQL columns so SQLite and JSON refuse what
+// PostgreSQL would. Everything here is server-generated (server.ts writes it
+// from the pipeline), so a malformed required field is a bug and the row is
+// refused; malformed descriptive scores are stored as NULL.
+
+const SHADOW_RESULT_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$/;
+const SHADOW_GATE_RE = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$/;
+/** basis / fusionBasis: short machine strings ("fused-2", "rejected-ambiguous", ...). */
+const SHADOW_BASIS_RE = /^[\x21-\x7E]{1,128}$/;
+const SHADOW_OUTCOMES: ReadonlySet<string> = new Set(["employee", "stranger", "insufficient"]);
+const SHADOW_AGREEMENTS: ReadonlySet<string> = new Set(["agree", "shadow-only", "legacy-only", "identity-mismatch", "none"]);
+const SHADOW_MAX_FRAMES = 2_147_483_647;
+const SHADOW_PAGE_MAX = 100;
+
+/** A validated shadow result as the stores hold it (NULL for absent optionals). */
+interface ShadowResultRow {
+  id: string;
+  gate: string;
+  trackId: string;
+  outcome: ShadowResultRecord["outcome"];
+  employeeId: string | null;
+  fusedCosine: number | null;
+  margin: number | null;
+  runnerUpEmployeeId: string | null;
+  runnerUpCosine: number | null;
+  basis: string;
+  fusionBasis: string | null;
+  meanCheckRefused: boolean | null;
+  framesSeen: number;
+  framesUsed: number;
+  firstSeenAt: string;
+  firstUsableAt: string | null;
+  decidedAt: string;
+  legacyLogId: string | null;
+  legacyStatus: "GRANTED" | "DENIED" | null;
+  legacyEmployeeId: string | null;
+  agreement: ShadowAgreement;
+  createdAt: string;
+}
+
+const frameCount = (v: unknown): v is number => Number.isSafeInteger(v) && (v as number) >= 0 && (v as number) <= SHADOW_MAX_FRAMES;
+const optionalId = (v: unknown, re: RegExp): { value: string | null; ok: boolean } => {
+  if (v === undefined || v === null || v === "") return { value: null, ok: true };
+  return typeof v === "string" && re.test(v) ? { value: v, ok: true } : { value: null, ok: false };
+};
+
+/**
+ * Validate one shadow result for storage. id, gate, trackId, outcome, basis,
+ * frame counts, firstSeenAt, decidedAt and agreement are required (the row
+ * could not be paged, filtered or summarised without them); an employee
+ * outcome needs its employeeId; ids that are present must fit their VARCHAR(64)
+ * columns. Malformed scores and fusionBasis are stored as NULL; a malformed
+ * firstUsableAt is dropped (the row then simply has no latency sample).
+ */
+export function normalizeShadowResult(record: ShadowResultRecord): { row?: ShadowResultRow; error?: string } {
+  if (!record || typeof record !== "object") return { error: "not-an-object" };
+  if (typeof record.id !== "string" || !SHADOW_RESULT_ID_RE.test(record.id)) return { error: "id" };
+  if (typeof record.gate !== "string" || !SHADOW_GATE_RE.test(record.gate)) return { error: "gate" };
+  if (typeof record.trackId !== "string" || !TRACK_ID_RE.test(record.trackId)) return { error: "trackId" };
+  if (typeof record.outcome !== "string" || !SHADOW_OUTCOMES.has(record.outcome)) return { error: "outcome" };
+  const employeeId = optionalId(record.employeeId, EMPLOYEE_ID_RE);
+  if (!employeeId.ok || (record.outcome === "employee" && !employeeId.value)) return { error: "employeeId" };
+  const runnerUp = optionalId(record.runnerUpEmployeeId, EMPLOYEE_ID_RE);
+  if (!runnerUp.ok) return { error: "runnerUpEmployeeId" };
+  if (typeof record.basis !== "string" || !SHADOW_BASIS_RE.test(record.basis)) return { error: "basis" };
+  if (!frameCount(record.framesSeen) || !frameCount(record.framesUsed)) return { error: "frames" };
+  const firstSeenAt = normIso(record.firstSeenAt);
+  if (!firstSeenAt) return { error: "firstSeenAt" };
+  const decidedAt = normIso(record.decidedAt);
+  if (!decidedAt) return { error: "decidedAt" };
+  const legacyLogId = optionalId(record.legacyLogId, ACCESS_LOG_ID_RE);
+  if (!legacyLogId.ok) return { error: "legacyLogId" };
+  if (record.legacyStatus !== undefined && record.legacyStatus !== null && record.legacyStatus !== "GRANTED" && record.legacyStatus !== "DENIED") {
+    return { error: "legacyStatus" };
+  }
+  const legacyEmployeeId = optionalId(record.legacyEmployeeId, EMPLOYEE_ID_RE);
+  if (!legacyEmployeeId.ok) return { error: "legacyEmployeeId" };
+  if (typeof record.agreement !== "string" || !SHADOW_AGREEMENTS.has(record.agreement)) return { error: "agreement" };
+  return {
+    row: {
+      id: record.id,
+      gate: record.gate,
+      trackId: record.trackId,
+      outcome: record.outcome,
+      employeeId: employeeId.value,
+      fusedCosine: realValue(record.fusedCosine) ? record.fusedCosine : null,
+      margin: realValue(record.margin) ? record.margin : null,
+      runnerUpEmployeeId: runnerUp.value,
+      runnerUpCosine: realValue(record.runnerUpCosine) ? record.runnerUpCosine : null,
+      basis: record.basis,
+      fusionBasis: typeof record.fusionBasis === "string" && SHADOW_BASIS_RE.test(record.fusionBasis) ? record.fusionBasis : null,
+      meanCheckRefused: record.meanCheckRefused === true ? true : record.meanCheckRefused === false ? false : null,
+      framesSeen: record.framesSeen,
+      framesUsed: record.framesUsed,
+      firstSeenAt,
+      firstUsableAt: normIso(record.firstUsableAt) || null,
+      decidedAt,
+      legacyLogId: legacyLogId.value,
+      legacyStatus: record.legacyStatus || null,
+      legacyEmployeeId: legacyEmployeeId.value,
+      agreement: record.agreement,
+      createdAt: normIso(record.createdAt) || new Date().toISOString(),
+    },
+  };
+}
+
+/** A PostgreSQL/SQLite/JSON row -> record; absent optionals (NULL) are omitted. */
+function rowToShadowResult(r: any): ShadowResultRecord {
+  const out: ShadowResultRecord = {
+    id: String(r.id),
+    gate: String(r.gate),
+    trackId: String(r.trackId),
+    outcome: r.outcome,
+    employeeId: optionalText(r.employeeId),
+    fusedCosine: optionalNumber(r.fusedCosine),
+    margin: optionalNumber(r.margin),
+    runnerUpEmployeeId: optionalText(r.runnerUpEmployeeId),
+    runnerUpCosine: optionalNumber(r.runnerUpCosine),
+    basis: String(r.basis),
+    fusionBasis: optionalText(r.fusionBasis),
+    meanCheckRefused: r.meanCheckRefused == null ? undefined : r.meanCheckRefused === true || r.meanCheckRefused === 1,
+    framesSeen: Number(r.framesSeen),
+    framesUsed: Number(r.framesUsed),
+    firstSeenAt: String(r.firstSeenAt),
+    firstUsableAt: optionalText(r.firstUsableAt),
+    decidedAt: String(r.decidedAt),
+    legacyLogId: optionalText(r.legacyLogId),
+    legacyStatus: r.legacyStatus === "GRANTED" || r.legacyStatus === "DENIED" ? r.legacyStatus : undefined,
+    legacyEmployeeId: optionalText(r.legacyEmployeeId),
+    agreement: r.agreement,
+    createdAt: String(r.createdAt),
+  };
+  for (const key of Object.keys(out) as Array<keyof ShadowResultRecord>) {
+    if (out[key] === undefined) delete out[key];
+  }
+  return out;
+}
+
+const SHADOW_RESULT_COLUMNS_PG = `id, gate, "trackId", outcome, "employeeId", "fusedCosine", margin, "runnerUpEmployeeId", "runnerUpCosine",
+  basis, "fusionBasis", "meanCheckRefused", "framesSeen", "framesUsed", "firstSeenAt", "firstUsableAt", "decidedAt",
+  "legacyLogId", "legacyStatus", "legacyEmployeeId", agreement, "createdAt"`;
+const SHADOW_RESULT_COLUMNS_SQLITE = `id, gate, trackId, outcome, employeeId, fusedCosine, margin, runnerUpEmployeeId, runnerUpCosine,
+  basis, fusionBasis, meanCheckRefused, framesSeen, framesUsed, firstSeenAt, firstUsableAt, decidedAt,
+  legacyLogId, legacyStatus, legacyEmployeeId, agreement, createdAt`;
+const SHADOW_RESULT_PARAM_COUNT = 22;
+
+const shadowResultInsertParams = (r: ShadowResultRow, meanCheckRefused: unknown): unknown[] => [
+  r.id, r.gate, r.trackId, r.outcome, r.employeeId, r.fusedCosine, r.margin, r.runnerUpEmployeeId, r.runnerUpCosine,
+  r.basis, r.fusionBasis, meanCheckRefused, r.framesSeen, r.framesUsed, r.firstSeenAt, r.firstUsableAt, r.decidedAt,
+  r.legacyLogId, r.legacyStatus, r.legacyEmployeeId, r.agreement, r.createdAt,
+];
+
+/** Bytewise (decidedAt DESC, id DESC), the order every store pages in. */
+const shadowNewestFirst = (a: { decidedAt: string; id: string }, b: { decidedAt: string; id: string }): number =>
+  a.decidedAt < b.decidedAt ? 1 : a.decidedAt > b.decidedAt ? -1 : a.id < b.id ? 1 : a.id > b.id ? -1 : 0;
+
+/** Median of a list of latencies in ms (mean of the two middle values for an even count), rounded; null for none. */
+export function medianMs(values: number[]): number | null {
+  const xs = values.filter((v) => Number.isFinite(v)).sort((a, b) => a - b);
+  if (!xs.length) return null;
+  const mid = xs.length >> 1;
+  return Math.round(xs.length % 2 ? xs[mid] : (xs[mid - 1] + xs[mid]) / 2);
+}
+
+/**
+ * ShadowAccuracySummary rows from light rows (gate, outcome, framesUsed,
+ * agreement, decidedAt, firstUsableAt). One definition for every store; the
+ * SQL stores pre-aggregate the counts and only send employee latencies here.
+ */
+function emptyShadowSummary(gate: string, since: string): ShadowAccuracySummary {
+  return {
+    gate, since, decisions: 0, employees: 0, strangers: 0, insufficient: 0, framesUsedZero: 0,
+    agree: 0, shadowOnly: 0, legacyOnly: 0, identityMismatch: 0, none: 0, decisionLatencyP50Ms: null,
+  };
+}
+
+function countShadowRow(s: ShadowAccuracySummary, r: { outcome: string; framesUsed: number; agreement: string }): void {
+  s.decisions += 1;
+  if (r.outcome === "employee") s.employees += 1;
+  else if (r.outcome === "stranger") s.strangers += 1;
+  else if (r.outcome === "insufficient") s.insufficient += 1;
+  if (Number(r.framesUsed) === 0) s.framesUsedZero += 1;
+  if (r.agreement === "agree") s.agree += 1;
+  else if (r.agreement === "shadow-only") s.shadowOnly += 1;
+  else if (r.agreement === "legacy-only") s.legacyOnly += 1;
+  else if (r.agreement === "identity-mismatch") s.identityMismatch += 1;
+  else if (r.agreement === "none") s.none += 1;
+}
+
+/** The count columns of an aggregated SQL row, as integers (SQLite sums come back as numbers, PostgreSQL ::int too). */
+function pickShadowCounts(r: any): Omit<ShadowAccuracySummary, "gate" | "since" | "decisionLatencyP50Ms"> {
+  const n = (v: unknown) => Number(v) || 0;
+  return {
+    decisions: n(r.decisions), employees: n(r.employees), strangers: n(r.strangers), insufficient: n(r.insufficient),
+    framesUsedZero: n(r.framesUsedZero), agree: n(r.agree), shadowOnly: n(r.shadowOnly), legacyOnly: n(r.legacyOnly),
+    identityMismatch: n(r.identityMismatch), none: n(r.none),
+  };
+}
+
+/** decidedAt - firstUsableAt in ms, for employee outcomes that have a usable-frame time. */
+const shadowLatencyMs = (r: { outcome: string; decidedAt: string; firstUsableAt?: string | null }): number | null => {
+  if (r.outcome !== "employee" || !r.firstUsableAt) return null;
+  const ms = Date.parse(r.decidedAt) - Date.parse(String(r.firstUsableAt));
+  return Number.isFinite(ms) ? ms : null;
+};
 
 const SQLITE_STRANGER_FACES_DDL = `
   CREATE TABLE IF NOT EXISTS stranger_faces (
@@ -930,11 +1275,25 @@ const SQLITE_STRANGER_FACES_DDL = `
     modelTag TEXT,
     crop BLOB,
     createdAt TEXT NOT NULL,
-    purgedAt TEXT
+    purgedAt TEXT,
+    employeeId TEXT,
+    matchCosine REAL,
+    matchMargin REAL
   );
   CREATE INDEX IF NOT EXISTS idx_stranger_faces_captured ON stranger_faces (capturedAt DESC, id DESC)
     WHERE purgedAt IS NULL;
   CREATE UNIQUE INDEX IF NOT EXISTS idx_stranger_faces_log ON stranger_faces (logId, faceIndex);
+`;
+/** Databases from the per-face release: add the observation columns (duplicate-column error = already done). */
+const SQLITE_STRANGER_FACES_MIGRATIONS = [
+  "ALTER TABLE stranger_faces ADD COLUMN employeeId TEXT",
+  "ALTER TABLE stranger_faces ADD COLUMN matchCosine REAL",
+  "ALTER TABLE stranger_faces ADD COLUMN matchMargin REAL",
+];
+/** After the columns exist (fresh or migrated). */
+const SQLITE_STRANGER_FACES_RECOGNISED_INDEX = `
+  CREATE INDEX IF NOT EXISTS idx_stranger_faces_recognised ON stranger_faces (employeeId, capturedAt DESC, id DESC)
+    WHERE employeeId IS NOT NULL AND purgedAt IS NULL;
 `;
 
 export interface CameraStreamsConfigRecord {
@@ -1080,7 +1439,7 @@ export function mergeAiRecognitionConfig(
 }
 
 // Database wrapper supporting PostgreSQL (via DATABASE_URL), native Node 22 SQLite, and fallback JSON
-class SQLiteStorage implements StrangerFaceStore {
+class SQLiteStorage implements StrangerFaceStore, ShadowResultStore {
   private db: any = null;
   private isNativeSqlite = false;
   private pgPool: Pool | null = null;
@@ -1106,6 +1465,8 @@ class SQLiteStorage implements StrangerFaceStore {
    * working exactly as before.
    */
   private pgStrangerFacesReady = false;
+  /** pipeline_shadow_results exists on PostgreSQL (same pattern: refuse writes until then). */
+  private pgShadowResultsReady = false;
 
   constructor() {
     this.init();
@@ -1704,6 +2065,12 @@ class SQLiteStorage implements StrangerFaceStore {
       } catch (err) {
         console.error("[PostgreSQL] Lỗi khởi tạo bảng stranger_faces:", err);
       }
+      try {
+        await this.pgPool.query(PG_SHADOW_RESULTS_DDL);
+        this.pgShadowResultsReady = true;
+      } catch (err) {
+        console.error("[PostgreSQL] Lỗi khởi tạo bảng pipeline_shadow_results:", err);
+      }
       this.warnStrandedLocalStrangerFaces();
       await this.loadResolvedStrangerClusters();
       await this.loadStrangerResolutions();
@@ -1928,8 +2295,17 @@ class SQLiteStorage implements StrangerFaceStore {
     }
     try {
       this.db.exec(SQLITE_STRANGER_FACES_DDL);
+      for (const migration of SQLITE_STRANGER_FACES_MIGRATIONS) {
+        try { this.db.exec(migration); } catch { /* column already present */ }
+      }
+      this.db.exec(SQLITE_STRANGER_FACES_RECOGNISED_INDEX);
     } catch (err) {
       console.error("[SQLite] Lỗi khởi tạo bảng stranger_faces:", err);
+    }
+    try {
+      this.db.exec(SQLITE_SHADOW_RESULTS_DDL);
+    } catch (err) {
+      console.error("[SQLite] Lỗi khởi tạo bảng pipeline_shadow_results:", err);
     }
   }
 
@@ -1952,6 +2328,7 @@ class SQLiteStorage implements StrangerFaceStore {
     app_users?: UserRecord[];
     org_catalog?: OrgCatalogRecord;
     stranger_faces?: StrangerFaceJson[];
+    pipeline_shadow_results?: ShadowResultRecord[];
   } = {
     employees: [],
     access_logs: [],
@@ -2545,11 +2922,20 @@ class SQLiteStorage implements StrangerFaceStore {
     }
   }
 
-  private strangerFaceMode(): "postgresql" | "sqlite" | "json" | null {
-    if (this.pgPool && this.isPostgres) return this.pgStrangerFacesReady ? "postgresql" : null;
+  /**
+   * The one store a single-authority table lives in: PostgreSQL when it is the
+   * active authority and the table's migration ran (`pgReady`), null while
+   * PostgreSQL is configured but not usable yet, else native SQLite, else JSON.
+   */
+  private singleStoreMode(pgReady: boolean): "postgresql" | "sqlite" | "json" | null {
+    if (this.pgPool && this.isPostgres) return pgReady ? "postgresql" : null;
     if (this.storage.connecting) return null;
     if (this.isNativeSqlite && this.db) return "sqlite";
     return "json";
+  }
+
+  private strangerFaceMode(): "postgresql" | "sqlite" | "json" | null {
+    return this.singleStoreMode(this.pgStrangerFacesReady);
   }
 
   /**
@@ -2595,14 +2981,13 @@ class SQLiteStorage implements StrangerFaceStore {
       const values = rows.map((row) => {
         const start = params.length;
         params.push(...strangerFaceInsertParams(row, JSON.stringify(row.box)));
-        const p = (i: number) => `$${start + i}`;
-        return `(${p(1)},${p(2)},${p(3)},${p(4)},${p(5)},${p(6)},${p(7)},${p(8)},${p(9)}::jsonb,${p(10)},${p(11)},${p(12)},${p(13)},${p(14)},${p(15)},${p(16)},${p(17)},${p(18)},${p(19)},${p(20)})`;
+        // $9 is the box (jsonb); the rest bind as their column types.
+        const placeholders = Array.from({ length: STRANGER_FACE_INSERT_PARAM_COUNT }, (_, i) => `$${start + i + 1}${i === 8 ? "::jsonb" : ""}`);
+        return `(${placeholders.join(",")})`;
       });
       try {
         await this.pgPool!.query(
-          `INSERT INTO stranger_faces (id, "logId", "faceIndex", "capturedAt", gate, "streamId", engine, "trackId", box,
-             "sourceWidth", "sourceHeight", "detectorScore", quality, "edgeEnergy", "sizePx", embedding, dims, "modelTag",
-             crop, "createdAt")
+          `INSERT INTO stranger_faces (${STRANGER_FACE_INSERT_COLUMNS_PG})
            VALUES ${values.join(",")}
            ON CONFLICT DO NOTHING`,
           params,
@@ -2630,9 +3015,8 @@ class SQLiteStorage implements StrangerFaceStore {
           return false;
         }
         const insert = this.db.prepare(
-          `INSERT INTO stranger_faces (id, logId, faceIndex, capturedAt, gate, streamId, engine, trackId, box,
-             sourceWidth, sourceHeight, detectorScore, quality, edgeEnergy, sizePx, embedding, dims, modelTag, crop, createdAt)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+          `INSERT INTO stranger_faces (${STRANGER_FACE_INSERT_COLUMNS_SQLITE})
+           VALUES (${Array(STRANGER_FACE_INSERT_PARAM_COUNT).fill("?").join(",")})
            ON CONFLICT DO NOTHING`,
         );
         for (const row of rows) insert.run(...strangerFaceInsertParams(row, JSON.stringify(row.box)));
@@ -2669,7 +3053,11 @@ class SQLiteStorage implements StrangerFaceStore {
     return true;
   }
 
-  /** StrangerFaceStore.getStrangerFacesPage: newest first, purged rows excluded, never the crop. */
+  /**
+   * StrangerFaceStore.getStrangerFacesPage: newest first, purged rows excluded,
+   * never the crop. Recognised-face observations (employeeId set) are not
+   * strangers and are excluded too: they never reach stranger grouping.
+   */
   async getStrangerFacesPage(cursor: { capturedAt: string; id: string } | null, limit: number): Promise<StrangerFacePage> {
     const n = Math.min(100, Math.max(1, Number.isFinite(limit) ? Math.trunc(limit) : 1));
     const after = cursor ? { capturedAt: String(cursor.capturedAt), id: String(cursor.id) } : null;
@@ -2677,7 +3065,7 @@ class SQLiteStorage implements StrangerFaceStore {
     let rows: StrangerFaceRecord[] = [];
     if (mode === "postgresql") {
       const params: unknown[] = [];
-      let where = `"purgedAt" IS NULL`;
+      let where = `"purgedAt" IS NULL AND "employeeId" IS NULL`;
       if (after) {
         params.push(after.capturedAt, after.id);
         where += ` AND ("capturedAt", id) < ($1, $2)`;
@@ -2691,7 +3079,7 @@ class SQLiteStorage implements StrangerFaceStore {
       rows = result.rows.map(rowToStrangerFace);
     } else if (mode === "sqlite") {
       const params: unknown[] = [];
-      let where = "purgedAt IS NULL";
+      let where = "purgedAt IS NULL AND employeeId IS NULL";
       if (after) {
         where += " AND (capturedAt < ? OR (capturedAt = ? AND id < ?))";
         params.push(after.capturedAt, after.capturedAt, after.id);
@@ -2702,7 +3090,7 @@ class SQLiteStorage implements StrangerFaceStore {
       ).all(...params, n + 1) as any[]).map(rowToStrangerFace);
     } else if (mode === "json") {
       rows = (this.fallbackData.stranger_faces || [])
-        .filter((face) => !face.purgedAt)
+        .filter((face) => !face.purgedAt && !face.employeeId)
         .filter((face) => !after || face.capturedAt < after.capturedAt || (face.capturedAt === after.capturedAt && face.id < after.id))
         .sort((a, b) => (a.capturedAt < b.capturedAt ? 1 : a.capturedAt > b.capturedAt ? -1 : a.id < b.id ? 1 : a.id > b.id ? -1 : 0))
         .slice(0, n + 1)
@@ -2762,6 +3150,61 @@ class SQLiteStorage implements StrangerFaceStore {
       return (this.fallbackData.stranger_faces || [])
         .filter((face) => set.has(face.logId))
         .sort((a, b) => (a.logId < b.logId ? -1 : a.logId > b.logId ? 1 : a.faceIndex - b.faceIndex))
+        .map(jsonToStrangerFace);
+    }
+    return [];
+  }
+
+  /**
+   * StrangerFaceStore.getRecognisedFaceObservations: faces the door engine
+   * granted (employeeId set), not purged, captured at or after `sinceIso`,
+   * newest first by (capturedAt DESC, id DESC); embedding included, never the
+   * crop; optional employee filter; limit clamped 1..2000 (default: the cap).
+   * An unparseable `sinceIso` throws RangeError; an employeeId that could not
+   * be stored matches nothing.
+   */
+  async getRecognisedFaceObservations(sinceIso: string, employeeId?: string, limit?: number): Promise<StrangerFaceRecord[]> {
+    const since = normIso(sinceIso);
+    if (!since) throw new RangeError("getRecognisedFaceObservations: invalid since");
+    const n = Math.min(2000, Math.max(1, Number.isFinite(limit as number) ? Math.trunc(limit as number) : 2000));
+    let who: string | null = null;
+    if (employeeId !== undefined && employeeId !== null && employeeId !== "") {
+      if (typeof employeeId !== "string" || !EMPLOYEE_ID_RE.test(employeeId)) return [];
+      who = employeeId;
+    }
+    const mode = this.strangerFaceMode();
+    if (mode === "postgresql") {
+      const params: unknown[] = [since];
+      let where = `"employeeId" IS NOT NULL AND "purgedAt" IS NULL AND "capturedAt" >= $1`;
+      if (who) {
+        params.push(who);
+        where += ` AND "employeeId" = $${params.length}`;
+      }
+      params.push(n);
+      const result = await this.pgPool!.query(
+        `SELECT ${STRANGER_FACE_COLUMNS_PG} FROM stranger_faces WHERE ${where}
+          ORDER BY "capturedAt" DESC, id DESC LIMIT $${params.length}`,
+        params,
+      );
+      return result.rows.map(rowToStrangerFace);
+    }
+    if (mode === "sqlite") {
+      const params: unknown[] = [since];
+      let where = "employeeId IS NOT NULL AND purgedAt IS NULL AND capturedAt >= ?";
+      if (who) {
+        where += " AND employeeId = ?";
+        params.push(who);
+      }
+      return (this.db.prepare(
+        `SELECT ${STRANGER_FACE_COLUMNS_SQLITE} FROM stranger_faces WHERE ${where}
+          ORDER BY capturedAt DESC, id DESC LIMIT ?`,
+      ).all(...params, n) as any[]).map(rowToStrangerFace);
+    }
+    if (mode === "json") {
+      return (this.fallbackData.stranger_faces || [])
+        .filter((face) => face.employeeId && !face.purgedAt && face.capturedAt >= since && (!who || face.employeeId === who))
+        .sort((a, b) => (a.capturedAt < b.capturedAt ? 1 : a.capturedAt > b.capturedAt ? -1 : a.id < b.id ? 1 : a.id > b.id ? -1 : 0))
+        .slice(0, n)
         .map(jsonToStrangerFace);
     }
     return [];
@@ -2842,6 +3285,234 @@ class SQLiteStorage implements StrangerFaceStore {
     this.writeFallback({ ...this.fallbackData, stranger_faces: staged });
     this.fallbackData.stranger_faces = staged;
     return purged;
+  }
+
+  // ================= SHADOW RESULTS (accuracy wave) =================
+  // Same single-authority rule as stranger faces: PostgreSQL when active (once
+  // its table exists), else SQLite, else JSON; refused (false / empty) while
+  // PostgreSQL is configured but not usable, so rows never land in a store the
+  // gateway stops reading once connected. Nothing biometric is stored here.
+
+  private shadowResultMode(): "postgresql" | "sqlite" | "json" | null {
+    return this.singleStoreMode(this.pgShadowResultsReady);
+  }
+
+  /**
+   * ShadowResultStore.saveShadowResult: insert, replay by id is a no-op. True
+   * once the authoritative store has the row (awaited); false for a malformed
+   * record, a store error, or PostgreSQL not ready. Never rejects.
+   */
+  async saveShadowResult(record: ShadowResultRecord): Promise<boolean> {
+    const { row, error } = normalizeShadowResult(record);
+    if (!row) {
+      console.warn(`[ShadowResults] Từ chối lưu kết quả shadow: trường không hợp lệ (${error}).`);
+      return false;
+    }
+    const mode = this.shadowResultMode();
+    if (!mode) {
+      console.warn("[ShadowResults] PostgreSQL chưa sẵn sàng; chưa lưu kết quả shadow.");
+      return false;
+    }
+    if (mode === "postgresql") {
+      try {
+        await this.pgPool!.query(
+          `INSERT INTO pipeline_shadow_results (${SHADOW_RESULT_COLUMNS_PG})
+           VALUES (${Array.from({ length: SHADOW_RESULT_PARAM_COUNT }, (_, i) => `$${i + 1}`).join(",")})
+           ON CONFLICT (id) DO NOTHING`,
+          shadowResultInsertParams(row, row.meanCheckRefused),
+        );
+        return true;
+      } catch (err: any) {
+        console.error(`[PostgreSQL] Lỗi saveShadowResult (${err?.code || "?"}): ${err?.message}`);
+        return false;
+      }
+    }
+    if (mode === "sqlite") {
+      try {
+        this.db.prepare(
+          `INSERT INTO pipeline_shadow_results (${SHADOW_RESULT_COLUMNS_SQLITE})
+           VALUES (${Array(SHADOW_RESULT_PARAM_COUNT).fill("?").join(",")})
+           ON CONFLICT (id) DO NOTHING`,
+        ).run(...shadowResultInsertParams(row, row.meanCheckRefused === null ? null : row.meanCheckRefused ? 1 : 0));
+        return true;
+      } catch (err: any) {
+        console.error("[SQLite] Lỗi saveShadowResult:", err?.message);
+        return false;
+      }
+    }
+    const existing = this.fallbackData.pipeline_shadow_results || [];
+    if (existing.some((item) => item.id === row.id)) return true;
+    const staged = [rowToShadowResult(row), ...existing];
+    try {
+      this.writeFallback({ ...this.fallbackData, pipeline_shadow_results: staged });
+    } catch (err: any) {
+      console.error("[JSON] Lỗi saveShadowResult:", err?.message);
+      return false;
+    }
+    this.fallbackData.pipeline_shadow_results = staged;
+    return true;
+  }
+
+  /**
+   * ShadowResultStore.getShadowResultsPage: newest first by (decidedAt DESC,
+   * id DESC), strict keyset cursor, limit clamped 1..100. Filters: exact gate,
+   * exact agreement (an unknown value matches nothing), decidedAt >= sinceIso
+   * (unparseable -> RangeError).
+   */
+  async getShadowResultsPage(
+    cursor: { decidedAt: string; id: string } | null,
+    limit: number,
+    filter?: { gate?: string; agreement?: ShadowAgreement; sinceIso?: string },
+  ): Promise<{ results: ShadowResultRecord[]; hasMore: boolean }> {
+    const n = Math.min(SHADOW_PAGE_MAX, Math.max(1, Number.isFinite(limit) ? Math.trunc(limit) : 1));
+    const after = cursor ? { decidedAt: String(cursor.decidedAt), id: String(cursor.id) } : null;
+    const gate = typeof filter?.gate === "string" && filter.gate !== "" ? filter.gate : null;
+    const rawAgreement: unknown = filter?.agreement;
+    const agreement = typeof rawAgreement === "string" && rawAgreement.length ? rawAgreement : null;
+    if (agreement && !SHADOW_AGREEMENTS.has(agreement)) return { results: [], hasMore: false };
+    let since: string | null = null;
+    if (filter?.sinceIso !== undefined && filter.sinceIso !== null && filter.sinceIso !== "") {
+      since = normIso(filter.sinceIso) || null;
+      if (!since) throw new RangeError("getShadowResultsPage: invalid sinceIso");
+    }
+    const mode = this.shadowResultMode();
+    let rows: ShadowResultRecord[] = [];
+    if (mode === "postgresql") {
+      const params: unknown[] = [];
+      const where: string[] = [];
+      if (gate) { params.push(gate); where.push(`gate = $${params.length}`); }
+      if (agreement) { params.push(agreement); where.push(`agreement = $${params.length}`); }
+      if (since) { params.push(since); where.push(`"decidedAt" >= $${params.length}`); }
+      if (after) { params.push(after.decidedAt, after.id); where.push(`("decidedAt", id) < ($${params.length - 1}, $${params.length})`); }
+      params.push(n + 1);
+      const result = await this.pgPool!.query(
+        `SELECT ${SHADOW_RESULT_COLUMNS_PG} FROM pipeline_shadow_results ${where.length ? `WHERE ${where.join(" AND ")}` : ""}
+          ORDER BY "decidedAt" DESC, id DESC LIMIT $${params.length}`,
+        params,
+      );
+      rows = result.rows.map(rowToShadowResult);
+    } else if (mode === "sqlite") {
+      const params: unknown[] = [];
+      const where: string[] = [];
+      if (gate) { params.push(gate); where.push("gate = ?"); }
+      if (agreement) { params.push(agreement); where.push("agreement = ?"); }
+      if (since) { params.push(since); where.push("decidedAt >= ?"); }
+      if (after) { params.push(after.decidedAt, after.decidedAt, after.id); where.push("(decidedAt < ? OR (decidedAt = ? AND id < ?))"); }
+      rows = (this.db.prepare(
+        `SELECT ${SHADOW_RESULT_COLUMNS_SQLITE} FROM pipeline_shadow_results ${where.length ? `WHERE ${where.join(" AND ")}` : ""}
+          ORDER BY decidedAt DESC, id DESC LIMIT ?`,
+      ).all(...params, n + 1) as any[]).map(rowToShadowResult);
+    } else if (mode === "json") {
+      rows = (this.fallbackData.pipeline_shadow_results || [])
+        .filter((r) => (!gate || r.gate === gate) && (!agreement || r.agreement === agreement) && (!since || r.decidedAt >= since))
+        .filter((r) => !after || r.decidedAt < after.decidedAt || (r.decidedAt === after.decidedAt && r.id < after.id))
+        .sort(shadowNewestFirst)
+        .slice(0, n + 1)
+        .map((r) => rowToShadowResult(r));
+    }
+    return { results: rows.slice(0, n), hasMore: rows.length > n };
+  }
+
+  /**
+   * ShadowResultStore.summarizeShadowResults: per-gate counts of results with
+   * decidedAt >= sinceIso (one row per gate that has any, gates in bytewise
+   * order) and the median decision latency (decidedAt - firstUsableAt) over
+   * employee outcomes that have a firstUsableAt. Counts are aggregated in SQL;
+   * the median is computed here from the employee rows' two timestamps, the
+   * same way for every store. Unparseable sinceIso -> RangeError.
+   */
+  async summarizeShadowResults(sinceIso: string): Promise<ShadowAccuracySummary[]> {
+    const since = normIso(sinceIso);
+    if (!since) throw new RangeError("summarizeShadowResults: invalid sinceIso");
+    const mode = this.shadowResultMode();
+    const byGate = new Map<string, ShadowAccuracySummary>();
+    const latencies = new Map<string, number[]>();
+    const addLatency = (gate: string, r: { outcome: string; decidedAt: string; firstUsableAt?: string | null }) => {
+      const ms = shadowLatencyMs(r);
+      if (ms === null) return;
+      (latencies.get(gate) || latencies.set(gate, []).get(gate)!).push(ms);
+    };
+    if (mode === "postgresql") {
+      const counts = await this.pgPool!.query(
+        `SELECT gate, count(*)::int AS decisions,
+           count(*) FILTER (WHERE outcome = 'employee')::int AS employees,
+           count(*) FILTER (WHERE outcome = 'stranger')::int AS strangers,
+           count(*) FILTER (WHERE outcome = 'insufficient')::int AS insufficient,
+           count(*) FILTER (WHERE "framesUsed" = 0)::int AS "framesUsedZero",
+           count(*) FILTER (WHERE agreement = 'agree')::int AS agree,
+           count(*) FILTER (WHERE agreement = 'shadow-only')::int AS "shadowOnly",
+           count(*) FILTER (WHERE agreement = 'legacy-only')::int AS "legacyOnly",
+           count(*) FILTER (WHERE agreement = 'identity-mismatch')::int AS "identityMismatch",
+           count(*) FILTER (WHERE agreement = 'none')::int AS none
+         FROM pipeline_shadow_results WHERE "decidedAt" >= $1 GROUP BY gate`,
+        [since],
+      );
+      for (const r of counts.rows) byGate.set(String(r.gate), { ...emptyShadowSummary(String(r.gate), since), ...pickShadowCounts(r) });
+      const emp = await this.pgPool!.query(
+        `SELECT gate, "decidedAt", "firstUsableAt" FROM pipeline_shadow_results
+          WHERE "decidedAt" >= $1 AND outcome = 'employee' AND "firstUsableAt" IS NOT NULL`,
+        [since],
+      );
+      for (const r of emp.rows) addLatency(String(r.gate), { outcome: "employee", decidedAt: String(r.decidedAt), firstUsableAt: r.firstUsableAt });
+    } else if (mode === "sqlite") {
+      const counts = this.db.prepare(
+        `SELECT gate, count(*) AS decisions,
+           sum(outcome = 'employee') AS employees,
+           sum(outcome = 'stranger') AS strangers,
+           sum(outcome = 'insufficient') AS insufficient,
+           sum(framesUsed = 0) AS framesUsedZero,
+           sum(agreement = 'agree') AS agree,
+           sum(agreement = 'shadow-only') AS shadowOnly,
+           sum(agreement = 'legacy-only') AS legacyOnly,
+           sum(agreement = 'identity-mismatch') AS identityMismatch,
+           sum(agreement = 'none') AS none
+         FROM pipeline_shadow_results WHERE decidedAt >= ? GROUP BY gate`,
+      ).all(since) as any[];
+      for (const r of counts) byGate.set(String(r.gate), { ...emptyShadowSummary(String(r.gate), since), ...pickShadowCounts(r) });
+      const emp = this.db.prepare(
+        `SELECT gate, decidedAt, firstUsableAt FROM pipeline_shadow_results
+          WHERE decidedAt >= ? AND outcome = 'employee' AND firstUsableAt IS NOT NULL`,
+      ).all(since) as any[];
+      for (const r of emp) addLatency(String(r.gate), { outcome: "employee", decidedAt: String(r.decidedAt), firstUsableAt: r.firstUsableAt });
+    } else if (mode === "json") {
+      for (const r of this.fallbackData.pipeline_shadow_results || []) {
+        if (!(r.decidedAt >= since)) continue;
+        const s = byGate.get(r.gate) || byGate.set(r.gate, emptyShadowSummary(r.gate, since)).get(r.gate)!;
+        countShadowRow(s, r);
+        addLatency(r.gate, r);
+      }
+    }
+    for (const [gate, s] of byGate) s.decisionLatencyP50Ms = medianMs(latencies.get(gate) || []);
+    return [...byGate.values()].sort((a, b) => (a.gate < b.gate ? -1 : a.gate > b.gate ? 1 : 0));
+  }
+
+  /**
+   * ShadowResultStore.purgeShadowResults: delete rows with decidedAt < cutoffIso
+   * (plain DELETE: no biometric data, nothing to tombstone). Returns rows
+   * deleted in the authoritative store. Unparseable cutoff -> RangeError.
+   */
+  async purgeShadowResults(cutoffIso: string): Promise<number> {
+    const cutoff = normIso(cutoffIso);
+    if (!cutoff) throw new RangeError("purgeShadowResults: invalid cutoff");
+    const mode = this.shadowResultMode();
+    if (mode === "postgresql") {
+      const result = await this.pgPool!.query(`DELETE FROM pipeline_shadow_results WHERE "decidedAt" < $1`, [cutoff]);
+      return result.rowCount || 0;
+    }
+    if (mode === "sqlite") {
+      const result = this.db.prepare("DELETE FROM pipeline_shadow_results WHERE decidedAt < ?").run(cutoff);
+      return Number(result?.changes || 0);
+    }
+    if (mode === "json") {
+      const current = this.fallbackData.pipeline_shadow_results || [];
+      const staged = current.filter((r) => !(r.decidedAt < cutoff));
+      const removed = current.length - staged.length;
+      if (!removed) return 0;
+      this.writeFallback({ ...this.fallbackData, pipeline_shadow_results: staged });
+      this.fallbackData.pipeline_shadow_results = staged;
+      return removed;
+    }
+    return 0;
   }
 
   /**
@@ -4378,6 +5049,26 @@ class SQLiteStorage implements StrangerFaceStore {
   // active stores. Embeddings are stored as float32 bytes (BYTEA / BLOB).
   private faceTemplatesCache: FaceTemplateRecord[] = [];
   private faceTemplatesHydrated = false;
+  /**
+   * PostgreSQL face_templates writes, in issue order. saveFaceTemplate and
+   * deleteFaceTemplate are synchronous for their callers (the gallery is the
+   * in-memory cache), so their PostgreSQL statements used to run unordered on
+   * the pool: a delete could overtake the insert of the same id and the
+   * template came back at the next restart. One chain keeps the order; jobs
+   * that need durability await settleFaceTemplateWrites().
+   */
+  private faceTemplateWrites: Promise<void> = Promise.resolve();
+
+  private queueFaceTemplateWrite(label: string, run: () => Promise<unknown>): void {
+    this.faceTemplateWrites = this.faceTemplateWrites
+      .then(run)
+      .then(() => undefined, (e: any) => { console.error(`[PostgreSQL] Lỗi ${label}:`, e?.message); });
+  }
+
+  /** Resolves once every PostgreSQL template write issued so far has finished (succeeded or been logged). */
+  settleFaceTemplateWrites(): Promise<void> {
+    return this.faceTemplateWrites;
+  }
 
   private async loadFaceTemplates() {
     if (!this.pgPool) return;
@@ -4435,6 +5126,27 @@ class SQLiteStorage implements StrangerFaceStore {
     return this.getFaceTemplates().filter((t) => t.employeeId === employeeId);
   }
 
+  /**
+   * Templates per (employee, camera, source) - the coverage indicator and the
+   * per-camera adaptation cap. Counted over the in-memory gallery, i.e. exactly
+   * the templates matching uses (every write updates it synchronously), sorted
+   * by employeeId, streamId (null first), source. Templates without a camera
+   * (photo enrolment) count under streamId null.
+   */
+  async countFaceTemplatesByEmployeeAndStream(): Promise<FaceTemplateCount[]> {
+    const counts = new Map<string, FaceTemplateCount>();
+    for (const t of this.getFaceTemplates()) {
+      const streamId = typeof t.streamId === "string" && t.streamId !== "" ? t.streamId : null;
+      const key = `${t.employeeId}\u0000${streamId ?? ""}\u0000${t.source}`;
+      const entry = counts.get(key);
+      if (entry) entry.count += 1;
+      else counts.set(key, { employeeId: t.employeeId, streamId, source: t.source, count: 1 });
+    }
+    const text = (v: string | null) => (v === null ? "" : `\u0001${v}`);
+    return [...counts.values()].sort((a, b) =>
+      a.employeeId.localeCompare(b.employeeId) || text(a.streamId).localeCompare(text(b.streamId)) || a.source.localeCompare(b.source));
+  }
+
   /** Insert or replace by id. Writes through to every active store. */
   saveFaceTemplate(t: FaceTemplateRecord): FaceTemplateRecord {
     const rec: FaceTemplateRecord = { ...t, dims: t.dims || t.embedding.length };
@@ -4444,16 +5156,14 @@ class SQLiteStorage implements StrangerFaceStore {
 
     const buf = embeddingToBuffer(rec.embedding);
     if (this.pgPool && this.isPostgres) {
-      this.pgPool
-        .query(
-          `INSERT INTO face_templates (id, "employeeId", embedding, dims, "modelTag", source, quality, "capturedAt", "sourceLogId", "streamId")
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
-           ON CONFLICT (id) DO UPDATE SET "employeeId" = EXCLUDED."employeeId", embedding = EXCLUDED.embedding, dims = EXCLUDED.dims,
-             "modelTag" = EXCLUDED."modelTag", source = EXCLUDED.source, quality = EXCLUDED.quality,
-             "capturedAt" = EXCLUDED."capturedAt", "sourceLogId" = EXCLUDED."sourceLogId", "streamId" = EXCLUDED."streamId"`,
-          [rec.id, rec.employeeId, buf, rec.dims, rec.modelTag, rec.source, rec.quality, rec.capturedAt, rec.sourceLogId || null, rec.streamId || null]
-        )
-        .catch((e: any) => console.error("[PostgreSQL] Lỗi saveFaceTemplate:", e?.message));
+      this.queueFaceTemplateWrite("saveFaceTemplate", () => this.pgPool!.query(
+        `INSERT INTO face_templates (id, "employeeId", embedding, dims, "modelTag", source, quality, "capturedAt", "sourceLogId", "streamId")
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+         ON CONFLICT (id) DO UPDATE SET "employeeId" = EXCLUDED."employeeId", embedding = EXCLUDED.embedding, dims = EXCLUDED.dims,
+           "modelTag" = EXCLUDED."modelTag", source = EXCLUDED.source, quality = EXCLUDED.quality,
+           "capturedAt" = EXCLUDED."capturedAt", "sourceLogId" = EXCLUDED."sourceLogId", "streamId" = EXCLUDED."streamId"`,
+        [rec.id, rec.employeeId, buf, rec.dims, rec.modelTag, rec.source, rec.quality, rec.capturedAt, rec.sourceLogId || null, rec.streamId || null],
+      ));
     }
     if (this.isNativeSqlite && this.db) {
       try {
@@ -4481,7 +5191,7 @@ class SQLiteStorage implements StrangerFaceStore {
     const before = this.faceTemplatesCache.length;
     this.faceTemplatesCache = this.faceTemplatesCache.filter((t) => t.id !== id);
     if (this.pgPool && this.isPostgres) {
-      this.pgPool.query("DELETE FROM face_templates WHERE id = $1", [id]).catch(() => {});
+      this.queueFaceTemplateWrite("deleteFaceTemplate", () => this.pgPool!.query("DELETE FROM face_templates WHERE id = $1", [id]));
     }
     if (this.isNativeSqlite && this.db) {
       try { this.ensureSqliteFaceTemplates(); this.db.prepare("DELETE FROM face_templates WHERE id = ?").run(id); } catch {}
