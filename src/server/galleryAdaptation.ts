@@ -32,6 +32,13 @@ export interface AdaptationPolicy {
   maxPerCamera: number;
   /** A new candidate must differ from every existing template of that camera by at least this (cosine below 1 - value); default 0.05. */
   minNovelty: number;
+  /**
+   * At most one template per access event per camera (default true): the
+   * frames of one passage are near-identical, and five of them would fill the
+   * cap with no new information (the calibration's k=2 dip). Diversity over
+   * days is what raises recognition.
+   */
+  onePerEvent: boolean;
 }
 
 export const DEFAULT_ADAPTATION_POLICY: Readonly<AdaptationPolicy> = Object.freeze({
@@ -40,6 +47,7 @@ export const DEFAULT_ADAPTATION_POLICY: Readonly<AdaptationPolicy> = Object.free
   minQuality: 0.35,
   maxPerCamera: 5,
   minNovelty: 0.05,
+  onePerEvent: true,
 });
 
 /**
@@ -67,6 +75,8 @@ export interface ExistingTemplate {
   source: string;
   quality: number;
   embedding: ArrayLike<number>;
+  /** The access event the template came from, for the one-per-event rule. */
+  sourceLogId?: string;
 }
 
 export interface AdaptationPlanItem {
@@ -106,6 +116,7 @@ export function planAdaptation(
   for (const o of eligible) {
     const key = `${o.employeeId}|${o.streamId}`;
     const cam = byKey.get(key) || [];
+    if (policy.onePerEvent && cam.some((t) => t.sourceLogId && t.sourceLogId === o.logId)) continue;
     if (cam.some((t) => cosine(t.embedding, o.embedding) >= 1 - policy.minNovelty)) continue;
     const adaptive = cam.filter((t) => t.source === "adaptation");
     let evictTemplateId: string | undefined;
@@ -116,7 +127,7 @@ export function planAdaptation(
     }
     plan.push({ observation: o, evictTemplateId });
     const next = cam.filter((t) => t.id !== evictTemplateId);
-    next.push({ id: `planned:${o.faceId}`, employeeId: o.employeeId, streamId: o.streamId, source: "adaptation", quality: o.quality, embedding: o.embedding });
+    next.push({ id: `planned:${o.faceId}`, employeeId: o.employeeId, streamId: o.streamId, source: "adaptation", quality: o.quality, embedding: o.embedding, sourceLogId: o.logId });
     byKey.set(key, next);
   }
   return plan;

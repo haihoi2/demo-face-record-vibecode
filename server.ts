@@ -9505,7 +9505,7 @@ async function runCameraAdaptation(): Promise<number> {
         quality: o.quality, matchCosine: o.matchCosine ?? 0, matchMargin: o.matchMargin ?? 0, embedding: o.embedding!,
       }));
     const existing = db.getFaceTemplates().filter((t) => t.modelTag === tag)
-      .map((t) => ({ id: t.id, employeeId: t.employeeId, streamId: t.streamId, source: t.source, quality: t.quality, embedding: t.embedding }));
+      .map((t) => ({ id: t.id, employeeId: t.employeeId, streamId: t.streamId, source: t.source, quality: t.quality, embedding: t.embedding, sourceLogId: t.sourceLogId }));
     const plan = planAdaptation(candidates, existing, currentFusionThresholds().acceptSingle, DEFAULT_ADAPTATION_POLICY);
     const touched = new Map<string, number>();
     for (const item of plan) {

@@ -83,7 +83,7 @@ test("floors follow acceptSingle: the cosine floor is acceptSingle + minCosineAb
 });
 
 test("DEFAULT_ADAPTATION_POLICY is the documented, frozen contract", () => {
-  assert.deepEqual(DEFAULT_ADAPTATION_POLICY, { minCosineAboveAcceptSingle: 0.10, minMargin: 0.15, minQuality: 0.35, maxPerCamera: 5, minNovelty: 0.05 });
+  assert.deepEqual(DEFAULT_ADAPTATION_POLICY, { minCosineAboveAcceptSingle: 0.10, minMargin: 0.15, minQuality: 0.35, maxPerCamera: 5, minNovelty: 0.05, onePerEvent: true });
   assert.ok(Object.isFrozen(DEFAULT_ADAPTATION_POLICY));
 });
 
@@ -242,4 +242,32 @@ test("templateCoverage: per employee, one row per camera in camera order, with t
   ]);
   assert.deepEqual(templateCoverage([], cameras), new Map(), "no templates, no rows");
   assert.deepEqual(templateCoverage(templates, []).get("E1"), [], "no cameras, empty rows");
+});
+
+// ---------------------------------------------------------------------------
+// One template per access event per camera (diversity over days, not five
+// near-identical frames of one passage)
+// ---------------------------------------------------------------------------
+import { planAdaptation as planAdaptation2, type RecognisedFaceObservation as Obs2, type ExistingTemplate as Tpl2 } from "../src/server/galleryAdaptation";
+
+function vec(seed: number): number[] {
+  const v: number[] = []; let x = seed * 2654435761 % 4294967296;
+  for (let i = 0; i < 16; i++) { x = (x * 1664525 + 1013904223) % 4294967296; v.push(x / 4294967296 - 0.5); }
+  const n = Math.hypot(...v); return v.map((a) => a / n);
+}
+const obs2 = (faceId: string, logId: string, seed: number, q = 0.8): Obs2 => ({
+  faceId, logId, employeeId: "E1", streamId: "cam-a", gate: "ENTRY", capturedAt: "2026-09-29T08:00:00.000Z", quality: q, matchCosine: 0.8, matchMargin: 0.3, embedding: vec(seed),
+});
+
+test("onePerEvent: a second distinct frame of the same event on the same camera is skipped", () => {
+  const existing: Tpl2[] = [{ id: "T1", employeeId: "E1", streamId: "cam-a", source: "adaptation", quality: 0.9, embedding: vec(1), sourceLogId: "LOG-1" }];
+  const plan = planAdaptation2([obs2("F2", "LOG-1", 2), obs2("F3", "LOG-2", 3)], existing, 0.55);
+  assert.deepEqual(plan.map((p) => p.observation.faceId), ["F3"]);
+});
+
+test("onePerEvent also applies within one batch, and can be switched off", () => {
+  const batch = [obs2("F1", "LOG-9", 11, 0.9), obs2("F2", "LOG-9", 12, 0.8)];
+  assert.deepEqual(planAdaptation2(batch, [], 0.55).map((p) => p.observation.faceId), ["F1"]);
+  const off = planAdaptation2(batch, [], 0.55, { ...DEFAULT_ADAPTATION_POLICY, onePerEvent: false });
+  assert.equal(off.length, 2);
 });
