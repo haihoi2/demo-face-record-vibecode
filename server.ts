@@ -38,6 +38,14 @@ import {
   type StrangerFaceRecord,
 } from "./src/server/strangerFaces";
 import { cropFaceFromImage, encodedImageSize } from "./src/server/pipeline/faceCrop";
+import {
+  classifyShadowAgreement,
+  newShadowResultId,
+  shadowResultRetentionDays,
+  SHADOW_MATCH_WINDOW_MS,
+  type ShadowResultRecord,
+} from "./src/server/shadowResults";
+import { planAdaptation, DEFAULT_ADAPTATION_POLICY } from "./src/server/galleryAdaptation";
 import { guardAsyncRoutes, jsonErrorHandler } from "./src/server/asyncRoutes";
 import { accessLogExportName, csvCell } from "./src/server/csv";
 import { effectivePipelineMode, parsePipelineMode, pipelineModeFromEnv } from "./src/server/pipeline/mode";
@@ -118,6 +126,8 @@ import {
   fuseDecision,
   recognizeObservations,
   DEFAULT_FUSION_THRESHOLDS,
+  matchObservations,
+  pipelineFusionThresholds,
 } from "./src/server/faceFusion";
 import type { FaceGallery } from "./src/server/faceFusion";
 
@@ -1803,6 +1813,25 @@ function strangerFacesOfFrame(
   return out;
 }
 
+/** The recognised faces of a frame with their match scores (index-parallel `observed`/`faces`, `decision.perObservation` parallel to the fused subset). */
+function recognisedFacesOfFrame(
+  observed: EngineObservation[],
+  decision: FusionDecision,
+  faces: Array<{ recognized?: boolean; employeeId?: string }>,
+): RecognisedFace[] {
+  const fusedOnly = observed.filter((o) => o.fused);
+  const matchByObs = new Map<EngineObservation, ObservationMatch>();
+  fusedOnly.forEach((o, i) => { const m = decision.perObservation[i]; if (m) matchByObs.set(o, m); });
+  const out: RecognisedFace[] = [];
+  observed.forEach((o, i) => {
+    const f = faces[i];
+    const m = matchByObs.get(o);
+    if (!f?.recognized || !f.employeeId || !m || m.employeeId !== f.employeeId) return;
+    out.push({ observation: o.observation, employeeId: f.employeeId, matchCosine: m.cosine, matchMargin: m.cosine - Math.max(0, m.secondCosine) });
+  });
+  return out;
+}
+
 function facesFromDecision(
   observed: EngineObservation[],
   decision: FusionDecision,
@@ -1939,7 +1968,9 @@ app.get(["/api/face-engine/status", "/api/face-engine/status/", "/api/face-engin
  * lowest-quality template(s). Returns the ids that were evicted.
  */
 function enforceTemplateCap(employeeId: string, keepRoom = 0): string[] {
-  const existing = db.getFaceTemplatesForEmployee(employeeId);
+  // Adaptation templates are capped per camera by planAdaptation and never
+  // count against (or get evicted by) the manual cap.
+  const existing = db.getFaceTemplatesForEmployee(employeeId).filter((t) => t.source !== "adaptation");
   const limit = Math.max(0, FACE_TEMPLATE_MAX - keepRoom);
   if (existing.length <= limit) return [];
   const evicted = [...existing]
@@ -4173,6 +4204,19 @@ interface RecognitionOutcomeInput {
    * where the single strangerObservation rules apply as before.
    */
   strangerFaces?: FaceObservation[];
+  /**
+   * Faces the door engine recognised in the stored frame, with the match
+   * scores. Stored as recognised-face observations (never grouped as
+   * strangers); they feed camera adaptation. Storage only.
+   */
+  recognisedFaces?: RecognisedFace[];
+}
+
+interface RecognisedFace {
+  observation: FaceObservation;
+  employeeId: string;
+  matchCosine: number;
+  matchMargin: number;
 }
 
 /** The stranger storage floor a face fails, or null. Storage only - never a door decision. */
@@ -4224,7 +4268,7 @@ function acceptStrangerFaces(
  * face whose crop cannot be made is skipped and logged.
  */
 async function persistStrangerFaces(
-  faces: FaceObservation[],
+  faces: Array<FaceObservation & { employeeId?: string; matchCosine?: number; matchMargin?: number }>,
   logId: string,
   capturedAt: string,
   frameImage: string | undefined,
@@ -4265,6 +4309,7 @@ async function persistStrangerFaces(
         modelTag: faceModelTag(),
         crop,
         createdAt: new Date().toISOString(),
+        ...(o.employeeId ? { employeeId: o.employeeId, matchCosine: round3(o.matchCosine), matchMargin: round3(o.matchMargin) } : {}),
       });
     }
     if (!rows.length) return 0;
@@ -4630,8 +4675,14 @@ async function applyRecognitionOutcome(input: RecognitionOutcomeInput): Promise<
       broadcastSSE("notification", warnNotif);
     }
 
-    if (tailgaterFaces.length && result.logs[0]) {
-      await persistStrangerFaces(tailgaterFaces, result.logs[0].id, result.logs[0].timestamp, input.frameImage, gateKey,
+    const grantedFaces = [
+      ...(input.recognisedFaces || [])
+        .filter((f) => grantable.some((e) => e.id === f.employeeId))
+        .map((f) => ({ ...f.observation, employeeId: f.employeeId, matchCosine: f.matchCosine, matchMargin: f.matchMargin })),
+      ...tailgaterFaces,
+    ];
+    if (grantedFaces.length && result.logs[0]) {
+      await persistStrangerFaces(grantedFaces, result.logs[0].id, result.logs[0].timestamp, input.frameImage, gateKey,
         firstGrantSaved || Promise.resolve(false));
     }
     return result;
@@ -5066,6 +5117,7 @@ async function performGateScan(input: GateScanRequest): Promise<GateScanResult> 
   let snapshotFaces: Array<DetectedFaceItem & { streamId: string; streamLabel: string }> = [];
   let snapshotObservation: FaceObservation | undefined;
   let snapshotStrangerFaces: FaceObservation[] | undefined;
+  let snapshotRecognisedFaces: RecognisedFace[] | undefined;
 
   if (faceEngine === "onnx" && allObserved.length > 0) {
     let pick = -1;
@@ -5094,6 +5146,8 @@ async function performGateScan(input: GateScanRequest): Promise<GateScanResult> 
         allObserved.filter((o) => o.streamId === chosen.streamId && o.frameIndex === chosen.frameIndex),
         allFaces.filter((_, i) => allObserved[i].streamId === chosen.streamId && allObserved[i].frameIndex === chosen.frameIndex),
       );
+      snapshotRecognisedFaces = recognisedFacesOfFrame(allObserved, fusion, allFaces)
+        .filter((f) => f.observation.streamId === chosen.streamId && f.observation.frameIndex === chosen.frameIndex);
     }
   } else if (faceEngine !== "onnx") {
     // Legacy per-stream path: one frame per stream was recognised, so prefer
@@ -5126,6 +5180,7 @@ async function performGateScan(input: GateScanRequest): Promise<GateScanResult> 
     denyWithoutFace: false,
     strangerObservation: snapshotObservation,
     strangerFaces: snapshotStrangerFaces,
+    recognisedFaces: snapshotRecognisedFaces,
   });
 
   return { status: 200, body: {
@@ -5642,10 +5697,22 @@ function logPipelineError(gate: Gate, message: string) {
 }
 
 /** Same gallery, thresholds and engine the legacy watcher decides with; null = fail closed. */
+/**
+ * The pipeline flow decides with the thresholds calibrated for ITS recogniser
+ * (faceFusion PIPELINE_FUSION_THRESHOLDS_BY_TAG, env PIPELINE_ACCEPT_*), not
+ * the door engine's. For the FP32 r50 both are the same numbers today; the
+ * selection is logged once so a mismatch is visible.
+ */
+let pipelineThresholdsLogged = "";
 function pipelineContext(): DecisionContext | null {
   if (!faceEngineActive()) return null;
   const tag = faceModelTag();
-  return { gallery: currentGallery(), galleryModelTag: tag, engineModelTag: tag, thresholds: currentFusionThresholds(), engineReady: true };
+  const selection = pipelineFusionThresholds(tag);
+  if (pipelineThresholdsLogged !== tag) {
+    pipelineThresholdsLogged = tag;
+    console.log(`[Pipeline] Ngưỡng hợp nhất cho ${tag}: ${JSON.stringify(selection.thresholds)}${selection.overrides.length ? ` (env: ${selection.overrides.join(", ")})` : ""}`);
+  }
+  return { gallery: currentGallery(), galleryModelTag: tag, engineModelTag: tag, thresholds: selection.thresholds, engineReady: true };
 }
 
 interface GatePipelineSlot {
@@ -5796,6 +5863,70 @@ function reportPipelineResult(gate: Gate, r: TrackDecisionResult) {
   };
   broadcastSSE("pipeline_shadow_result", payload);
   console.log(`[Pipeline ${gate}] shadow ${JSON.stringify(payload)}`);
+  // The door engine scans with a gap of a few seconds, so its event for the
+  // same passage can arrive AFTER the shadow decision: wait one window, then
+  // pair and store. Never blocks the pipeline; never throws.
+  setTimeout(() => {
+    persistShadowResult(gate, r).catch((err: any) => console.warn("[Pipeline] Không lưu được kết quả shadow:", err?.message || err));
+  }, SHADOW_MATCH_WINDOW_MS).unref();
+}
+
+/** The door-engine event on the same gate nearest to `atMs` within the window (from the in-memory recent logs). */
+function nearestLegacyEvent(gate: Gate, atMs: number): { id: string; status: "GRANTED" | "DENIED"; employeeId?: string } | null {
+  let best: AccessLogRecord | null = null;
+  let bestDelta = Infinity;
+  for (let i = 0; i < accessLogs.length && i < 500; i++) {
+    const log = accessLogs[i];
+    if (log.type !== gate || (log.status !== "GRANTED" && log.status !== "DENIED")) continue;
+    const delta = Math.abs(new Date(log.timestamp).getTime() - atMs);
+    if (delta <= SHADOW_MATCH_WINDOW_MS && delta < bestDelta) { best = log; bestDelta = delta; }
+    if (new Date(log.timestamp).getTime() < atMs - SHADOW_MATCH_WINDOW_MS) break;
+  }
+  return best ? { id: best.id, status: best.status as "GRANTED" | "DENIED", employeeId: best.employeeId || undefined } : null;
+}
+
+const round3 = (v: unknown) => (typeof v === "number" && Number.isFinite(v) ? Math.round(v * 1000) / 1000 : undefined);
+
+async function persistShadowResult(gate: Gate, r: TrackDecisionResult): Promise<void> {
+  const sh = r.shadow;
+  const o = r.outcome;
+  const fused = o.kind === "employee" ? (o.fused as Record<string, unknown>) : undefined;
+  const candidates = Array.isArray(fused?.candidates)
+    ? (fused!.candidates as Array<{ employeeId: string; fusedCosine: number }>)
+    : [];
+  const winner = candidates.find((c) => c.employeeId === (o.kind === "employee" ? o.employeeId : ""));
+  const runnerUp = candidates
+    .filter((c) => c.employeeId !== (o.kind === "employee" ? o.employeeId : ""))
+    .sort((a, b) => b.fusedCosine - a.fusedCosine)[0];
+  const legacy = nearestLegacyEvent(gate, sh.decidedAtMs);
+  const record: ShadowResultRecord = {
+    id: newShadowResultId(),
+    gate,
+    trackId: sh.trackId,
+    outcome: sh.outcome,
+    employeeId: sh.employeeId,
+    fusedCosine: round3(fused?.fusedCosine),
+    margin: winner && runnerUp ? round3(winner.fusedCosine - runnerUp.fusedCosine) : undefined,
+    runnerUpEmployeeId: runnerUp?.employeeId,
+    runnerUpCosine: runnerUp ? round3(runnerUp.fusedCosine) : undefined,
+    basis: String(r.basis),
+    fusionBasis: r.fusionBasis ? String(r.fusionBasis) : undefined,
+    meanCheckRefused: r.meanCheckRefused ? true : undefined,
+    framesSeen: sh.framesSeen,
+    framesUsed: sh.framesUsed,
+    firstSeenAt: new Date(sh.firstSeenAtMs).toISOString(),
+    firstUsableAt: sh.firstUsableAtMs ? new Date(sh.firstUsableAtMs).toISOString() : undefined,
+    decidedAt: new Date(sh.decidedAtMs).toISOString(),
+    legacyLogId: legacy?.id,
+    legacyStatus: legacy?.status,
+    legacyEmployeeId: legacy?.employeeId,
+    agreement: classifyShadowAgreement({ outcome: sh.outcome, employeeId: sh.employeeId }, legacy),
+    createdAt: new Date().toISOString(),
+  };
+  await db.saveShadowResult(record);
+  if (record.agreement === "identity-mismatch") {
+    console.warn(`[Pipeline ${gate}] shadow nhận ${record.employeeId} nhưng cửa đã mở cho ${record.legacyEmployeeId} (${record.legacyLogId}) - cần kiểm tra.`);
+  }
 }
 
 /** Watcher-runtime fields for the dashboard: stream health + decision counters. */
@@ -6614,6 +6745,25 @@ function publicTemplate(t: FaceTemplateRecord) {
   };
 }
 
+/** Enabled camera streams of both gates, as the coverage and suggestion features name them. */
+function configuredCameras(): Array<{ streamId: string; gate: "ENTRY" | "EXIT"; label: string }> {
+  const out: Array<{ streamId: string; gate: "ENTRY" | "EXIT"; label: string }> = [];
+  for (const [gate, cfg] of [["ENTRY", cameraStreamsConfig.entryGate], ["EXIT", cameraStreamsConfig.exitGate]] as const) {
+    for (const st of cfg?.streams || []) {
+      if (st?.id && st.enabled !== false) out.push({ streamId: st.id, gate, label: st.label || st.id });
+    }
+  }
+  return out;
+}
+
+function templateCoverageFor(employeeId: string) {
+  const rows = db.getFaceTemplatesForEmployee(employeeId);
+  return configuredCameras().map((c) => {
+    const mine = rows.filter((t) => t.streamId === c.streamId);
+    return { streamId: c.streamId, gate: c.gate, label: c.label, count: mine.length, adaptation: mine.filter((t) => t.source === "adaptation").length };
+  });
+}
+
 app.get(EMPLOYEE_TEMPLATE_ROUTES, requireOperatorRole("viewer"), (req, res) => {
   const employee = employees.find((e) => e.id === req.params.id);
   if (!employee) {
@@ -6630,6 +6780,7 @@ app.get(EMPLOYEE_TEMPLATE_ROUTES, requireOperatorRole("viewer"), (req, res) => {
     count: rows.length,
     max: FACE_TEMPLATE_MAX,
     usableCount: rows.filter((t) => t.modelTag === modelTag).length,
+    coverage: templateCoverageFor(employee.id),
     byStream: rows.reduce<Record<string, number>>((acc, t) => {
       const key = t.streamId || "unknown";
       acc[key] = (acc[key] || 0) + 1;
@@ -7517,9 +7668,47 @@ async function strangerWindow(): Promise<{ logs: AccessLogRecord[]; faces: Stran
   if (strangerWindowCache?.key === key) return strangerWindowCache;
   const observations = [...observationsFromLogs(logs, retired), ...observationsFromFaces(faces, retired)];
   const clusters = clusterStrangerObservations(observations, retired, { includeDemoSeeds: DEMO_DATA_ENABLED });
+  attachClusterSuggestions(clusters, observations);
   registerStrangerClusters(clusters, logs, faces);
   strangerWindowCache = { key, logs, faces, clusters };
   return strangerWindowCache;
+}
+
+/**
+ * Best-matching employee per stranger group (owner decision 5, 2026-09-29):
+ * an employee the camera does not recognise shows up there as a stranger; the
+ * operator merges the group into the suggested person, which enrols that
+ * camera. A SUGGESTION for the operator only - it never grants anything and
+ * the threshold is the evidence floor, well below the accept thresholds.
+ */
+function attachClusterSuggestions(clusters: any[], observations: Array<{ observationId: string; embedding?: number[]; modelTag?: string }>) {
+  if (!faceEngineActive()) return;
+  const tag = faceModelTag();
+  const gallery = currentGallery();
+  const floor = currentFusionThresholds().minEvidence;
+  const byId = new Map(observations.map((o) => [o.observationId, o]));
+  const cameras = configuredCameras();
+  for (const cluster of clusters) {
+    const probes: FaceObservation[] = [];
+    for (const photo of cluster.photos || []) {
+      const o = byId.get(String(photo.observationId || `log:${photo.logId}`));
+      if (o?.embedding?.length && o.modelTag === tag) probes.push({ streamId: "cluster", embedding: o.embedding, quality: 1, detectorScore: 1 });
+    }
+    if (!probes.length) continue;
+    let best: ObservationMatch | undefined;
+    for (const m of matchObservations(probes, gallery)) if (m.employeeId && (!best || m.cosine > best.cosine)) best = m;
+    if (!best?.employeeId || best.cosine < floor) continue;
+    const emp = employees.find((e) => e.id === best!.employeeId);
+    if (!emp) continue;
+    const covered = new Set(db.getFaceTemplatesForEmployee(emp.id).map((t) => t.streamId).filter(Boolean));
+    cluster.suggestion = {
+      employeeId: emp.id,
+      name: emp.name,
+      employeeCode: emp.employeeCode,
+      cosine: Math.round(best.cosine * 1000) / 1000,
+      missingCameras: cameras.filter((c) => !covered.has(c.streamId)).map((c) => c.label),
+    };
+  }
 }
 
 /**
@@ -7714,6 +7903,44 @@ app.get("/api/strangers/lookup", requireOperatorRole("viewer"), async (req, res)
 });
 
 /** A stranger face crop (biometric; viewer and up, like the frame photo). 404 once retention purged it. */
+/** Shadow-engine accuracy per gate over the last N hours (viewer; numbers only). */
+app.get("/api/pipeline/shadow-summary", requireOperatorRole("viewer"), async (req, res) => {
+  const hours = boundedInt(req.query.hours, 24, 1, 720);
+  const since = new Date(Date.now() - hours * 3600 * 1000).toISOString();
+  try {
+    const gates = await db.summarizeShadowResults(since);
+    res.json({ success: true, since, hours, gates });
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: err?.message || "Lỗi tổng hợp kết quả shadow" });
+  }
+});
+
+app.get("/api/pipeline/shadow-results", requireOperatorRole("viewer"), async (req, res) => {
+  const limit = boundedInt(req.query.limit, 50, 1, 100);
+  const gate = typeof req.query.gate === "string" && /^[A-Z]{2,16}$/.test(req.query.gate) ? req.query.gate : undefined;
+  const agreement = typeof req.query.agreement === "string" && ["agree", "shadow-only", "legacy-only", "identity-mismatch", "none"].includes(req.query.agreement)
+    ? (req.query.agreement as any) : undefined;
+  const sinceIso = typeof req.query.since === "string" && !Number.isNaN(Date.parse(req.query.since)) ? new Date(req.query.since).toISOString() : undefined;
+  let cursor: { decidedAt: string; id: string } | null = null;
+  if (req.query.cursor) {
+    try {
+      const parsed = JSON.parse(Buffer.from(String(req.query.cursor), "base64url").toString("utf8"));
+      if (typeof parsed?.decidedAt === "string" && typeof parsed?.id === "string") cursor = parsed;
+    } catch {}
+    if (!cursor) { res.status(400).json({ success: false, error: "Cursor không hợp lệ" }); return; }
+  }
+  try {
+    const page = await db.getShadowResultsPage(cursor, limit, { gate, agreement, sinceIso });
+    const last = page.results[page.results.length - 1];
+    res.json({
+      success: true, results: page.results, hasMore: page.hasMore,
+      nextCursor: last && page.hasMore ? Buffer.from(JSON.stringify({ decidedAt: last.decidedAt, id: last.id }), "utf8").toString("base64url") : null,
+    });
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: err?.message || "Lỗi đọc kết quả shadow" });
+  }
+});
+
 app.get("/api/strangers/faces/:faceId/image", requireOperatorRole("viewer"), async (req, res) => {
   if (!guardBiometricImage(req, res)) return;
   const faceId = String(req.params.faceId || "");
@@ -8386,6 +8613,7 @@ interface RecognizeFrameResult {
   strangerObservation?: FaceObservation;
   /** Unrecognised faces of the frame that match no employee alone (per-face stranger records). */
   strangerFaces?: FaceObservation[];
+  recognisedFaces?: RecognisedFace[];
 }
 
 /**
@@ -8457,6 +8685,7 @@ async function recognizeFrame({
   let fusion: FusionDecision | undefined;
   let strangerObservation: FaceObservation | undefined;
   let strangerFaces: FaceObservation[] | undefined;
+  let recognisedFaces: RecognisedFace[] | undefined;
 
   if (faceEngine === "onnx" && detectedFaces.length === 0 && rawImage) {
     const engineInfo = getFaceEngineInfo();
@@ -8479,6 +8708,7 @@ async function recognizeFrame({
         .sort((a, b) => b.quality - a.quality)[0];
       detectedFaces = facesFromDecision(observed, fusion, employees);
       strangerFaces = strangerFacesOfFrame(observed, detectedFaces);
+      recognisedFaces = recognisedFacesOfFrame(observed, fusion, detectedFaces);
       const winner = fusion.recognized
         ? employees.find((e) => e.id === fusion!.employeeId)
         : undefined;
@@ -8781,6 +9011,7 @@ Yêu cầu phân tích:
     faceEngine,
     strangerObservation,
     strangerFaces,
+    recognisedFaces,
   };
 }
 
@@ -9062,6 +9293,7 @@ app.post(RECOGNIZE_FACE_ROUTES, async (req, res) => {
       sseSnapshot: imageBase64,
       strangerObservation: recognition.strangerObservation,
       strangerFaces: recognition.strangerFaces,
+      recognisedFaces: recognition.recognisedFaces,
     });
     const recognizedEmployees = outcome.recognizedEmployees;
     const generatedLogs = outcome.logs;
@@ -9233,6 +9465,81 @@ async function purgeExpiredStrangerFaces(): Promise<number> {
   }
 }
 
+const SHADOW_RESULT_RETENTION_DAYS = shadowResultRetentionDays();
+async function purgeExpiredShadowResults(): Promise<number> {
+  if (SHADOW_RESULT_RETENTION_DAYS <= 0) return 0;
+  const cutoff = new Date(Date.now() - SHADOW_RESULT_RETENTION_DAYS * 24 * 60 * 60 * 1000).toISOString();
+  try {
+    const n = await db.purgeShadowResults(cutoff);
+    if (n > 0) console.log(`[Pipeline] Đã xóa ${n} kết quả shadow cũ hơn ${SHADOW_RESULT_RETENTION_DAYS} ngày.`);
+    return n;
+  } catch (err: any) {
+    console.error("[Pipeline] Lỗi xóa kết quả shadow cũ:", err?.message || err);
+    return 0;
+  }
+}
+
+/**
+ * Camera adaptation (owner decision 3, 2026-09-29: automatic with audit and
+ * operator delete). Turns confident door-engine grants into per-camera
+ * templates: only ADDS templates for an employee the door engine already
+ * granted with a clear margin (galleryAdaptation.ts policy), never creates
+ * employees or changes access. Each template is source "adaptation",
+ * attributed to its event, listed and deletable like any other.
+ */
+const ADAPTATION_EVERY_MS = 10 * 60 * 1000;
+let adaptationSince: string | null = null;
+let adaptationRunning = false;
+async function runCameraAdaptation(): Promise<number> {
+  if (adaptationRunning || !faceEngineActive()) return 0;
+  adaptationRunning = true;
+  try {
+    const since = adaptationSince || new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+    const startedAt = new Date().toISOString();
+    const tag = faceModelTag();
+    const observations = await db.getRecognisedFaceObservations(since, undefined, 2000);
+    const candidates = observations
+      .filter((o) => o.employeeId && o.streamId && o.embedding?.length && o.modelTag === tag && !o.purgedAt)
+      .map((o) => ({
+        faceId: o.id, logId: o.logId, employeeId: o.employeeId!, streamId: o.streamId!, gate: o.gate, capturedAt: o.capturedAt,
+        quality: o.quality, matchCosine: o.matchCosine ?? 0, matchMargin: o.matchMargin ?? 0, embedding: o.embedding!,
+      }));
+    const existing = db.getFaceTemplates().filter((t) => t.modelTag === tag)
+      .map((t) => ({ id: t.id, employeeId: t.employeeId, streamId: t.streamId, source: t.source, quality: t.quality, embedding: t.embedding }));
+    const plan = planAdaptation(candidates, existing, currentFusionThresholds().acceptSingle, DEFAULT_ADAPTATION_POLICY);
+    const touched = new Map<string, number>();
+    for (const item of plan) {
+      const o = item.observation;
+      if (!employees.some((e) => e.id === o.employeeId)) continue;
+      if (item.evictTemplateId) db.deleteFaceTemplate(item.evictTemplateId);
+      db.saveFaceTemplate({
+        id: `FT-${randomUUID()}`, employeeId: o.employeeId, embedding: Array.from(o.embedding), dims: o.embedding.length, modelTag: tag,
+        source: "adaptation" as FaceTemplateRecord["source"], quality: Math.round(o.quality * 1000) / 1000, capturedAt: o.capturedAt,
+        sourceLogId: o.logId, streamId: o.streamId,
+      });
+      touched.set(o.employeeId, (touched.get(o.employeeId) || 0) + 1);
+      console.log(`[Adaptation] ${o.employeeId}: mẫu mới từ camera ${o.streamId} (sự kiện ${o.logId}, cosine ${o.matchCosine.toFixed(3)}, biên ${o.matchMargin.toFixed(3)}, chất lượng ${o.quality.toFixed(2)})${item.evictTemplateId ? ` thay ${item.evictTemplateId}` : ""}`);
+    }
+    for (const [employeeId, added] of touched) {
+      broadcastSSE("face_templates_updated", { employeeId, added, source: "adaptation", total: db.getFaceTemplatesForEmployee(employeeId).length });
+    }
+    adaptationSince = startedAt;
+    return plan.length;
+  } catch (err: any) {
+    console.error("[Adaptation] Lỗi:", err?.message || err);
+    return 0;
+  } finally {
+    adaptationRunning = false;
+  }
+}
+
+function startAccuracyJobs() {
+  setTimeout(() => void purgeExpiredShadowResults(), 3 * 60 * 1000).unref();
+  setInterval(() => void purgeExpiredShadowResults(), 6 * 60 * 60 * 1000).unref();
+  setTimeout(() => void runCameraAdaptation(), 3 * 60 * 1000).unref();
+  setInterval(() => void runCameraAdaptation(), ADAPTATION_EVERY_MS).unref();
+}
+
 function startStrangerFaceRetention() {
   if (STRANGER_FACE_RETENTION_DAYS <= 0) {
     console.warn("[Strangers] FACE_STRANGER_FACE_RETENTION_DAYS=0: khuôn mặt người lạ không tự xóa.");
@@ -9269,6 +9576,7 @@ async function startServer() {
     syncGateWatchers();
     void auditStoredDestinations().catch(() => {});
     startStrangerFaceRetention();
+    startAccuracyJobs();
   });
 }
 
