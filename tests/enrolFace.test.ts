@@ -61,9 +61,13 @@ describe("chooseEnrolFaces", () => {
 });
 
 describe("wiring", () => {
-  it("both stranger enrolment routes pass the sighting's own embedding", () => {
+  it("both stranger enrolment routes enrol from the chosen tile with its own embedding", () => {
     const src = readFileSync(new URL("../server.ts", import.meta.url), "utf8");
-    assert.equal((src.match(/expectedEmbedding: sightingEmbedding\(sightingLog\)/g) || []).length, 2);
+    assert.match(src, /enrolFromStrangerSource\(newEmployee\.id, sourceObservation, validated, "enrollment"\)/);
+    assert.match(src, /enrolFromStrangerSource\(target\.id, sourceObservation, validated, "merge"\)/);
+    // whole-frame capture: the log's embedding; a face: its own crop + embedding
+    assert.match(src, /expectedEmbedding: sightingEmbedding\(sightingLog\)/);
+    assert.match(src, /prepareTemplateFromImage\(employeeId, crop, \{/);
     assert.match(src, /const choice = chooseEnrolFaces\(found, opts\.expectedEmbedding\);/);
   });
 
