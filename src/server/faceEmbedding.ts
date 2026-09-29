@@ -125,6 +125,8 @@ export interface FaceEngineInfo {
   variantWarning: string | null;
   /** How pictures smaller than the detector input are letterboxed (FACE_DETECT_UPSCALE). */
   detectUpscale: DetectUpscaleMode;
+  /** Horizontal-flip test-time augmentation of the recogniser (FACE_TTA_FLIP=1); default off. */
+  ttaFlip: boolean;
   detectorInputSize: number;
   /**
    * Spatial input dims of the LOADED detector graph: a number where the ONNX
@@ -378,6 +380,24 @@ export function detectUpscaleMode(): DetectUpscaleMode {
   const v = (process.env.FACE_DETECT_UPSCALE || "").trim().toLowerCase();
   return v === "none" || v === "bilinear" || v === "area" ? v : DEFAULT_DETECT_UPSCALE;
 }
+/**
+ * Horizontal-flip test-time augmentation for the recogniser (plan D2,
+ * ADDITIVE 2026-09-29). Off unless FACE_TTA_FLIP is exactly "1" or "true"
+ * (case/whitespace-insensitive); any other value is off, so a typo cannot
+ * enable it. When on, embedFace() embeds the crop and its mirror image and
+ * returns l2(embed(x) + embed(flip(x))) - two recogniser runs per face
+ * (measured 2.0x the single-run latency on r50 and r50_int8; a batch of two
+ * saves nothing on the CPU EP and the INT8 graph has a static batch of 1).
+ * The embedding space and the template tag are unchanged (same model), but the
+ * calibrated thresholds were measured WITHOUT flip: keep it off until
+ * scripts/perf/calib-eval.ts --flip has been run on the site's crop set and
+ * the operating point re-checked. Read per call so tests can toggle it.
+ */
+export function ttaFlipEnabled(environment: NodeJS.ProcessEnv = process.env): boolean {
+  const v = String(environment.FACE_TTA_FLIP ?? "").trim().toLowerCase();
+  return v === "1" || v === "true";
+}
+
 function ffmpegPath(): string {
   return env("FFMPEG_PATH", "ffmpeg");
 }
@@ -722,6 +742,23 @@ export function resizeBilinear(src: RgbImage, dstW: number, dstH: number): RgbIm
   return { width: dstW, height: dstH, data: out };
 }
 
+/** Mirror an RGB image left-to-right (pure; a new buffer, the input is untouched). */
+export function flipHorizontal(img: RgbImage): RgbImage {
+  const { width, height, data } = img;
+  const out = new Uint8Array(width * height * 3);
+  for (let y = 0; y < height; y++) {
+    const row = y * width;
+    for (let x = 0; x < width; x++) {
+      const s = (row + x) * 3;
+      const d = (row + (width - 1 - x)) * 3;
+      out[d] = data[s];
+      out[d + 1] = data[s + 1];
+      out[d + 2] = data[s + 2];
+    }
+  }
+  return { width, height, data: out };
+}
+
 /** Bilinear RGB sample with edge clamping. Returns [r, g, b] as floats. */
 function sampleBilinear(img: RgbImage, x: number, y: number, out: Float32Array): void {
   const x0 = Math.floor(x);
@@ -894,6 +931,7 @@ export function getFaceEngineInfo(): FaceEngineInfo {
     modelTag: faceModelTagFor(recognizerModel),
     variantWarning: warnings.length ? warnings.join("; ") : null,
     detectUpscale: detectUpscaleMode(),
+    ttaFlip: ttaFlipEnabled(),
     detectorInputSize: detectorInputSize(),
     detectorInputDims: engineRef ? engineRef.detectorInputDims : null,
     embeddingDim: EMBEDDING_DIM,
@@ -1223,26 +1261,51 @@ export async function embedFace(aligned: RgbImage): Promise<Float32Array | null>
       log("warn", `embedFace: expected ${ALIGNED_SIZE}x${ALIGNED_SIZE}, got ${aligned.width}x${aligned.height}`);
       return null;
     }
-    const plane = ALIGNED_SIZE * ALIGNED_SIZE;
-    const data = new Float32Array(3 * plane);
-    for (let i = 0; i < plane; i++) {
-      const s = i * 3;
-      data[i] = (aligned.data[s] - 127.5) / 127.5;
-      data[plane + i] = (aligned.data[s + 1] - 127.5) / 127.5;
-      data[2 * plane + i] = (aligned.data[s + 2] - 127.5) / 127.5;
-    }
-    const tensor = new engine.ort.Tensor("float32", data, [1, 3, ALIGNED_SIZE, ALIGNED_SIZE]);
-    const out = await engine.recognizer.run({ [engine.recognizerInput]: tensor });
-    const raw = out[engine.recognizerOutput].data as Float32Array;
-    if (!raw || raw.length !== EMBEDDING_DIM) {
-      log("error", `embedFace: unexpected embedding length ${raw ? raw.length : "null"}`);
-      return null;
-    }
-    return l2Normalize(raw);
+    const raw = await runRecognizer(engine, alignedToTensorData(aligned));
+    if (!raw) return null;
+    if (!ttaFlipEnabled()) return l2Normalize(raw);
+    // FACE_TTA_FLIP: l2(embed(x) + embed(flip(x))), each view unit length first
+    // so both weigh equally. Fails closed to null if the mirrored run fails.
+    const rawFlipped = await runRecognizer(engine, alignedToTensorData(flipHorizontal(aligned)));
+    if (!rawFlipped) return null;
+    const a = l2Normalize(raw);
+    const b = l2Normalize(rawFlipped);
+    const sum = new Float32Array(EMBEDDING_DIM);
+    for (let i = 0; i < EMBEDDING_DIM; i++) sum[i] = a[i] + b[i];
+    return l2Normalize(sum);
   } catch (err) {
     log("error", "embedFace failed", err);
     return null;
   }
+}
+
+/**
+ * The recogniser's input tensor data for a 112x112 aligned crop: NCHW RGB,
+ * (px - 127.5) / 127.5. Pure; exported so tests can pin the exact bytes
+ * embedFace() feeds the model.
+ */
+export function alignedToTensorData(aligned: RgbImage): Float32Array {
+  const plane = ALIGNED_SIZE * ALIGNED_SIZE;
+  const data = new Float32Array(3 * plane);
+  for (let i = 0; i < plane; i++) {
+    const s = i * 3;
+    data[i] = (aligned.data[s] - 127.5) / 127.5;
+    data[plane + i] = (aligned.data[s + 1] - 127.5) / 127.5;
+    data[2 * plane + i] = (aligned.data[s + 2] - 127.5) / 127.5;
+  }
+  return data;
+}
+
+/** One recogniser run; the raw (un-normalised) 512-D output, or null on a bad output shape. */
+async function runRecognizer(engine: Engine, data: Float32Array): Promise<Float32Array | null> {
+  const tensor = new engine.ort.Tensor("float32", data, [1, 3, ALIGNED_SIZE, ALIGNED_SIZE]);
+  const out = await engine.recognizer.run({ [engine.recognizerInput]: tensor });
+  const raw = out[engine.recognizerOutput].data as Float32Array;
+  if (!raw || raw.length !== EMBEDDING_DIM) {
+    log("error", `embedFace: unexpected embedding length ${raw ? raw.length : "null"}`);
+    return null;
+  }
+  return raw;
 }
 
 // ---------------------------------------------------------------------------
