@@ -29,6 +29,10 @@ Status: APPROVED 2026-09-29. Owner decisions: 1 yes, 2 yes, 3 automatic with aud
 | 1 thread, `auto` (today) | 70% | 93% | 4 / 35 | 0 / 45 |
 | 4 threads, `auto` | 49% | 96% | 4 / 35 | 2 / 45 |
 | 4 threads, `auto:960` | 74% | 97% | 2 / 35 | 0 / 45 |
+| 4 threads, `auto` + `PIPELINE_MIN_FACE_PX=40` (clean host, load 6.6) | 49% | 91% | 6 / 35 (7 / 35 in a second run) | 2 / 45 |
+| 4 threads, `auto:960` + 40 px (clean host) | 73% (loop 365 ms) | 92% | 4 / 35 | 0 / 45 |
+
+**Conclusion (2026-09-29):** the best affordable live setting is **4 threads per gate, `auto`, 40 px pipeline-only floor**: entrance usable decisions 4 → 6–7 of 35 and decision delay 9.3 s → 2.6–6.8 s. `auto:960` doubles usable frames offline but costs a 365 ms loop at 4 threads, so the live pipeline drops 73% of frames and loses more than it gains; it would need ~8 threads per gate, which 18 vCPU cannot spare next to the door engine. The remaining gap is the camera geometry at both gates (section below), not software.
 
 Threads cut the drops but not the misses. The run-3 log showed 351 detections for 8 embeddings at the entrance, and the per-frame diagnostic (`usable.ts`) on the entry strip found: 174 faces under 60 px, 47 failing the pose gate (aspect 29, roll 9, yaw 9), 14 usable; only 3 of 18 passages with people ever had two usable frames. **The entrance limiter is face size in the wide 4K overview (the 60 px floor) plus downward pose, not throughput.** Consequence: A.1 (threads) still helps and stays; A.2 (`auto:960`) does not help at the entrance; a new A.4 is added below.
 
@@ -111,6 +115,8 @@ Design:
 5. **C1 now**: have an operator enrol all 31 employees on both cameras this week.
 6. **`FACE_DETECT_UPSCALE` stays `none`** (closes review item 7). Recommended: yes.
 7. **Pipeline-only face floor** `PIPELINE_MIN_FACE_PX=40` on staging in shadow mode (door engine unchanged at 60 px), after the dev replay shows it lifts usable decisions. Recommended: yes, shadow only.
+9. **Entrance camera placement:** a second, closer camera at the entrance door (face ≥ 100 px at the door line) as a new stream of the entry gate, keeping the 4K overview for context. Software gains at the entrance are capped at roughly 7 of 35 passages by face size; recognition at the door line needs this. Hardware decision.
+10. **Exit camera placement:** the exit camera sees people from behind or the side in most passages (no face detectable in 840 sampled frames at any detector size). Either re-aim it towards approaching faces or add a face camera at the exit door. Hardware decision.
 8. **Flip TTA measurement** needs a read-only re-export of stored face crops from the live database (about 20 minutes of compute, biometric data kept under /data/test-clips, deleted after). Recommended: yes, once, by INT.
 
 ## 9. Contract (accuracy wave, base `release/accuracy`)
