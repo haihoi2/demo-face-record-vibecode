@@ -124,7 +124,7 @@ describe("server wiring", () => {
 
   it("tailgating strangers are recorded only after the grant, never feeding the door decision", () => {
     const grant = src.indexOf("unlockDoor(unlockSource");
-    const persist = src.indexOf("await persistStrangerFaces(tailgaterFaces");
+    const persist = src.indexOf("await persistStrangerFaces(grantedFaces");
     assert.ok(grant > 0 && persist > grant);
   });
 

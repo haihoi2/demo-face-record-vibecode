@@ -7911,7 +7911,7 @@ app.get("/api/pipeline/shadow-summary", requireOperatorRole("viewer"), async (re
     const gates = await db.summarizeShadowResults(since);
     res.json({ success: true, since, hours, gates });
   } catch (err: any) {
-    res.status(500).json({ success: false, error: err?.message || "Lỗi tổng hợp kết quả shadow" });
+    res.status(err instanceof RangeError ? 400 : 500).json({ success: false, error: err?.message || "Lỗi tổng hợp kết quả shadow" });
   }
 });
 
@@ -7937,7 +7937,7 @@ app.get("/api/pipeline/shadow-results", requireOperatorRole("viewer"), async (re
       nextCursor: last && page.hasMore ? Buffer.from(JSON.stringify({ decidedAt: last.decidedAt, id: last.id }), "utf8").toString("base64url") : null,
     });
   } catch (err: any) {
-    res.status(500).json({ success: false, error: err?.message || "Lỗi đọc kết quả shadow" });
+    res.status(err instanceof RangeError ? 400 : 500).json({ success: false, error: err?.message || "Lỗi đọc kết quả shadow" });
   }
 });
 
@@ -9514,12 +9514,14 @@ async function runCameraAdaptation(): Promise<number> {
       if (item.evictTemplateId) db.deleteFaceTemplate(item.evictTemplateId);
       db.saveFaceTemplate({
         id: `FT-${randomUUID()}`, employeeId: o.employeeId, embedding: Array.from(o.embedding), dims: o.embedding.length, modelTag: tag,
-        source: "adaptation" as FaceTemplateRecord["source"], quality: Math.round(o.quality * 1000) / 1000, capturedAt: o.capturedAt,
+        source: "adaptation", quality: Math.round(o.quality * 1000) / 1000, capturedAt: o.capturedAt,
         sourceLogId: o.logId, streamId: o.streamId,
       });
       touched.set(o.employeeId, (touched.get(o.employeeId) || 0) + 1);
       console.log(`[Adaptation] ${o.employeeId}: mẫu mới từ camera ${o.streamId} (sự kiện ${o.logId}, cosine ${o.matchCosine.toFixed(3)}, biên ${o.matchMargin.toFixed(3)}, chất lượng ${o.quality.toFixed(2)})${item.evictTemplateId ? ` thay ${item.evictTemplateId}` : ""}`);
     }
+    // Durable before it is announced (PostgreSQL template writes are an ordered async chain).
+    await db.settleFaceTemplateWrites();
     for (const [employeeId, added] of touched) {
       broadcastSSE("face_templates_updated", { employeeId, added, source: "adaptation", total: db.getFaceTemplatesForEmployee(employeeId).length });
     }

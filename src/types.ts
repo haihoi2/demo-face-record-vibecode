@@ -490,7 +490,7 @@ export interface FaceTemplate {
   dims: number;
   /** Which model produced it, e.g. "arcface_w600k_r50". Never compare across tags. */
   modelTag: string;
-  source: "enrollment" | "merge" | "manual" | "auto";
+  source: "enrollment" | "merge" | "manual" | "auto" | "adaptation";
   /** 0-1 capture quality (size × sharpness × detector score). */
   quality: number;
   capturedAt: string;
