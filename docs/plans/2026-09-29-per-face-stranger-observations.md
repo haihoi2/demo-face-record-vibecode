@@ -1,6 +1,6 @@
 # Plan: one stranger record per face (step 1)
 
-Status: PROPOSED 2026-09-29. Needs the owner's decisions in section 7 before any code is written.
+Status: APPROVED 2026-09-29. Owner decisions: 1 = **14 days**, 2 = **yes**, 3 = **no backfill**, 4 = **yes** (section 7).
 
 ## 1. Problem
 
@@ -108,10 +108,10 @@ Storage estimate: about 300-400 stranger faces a day at about 30 KB is 10-15 MB/
 
 ## 7. Owner decisions needed
 
-1. **Retention for unresolved stranger faces** (crop + embedding): recommend **30 days**. The whole-frame photo retention decision is still open and can be set at the same time.
-2. **Record strangers who walk in beside a recognised employee** (tailgating): recommend **yes**. Today they leave no record except a notification.
-3. **Backfill existing photos:** recommend **no**. Old photos have boxes burned in and are whole frames; they keep working at log level.
-4. **Panel shows face crops, with a link to the full frame / NVR clip:** recommend **yes**.
+1. **Retention for unresolved stranger faces** (crop + embedding): owner chose **14 days** (recommended 30). The whole-frame photo retention decision is still open and can be set at the same time.
+2. **Record strangers who walk in beside a recognised employee** (tailgating): owner chose **yes**. Today they leave no record except a notification.
+3. **Backfill existing photos:** owner chose **no**. Old photos have boxes burned in and are whole frames; they keep working at log level.
+4. **Panel shows face crops, with a link to the full frame / NVR clip:** owner chose **yes**.
 
 ## 8. Work plan and gates
 
@@ -137,3 +137,28 @@ Tests:
 - PostgreSQL and SQLite parity (length limits, JSONB).
 
 Gates: typecheck, unit, build, integration on SQLite and PostgreSQL. Then a dev demo on the harness with a two-person scripted clip, then the owner's confirmation before staging.
+
+## 9. Contract (wave per-face, base `release/per-face`)
+
+- **Types:**
+  - `src/server/strangerFaces.ts`: `StrangerFaceRecord`, `StrangerFaceStore` (the db methods), observation-id helpers and retention env `FACE_STRANGER_FACE_RETENTION_DAYS` (default 14).
+  - `src/types.ts`: `StrangerPhoto.observationId`, `faceId`, `frameUrl`.
+- **db.ts (data-migrations):**
+  - `stranger_faces` table in PG, SQLite and JSON, implementing `StrangerFaceStore`.
+  - `stranger_resolutions."faceIds"`.
+  - `getRetiredStrangerObservationIds` adds `face:<id>`.
+  - `getStrangerCandidateLogsPage` excludes logs that have face rows.
+  - Restore compares `faceIds` too.
+- **API (INT, server.ts):**
+  - `GET /api/strangers/faces/:id/image`: viewer; 404 when unknown or purged.
+  - `dismiss`, `merge`, `quick-register` and `restore` accept `clusterObservationIds` (`face:`/`log:`) and `sourceObservationId`. `clusterLogIds` stays for old clients.
+  - `GET /api/strangers/lookup?faceId=`.
+  - Cluster photos carry `observationId`, `faceId` and `frameUrl`. A face tile's `photoSnapshot`/`imageUrl` is the crop URL.
+- **UI (frontend):**
+  - Key tiles by `observationId ?? logId`.
+  - Send `clusterObservationIds = photos.map(p => p.observationId ?? "log:" + p.logId)` and `sourceObservationId` for the chosen tile.
+  - "Xem khung hình" opens `frameUrl`.
+- **Hotspot writers this wave:**
+  - `db.ts`: data-migrations agent.
+  - `server.ts`, `src/types.ts`, `src/server/strangers.ts`, `src/server/auth.ts`: INT.
+  - `src/components/StrangerClusterModal.tsx`: frontend agent.

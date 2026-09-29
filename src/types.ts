@@ -42,9 +42,23 @@ export interface AccessLog {
 }
 
 export interface StrangerPhoto {
+  /** The access event of the frame. Several face tiles can share one logId. */
   logId: string;
-  /** Validated server image endpoint; retained under the legacy key for compatibility. */
+  /**
+   * Identity of this tile in resolve requests: `face:<faceId>` for a per-face
+   * record, `log:<logId>` for an older whole-frame capture. Absent from servers
+   * older than the per-face wave (then use `log:<logId>`).
+   */
+  observationId?: string;
+  /** Per-face record id, when the tile is one face. */
+  faceId?: string;
+  /**
+   * Validated server image endpoint; retained under the legacy key for
+   * compatibility. For a face tile this is the face crop.
+   */
   photoSnapshot: string;
+  /** Whole frame of the event ("Xem khung hình"); a face tile's photoSnapshot is only the crop. */
+  frameUrl?: string;
   imageUrl?: string;
   hasImage?: boolean;
   timestamp: string;
