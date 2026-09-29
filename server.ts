@@ -99,6 +99,7 @@ import { gateAreaToPixels, normalizeGateArea } from "./src/server/pipeline/gateA
 import type { DecisionContext, TrackDecisionResult } from "./src/server/pipeline/trackDecision";
 import type { Gate, PipelineMode } from "./src/server/pipeline/contracts";
 import type { ExtractedFace, UnclearReason } from "./src/server/faceEmbedding";
+import { chooseEnrolFaces } from "./src/server/enrolFace";
 import {
   buildGallery,
   cosine,
@@ -6324,10 +6325,22 @@ const EMPLOYEE_TEMPLATE_ITEM_ROUTES = [
   "/employees/:id/templates/:templateId",
 ];
 
+/** A sighting's stored stranger embedding, when it comes from the current model (else unusable). */
+function sightingEmbedding(log: AccessLogRecord | undefined): number[] | undefined {
+  if (!log?.faceEmbedding?.length) return undefined;
+  if (log.faceEmbeddingModelTag && log.faceEmbeddingModelTag !== faceModelTag()) return undefined;
+  return log.faceEmbedding;
+}
+
 async function prepareTemplateFromImage(
   employeeId: string,
   image: string | Buffer,
-  opts: { source: "enrollment" | "merge"; sourceLogId?: string },
+  opts: {
+    source: "enrollment" | "merge";
+    sourceLogId?: string;
+    /** The source log's stored stranger embedding: only the face matching it is enrolled (enrolFace.ts). */
+    expectedEmbedding?: ArrayLike<number> | null;
+  },
 ): Promise<EnrollOutcome & { record?: FaceTemplateRecord }> {
   if (!faceEngineActive()) {
     return { rejected: activeFaceEngine() === "unavailable" ? "engine-unavailable" : "engine-disabled" };
@@ -6336,8 +6349,19 @@ async function prepareTemplateFromImage(
     return { rejected: "template-cap" };
   }
   try {
-    const detected = await extractFaces(image);
-    if (detected.length === 0) return { rejected: "no-face", detectedFaces: 0 };
+    const found = await extractFaces(image);
+    if (found.length === 0) return { rejected: "no-face", detectedFaces: 0 };
+    // A stored stranger photo is the whole frame: enrol only the person the
+    // stranger group was built from, never whoever else is in the picture.
+    const choice = chooseEnrolFaces(found, opts.expectedEmbedding);
+    if ("rejected" in choice) {
+      console.warn(
+        `[FaceEngine] Không tạo mẫu cho ${employeeId} từ ${opts.sourceLogId || "ảnh"}: ${choice.rejected}` +
+          ("bestCosine" in choice ? ` (cosine tốt nhất ${choice.bestCosine})` : ` (${choice.detectedFaces} khuôn mặt)`),
+      );
+      return { rejected: choice.rejected, detectedFaces: found.length };
+    }
+    const detected = choice.faces;
     // A template must be a face looking at the camera: a turned or bowed head
     // makes a poor reference and drags every later comparison down.
     const faces = detected.filter((f) => f.clear);
@@ -7477,7 +7501,7 @@ app.post(["/api/strangers/quick-register", "/api/strangers/register"], requireOp
     const sourceLog = sightingLog ? await db.getAccessLogById(sightingLog.id) : undefined;
     const enrolled = sourceLog && isEnrollableImage(sourceLog.photoSnapshot)
       ? await prepareTemplateFromImage(newEmployee.id, sourceLog.photoSnapshot, {
-          source: "enrollment", sourceLogId: sourceLog.id,
+          source: "enrollment", sourceLogId: sourceLog.id, expectedEmbedding: sightingEmbedding(sightingLog),
         })
       : { rejected: "unsupported-image" as const };
     const commit = await db.commitStrangerResolution({
@@ -7795,7 +7819,7 @@ app.post(["/api/strangers/merge", "/api/strangers/assign"], requireOperatorRole(
     const sourceLog = sightingLog ? await db.getAccessLogById(sightingLog.id) : undefined;
     const enrolled = sourceLog && isEnrollableImage(sourceLog.photoSnapshot)
       ? await prepareTemplateFromImage(target.id, sourceLog.photoSnapshot, {
-          source: "merge", sourceLogId: sourceLog.id,
+          source: "merge", sourceLogId: sourceLog.id, expectedEmbedding: sightingEmbedding(sightingLog),
         })
       : { rejected: "unsupported-image" as const };
     const commit = await db.commitStrangerResolution({

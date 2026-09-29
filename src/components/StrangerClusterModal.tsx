@@ -45,6 +45,22 @@ interface StrangerClusterModalProps {
   initialPreselectedLogId?: string | null;
 }
 
+/** Why no template was made from the chosen photo, for the reasons an operator can act on. */
+export function templateRejectHint(reason?: string | null): string {
+  switch (reason) {
+    case "multiple-faces":
+      return " Ảnh có nhiều người nên không biết chọn khuôn mặt nào - hãy chọn ảnh chỉ có người này.";
+    case "face-mismatch":
+      return " Không tìm thấy đúng khuôn mặt của cụm trong ảnh - hãy chọn ảnh khác của người này.";
+    case "not-frontal":
+      return " Khuôn mặt không nhìn thẳng - hãy chọn ảnh nhìn thẳng.";
+    case "low-quality":
+      return " Khuôn mặt quá nhỏ hoặc mờ - hãy chọn ảnh rõ hơn.";
+    default:
+      return "";
+  }
+}
+
 export const StrangerClusterModal: React.FC<StrangerClusterModalProps> = ({
   isOpen,
   onClose,
@@ -296,7 +312,7 @@ export const StrangerClusterModal: React.FC<StrangerClusterModalProps> = ({
       setSuccessToast(
         res.data.recognitionReady
           ? `Đã adjudicate ${adjudicatedCount} lượt quét cho ${merged.name} và tạo mẫu nhận diện.`
-          : `Đã adjudicate ${adjudicatedCount} lượt quét cho ${merged.name}; chưa tạo được mẫu nhận diện nên quyền mở cửa chưa được kích hoạt.`
+          : `Đã adjudicate ${adjudicatedCount} lượt quét cho ${merged.name}; chưa tạo được mẫu nhận diện nên quyền mở cửa chưa được kích hoạt.${templateRejectHint(res.data.faceTemplateRejected)}`
       );
       setSelectedCluster(null);
       setMergeTarget(null);
@@ -399,7 +415,7 @@ export const StrangerClusterModal: React.FC<StrangerClusterModalProps> = ({
       setSuccessToast(
         res.data.recognitionReady
           ? `Đã tạo ${createdEmployee.name} (${createdEmployee.employeeCode}) và mẫu nhận diện đã sẵn sàng.`
-          : `Đã tạo hồ sơ ${createdEmployee.name} (${createdEmployee.employeeCode}), nhưng chưa có mẫu nhận diện; quyền mở cửa chưa được kích hoạt.`
+          : `Đã tạo hồ sơ ${createdEmployee.name} (${createdEmployee.employeeCode}), nhưng chưa có mẫu nhận diện; quyền mở cửa chưa được kích hoạt.${templateRejectHint(res.data.faceTemplateRejected)}`
       );
 
       // Remove this cluster from view
