@@ -30,6 +30,14 @@ import {
   AccessLogQuery,
 } from "./src/server/db";
 import { envNumber } from "./src/server/env";
+import {
+  faceObservationId,
+  newStrangerFaceId,
+  parseObservationIds,
+  strangerFaceRetentionDays,
+  type StrangerFaceRecord,
+} from "./src/server/strangerFaces";
+import { cropFaceFromImage, encodedImageSize } from "./src/server/pipeline/faceCrop";
 import { guardAsyncRoutes, jsonErrorHandler } from "./src/server/asyncRoutes";
 import { accessLogExportName, csvCell } from "./src/server/csv";
 import { effectivePipelineMode, parsePipelineMode, pipelineModeFromEnv } from "./src/server/pipeline/mode";
@@ -78,6 +86,10 @@ import type {
 import { runLocalFaceRecognition } from "./src/utils/localBiometrics";
 import {
   clusterStrangerFaces,
+  clusterStrangerObservations,
+  observationsFromLogs,
+  observationsFromFaces,
+  faceImageUrl,
   collectStrangerWindow,
   pageStrangerClusters,
   strangerCaptureDecision,
@@ -1768,6 +1780,29 @@ function capObservations(all: EngineObservation[]): FaceObservation[] {
  * annotator may draw them. `livenessScore` reports CAPTURE QUALITY: this engine
  * has no anti-spoofing model and nothing here may be read as a liveness check.
  */
+/**
+ * The faces of one frame that are strangers: not the recognised identity, and
+ * not matching any employee on their own either. Fusion names at most ONE
+ * employee per scan, so a second employee in the frame is "not recognised" by
+ * it; that person must not be stored as a stranger. `observed` and `faces` are
+ * index-parallel.
+ */
+function strangerFacesOfFrame(
+  observed: EngineObservation[],
+  faces: Array<{ recognized?: boolean }>,
+): FaceObservation[] {
+  const gallery = currentGallery();
+  const thresholds = currentFusionThresholds();
+  const out: FaceObservation[] = [];
+  observed.forEach((o, i) => {
+    if (faces[i]?.recognized) return;
+    if (!o.observation.embedding?.length) return;
+    if (recognizeObservations([o.observation], gallery, thresholds).recognized) return;
+    out.push(o.observation);
+  });
+  return out;
+}
+
 function facesFromDecision(
   observed: EngineObservation[],
   decision: FusionDecision,
@@ -4130,6 +4165,116 @@ interface RecognitionOutcomeInput {
   sseSnapshot?: string;
   /** Highest-quality real ArcFace observation for a DENIED event; never serialized. */
   strangerObservation?: FaceObservation;
+  /**
+   * Every real face of the stored frame that nobody was recognised as, and that
+   * matches no employee on its own (plan 2026-09-29: one stranger record per
+   * face). Each gets the stranger floors and cooldown separately and, when it
+   * passes, its own stranger_faces row with a crop. Absent on non-ONNX paths,
+   * where the single strangerObservation rules apply as before.
+   */
+  strangerFaces?: FaceObservation[];
+}
+
+/** The stranger storage floor a face fails, or null. Storage only - never a door decision. */
+function strangerFaceFloor(o: FaceObservation): OutcomeSuppression | null {
+  if (FACE_STRANGER_MIN_QUALITY > 0 && !(o.quality >= FACE_STRANGER_MIN_QUALITY)) return "stranger-quality";
+  if (FACE_STRANGER_MIN_DETECTOR_SCORE > 0 && !(Number(o.detectorScore) >= FACE_STRANGER_MIN_DETECTOR_SCORE)) return "stranger-not-face";
+  if (FACE_STRANGER_MIN_EDGE_ENERGY > 0 && typeof o.edgeEnergy === "number" && o.edgeEnergy < FACE_STRANGER_MIN_EDGE_ENERGY) return "stranger-blur";
+  if (o.box && FACE_STRANGER_MIN_SIZE_PX > 0 && Math.min(o.box[2] - o.box[0], o.box[3] - o.box[1]) < FACE_STRANGER_MIN_SIZE_PX) return "stranger-small";
+  return null;
+}
+
+/**
+ * The faces of one frame that may be stored as strangers: each must pass the
+ * floors and, with cooldowns, the per-person cooldown at this gate. Runs
+ * synchronously (cooldown slots are claimed before any await). Best quality
+ * first, so the DENIED log keeps the best face as its embedding.
+ */
+function acceptStrangerFaces(
+  faces: FaceObservation[],
+  gateKey: "entry" | "exit",
+  nowMs: number,
+  cooldowns: boolean,
+): { accepted: FaceObservation[]; firstReason: OutcomeSuppression | null } {
+  const accepted: FaceObservation[] = [];
+  let firstReason: OutcomeSuppression | null = null;
+  const cooldownMs = FACE_STRANGER_COOLDOWN_SECONDS * 1000;
+  for (const o of [...faces].sort((a, b) => b.quality - a.quality)) {
+    const reason = strangerFaceFloor(o);
+    if (reason) {
+      firstReason ??= reason;
+      continue;
+    }
+    if (cooldowns && cooldownMs > 0 && o.embedding?.length) {
+      const decision = strangerCaptureDecision(recentStrangersByGate.get(gateKey) || [], o.embedding, nowMs, cooldownMs);
+      recentStrangersByGate.set(gateKey, decision.recent);
+      if (!decision.capture) {
+        firstReason ??= "stranger-cooldown";
+        continue;
+      }
+    }
+    accepted.push(o);
+  }
+  return { accepted, firstReason };
+}
+
+/**
+ * Write one stranger_faces row (with its crop) per accepted face, linked to the
+ * frame's access event. Never throws and never changes the access outcome: a
+ * face whose crop cannot be made is skipped and logged.
+ */
+async function persistStrangerFaces(
+  faces: FaceObservation[],
+  logId: string,
+  capturedAt: string,
+  frameImage: string | undefined,
+  gateKey: "entry" | "exit",
+): Promise<number> {
+  if (!faces.length || !frameImage) return 0;
+  try {
+    const frameBytes = frameImage.startsWith("data:") ? Buffer.from(frameImage.split(",", 2)[1] || "", "base64") : null;
+    if (!frameBytes?.length) return 0;
+    const size = encodedImageSize(frameBytes);
+    const rows: StrangerFaceRecord[] = [];
+    for (let i = 0; i < faces.length; i++) {
+      const o = faces[i];
+      if (!o.box || !o.embedding?.length) continue;
+      const crop = await cropFaceFromImage(frameBytes, o.box);
+      if (!crop) {
+        console.warn(`[Strangers] Không cắt được ảnh khuôn mặt ${i} của ${logId}; bỏ qua khuôn mặt này.`);
+        continue;
+      }
+      rows.push({
+        id: newStrangerFaceId(),
+        logId,
+        faceIndex: i,
+        capturedAt,
+        gate: gateKey === "exit" ? "EXIT" : "ENTRY",
+        streamId: o.streamId || undefined,
+        engine: "legacy",
+        box: [Math.round(o.box[0]), Math.round(o.box[1]), Math.round(o.box[2]), Math.round(o.box[3])],
+        sourceWidth: size?.width,
+        sourceHeight: size?.height,
+        detectorScore: Math.round(Number(o.detectorScore) * 1000) / 1000,
+        quality: Math.round(o.quality * 1000) / 1000,
+        edgeEnergy: typeof o.edgeEnergy === "number" ? Math.round(o.edgeEnergy * 10000) / 10000 : undefined,
+        sizePx: Math.round(Math.min(o.box[2] - o.box[0], o.box[3] - o.box[1])),
+        embedding: Array.from(o.embedding),
+        dims: o.embedding.length,
+        modelTag: faceModelTag(),
+        crop,
+        createdAt: new Date().toISOString(),
+      });
+    }
+    if (!rows.length) return 0;
+    const saved = await db.saveStrangerFaces(rows);
+    if (!saved) console.error(`[Strangers] Không lưu được ${rows.length} khuôn mặt người lạ của ${logId}.`);
+    strangerWindowCache = null;
+    return saved ? rows.length : 0;
+  } catch (err: any) {
+    console.error(`[Strangers] Lỗi lưu khuôn mặt người lạ của ${logId}:`, err?.message || err);
+    return 0;
+  }
 }
 
 /** JSON-safe outcome report: ids, flags and counters - never image bytes. */
@@ -4234,6 +4379,10 @@ async function applyRecognitionOutcome(input: RecognitionOutcomeInput): Promise<
   const grantCooldownMs = FACE_GRANT_COOLDOWN_SECONDS * 1000;
   const strangerCooldownMs = FACE_STRANGER_COOLDOWN_SECONDS * 1000;
   let grantable: EmployeeRecord[] = recognizedEmployees;
+  // Per-face stranger records to write once the access event exists.
+  let tailgaterFaces: FaceObservation[] = [];
+  let deniedFaces: FaceObservation[] = [];
+  let logStrangerObservation: FaceObservation | undefined = input.strangerObservation;
 
   if (hasAuthorized) {
     if (input.cooldowns && grantCooldownMs > 0) {
@@ -4258,6 +4407,11 @@ async function applyRecognitionOutcome(input: RecognitionOutcomeInput): Promise<
       summary.suppressed = "grant-cooldown";
       return result;
     }
+    // Unregistered people walking in with the employee (owner 2026-09-29: record
+    // them). Never part of the door decision above.
+    if (input.strangerFaces?.length) {
+      tailgaterFaces = acceptStrangerFaces(input.strangerFaces, gateKey, nowMs, input.cooldowns).accepted;
+    }
   } else {
     const hasRealFace = detectedFaces.some((f) => f.boxSource === "detector");
     const hasImage = Boolean(input.frameImage);
@@ -4267,6 +4421,21 @@ async function applyRecognitionOutcome(input: RecognitionOutcomeInput): Promise<
       // rather than filling the cluster panel with pictures of a doorway.
       return result;
     }
+    if (input.strangerFaces?.length) {
+      // One decision per face: the frame is stored when at least one stranger
+      // in it passes; each passing face gets its own record.
+      const { accepted, firstReason } = acceptStrangerFaces(input.strangerFaces, gateKey, nowMs, input.cooldowns);
+      if (accepted.length === 0) {
+        const reason = firstReason || "stranger-quality";
+        stats.strangersSuppressed += 1;
+        stats.lastSuppressed = reason;
+        stats.lastSuppressedAt = new Date(nowMs).toISOString();
+        summary.suppressed = reason;
+        return result;
+      }
+      deniedFaces = accepted;
+      logStrangerObservation = accepted[0];
+    } else {
     // Too poor to identify anyone from: count it, but do not store the image.
     const bestQuality = detectedFaces.reduce(
       (best, f) => Math.max(best, Number.isFinite(f.livenessScore) ? f.livenessScore / 100 : 0),
@@ -4340,6 +4509,7 @@ async function applyRecognitionOutcome(input: RecognitionOutcomeInput): Promise<
         }
         lastStrangerLogAtByGate.set(gateKey, nowMs);
       }
+    }
     }
   }
 
@@ -4452,6 +4622,9 @@ async function applyRecognitionOutcome(input: RecognitionOutcomeInput): Promise<
       broadcastSSE("notification", warnNotif);
     }
 
+    if (tailgaterFaces.length && result.logs[0]) {
+      await persistStrangerFaces(tailgaterFaces, result.logs[0].id, result.logs[0].timestamp, input.frameImage, gateKey);
+    }
     return result;
   }
 
@@ -4472,9 +4645,9 @@ async function applyRecognitionOutcome(input: RecognitionOutcomeInput): Promise<
     reason:
       (detectedFaces[0]?.message || "Không có khuôn mặt nào khớp với cơ sở dữ liệu nhân viên") +
       recognitionSourceSuffix(input),
-    faceEmbedding: input.strangerObservation?.embedding,
-    faceEmbeddingModelTag: input.strangerObservation ? faceModelTag() : undefined,
-    faceEmbeddingQuality: input.strangerObservation?.quality,
+    faceEmbedding: logStrangerObservation?.embedding,
+    faceEmbeddingModelTag: logStrangerObservation ? faceModelTag() : undefined,
+    faceEmbeddingQuality: logStrangerObservation?.quality,
   };
   accessLogs.unshift(accessLog);
   db.saveAccessLog(accessLog);
@@ -4533,13 +4706,14 @@ async function applyRecognitionOutcome(input: RecognitionOutcomeInput): Promise<
     doorName: smartLockState.doorName,
     faceCount: detectedFaces.length,
     baseUrl: input.baseUrl,
-    embedding: input.strangerObservation?.embedding,
+    embedding: logStrangerObservation?.embedding,
   })
     .then((sent) => {
       if (!sent) stats.strangerWebhooksNotSent += 1;
     })
     .catch(() => {});
 
+  if (deniedFaces.length) await persistStrangerFaces(deniedFaces, accessLog.id, accessLog.timestamp, input.frameImage, gateKey);
   return result;
 }
 
@@ -4882,6 +5056,7 @@ async function performGateScan(input: GateScanRequest): Promise<GateScanResult> 
   let snapshotStreamLabel: string | undefined;
   let snapshotFaces: Array<DetectedFaceItem & { streamId: string; streamLabel: string }> = [];
   let snapshotObservation: FaceObservation | undefined;
+  let snapshotStrangerFaces: FaceObservation[] | undefined;
 
   if (faceEngine === "onnx" && allObserved.length > 0) {
     let pick = -1;
@@ -4905,6 +5080,10 @@ async function performGateScan(input: GateScanRequest): Promise<GateScanResult> 
       snapshotStreamLabel = chosen.streamLabel;
       snapshotFaces = allFaces.filter(
         (_, i) => allObserved[i].streamId === chosen.streamId && allObserved[i].frameIndex === chosen.frameIndex
+      );
+      snapshotStrangerFaces = strangerFacesOfFrame(
+        allObserved.filter((o) => o.streamId === chosen.streamId && o.frameIndex === chosen.frameIndex),
+        allFaces.filter((_, i) => allObserved[i].streamId === chosen.streamId && allObserved[i].frameIndex === chosen.frameIndex),
       );
     }
   } else if (faceEngine !== "onnx") {
@@ -4937,6 +5116,7 @@ async function performGateScan(input: GateScanRequest): Promise<GateScanResult> 
     cooldowns: true,
     denyWithoutFace: false,
     strangerObservation: snapshotObservation,
+    strangerFaces: snapshotStrangerFaces,
   });
 
   return { status: 200, body: {
@@ -7171,7 +7351,11 @@ app.get("/api/logs/:id/recording", requireOperatorRole("viewer"), async (req, re
   });
 });
 
-app.get("/api/logs/:id/image", requireOperatorRole("viewer"), async (req, res) => {
+/**
+ * Headers and cross-site refusal shared by the biometric image routes (frame
+ * photos and face crops). Returns false when the request was refused.
+ */
+function guardBiometricImage(req: Request, res: Response): boolean {
   const fetchSite = String(req.headers["sec-fetch-site"] || "").toLowerCase();
   const origin = String(req.headers.origin || "").trim().replace(/\/+$/, "").toLowerCase();
   let refererOrigin = "";
@@ -7183,9 +7367,14 @@ app.get("/api/logs/:id/image", requireOperatorRole("viewer"), async (req, res) =
   res.setHeader("X-Content-Type-Options", "nosniff");
   if ((browserOrigin && !trustedBrowserOrigin) || (fetchSite === "cross-site" && !trustedBrowserOrigin)) {
     res.status(403).json({ success: false, code: "IMAGE_CROSS_SITE_FORBIDDEN", error: "Cross-site image request is not allowed" });
-    return;
+    return false;
   }
   res.setHeader("Cross-Origin-Resource-Policy", fetchSite === "cross-site" && trustedBrowserOrigin ? "cross-origin" : "same-site");
+  return true;
+}
+
+app.get("/api/logs/:id/image", requireOperatorRole("viewer"), async (req, res) => {
+  if (!guardBiometricImage(req, res)) return;
   const id = String(req.params.id || "");
   if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(id)) {
     res.status(400).json({ success: false, error: "Invalid log id" });
@@ -7256,17 +7445,23 @@ const decodeStrangerCursor = (value: unknown): { timestamp: string; id: string }
     return null;
   }
 };
-const strangerClusterRegistry = new Map<string, { cluster: any; logs: AccessLogRecord[]; version: number }>();
-const registerStrangerClusters = (clusters: any[], logs: AccessLogRecord[]) => {
+const strangerClusterRegistry = new Map<string, {
+  cluster: any;
+  logs: AccessLogRecord[];
+  faces: StrangerFaceRecord[];
+  version: number;
+}>();
+const registerStrangerClusters = (clusters: any[], logs: AccessLogRecord[], faces: StrangerFaceRecord[] = []) => {
   for (const cluster of clusters) {
-    const memberIds = new Set(cluster.photos.map((photo: any) => photo.logId));
-    const members = logs.filter((log) => memberIds.has(log.id));
+    const memberIds = new Set<string>(cluster.photos.map((photo: any) => photo.observationId || `log:${photo.logId}`));
+    const members = logs.filter((log) => memberIds.has(`log:${log.id}`));
+    const memberFaces = faces.filter((face) => memberIds.has(faceObservationId(face.id)));
     const version = Number.parseInt(createHash("sha256").update(cluster.clusterId).digest("hex").slice(0, 8), 16);
     cluster.clusterVersion = version;
     cluster.status = "OPEN";
     cluster.observationCount = cluster.photos.length;
     strangerClusterRegistry.delete(cluster.clusterId);
-    strangerClusterRegistry.set(cluster.clusterId, { cluster, logs: members, version });
+    strangerClusterRegistry.set(cluster.clusterId, { cluster, logs: members, faces: memberFaces, version });
   }
   while (strangerClusterRegistry.size > 1000) {
     const oldest = strangerClusterRegistry.keys().next().value;
@@ -7285,17 +7480,108 @@ const registerStrangerClusters = (clusters: any[], logs: AccessLogRecord[]) => {
  * validates. Recomputed only when the window or the adjudications change.
  */
 const STRANGER_CLUSTER_WINDOW = envInt("FACE_STRANGER_CLUSTER_WINDOW", 500, 50, 5000);
-let strangerWindowCache: { key: string; logs: AccessLogRecord[]; clusters: any[] } | null = null;
+let strangerWindowCache: { key: string; logs: AccessLogRecord[]; faces: StrangerFaceRecord[]; clusters: any[] } | null = null;
 
-async function strangerWindow(): Promise<{ logs: AccessLogRecord[]; clusters: any[] }> {
+/** Newest per-face stranger records, up to the window (keyset pages of 100). */
+async function collectStrangerFaceWindow(max: number): Promise<StrangerFaceRecord[]> {
+  const faces: StrangerFaceRecord[] = [];
+  let cursor: { capturedAt: string; id: string } | null = null;
+  while (faces.length < max) {
+    const page = await db.getStrangerFacesPage(cursor, Math.min(100, max - faces.length));
+    faces.push(...page.faces);
+    const last = page.faces[page.faces.length - 1];
+    if (!page.hasMore || !last) break;
+    cursor = { capturedAt: last.capturedAt, id: last.id };
+  }
+  return faces;
+}
+
+async function strangerWindow(): Promise<{ logs: AccessLogRecord[]; faces: StrangerFaceRecord[]; clusters: any[] }> {
   const logs = await collectStrangerWindow((cursor, limit) => db.getStrangerCandidateLogsPage(cursor, limit), STRANGER_CLUSTER_WINDOW);
+  const faces = await collectStrangerFaceWindow(STRANGER_CLUSTER_WINDOW);
   const retired = db.getRetiredStrangerObservationIds();
-  const key = `${logs.length}|${logs[0]?.id || ""}|${logs[logs.length - 1]?.id || ""}|${retired.length}|${DEMO_DATA_ENABLED}`;
+  const key = [
+    logs.length, logs[0]?.id || "", logs[logs.length - 1]?.id || "",
+    faces.length, faces[0]?.id || "", faces[faces.length - 1]?.id || "",
+    retired.length, DEMO_DATA_ENABLED,
+  ].join("|");
   if (strangerWindowCache?.key === key) return strangerWindowCache;
-  const clusters = clusterStrangerFaces(logs, retired, { includeDemoSeeds: DEMO_DATA_ENABLED });
-  registerStrangerClusters(clusters, logs);
-  strangerWindowCache = { key, logs, clusters };
+  const observations = [...observationsFromLogs(logs, retired), ...observationsFromFaces(faces, retired)];
+  const clusters = clusterStrangerObservations(observations, retired, { includeDemoSeeds: DEMO_DATA_ENABLED });
+  registerStrangerClusters(clusters, logs, faces);
+  strangerWindowCache = { key, logs, faces, clusters };
   return strangerWindowCache;
+}
+
+/**
+ * The members a resolve request names: `clusterObservationIds` (face:/log:)
+ * from current clients, else `clusterLogIds` (older clients; whole-frame
+ * captures only).
+ */
+function requestedMembership(body: any): { logIds: string[]; faceIds: string[]; observationIds: string[] } | { error: string } {
+  if (body?.clusterObservationIds !== undefined) {
+    const parsed = parseObservationIds(body.clusterObservationIds);
+    if (!parsed) return { error: "clusterObservationIds không hợp lệ" };
+    return {
+      ...parsed,
+      observationIds: [...parsed.logIds.map((id) => `log:${id}`), ...parsed.faceIds.map(faceObservationId)].sort(),
+    };
+  }
+  const logIds = requestedLogIds(body?.clusterLogIds);
+  return { logIds, faceIds: [], observationIds: logIds.map((id) => `log:${id}`).sort() };
+}
+
+/** The tile the operator chose (sourceObservationId, else sourceLogId, else the first member), if it is a member. */
+function requestedSourceObservation(body: any, membership: { observationIds: string[] }): string | null {
+  const raw = typeof body?.sourceObservationId === "string" ? body.sourceObservationId.trim() : "";
+  const legacy = typeof body?.sourceLogId === "string" && body.sourceLogId.trim() ? `log:${body.sourceLogId.trim()}` : "";
+  const chosen = raw || legacy || membership.observationIds[0] || "";
+  return membership.observationIds.includes(chosen) ? chosen : null;
+}
+
+/** Record fields for a source tile: whole-frame captures keep sourceLogId as before; a face adds sourceFaceId to the intent. */
+const sourceIntent = (sourceObservation: string) =>
+  sourceObservation.startsWith("face:") ? { sourceFaceId: sourceObservation.slice(5) } : {};
+
+/**
+ * Template from the chosen tile: a face enrols from its own crop (one face,
+ * matched to its embedding); a whole-frame capture as before.
+ */
+async function enrolFromStrangerSource(
+  employeeId: string,
+  sourceObservation: string,
+  validated: { logs: AccessLogRecord[]; faces: StrangerFaceRecord[] },
+  source: "enrollment" | "merge",
+): Promise<EnrollOutcome & { record?: FaceTemplateRecord }> {
+  if (sourceObservation.startsWith("face:")) {
+    const face = validated.faces.find((f) => f.id === sourceObservation.slice(5));
+    const crop = face ? await db.getStrangerFaceCrop(face.id) : undefined;
+    if (!face || !crop) return { rejected: "unsupported-image" };
+    return prepareTemplateFromImage(employeeId, crop, {
+      source, sourceLogId: face.logId, expectedEmbedding: face.embedding?.length ? face.embedding : undefined,
+    });
+  }
+  const sightingLog = validated.logs.find((log) => `log:${log.id}` === sourceObservation) ||
+    validated.logs.find((log) => Boolean(log.photoSnapshot));
+  const sourceLog = sightingLog ? await db.getAccessLogById(sightingLog.id) : undefined;
+  return sourceLog && isEnrollableImage(sourceLog.photoSnapshot)
+    ? prepareTemplateFromImage(employeeId, sourceLog.photoSnapshot, {
+        source, sourceLogId: sourceLog.id, expectedEmbedding: sightingEmbedding(sightingLog),
+      })
+    : { rejected: "unsupported-image" };
+}
+
+/** The access event a source tile belongs to. */
+function sourceLogIdOf(sourceObservation: string, validated: { faces: StrangerFaceRecord[] }): string | undefined {
+  if (sourceObservation.startsWith("log:")) return sourceObservation.slice(4);
+  return validated.faces.find((f) => f.id === sourceObservation.slice(5))?.logId;
+}
+
+/** Image URL for a tile (employee photo when a stranger becomes an employee). */
+function sourceImageUrl(sourceObservation: string, validated: { faces: StrangerFaceRecord[] }): string | undefined {
+  if (sourceObservation.startsWith("face:")) return faceImageUrl(sourceObservation.slice(5));
+  const logId = sourceObservation.slice(4);
+  return logId ? logImageUrl(logId) : undefined;
 }
 
 // --- Stranger Face Alerts & Clustered Face Quick Registration ---
@@ -7336,6 +7622,37 @@ app.get(["/api/strangers/clusters", "/api/strangers", "/api/strangers/"], requir
 });
 
 app.get("/api/strangers/lookup", requireOperatorRole("viewer"), async (req, res) => {
+  if (req.query.faceId !== undefined) {
+    // One face of a frame (per-face records): its group in the panel's window.
+    const faceId = String(req.query.faceId || "").trim();
+    if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(faceId)) {
+      res.status(400).json({ success: false, error: "faceId không hợp lệ" });
+      return;
+    }
+    if (db.getRetiredStrangerObservationIds().includes(faceObservationId(faceId))) {
+      res.status(410).json({ success: false, status: "RESOLVED", error: "Khuôn mặt đã được xử lý" });
+      return;
+    }
+    const { clusters } = await strangerWindow();
+    const inWindow = clusters.find((c) => c.photos.some((photo: any) => photo.faceId === faceId));
+    if (inWindow) {
+      res.json({ success: true, cluster: inWindow });
+      return;
+    }
+    const [face] = await db.getStrangerFacesByIds([faceId]);
+    if (!face || face.purgedAt) {
+      res.status(404).json({ success: false, status: "MISSING", error: "Không tìm thấy khuôn mặt người lạ" });
+      return;
+    }
+    const [cluster] = clusterStrangerObservations(observationsFromFaces([face]), db.getRetiredStrangerObservationIds());
+    if (!cluster) {
+      res.status(404).json({ success: false, status: "MISSING", error: "Không tìm thấy cụm người lạ" });
+      return;
+    }
+    registerStrangerClusters([cluster], [], [face]);
+    res.json({ success: true, cluster });
+    return;
+  }
   const logId = String(req.query.logId || "").trim();
   if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(logId)) {
     res.status(400).json({ success: false, error: "logId không hợp lệ" });
@@ -7367,6 +7684,25 @@ app.get("/api/strangers/lookup", requireOperatorRole("viewer"), async (req, res)
   res.json({ success: true, cluster });
 });
 
+/** A stranger face crop (biometric; viewer and up, like the frame photo). 404 once retention purged it. */
+app.get("/api/strangers/faces/:faceId/image", requireOperatorRole("viewer"), async (req, res) => {
+  if (!guardBiometricImage(req, res)) return;
+  const faceId = String(req.params.faceId || "");
+  if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(faceId)) {
+    res.status(400).json({ success: false, error: "faceId không hợp lệ" });
+    return;
+  }
+  const crop = await db.getStrangerFaceCrop(faceId);
+  if (!crop) {
+    res.status(404).json({ success: false, error: "Ảnh khuôn mặt không tồn tại hoặc đã hết hạn lưu trữ" });
+    return;
+  }
+  res.setHeader("Content-Type", "image/jpeg");
+  res.setHeader("Content-Length", String(crop.length));
+  res.setHeader("Content-Security-Policy", "default-src 'none'; sandbox");
+  res.send(crop);
+});
+
 app.get("/api/strangers/clusters/:clusterId", requireOperatorRole("viewer"), (req, res) => {
   const entry = strangerClusterRegistry.get(String(req.params.clusterId || ""));
   if (!entry) {
@@ -7378,28 +7714,37 @@ app.get("/api/strangers/clusters/:clusterId", requireOperatorRole("viewer"), (re
     totalObservations: entry.cluster.photos.length, hasMore: entry.cluster.photos.length > limit });
 });
 
-async function validatedStrangerCluster(clusterId: unknown, requestedIds: unknown, requestedVersion?: unknown): Promise<{
+async function validatedStrangerCluster(
+  clusterId: unknown,
+  membership: { observationIds: string[] },
+  requestedVersion?: unknown,
+): Promise<{
   clusterId: string;
   logIds: string[];
+  faceIds: string[];
+  observationIds: string[];
   logs: AccessLogRecord[];
+  faces: StrangerFaceRecord[];
 } | { error: string }> {
   const id = String(clusterId || "").trim();
-  let ids = Array.isArray(requestedIds) ? [...new Set(requestedIds.map(String))].sort() : [];
+  let ids = [...membership.observationIds].sort();
   const registered = strangerClusterRegistry.get(id);
-  if (registered && ids.length === 0 && Number(requestedVersion) === registered.version) {
-    ids = registered.cluster.photos.map((photo: any) => photo.logId).sort();
-  }
-  if (!id || ids.length === 0) return { error: "Cần clusterId và danh sách log hoặc clusterVersion của cụm" };
+  const actual = registered
+    ? registered.cluster.photos.map((photo: any) => String(photo.observationId || `log:${photo.logId}`)).sort()
+    : [];
+  if (registered && ids.length === 0 && Number(requestedVersion) === registered.version) ids = actual;
+  if (!id || ids.length === 0) return { error: "Cần clusterId và danh sách thành viên hoặc clusterVersion của cụm" };
   if (!registered) return { error: "Cụm người lạ không tồn tại hoặc đã hết phiên tra cứu" };
   if (requestedVersion != null && Number(requestedVersion) !== registered.version) return { error: "Phiên bản cụm đã thay đổi" };
-  const actual = registered.cluster.photos.map((photo: any) => photo.logId).sort();
   if (actual.length !== ids.length || actual.some((value: string, index: number) => value !== ids[index])) {
-    return { error: "Danh sách log không khớp thành viên cụm trên máy chủ" };
+    return { error: "Danh sách thành viên không khớp cụm trên máy chủ" };
   }
   if (registered.logs.some((log) => log.status !== "DENIED")) {
     return { error: "Cụm chứa log không hợp lệ hoặc không còn là sự kiện DENIED" };
   }
-  return { clusterId: id, logIds: ids, logs: registered.logs };
+  const logIds = ids.filter((x) => x.startsWith("log:")).map((x) => x.slice(4)).sort();
+  const faceIds = ids.filter((x) => x.startsWith("face:")).map((x) => x.slice(5)).sort();
+  return { clusterId: id, logIds, faceIds, observationIds: ids, logs: registered.logs, faces: registered.faces };
 }
 
 const resolutionId = (clusterId: string) =>
@@ -7416,8 +7761,6 @@ app.post(["/api/strangers/quick-register", "/api/strangers/register"], requireOp
       photoUrl,
       clusterId,
       clusterVersion,
-      clusterLogIds = [],
-      sourceLogId,
     } = req.body;
 
     const normalizedName = normalizedField(name, 120);
@@ -7425,8 +7768,13 @@ app.post(["/api/strangers/quick-register", "/api/strangers/register"], requireOp
     const normalizedDepartment = normalizedOptionalField(department, 120);
     const normalizedPosition = normalizedOptionalField(position, 120);
     const normalizedPhotoUrl = normalizedOptionalField(photoUrl, 2048);
-    const normalizedLogIds = requestedLogIds(clusterLogIds);
-    const normalizedSourceLogId = normalizedField(sourceLogId, 128) || normalizedLogIds[0] || null;
+    const membership = requestedMembership(req.body);
+    if ("error" in membership) {
+      res.status(400).json({ success: false, error: membership.error });
+      return;
+    }
+    const sourceObservation = requestedSourceObservation(req.body, membership);
+    const normalizedSourceLogId = sourceObservation?.startsWith("log:") ? sourceObservation.slice(4) : null;
     if (!normalizedName || !normalizedEmployeeCode || normalizedDepartment === null || normalizedPosition === null || normalizedPhotoUrl === null) {
       res.status(400).json({ success: false, error: "Thông tin nhân viên không đúng kiểu hoặc vượt quá độ dài cho phép" });
       return;
@@ -7439,8 +7787,8 @@ app.post(["/api/strangers/quick-register", "/api/strangers/register"], requireOp
       res.status(400).json({ success: false, error: "Quyền truy cập không hợp lệ" });
       return;
     }
-    if (!normalizedSourceLogId || !normalizedLogIds.includes(normalizedSourceLogId)) {
-      res.status(400).json({ success: false, error: "sourceLogId phải là một thành viên của cụm" });
+    if (!sourceObservation) {
+      res.status(400).json({ success: false, error: "Ảnh nguồn (sourceObservationId/sourceLogId) phải là một thành viên của cụm" });
       return;
     }
     const departmentName = resolveOrgName("departments", normalizedDepartment, NEW_STRANGER_DEFAULTS.departments);
@@ -7454,14 +7802,16 @@ app.post(["/api/strangers/quick-register", "/api/strangers/register"], requireOp
       return;
     }
     const intent = { name: normalizedName, employeeCode: normalizedEmployeeCode,
-      department: departmentName.name, position: positionName.name, accessLevel, photoUrl: normalizedPhotoUrl };
+      department: departmentName.name, position: positionName.name, accessLevel, photoUrl: normalizedPhotoUrl,
+      ...sourceIntent(sourceObservation) };
 
     const existingResolution = db.getStrangerResolution(String(clusterId || ""));
     if (existingResolution) {
       const employee = employees.find((item) => item.id === existingResolution.employeeId);
       if (!employee || !sameResolutionIntent(existingResolution, {
         ...existingResolution, action: "QUICK_REGISTER", employeeId: employee.id,
-        logIds: normalizedLogIds, sourceLogId: normalizedSourceLogId, metadata: { intent },
+        logIds: membership.logIds, faceIds: membership.faceIds,
+        sourceLogId: normalizedSourceLogId ?? existingResolution.sourceLogId, metadata: { intent },
       })) {
         res.status(409).json({ success: false, error: "Cụm đã được xử lý theo cách khác" });
         return;
@@ -7478,7 +7828,7 @@ app.post(["/api/strangers/quick-register", "/api/strangers/register"], requireOp
       return;
     }
 
-    const validated = await validatedStrangerCluster(clusterId, normalizedLogIds, clusterVersion);
+    const validated = await validatedStrangerCluster(clusterId, membership, clusterVersion);
     if ("error" in validated) {
       res.status(409).json({ success: false, error: validated.error });
       return;
@@ -7491,26 +7841,18 @@ app.post(["/api/strangers/quick-register", "/api/strangers/register"], requireOp
       employeeCode: normalizedEmployeeCode,
       department: departmentName.name,
       position: positionName.name,
-      photoUrl: normalizedPhotoUrl || logImageUrl(validated.logIds[0]),
+      photoUrl: normalizedPhotoUrl || sourceImageUrl(sourceObservation, validated) || logImageUrl(validated.logIds[0]),
       registeredAt: new Date().toISOString(),
       accessLevel,
     };
-    const requestedSource = normalizedSourceLogId;
-    const sightingLog = validated.logs.find((log) => log.id === requestedSource) ||
-      validated.logs.find((log) => Boolean(log.photoSnapshot));
-    const sourceLog = sightingLog ? await db.getAccessLogById(sightingLog.id) : undefined;
-    const enrolled = sourceLog && isEnrollableImage(sourceLog.photoSnapshot)
-      ? await prepareTemplateFromImage(newEmployee.id, sourceLog.photoSnapshot, {
-          source: "enrollment", sourceLogId: sourceLog.id, expectedEmbedding: sightingEmbedding(sightingLog),
-        })
-      : { rejected: "unsupported-image" as const };
+    const enrolled = await enrolFromStrangerSource(newEmployee.id, sourceObservation, validated, "enrollment");
     const commit = await db.commitStrangerResolution({
       employee: newEmployee,
       faceTemplate: enrolled.record,
       resolution: {
         id: resolutionId(validated.clusterId), clusterId: validated.clusterId, action: "QUICK_REGISTER",
         employeeId: newEmployee.id, actor: operatorActor(req), resolvedAt: new Date().toISOString(),
-        logIds: validated.logIds, sourceLogId: sightingLog?.id,
+        logIds: validated.logIds, faceIds: validated.faceIds, sourceLogId: sourceLogIdOf(sourceObservation, validated),
         metadata: { intent, recognitionReady: Boolean(enrolled.saved), enrollmentRejected: enrolled.rejected || null },
       },
     });
@@ -7546,14 +7888,14 @@ app.post(["/api/strangers/quick-register", "/api/strangers/register"], requireOp
     broadcastSSE("employee_added", newEmployee);
     broadcastSSE("notification", notif);
     broadcastSSE("stranger_registered", { employee: newEmployee, updatedLogsCount: 0,
-      clusterId: validated.clusterId, clusterLogIds: validated.logIds });
+      clusterId: validated.clusterId, clusterLogIds: validated.logIds, clusterObservationIds: validated.observationIds });
 
     res.json({
       success: true,
       message: `Đã khai báo nhân viên ${newEmployee.name}`,
       employee: newEmployee,
       updatedLogsCount: 0,
-      adjudicatedLogsCount: validated.logIds.length,
+      adjudicatedLogsCount: validated.observationIds.length,
       clusterId: validated.clusterId,
       clusterResolved: true,
       faceTemplate: enrolled.saved || null,
@@ -7577,14 +7919,18 @@ app.post(["/api/strangers/quick-register", "/api/strangers/register"], requireOp
 // only the panel stops offering them. Reversible via /api/strangers/restore.
 app.post(["/api/strangers/dismiss", "/api/strangers/reject"], requireOperatorRole("operator"), requireCsrf, async (req, res) => {
   try {
-    const { clusterId, clusterVersion, clusterLogIds = [], reason } = req.body || {};
-    const normalizedLogIds = requestedLogIds(clusterLogIds);
+    const { clusterId, clusterVersion, reason } = req.body || {};
+    const membership = requestedMembership(req.body);
+    if ("error" in membership) {
+      res.status(400).json({ success: false, error: membership.error });
+      return;
+    }
     const normalizedReason = typeof reason === "string" ? reason.trim().slice(0, 120) : "";
     const existing = db.getStrangerResolution(String(clusterId || ""));
     if (existing) {
       if (!sameResolutionIntent(existing, {
         ...existing, action: "DISMISS", employeeId: undefined, sourceLogId: undefined,
-        logIds: normalizedLogIds, metadata: { intent: { reason: normalizedReason } },
+        logIds: membership.logIds, faceIds: membership.faceIds, metadata: { intent: { reason: normalizedReason } },
       })) {
         res.status(409).json({ success: false, error: "Cụm đã được xử lý theo cách khác" });
         return;
@@ -7592,7 +7938,7 @@ app.post(["/api/strangers/dismiss", "/api/strangers/reject"], requireOperatorRol
       res.json({ success: true, resolution: existing, idempotentReplay: true });
       return;
     }
-    const validated = await validatedStrangerCluster(clusterId, normalizedLogIds, clusterVersion);
+    const validated = await validatedStrangerCluster(clusterId, membership, clusterVersion);
     if ("error" in validated) {
       res.status(409).json({ success: false, error: validated.error });
       return;
@@ -7605,6 +7951,7 @@ app.post(["/api/strangers/dismiss", "/api/strangers/reject"], requireOperatorRol
         actor: operatorActor(req),
         resolvedAt: new Date().toISOString(),
         logIds: validated.logIds,
+        faceIds: validated.faceIds,
         metadata: { intent: { reason: normalizedReason }, reason: normalizedReason || null },
       },
     });
@@ -7613,7 +7960,7 @@ app.post(["/api/strangers/dismiss", "/api/strangers/reject"], requireOperatorRol
       return;
     }
     const resolution = commit.resolution;
-    broadcastSSE("stranger_dismissed", { clusterId: validated.clusterId, clusterLogIds: validated.logIds });
+    broadcastSSE("stranger_dismissed", { clusterId: validated.clusterId, clusterLogIds: validated.logIds, clusterObservationIds: validated.observationIds });
     res.json({ success: true, message: "Đã từ chối và ẩn cụm ảnh người lạ", resolution, idempotentReplay: commit.status === "replay" });
   } catch (err: any) {
     console.error("[Strangers] Lỗi từ chối cụm ảnh người lạ:", err);
@@ -7681,17 +8028,21 @@ app.post("/api/strangers/retire-non-faces", requireOperatorRole("admin"), requir
 app.post("/api/strangers/restore", requireOperatorRole("operator"), requireCsrf, async (req, res) => {
   try {
     const clusterId = String(req.body?.clusterId || "").trim();
-    const requested = Array.isArray(req.body?.clusterLogIds)
-      ? [...new Set(req.body.clusterLogIds.map(String))].sort()
-      : [];
+    const membership = requestedMembership(req.body);
+    if ("error" in membership) {
+      res.status(400).json({ success: false, error: membership.error });
+      return;
+    }
     const resolution = db.getStrangerResolution(clusterId);
     if (!resolution || resolution.action !== "DISMISS") {
       res.status(409).json({ success: false, error: "Không tìm thấy adjudication DISMISS có thể khôi phục" });
       return;
     }
     const actual = [...resolution.logIds].sort();
-    if (requested.length !== actual.length || actual.some((value, index) => value !== requested[index])) {
-      res.status(409).json({ success: false, error: "Danh sách log không khớp adjudication đã lưu" });
+    const actualFaces = [...(resolution.faceIds || [])].sort();
+    const same = (a: string[], b: string[]) => a.length === b.length && a.every((value, index) => value === b[index]);
+    if (!same(membership.logIds, actual) || !same(membership.faceIds, actualFaces)) {
+      res.status(409).json({ success: false, error: "Danh sách thành viên không khớp adjudication đã lưu" });
       return;
     }
     const restored = await db.restoreStrangerResolution({
@@ -7705,9 +8056,13 @@ app.post("/api/strangers/restore", requireOperatorRole("operator"), requireCsrf,
       actor: operatorActor(req),
       resolvedAt: new Date().toISOString(),
       logIds: actual,
+      faceIds: actualFaces,
       metadata: { restoredResolutionId: resolution.id },
     });
-    broadcastSSE("stranger_restored", { clusterId, clusterLogIds: actual, actor: operatorActor(req) });
+    strangerWindowCache = null;
+    broadcastSSE("stranger_restored", {
+      clusterId, clusterLogIds: actual, clusterObservationIds: actualFaces.map(faceObservationId), actor: operatorActor(req),
+    });
     res.json({ success: true, message: "Đã khôi phục cụm ảnh người lạ", resolution: restored });
   } catch (err: any) {
     if (err?.message === "restore-conflict") {
@@ -7765,9 +8120,7 @@ app.post(["/api/strangers/merge", "/api/strangers/assign"], requireOperatorRole(
       employeeCode,
       clusterId,
       clusterVersion,
-      clusterLogIds = [],
       adoptPhoto = false,
-      sourceLogId,
     } = req.body || {};
 
     if (!employeeId && !employeeCode) {
@@ -7782,18 +8135,25 @@ app.post(["/api/strangers/merge", "/api/strangers/assign"], requireOperatorRole(
       return;
     }
 
-    const normalizedLogIds = requestedLogIds(clusterLogIds);
-    const normalizedSourceLogId = normalizedField(sourceLogId, 128) || normalizedLogIds[0] || null;
-    if (!normalizedSourceLogId || !normalizedLogIds.includes(normalizedSourceLogId)) {
-      res.status(400).json({ success: false, error: "sourceLogId phải là một thành viên của cụm" });
+    const membership = requestedMembership(req.body);
+    if ("error" in membership) {
+      res.status(400).json({ success: false, error: membership.error });
       return;
     }
+    const sourceObservation = requestedSourceObservation(req.body, membership);
+    if (!sourceObservation) {
+      res.status(400).json({ success: false, error: "Ảnh nguồn (sourceObservationId/sourceLogId) phải là một thành viên của cụm" });
+      return;
+    }
+    const normalizedSourceLogId = sourceObservation.startsWith("log:") ? sourceObservation.slice(4) : null;
+    const mergeIntent = { adoptPhoto: Boolean(adoptPhoto), ...sourceIntent(sourceObservation) };
     const existingResolution = db.getStrangerResolution(String(clusterId || ""));
     if (existingResolution) {
       if (!sameResolutionIntent(existingResolution, {
         ...existingResolution, action: "MERGE", employeeId: target.id,
-        logIds: normalizedLogIds, sourceLogId: normalizedSourceLogId,
-        metadata: { intent: { adoptPhoto: Boolean(adoptPhoto) } },
+        logIds: membership.logIds, faceIds: membership.faceIds,
+        sourceLogId: normalizedSourceLogId ?? existingResolution.sourceLogId,
+        metadata: { intent: mergeIntent },
       })) {
         res.status(409).json({ success: false, error: "Cụm đã được xử lý theo cách khác" });
         return;
@@ -7805,31 +8165,22 @@ app.post(["/api/strangers/merge", "/api/strangers/assign"], requireOperatorRole(
       return;
     }
 
-    const validated = await validatedStrangerCluster(clusterId, normalizedLogIds, clusterVersion);
+    const validated = await validatedStrangerCluster(clusterId, membership, clusterVersion);
     if ("error" in validated) {
       res.status(409).json({ success: false, error: validated.error });
       return;
     }
-    const requestedSource = normalizedSourceLogId;
-    const sightingLog = validated.logs.find((log) => log.id === requestedSource) ||
-      validated.logs.find((log) => Boolean(log.photoSnapshot));
-
-    const nextPhotoUrl = adoptPhoto && sightingLog ? logImageUrl(sightingLog.id) : null;
+    const nextPhotoUrl = adoptPhoto ? sourceImageUrl(sourceObservation, validated) || null : null;
     const photoUpdated = Boolean(nextPhotoUrl && nextPhotoUrl !== target.photoUrl);
-    const sourceLog = sightingLog ? await db.getAccessLogById(sightingLog.id) : undefined;
-    const enrolled = sourceLog && isEnrollableImage(sourceLog.photoSnapshot)
-      ? await prepareTemplateFromImage(target.id, sourceLog.photoSnapshot, {
-          source: "merge", sourceLogId: sourceLog.id, expectedEmbedding: sightingEmbedding(sightingLog),
-        })
-      : { rejected: "unsupported-image" as const };
+    const enrolled = await enrolFromStrangerSource(target.id, sourceObservation, validated, "merge");
     const commit = await db.commitStrangerResolution({
       employeePhotoUpdate: nextPhotoUrl ? { employeeId: target.id, photoUrl: nextPhotoUrl } : undefined,
       faceTemplate: enrolled.record,
       resolution: {
         id: resolutionId(validated.clusterId), clusterId: validated.clusterId, action: "MERGE",
         employeeId: target.id, actor: operatorActor(req), resolvedAt: new Date().toISOString(),
-        logIds: validated.logIds, sourceLogId: sightingLog?.id,
-        metadata: { intent: { adoptPhoto: Boolean(adoptPhoto) }, recognitionReady: Boolean(enrolled.saved), enrollmentRejected: enrolled.rejected || null },
+        logIds: validated.logIds, faceIds: validated.faceIds, sourceLogId: sourceLogIdOf(sourceObservation, validated),
+        metadata: { intent: mergeIntent, recognitionReady: Boolean(enrolled.saved), enrollmentRejected: enrolled.rejected || null },
       },
     });
     if (commit.status === "conflict") {
@@ -7858,7 +8209,7 @@ app.post(["/api/strangers/merge", "/api/strangers/assign"], requireOperatorRole(
     db.saveNotification(notif);
     broadcastSSE("notification", notif);
     broadcastSSE("stranger_merged", { employee: target, updatedLogsCount: 0,
-      clusterId: validated.clusterId, clusterLogIds: validated.logIds, photoUpdated });
+      clusterId: validated.clusterId, clusterLogIds: validated.logIds, clusterObservationIds: validated.observationIds, photoUpdated });
     if (photoUpdated) broadcastSSE("employee_updated", target);
 
     res.json({
@@ -7866,7 +8217,7 @@ app.post(["/api/strangers/merge", "/api/strangers/assign"], requireOperatorRole(
       message: `Đã adjudicate cụm ảnh cho nhân viên ${target.name}`,
       employee: target,
       updatedLogsCount: 0,
-      adjudicatedLogsCount: validated.logIds.length,
+      adjudicatedLogsCount: validated.observationIds.length,
       skippedLogIds: [],
       photoUpdated,
       clusterId: validated.clusterId,
@@ -8004,6 +8355,8 @@ interface RecognizeFrameResult {
   faceEngine: ActiveFaceEngine;
   /** Internal only; route responses never expose embeddings. */
   strangerObservation?: FaceObservation;
+  /** Unrecognised faces of the frame that match no employee alone (per-face stranger records). */
+  strangerFaces?: FaceObservation[];
 }
 
 /**
@@ -8074,6 +8427,7 @@ async function recognizeFrame({
   const faceEngine = activeFaceEngine();
   let fusion: FusionDecision | undefined;
   let strangerObservation: FaceObservation | undefined;
+  let strangerFaces: FaceObservation[] | undefined;
 
   if (faceEngine === "onnx" && detectedFaces.length === 0 && rawImage) {
     const engineInfo = getFaceEngineInfo();
@@ -8095,6 +8449,7 @@ async function recognizeFrame({
         .map((item) => item.observation)
         .sort((a, b) => b.quality - a.quality)[0];
       detectedFaces = facesFromDecision(observed, fusion, employees);
+      strangerFaces = strangerFacesOfFrame(observed, detectedFaces);
       const winner = fusion.recognized
         ? employees.find((e) => e.id === fusion!.employeeId)
         : undefined;
@@ -8396,6 +8751,7 @@ Yêu cầu phân tích:
     fusion,
     faceEngine,
     strangerObservation,
+    strangerFaces,
   };
 }
 
@@ -8676,6 +9032,7 @@ app.post(RECOGNIZE_FACE_ROUTES, async (req, res) => {
       denyWithoutFace: true,
       sseSnapshot: imageBase64,
       strangerObservation: recognition.strangerObservation,
+      strangerFaces: recognition.strangerFaces,
     });
     const recognizedEmployees = outcome.recognizedEmployees;
     const generatedLogs = outcome.logs;
@@ -8817,6 +9174,45 @@ async function auditStoredDestinations(): Promise<void> {
   }
 }
 
+/**
+ * Retention for stranger face records (owner 2026-09-29: 14 days). Clears the
+ * crop and the embedding of faces older than the period, keeping the row as an
+ * audit tombstone. Faces that became part of an employee (quick-register or
+ * merge) are kept: the employee's photo and templates came from them.
+ */
+const STRANGER_FACE_RETENTION_DAYS = strangerFaceRetentionDays();
+const STRANGER_FACE_PURGE_EVERY_MS = 6 * 60 * 60 * 1000;
+
+async function purgeExpiredStrangerFaces(): Promise<number> {
+  if (STRANGER_FACE_RETENTION_DAYS <= 0) return 0;
+  const cutoff = new Date(Date.now() - STRANGER_FACE_RETENTION_DAYS * 24 * 60 * 60 * 1000).toISOString();
+  const keep = new Set<string>(
+    db.getStrangerResolutions()
+      .filter((r) => r.action === "QUICK_REGISTER" || r.action === "MERGE")
+      .flatMap((r) => r.faceIds || []),
+  );
+  try {
+    const purged = await db.purgeStrangerFaces(cutoff, keep);
+    if (purged > 0) {
+      strangerWindowCache = null;
+      console.log(`[Strangers] Hết hạn lưu trữ ${STRANGER_FACE_RETENTION_DAYS} ngày: đã xóa ảnh và đặc trưng của ${purged} khuôn mặt người lạ (trước ${cutoff}).`);
+    }
+    return purged;
+  } catch (err: any) {
+    console.error("[Strangers] Lỗi xóa khuôn mặt người lạ hết hạn:", err?.message || err);
+    return 0;
+  }
+}
+
+function startStrangerFaceRetention() {
+  if (STRANGER_FACE_RETENTION_DAYS <= 0) {
+    console.warn("[Strangers] FACE_STRANGER_FACE_RETENTION_DAYS=0: khuôn mặt người lạ không tự xóa.");
+    return;
+  }
+  setTimeout(() => void purgeExpiredStrangerFaces(), 2 * 60 * 1000).unref();
+  setInterval(() => void purgeExpiredStrangerFaces(), STRANGER_FACE_PURGE_EVERY_MS).unref();
+}
+
 async function startServer() {
   const isProduction =
     process.env.NODE_ENV === "production" ||
@@ -8843,6 +9239,7 @@ async function startServer() {
     // only for gates whose persisted `watch.enabled` is true.
     syncGateWatchers();
     void auditStoredDestinations().catch(() => {});
+    startStrangerFaceRetention();
   });
 }
 

@@ -1,6 +1,7 @@
 import { createHash } from "crypto";
 import { AccessLogRecord } from "./db";
 import { envNumber } from "./env";
+import { faceObservationId, logObservationId, type StrangerFaceRecord } from "./strangerFaces";
 
 /**
  * Cosine at or above which two stranger captures are treated as the same
@@ -14,8 +15,13 @@ export const STRANGER_SAME_PERSON_COSINE = envNumber("FACE_STRANGER_CLUSTER_COSI
 
 export interface StrangerPhoto {
   logId: string;
-  /** Compatibility key: this is a validated endpoint URL, never embedded image data. */
+  /** `face:<faceId>` for a per-face record, `log:<logId>` for a whole-frame capture. */
+  observationId: string;
+  faceId?: string;
+  /** Compatibility key: this is a validated endpoint URL, never embedded image data. For a face, the crop. */
   photoSnapshot: string;
+  /** Whole frame of the event. */
+  frameUrl: string;
   imageUrl: string;
   hasImage: boolean;
   timestamp: string;
@@ -57,6 +63,8 @@ const SEED_STRANGER_CLUSTERS: StrangerCluster[] = [
     photos: [
       {
         logId: "LOG-STRANGER-DEMO-1",
+        observationId: "log:LOG-STRANGER-DEMO-1",
+        frameUrl: "https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=450&auto=format&fit=crop&q=80",
         photoSnapshot: "https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=450&auto=format&fit=crop&q=80",
         imageUrl: "https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=450&auto=format&fit=crop&q=80",
         hasImage: true,
@@ -93,38 +101,104 @@ function clusterIdFor(logIds: string[]): string {
 }
 
 /**
- * Deterministic connected-component grouping over compatible ArcFace vectors.
- * Missing embeddings are intentionally singletons; image bytes are never used
- * as an identity signal and raw vectors are never copied into the result.
+ * One thing the stranger panel groups: an older whole-frame capture
+ * (`log:<id>`, one embedding per access log) or a per-face record
+ * (`face:<id>`, plan 2026-09-29). Raw vectors stay server-side.
  */
-export function clusterStrangerFaces(
-  accessLogs: AccessLogRecord[],
-  resolvedClusterIds: string[] = [],
-  options: StrangerClusterOptions = {},
-): StrangerCluster[] {
-  const resolved = new Set(resolvedClusterIds);
-  const dismissedLogs = new Set(
-    resolvedClusterIds.filter((id) => id.startsWith("log:")).map((id) => id.slice(4)),
-  );
-  const thresholdValue = options.cosineThreshold ?? STRANGER_SAME_PERSON_COSINE;
-  const threshold = Number.isFinite(thresholdValue)
-    ? Math.max(-1, Math.min(1, thresholdValue))
-    : STRANGER_SAME_PERSON_COSINE;
+export interface StrangerObservation {
+  observationId: string;
+  logId: string;
+  faceId?: string;
+  timestamp: string;
+  embedding?: number[];
+  modelTag?: string;
+  /** Tile image: the face crop for a face, the whole frame for a log. */
+  photoUrl: string;
+  frameUrl: string;
+  hasImage: boolean;
+  confidence: number;
+  doorName: string;
+  reason?: string;
+}
 
-  const logs = accessLogs
+/** Whole-frame stranger captures, as today: DENIED/unknown logs with a stored photo, minus retired ones. */
+export function observationsFromLogs(accessLogs: AccessLogRecord[], retiredIds: string[] = []): StrangerObservation[] {
+  const dismissedLogs = new Set(retiredIds.filter((id) => id.startsWith("log:")).map((id) => id.slice(4)));
+  return accessLogs
     .filter(
       (log) =>
         !dismissedLogs.has(log.id) &&
         Boolean(log.photoSnapshot) &&
         (log.status === "DENIED" || !log.employeeId || log.employeeName === "Không xác định"),
     )
-    .slice()
-    .sort((a, b) => a.id.localeCompare(b.id));
+    .map((log) => ({
+      observationId: logObservationId(log.id),
+      logId: log.id,
+      timestamp: log.timestamp,
+      embedding: log.faceEmbedding?.length ? log.faceEmbedding : undefined,
+      modelTag: log.faceEmbeddingModelTag || undefined,
+      photoUrl: imageUrl(log.id),
+      frameUrl: imageUrl(log.id),
+      hasImage: Boolean(log.photoSnapshot),
+      confidence: log.confidence || 30,
+      doorName: log.doorName || "Cổng Quét Cửa",
+      reason: log.reason || "Cảnh báo người lạ chụp hình",
+    }));
+}
 
-  const groups: AccessLogRecord[][] = [];
-  for (const log of logs) {
-    if (!log.faceEmbedding?.length || !log.faceEmbeddingModelTag) {
-      groups.push([log]);
+export function faceImageUrl(faceId: string): string {
+  return `/api/strangers/faces/${encodeURIComponent(faceId)}/image`;
+}
+
+/** Per-face records (not purged, not retired). */
+export function observationsFromFaces(faces: StrangerFaceRecord[], retiredIds: string[] = []): StrangerObservation[] {
+  const retired = new Set(retiredIds);
+  return faces
+    .filter((f) => !f.purgedAt && !retired.has(faceObservationId(f.id)))
+    .map((f) => ({
+      observationId: faceObservationId(f.id),
+      logId: f.logId,
+      faceId: f.id,
+      timestamp: f.capturedAt,
+      embedding: f.embedding?.length ? f.embedding : undefined,
+      modelTag: f.modelTag || undefined,
+      photoUrl: faceImageUrl(f.id),
+      frameUrl: imageUrl(f.logId),
+      hasImage: true,
+      confidence: 30,
+      doorName: f.gate === "EXIT" ? "Cổng ra" : "Cổng vào",
+      reason: "Người lạ (khuôn mặt riêng trong khung hình)",
+    }));
+}
+
+/** Membership key: bare log id for whole-frame captures (so their cluster ids never change), `face:<id>` for faces. */
+const membershipKey = (o: StrangerObservation) => (o.faceId ? o.observationId : o.logId);
+
+/**
+ * Deterministic connected-component grouping over compatible ArcFace vectors.
+ * Missing embeddings are intentionally singletons; image bytes are never used
+ * as an identity signal and raw vectors are never copied into the result.
+ */
+export function clusterStrangerObservations(
+  observations: StrangerObservation[],
+  resolvedClusterIds: string[] = [],
+  options: StrangerClusterOptions = {},
+): StrangerCluster[] {
+  const resolved = new Set(resolvedClusterIds);
+  const thresholdValue = options.cosineThreshold ?? STRANGER_SAME_PERSON_COSINE;
+  const threshold = Number.isFinite(thresholdValue)
+    ? Math.max(-1, Math.min(1, thresholdValue))
+    : STRANGER_SAME_PERSON_COSINE;
+
+  const items = observations
+    .filter((o) => !resolved.has(o.observationId))
+    .slice()
+    .sort((a, b) => membershipKey(a).localeCompare(membershipKey(b)));
+
+  const groups: StrangerObservation[][] = [];
+  for (const item of items) {
+    if (!item.embedding?.length || !item.modelTag) {
+      groups.push([item]);
       continue;
     }
 
@@ -132,39 +206,40 @@ export function clusterStrangerFaces(
     let bestMinimumSimilarity = -Infinity;
     for (let groupIndex = 0; groupIndex < groups.length; groupIndex++) {
       const group = groups[groupIndex];
-      if (group.some((member) =>
-        !member.faceEmbedding?.length || member.faceEmbeddingModelTag !== log.faceEmbeddingModelTag
-      )) continue;
-      const similarities = group.map((member) => cosineSimilarity(log.faceEmbedding!, member.faceEmbedding!));
+      if (group.some((member) => !member.embedding?.length || member.modelTag !== item.modelTag)) continue;
+      const similarities = group.map((member) => cosineSimilarity(item.embedding!, member.embedding!));
       const minimumSimilarity = Math.min(...similarities);
       if (minimumSimilarity >= threshold && minimumSimilarity > bestMinimumSimilarity) {
         bestGroup = groupIndex;
         bestMinimumSimilarity = minimumSimilarity;
       }
     }
-    if (bestGroup >= 0) groups[bestGroup].push(log);
-    else groups.push([log]);
+    if (bestGroup >= 0) groups[bestGroup].push(item);
+    else groups.push([item]);
   }
 
   const clusters: StrangerCluster[] = [];
   let index = 1;
   for (const members of groups) {
-    const clusterId = clusterIdFor(members.map((log) => log.id));
+    const clusterId = clusterIdFor(members.map(membershipKey));
     if (resolved.has(clusterId)) continue;
 
     members.sort((a, b) => {
       const recent = new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime();
-      return recent || a.id.localeCompare(b.id);
+      return recent || membershipKey(a).localeCompare(membershipKey(b));
     });
-    const photos: StrangerPhoto[] = members.map((log) => ({
-      logId: log.id,
-      photoSnapshot: imageUrl(log.id),
-      imageUrl: imageUrl(log.id),
-      hasImage: Boolean(log.photoSnapshot),
-      timestamp: log.timestamp,
-      confidence: log.confidence || 30,
-      doorName: log.doorName || "Cổng Quét Cửa",
-      reason: log.reason || "Cảnh báo người lạ chụp hình",
+    const photos: StrangerPhoto[] = members.map((o) => ({
+      logId: o.logId,
+      observationId: o.observationId,
+      ...(o.faceId ? { faceId: o.faceId } : {}),
+      photoSnapshot: o.photoUrl,
+      frameUrl: o.frameUrl,
+      imageUrl: o.photoUrl,
+      hasImage: o.hasImage,
+      timestamp: o.timestamp,
+      confidence: o.confidence,
+      doorName: o.doorName,
+      reason: o.reason,
     }));
 
     const similarities: number[] = [];
@@ -172,12 +247,8 @@ export function clusterStrangerFaces(
       for (let j = i + 1; j < members.length; j++) {
         const a = members[i];
         const b = members[j];
-        if (
-          a.faceEmbedding?.length &&
-          b.faceEmbedding?.length &&
-          a.faceEmbeddingModelTag === b.faceEmbeddingModelTag
-        ) {
-          similarities.push(cosineSimilarity(a.faceEmbedding, b.faceEmbedding));
+        if (a.embedding?.length && b.embedding?.length && a.modelTag === b.modelTag) {
+          similarities.push(cosineSimilarity(a.embedding, b.embedding));
         }
       }
     }
@@ -215,6 +286,14 @@ export function clusterStrangerFaces(
   return clusters;
 }
 
+/** Whole-frame captures only (the behaviour before per-face records; cluster ids unchanged). */
+export function clusterStrangerFaces(
+  accessLogs: AccessLogRecord[],
+  resolvedClusterIds: string[] = [],
+  options: StrangerClusterOptions = {},
+): StrangerCluster[] {
+  return clusterStrangerObservations(observationsFromLogs(accessLogs, resolvedClusterIds), resolvedClusterIds, options);
+}
 
 export interface RecentStranger {
   at: number;
