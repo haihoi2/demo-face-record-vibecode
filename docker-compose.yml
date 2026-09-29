@@ -74,6 +74,8 @@ services:
       - FACE_STRANGER_MIN_EDGE_ENERGY=${FACE_STRANGER_MIN_EDGE_ENERGY:-}
       - FACE_STRANGER_FACE_RETENTION_DAYS=${FACE_STRANGER_FACE_RETENTION_DAYS:-}
       - SHADOW_RESULT_RETENTION_DAYS=${SHADOW_RESULT_RETENTION_DAYS:-}
+      - PIPELINE_MIN_FACE_PX=${PIPELINE_MIN_FACE_PX:-}
+      - FACE_TTA_FLIP=${FACE_TTA_FLIP:-}
       # Compression of the stored access-log photo (FFmpeg -q:v, 2-31; default 8).
       - SNAPSHOT_JPEG_QSCALE=${SNAPSHOT_JPEG_QSCALE:-}
       # NVR playback for access-history review (server-side only; see .env.example).

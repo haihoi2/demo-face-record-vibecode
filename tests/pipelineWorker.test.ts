@@ -326,3 +326,17 @@ describe("PipelineCore", () => {
     assert.equal(msgs.filter((m) => m.type === "frame-done").length, 5, "frames after stop are ignored");
   });
 });
+
+describe("pipelineWorkerEnv: PIPELINE_MIN_FACE_PX (pipeline-only face-size floor)", () => {
+  it("sets the worker's floor only when given, leaving the door engine's untouched", () => {
+    const base = { FACE_MIN_SIZE_PX: "60" } as NodeJS.ProcessEnv;
+    assert.equal(pipelineWorkerEnv(base).FACE_MIN_SIZE_PX, "60");
+    assert.equal(pipelineWorkerEnv({ ...base, PIPELINE_MIN_FACE_PX: "40" }).FACE_MIN_SIZE_PX, "40");
+    assert.equal(base.FACE_MIN_SIZE_PX, "60");
+  });
+  it("ignores out-of-range or non-integer values", () => {
+    for (const bad of ["10", "4000", "40.5", "abc", ""]) {
+      assert.equal(pipelineWorkerEnv({ FACE_MIN_SIZE_PX: "60", PIPELINE_MIN_FACE_PX: bad } as NodeJS.ProcessEnv).FACE_MIN_SIZE_PX, "60", bad);
+    }
+  });
+});

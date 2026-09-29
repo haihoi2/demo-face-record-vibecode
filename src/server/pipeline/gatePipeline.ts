@@ -175,6 +175,12 @@ export function pipelineWorkerEnv(env: NodeJS.ProcessEnv = process.env): NodeJS.
   };
   const threads = int("PIPELINE_ORT_THREADS", 1, 16);
   if (threads) out.FACE_ORT_THREADS = threads;
+  // Pipeline-only face-size floor (source pixels) for tracking AND embedding
+  // evidence in the worker; the door engine on the main thread keeps
+  // FACE_MIN_SIZE_PX. Unset = the worker inherits the door engine's floor.
+  // Entry diagnostic 2026-09-29: most faces in the 4K entry strip are < 60 px.
+  const minFace = int("PIPELINE_MIN_FACE_PX", 24, 2000);
+  if (minFace) out.FACE_MIN_SIZE_PX = minFace;
   const variant = String(env.PIPELINE_DETECTOR_VARIANT ?? "").trim().toLowerCase();
   if (variant === "fp32" || variant === "int8") out.FACE_DETECTOR_VARIANT = variant;
   // A file name only (no path separators), so the worker cannot be pointed outside FACE_MODEL_DIR.
