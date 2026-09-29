@@ -85,3 +85,13 @@ Design:
 4. **N-gate model**: direction + door per gate as in section 6. Confirm that each future gate has its own physical door/controller.
 5. **C1 now**: have an operator enrol all 31 employees on both cameras this week.
 6. **`FACE_DETECT_UPSCALE` stays `none`** (closes review item 7). Recommended: yes.
+
+## 9. Contract (accuracy wave, base `release/accuracy`)
+
+- `src/server/shadowResults.ts`: `ShadowResultRecord`, `ShadowResultStore`, `classifyShadowAgreement`, `SHADOW_RESULT_RETENTION_DAYS` (30).
+- `src/server/galleryAdaptation.ts`: `planAdaptation` policy (pure), `templateCoverage`, `DEFAULT_ADAPTATION_POLICY`.
+- `src/server/strangerFaces.ts`: recognised-face observations (`employeeId`, `matchCosine`, `matchMargin`) and `getRecognisedFaceObservations`.
+- `src/types.ts`: `StrangerCluster.suggestion` (`StrangerClusterSuggestion`), `ShadowAccuracySummaryView`.
+- API (INT): `GET /api/pipeline/shadow-summary?hours=24` → `{ success, since, gates: ShadowAccuracySummaryView[] }` (viewer); `GET /api/pipeline/shadow-results?gate=&agreement=&cursor=&limit=` (viewer); `GET /api/employees/:id/templates` gains `coverage: [{streamId, gate, count, adaptation}]`; `DELETE` of an adaptation template uses the existing template route; stranger cluster payloads gain `suggestion`.
+- db (data-migrations): `pipeline_shadow_results` table implementing `ShadowResultStore`; `stranger_faces` gains `employeeId`, `matchCosine`, `matchMargin` (nullable) and the candidate/grouping queries exclude rows with `employeeId`; `face_templates.source` accepts `"adaptation"`; a per-(employee, streamId) template count query.
+- Hotspot writers: db.ts data-migrations; server.ts, strangers.ts, types.ts, contracts INT; StrangerClusterModal.tsx, EmployeeRegistration.tsx, RealtimeEngineCard.tsx frontend.

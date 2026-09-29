@@ -67,10 +67,40 @@ export interface StrangerPhoto {
   reason?: string;
 }
 
+/** Best-matching employee for a stranger group (plan 2026-09-29 C1/C2): a suggestion for the operator's merge, never an access decision. */
+export interface StrangerClusterSuggestion {
+  employeeId: string;
+  name: string;
+  employeeCode: string;
+  /** Best cosine of the group's faces to that employee's templates (0..1). */
+  cosine: number;
+  /** Cameras on which the employee has no template yet (why the person appeared as a stranger). */
+  missingCameras: string[];
+}
+
+/** Per-gate shadow-engine accuracy over a window (GET /api/pipeline/shadow-summary). */
+export interface ShadowAccuracySummaryView {
+  gate: string;
+  since: string;
+  decisions: number;
+  employees: number;
+  strangers: number;
+  insufficient: number;
+  framesUsedZero: number;
+  agree: number;
+  shadowOnly: number;
+  legacyOnly: number;
+  identityMismatch: number;
+  none: number;
+  decisionLatencyP50Ms: number | null;
+}
+
 export interface StrangerCluster {
   clusterId: string;
   label: string;
   photos: StrangerPhoto[];
+  /** Present when at least one face of the group matches an employee at or above the evidence floor. */
+  suggestion?: StrangerClusterSuggestion;
   firstSeen: string;
   lastSeen: string;
   totalSightings: number;

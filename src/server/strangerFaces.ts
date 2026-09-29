@@ -49,6 +49,15 @@ export interface StrangerFaceRecord {
   createdAt: string;
   /** Set when retention cleared crop + embedding. */
   purgedAt?: string;
+  /**
+   * Recognised-face observation (plan 2026-09-29 Part C): set when the door
+   * engine granted this face. Such rows are NOT strangers - grouping skips
+   * them - but they feed camera adaptation (galleryAdaptation.ts). Same
+   * retention as stranger faces.
+   */
+  employeeId?: string;
+  matchCosine?: number;
+  matchMargin?: number;
 }
 
 export interface StrangerFacePage {
@@ -78,6 +87,11 @@ export interface StrangerFaceStore {
    * capturedAt < cutoffIso whose id is not in keepIds. Returns rows purged.
    */
   purgeStrangerFaces(cutoffIso: string, keepIds: ReadonlySet<string>): Promise<number>;
+  /**
+   * Recognised-face observations (employeeId set, not purged) with capturedAt >= sinceIso,
+   * newest first, embedding included, crop excluded; optional employee filter; limit clamped 1..2000.
+   */
+  getRecognisedFaceObservations(sinceIso: string, employeeId?: string, limit?: number): Promise<StrangerFaceRecord[]>;
 }
 
 /*
