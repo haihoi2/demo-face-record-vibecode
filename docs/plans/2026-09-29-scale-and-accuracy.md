@@ -32,6 +32,19 @@ Status: APPROVED 2026-09-29. Owner decisions: 1 yes, 2 yes, 3 automatic with aud
 
 Threads cut the drops but not the misses. The run-3 log showed 351 detections for 8 embeddings at the entrance, and the per-frame diagnostic (`usable.ts`) on the entry strip found: 174 faces under 60 px, 47 failing the pose gate (aspect 29, roll 9, yaw 9), 14 usable; only 3 of 18 passages with people ever had two usable frames. **The entrance limiter is face size in the wide 4K overview (the 60 px floor) plus downward pose, not throughput.** Consequence: A.1 (threads) still helps and stays; A.2 (`auto:960`) does not help at the entrance; a new A.4 is added below.
 
+**Offline diagnostic per gate (usable.ts, 2 fps inside the labelled passage windows, detector `det_10g_int8_dyn`):**
+
+| Gate, detector input | Passages with people | ...with any face detected | ...with ≥ 2 usable frames | Faces: usable / < 60 px / pose-unclear |
+|---|---|---|---|---|
+| Entry `auto` (1696×224, scale 0.49) | 18 | 12 | 3 | 14 / 174 / 47 |
+| Entry `auto:960` (2592×352, scale 0.76) | 18 | 14 | 7 | 28 / 223 / 45 |
+| Exit `auto` (832×480) | 23 | 3 | 3 | 20 / 13 / 0 |
+| Exit `auto:960` (1280×704) | 23 | 4 | 3 | 19 / 15 / 0 |
+| Exit `auto:1280` (1696×960) | 23 | 3 | 3 | 19 / 14 / 0 |
+
+- **Entrance:** the larger detector input doubles usable frames; most detected faces are still under 60 px. So `auto:960` **does** help at the entrance when the worker has CPU (run 3 was CPU-starved at host load 15), and a lower pipeline-only floor helps on top.
+- **Exit:** in 840 sampled frames with people present no face is detectable at any input size; the few passages with a visible face are usable. The exit camera (NVR channel, steep angle) mostly sees people from behind or the side. **This is camera placement, not software.** The door engine's 11 expected grants out of 59 people at the exit match this picture.
+
 4. **A.4 Pipeline-only face-size floor** `PIPELINE_MIN_FACE_PX` (worker only; the door engine keeps 60 px): test 40 px on the replay, then in shadow on staging. Recognition accuracy at 40–60 px was measured earlier at about 23% of grants on the entry camera being 40–60 px faces that matched correctly, so this is an owner decision (section 8, decision 7). If 40 px is still short, the entrance needs a closer camera (hardware).
 
 1. `PIPELINE_ORT_THREADS` 1 → **4** per gate (2 gates × 4 = 8 of 18 vCPU). Expected loop ~120–150 ms → 7–8 fps processed. Success: dropped-busy < 20%, `framesUsed = 0` share < 40%, decisions per person ≥ 90% on the NVR replay clips.
