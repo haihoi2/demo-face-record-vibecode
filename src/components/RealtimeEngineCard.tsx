@@ -9,9 +9,20 @@
  * renders whatever the server hands back - never an optimistic guess.
  */
 import React, { useCallback, useEffect, useRef, useState } from "react";
-import { AlertTriangle, Check, Cpu, Gauge, GitBranch, Info, Radar, RefreshCw, ShieldAlert, X } from "lucide-react";
+import { AlertTriangle, Check, Cpu, Gauge, GitBranch, Info, Radar, RefreshCw, ShieldAlert, Target, X } from "lucide-react";
 
 import { operatorJsonFetch, safeJsonFetch } from "../utils/api";
+import {
+  IDENTITY_MISMATCH_REVIEW_LABEL,
+  agreementRows,
+  formatShare,
+  formatSince,
+  isEmptyShadowWindow,
+  noUsableFaceTone,
+  readShadowSummary,
+  shadowSummaryForGate,
+  type ShadowSummary,
+} from "../utils/accuracyUi";
 import { hasRole, useOperatorSession } from "../utils/session";
 import {
   formatDurationMs,
@@ -53,6 +64,10 @@ const TONE_CHIP: Record<Tone, string> = {
 };
 
 const POLL_MS = 5000;
+
+/** Window of the accuracy section (plan Part B: "per gate over 24 h"). */
+const SHADOW_SUMMARY_HOURS = 24;
+const SHADOW_SUMMARY_URL = `/api/pipeline/shadow-summary?hours=${SHADOW_SUMMARY_HOURS}`;
 
 type Rows = Partial<Record<GateKey, GatePipelineRow>>;
 type Notice = { tone: Tone; text: string } | null;
@@ -184,11 +199,43 @@ export const RealtimeEngineCard: React.FC = () => {
   const [pendingGate, setPendingGate] = useState<GateKey | null>(null);
   const [confirm, setConfirm] = useState<PendingSwitch>(null);
   const [notice, setNotice] = useState<Notice>(null);
+  // Shadow accuracy over the last 24 h (plan Part B). `supported` false = an older
+  // server without the route: the section is hidden rather than shown empty.
+  const [shadowSummary, setShadowSummary] = useState<ShadowSummary | null>(null);
+  const [shadowSupported, setShadowSupported] = useState<boolean | null>(null);
+  const [shadowError, setShadowError] = useState<string | null>(null);
   const mounted = useRef(true);
+
+  const fetchShadowSummary = useCallback(async () => {
+    const res = await safeJsonFetch<unknown>(SHADOW_SUMMARY_URL);
+    if (!mounted.current) return;
+    if (res.status === 404 || res.status === 501) {
+      setShadowSupported(false);
+      setShadowSummary(null);
+      setShadowError(null);
+      return;
+    }
+    if (res.ok) {
+      const summary = readShadowSummary(res.data);
+      if (summary) {
+        setShadowSummary(summary);
+        setShadowSupported(true);
+        setShadowError(null);
+        return;
+      }
+    }
+    // A refusal (401/403/5xx) or a transport failure is neither "unsupported" nor
+    // data: keep the last good numbers and say why they are stale.
+    setShadowError(
+      res.status === 0
+        ? "Không kết nối được máy chủ để đọc số liệu độ chính xác."
+        : res.error || `Không đọc được số liệu độ chính xác (HTTP ${res.status}).`,
+    );
+  }, []);
 
   const fetchRows = useCallback(async (silent = false) => {
     if (!silent) setLoading(true);
-    const res = await safeJsonFetch<unknown>("/api/camera-streams/watch");
+    const [res] = await Promise.all([safeJsonFetch<unknown>("/api/camera-streams/watch"), fetchShadowSummary()]);
     if (!mounted.current) return;
     if (res.status === 404 || res.status === 501) {
       setSupported(false);
@@ -206,7 +253,7 @@ export const RealtimeEngineCard: React.FC = () => {
     }
     setCheckedAt(new Date().toLocaleTimeString("vi-VN"));
     setLoading(false);
-  }, []);
+  }, [fetchShadowSummary]);
 
   // Poll every 5 s while the page is visible; catch up on return; stop on unmount.
   useEffect(() => {
@@ -304,6 +351,97 @@ export const RealtimeEngineCard: React.FC = () => {
         </button>
         {busy && <RefreshCw className="w-3.5 h-3.5 text-indigo-600 animate-spin" aria-label="Đang gửi yêu cầu" />}
       </div>
+    );
+  };
+
+  /**
+   * "Độ chính xác (24 giờ)": what the shadow engine decided on this gate and how
+   * it lines up with the legacy engine's events. Hidden entirely on a server
+   * without the route; an empty window says so instead of showing zeros as facts.
+   */
+  const renderAccuracy = (key: GateKey) => {
+    if (shadowSupported !== true) return null;
+    const view = shadowSummaryForGate(shadowSummary, key);
+    const since = formatSince(view?.since || shadowSummary?.since);
+    const sectionId = `rt-accuracy-${key}`;
+    return (
+      <section
+        aria-labelledby={`${sectionId}-title`}
+        className="rounded-lg border border-slate-200 bg-white p-2.5 space-y-2"
+        data-testid={sectionId}
+      >
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <h4 id={`${sectionId}-title`} className="text-[11px] font-bold text-slate-800 inline-flex items-center gap-1.5">
+            <Target className="w-3.5 h-3.5 text-sky-600" />
+            Độ chính xác ({SHADOW_SUMMARY_HOURS} giờ)
+          </h4>
+          <span className="text-[10px] text-slate-500">
+            {since ? `từ ${since} · ` : ""}chạy thử so với động cơ hiện tại, chỉ để quan sát
+          </span>
+        </div>
+
+        {!view || isEmptyShadowWindow(view) ? (
+          <p className="text-[11px] text-slate-500">
+            {view
+              ? `Chưa có quyết định chạy thử nào trên cổng này trong ${SHADOW_SUMMARY_HOURS} giờ qua.`
+              : "Máy chủ chưa có số liệu chạy thử cho cổng này."}
+          </p>
+        ) : (
+          <>
+            <div className="grid grid-cols-2 sm:grid-cols-4 gap-1.5">
+              <Stat
+                label="Quyết định"
+                icon={<Gauge className="w-2.5 h-2.5" />}
+                value={
+                  <>
+                    {view.decisions}
+                    <span className="font-normal text-slate-500">
+                      {" "}
+                      · NV {view.employees} · lạ {view.strangers} · chưa đủ {view.insufficient}
+                    </span>
+                  </>
+                }
+              />
+              <Stat
+                label="Không có mặt dùng được"
+                tone={noUsableFaceTone(view)}
+                value={
+                  <>
+                    {formatShare(view.framesUsedZero, view.decisions)}
+                    <span className="font-normal opacity-80">
+                      {" "}
+                      · {view.framesUsedZero}/{view.decisions} lượt
+                    </span>
+                  </>
+                }
+              />
+              <Stat label="Trùng với động cơ cũ" value={formatShare(view.agree, view.decisions)} tone={view.agree > 0 ? "emerald" : undefined} />
+              <Stat label="Độ trễ trung vị" value={formatDurationMs(view.decisionLatencyP50Ms)} />
+            </div>
+            <p className="text-[10px] text-slate-500">
+              "Không có mặt dùng được" là các lượt người đi qua mà không khung hình nào tới được bước nhận diện - chỉ số
+              về thông lượng, không phải về mô hình.
+            </p>
+            <ul className="flex flex-wrap gap-1.5" aria-label={`Đối chiếu hai động cơ tại ${gateLabel(key)}`}>
+              {agreementRows(view).map((rowItem) => (
+                <li
+                  key={rowItem.key}
+                  className={`inline-flex items-center gap-1 px-1.5 py-0.5 rounded border text-[10px] ${TONE_CHIP[rowItem.tone]} ${
+                    rowItem.needsReview ? "font-bold ring-1 ring-rose-300" : ""
+                  }`}
+                  data-testid={`${sectionId}-${rowItem.key}`}
+                >
+                  {rowItem.needsReview && <AlertTriangle className="w-3 h-3" aria-hidden="true" />}
+                  <span>{rowItem.label}</span>
+                  <span className="font-mono">{rowItem.count}</span>
+                  <span className="opacity-70">({rowItem.share})</span>
+                  {rowItem.needsReview && <span className="uppercase tracking-wide">· {IDENTITY_MISMATCH_REVIEW_LABEL}</span>}
+                </li>
+              ))}
+            </ul>
+          </>
+        )}
+      </section>
     );
   };
 
@@ -453,6 +591,8 @@ export const RealtimeEngineCard: React.FC = () => {
             </span>
           </div>
         )}
+
+        {renderAccuracy(key)}
       </div>
     );
   };
@@ -509,6 +649,15 @@ export const RealtimeEngineCard: React.FC = () => {
           <div className={`px-3 py-2 rounded-lg border text-xs flex items-start gap-2 ${TONE_CHIP.rose}`}>
             <AlertTriangle className="w-4 h-4 shrink-0" />
             <span>{fetchError}</span>
+          </div>
+        )}
+        {shadowError && (
+          <div className={`px-3 py-2 rounded-lg border text-xs flex items-start gap-2 ${TONE_CHIP.amber}`} data-testid="rt-accuracy-error">
+            <AlertTriangle className="w-4 h-4 shrink-0" />
+            <span>
+              {shadowError}
+              {shadowSummary ? " Đang hiển thị số liệu độ chính xác của lần đọc trước." : ""}
+            </span>
           </div>
         )}
         {supported !== false && GATE_KEYS.map(renderRow)}
