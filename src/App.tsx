@@ -520,11 +520,15 @@ export default function App() {
   };
 
   const handleEmployeeDeleted = async (id: string) => {
+    const emp = employees.find((e) => e.id === id);
+    const label = emp ? `${emp.name} (${emp.employeeCode})` : id;
+    if (!window.confirm(`Xóa vĩnh viễn nhân viên ${label} cùng các mẫu khuôn mặt? Lịch sử ra vào vẫn được giữ.`)) return;
     try {
-      const result = await operatorJsonFetch(`/api/employees/${encodeURIComponent(id)}`, { method: "DELETE" });
-      if (!result.ok) throw new Error(result.error || `Xóa nhân viên thất bại (HTTP ${result.status})`);
-    } catch (err) {
+      const result = await operatorJsonFetch<{ error?: string }>(`/api/employees/${encodeURIComponent(id)}`, { method: "DELETE" });
+      if (!result.ok) throw new Error(result.data?.error || result.error || `Xóa nhân viên thất bại (HTTP ${result.status})`);
+    } catch (err: any) {
       console.warn("Xóa nhân viên trên máy chủ thất bại:", err);
+      window.alert(`Không xóa được nhân viên ${label}: ${err?.message || err}`);
       return;
     }
     setEmployees((prev) => {

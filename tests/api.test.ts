@@ -181,3 +181,40 @@ describe("operatorJsonFetch sign-in on 401", () => {
     }
   });
 });
+
+describe("body-less mutations are sent as JSON", () => {
+  it("DELETE without a body gets Content-Type application/json and {} (else the server answers 415 JSON_REQUIRED)", async () => {
+    const originalFetch = globalThis.fetch;
+    let seen: { method?: string; type: string | null; body: unknown } | null = null;
+    globalThis.fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
+      seen = { method: init?.method, type: new Headers(init?.headers).get("content-type"), body: init?.body };
+      return new Response(JSON.stringify({ success: true }), { status: 200, headers: { "Content-Type": "application/json" } });
+    }) as typeof fetch;
+    try {
+      const res = await operatorJsonFetch("/api/employees/EMP-1", { method: "DELETE" });
+      assert.equal(res.status, 200);
+      assert.equal(seen!.method, "DELETE");
+      assert.equal(seen!.type, "application/json");
+      assert.equal(seen!.body, "{}");
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it("GET stays body-less, and an explicit body and header are kept", async () => {
+    const originalFetch = globalThis.fetch;
+    const seen: Array<{ type: string | null; body: unknown }> = [];
+    globalThis.fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
+      seen.push({ type: new Headers(init?.headers).get("content-type"), body: init?.body });
+      return new Response("{}", { status: 200, headers: { "Content-Type": "application/json" } });
+    }) as typeof fetch;
+    try {
+      await operatorJsonFetch("/api/org");
+      await operatorJsonFetch("/api/x", { method: "POST", headers: { "Content-Type": "text/csv" }, body: "a,b" });
+      assert.deepEqual(seen[0], { type: null, body: undefined });
+      assert.deepEqual(seen[1], { type: "text/csv", body: "a,b" });
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+});

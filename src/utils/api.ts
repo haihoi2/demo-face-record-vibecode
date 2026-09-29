@@ -149,10 +149,19 @@ export function normalizeApiAssetUrl(rawUrl: string): string {
 function credentialedOptions(options: RequestInit = {}): RequestInit {
   const method = String(options.method || "GET").toUpperCase();
   const headers = new Headers(options.headers);
-  if (!["GET", "HEAD", "OPTIONS"].includes(method) && sessionCsrfToken) {
+  const mutation = !["GET", "HEAD", "OPTIONS"].includes(method);
+  if (mutation && sessionCsrfToken) {
     headers.set("X-CSRF-Token", sessionCsrfToken);
   }
-  return { ...options, headers, credentials: options.credentials || "include" };
+  // The server's CSRF guard accepts protected mutations only as JSON (415
+  // JSON_REQUIRED otherwise). A body-less DELETE/POST - deleting an employee
+  // or a face template - was refused and the UI silently did nothing.
+  let body = options.body;
+  if (mutation && (body === undefined || body === null)) {
+    body = "{}";
+    if (!headers.has("Content-Type")) headers.set("Content-Type", "application/json");
+  }
+  return { ...options, headers, body, credentials: options.credentials || "include" };
 }
 
 export async function apiFetch(
