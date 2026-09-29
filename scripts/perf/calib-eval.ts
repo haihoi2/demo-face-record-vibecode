@@ -4,7 +4,13 @@
  *
  *   npx tsx scripts/perf/calib-eval.ts <crops-dir> --models r50=/models/w600k_r50.onnx,mbf=/models/candidates/w600k_mbf.onnx
  *        --out <report.json> [--ref r50] [--parents r50_int8=r50,mbf_int8=mbf] [--threads 2]
- *        [--bench-threads 1,2] [--bench-iters 60] [--via-crop] [--no-bench]
+ *        [--bench-threads 1,2] [--bench-iters 60] [--via-crop] [--no-bench] [--flip]
+ *
+ * --flip (plan D2, 2026-09-29): horizontal-flip test-time augmentation, exactly
+ * what faceEmbedding.ts does with FACE_TTA_FLIP=1: l2(l2(f(x)) + l2(f(flip(x)))).
+ * Embeddings are cached separately (emb_<model>_flip.f32) and the latency bench
+ * times both runs, so a --flip report is directly comparable with a plain one
+ * on the same crops directory.
  *
  * <crops-dir> is the output of scripts/perf/calib-crops.ts. For every model the
  * aligned crops are embedded exactly as faceEmbedding.ts embedFace() does
@@ -70,6 +76,8 @@ const BENCH_THREADS = opt("--bench-threads", "1,2")!.split(",").map(Number);
 const BENCH_ITERS = Number(opt("--bench-iters", "60"));
 const VIA_CROP = args.includes("--via-crop");
 const NO_BENCH = args.includes("--no-bench");
+/** Horizontal-flip TTA (see header). */
+const FLIP = args.includes("--flip");
 const OUT = opt("--out");
 /** Identities excluded from scoring (declared in the report), e.g. a suspected duplicate employee id. */
 const EXCLUDE = new Set((opt("--exclude", "") || "").split(",").filter(Boolean));
@@ -112,6 +120,28 @@ function l2(v: Float32Array): Float32Array {
   if (n > 0) for (let i = 0; i < v.length; i++) out[i] = v[i] / n;
   return out;
 }
+/** Mirror a 112x112x3 HWC buffer left-to-right (same as faceEmbedding.ts flipHorizontal). */
+function flipU8(u8: Buffer): Buffer {
+  const out = Buffer.alloc(u8.length);
+  for (let y = 0; y < SIZE; y++) {
+    for (let x = 0; x < SIZE; x++) {
+      const s = (y * SIZE + x) * 3;
+      const d = (y * SIZE + (SIZE - 1 - x)) * 3;
+      out[d] = u8[s];
+      out[d + 1] = u8[s + 1];
+      out[d + 2] = u8[s + 2];
+    }
+  }
+  return out;
+}
+/** l2(l2(a) + l2(b)): the FACE_TTA_FLIP formula. */
+function fuseViews(a: Float32Array, b: Float32Array): Float32Array {
+  const na = l2(a);
+  const nb = l2(b);
+  const sum = new Float32Array(na.length);
+  for (let i = 0; i < sum.length; i++) sum[i] = na[i] + nb[i];
+  return l2(sum);
+}
 function toTensor(u8: Buffer): ort.Tensor {
   const data = new Float32Array(3 * PLANE);
   for (let i = 0; i < PLANE; i++) {
@@ -131,7 +161,7 @@ async function session(file: string, threads: number) {
 // ---------------------------------------------------------------- embeddings
 
 async function embedAll(model: { name: string; file: string }, entries: Entry[], prefix: "rec" | "crop"): Promise<Map<number, Float32Array>> {
-  const cache = path.join(cropsDir, `emb_${model.name}${prefix === "crop" ? "_viacrop" : ""}.f32`);
+  const cache = path.join(cropsDir, `emb_${model.name}${prefix === "crop" ? "_viacrop" : ""}${FLIP ? "_flip" : ""}.f32`);
   const out = new Map<number, Float32Array>();
   const wanted = entries.filter((e) => prefix === "rec" || e.viaCrop?.found).map((e) => e.n);
   if (fs.existsSync(cache)) {
@@ -155,7 +185,10 @@ async function embedAll(model: { name: string; file: string }, entries: Entry[],
     const raw = res[output].data as Float32Array;
     dim = raw.length;
     if (dim !== 512) throw new Error(`${model.name}: embedding dim ${dim}, expected 512`);
-    out.set(n, l2(raw));
+    if (FLIP) {
+      const resF = await s.run({ [input]: toTensor(flipU8(u8)) });
+      out.set(n, fuseViews(raw, resF[output].data as Float32Array));
+    } else out.set(n, l2(raw));
   }
   const idx = [...out.keys()];
   const buf = Buffer.alloc(idx.length * 512 * 4);
@@ -385,8 +418,10 @@ async function bench(model: { name: string; file: string }, sample: Buffer[]) {
     const times: number[] = [];
     for (let i = 0; i < BENCH_ITERS; i++) {
       const t = toTensor(sample[i % sample.length]);
+      const tF = FLIP ? toTensor(flipU8(sample[i % sample.length])) : null;
       const t0 = process.hrtime.bigint();
       await s.run({ [input]: t });
+      if (tF) await s.run({ [input]: tF });
       times.push(Number(process.hrtime.bigint() - t0) / 1e6);
     }
     times.sort((a, b) => a - b);
@@ -422,8 +457,10 @@ async function main() {
     crops: { total: all.length, scored: entries.length, calibrationExcluded: calibSet.size, byIdentity: Object.fromEntries(identities), employeesWithLabels: [...identities.keys()].filter(isEmployee).length },
     pairs: counts,
     legacyThresholds: LEGACY,
+    tta: FLIP ? "flip" : "none",
     models: {},
   };
+  if (FLIP) console.log("test-time augmentation: horizontal flip (two recogniser runs per crop; latency bench times both)");
 
   const embs = new Map<string, Map<number, Float32Array>>();
   const sums = new Map<string, ReturnType<typeof summarize>>();
