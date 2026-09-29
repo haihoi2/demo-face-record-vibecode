@@ -1,6 +1,7 @@
 # Plan: one stranger record per face (step 1)
 
 Status: APPROVED 2026-09-29. Owner decisions: 1 = **14 days**, 2 = **yes**, 3 = **no backfill**, 4 = **yes** (section 7).
+Follow-up decisions 2026-09-29: purged tombstone rows are kept **forever** (audit); the stranger floors are **not** loosened for faces near 60 px.
 
 ## 1. Problem
 
