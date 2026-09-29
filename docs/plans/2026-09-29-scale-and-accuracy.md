@@ -22,6 +22,18 @@ Status: APPROVED 2026-09-29. Owner decisions: 1 yes, 2 yes, 3 automatic with aud
 
 ## 2. Part A: let the new engine see the frames (configuration, this week)
 
+**Measured 2026-09-29 (dev replay of the NVR sequences, ground truth in clips.json, host load 12–15):**
+
+| Setting | Entry dropped-busy | Entry tracks with no usable face | Entry passages with a usable decision | Exit passages |
+|---|---|---|---|---|
+| 1 thread, `auto` (today) | 70% | 93% | 4 / 35 | 0 / 45 |
+| 4 threads, `auto` | 49% | 96% | 4 / 35 | 2 / 45 |
+| 4 threads, `auto:960` | 74% | 97% | 2 / 35 | 0 / 45 |
+
+Threads cut the drops but not the misses. The run-3 log showed 351 detections for 8 embeddings at the entrance, and the per-frame diagnostic (`usable.ts`) on the entry strip found: 174 faces under 60 px, 47 failing the pose gate (aspect 29, roll 9, yaw 9), 14 usable; only 3 of 18 passages with people ever had two usable frames. **The entrance limiter is face size in the wide 4K overview (the 60 px floor) plus downward pose, not throughput.** Consequence: A.1 (threads) still helps and stays; A.2 (`auto:960`) does not help at the entrance; a new A.4 is added below.
+
+4. **A.4 Pipeline-only face-size floor** `PIPELINE_MIN_FACE_PX` (worker only; the door engine keeps 60 px): test 40 px on the replay, then in shadow on staging. Recognition accuracy at 40–60 px was measured earlier at about 23% of grants on the entry camera being 40–60 px faces that matched correctly, so this is an owner decision (section 8, decision 7). If 40 px is still short, the entrance needs a closer camera (hardware).
+
 1. `PIPELINE_ORT_THREADS` 1 → **4** per gate (2 gates × 4 = 8 of 18 vCPU). Expected loop ~120–150 ms → 7–8 fps processed. Success: dropped-busy < 20%, `framesUsed = 0` share < 40%, decisions per person ≥ 90% on the NVR replay clips.
 2. If entry recall is still short: `PIPELINE_DETECT_INPUT=auto:960` on the entry gate (calibration: 100% recall vs 95%, 2.4× detector cost, affordable at 4 threads).
 3. Fallback only if 1–2 are not enough: tracker `tentativeMaxMissMs` 500 → 1000 and `confirmHits` at low fps (code change, small).
@@ -41,7 +53,7 @@ Calibration: recognition by templates per person 1 → 70.9%, 5 → 86.4%, 10 �
 - **C1 (operator, no code; owner decision 5):** no manual capture session. An employee the exit camera does not recognise is captured there as a stranger; the operator merges that group into the employee, which enrols a template from that camera's crop. C2 must make this visible: the group card shows the best-matching employee as a suggestion, and the employee list shows which cameras still lack templates.
 - **C2 (code):** template cap per camera instead of the global 12 (5 per camera + photo templates), eviction per camera, and a coverage indicator per employee per camera with a "missing on camera X" filter.
 - **C3 (code, decision 3): camera adaptation.** A guarded derivation job (the existing `planGalleryDerivation`) turns confident old-engine grants into per-camera templates from the stored face crop: fused cosine ≥ acceptSingle + 0.10, margin ≥ 0.15, quality ≥ 0.35, at most 5 per camera per employee, never from stranger merges, each template attributed to the job and deletable by an operator. Audit line per template.
-  - This is also how a **new gate shares faces**: the day a camera is added, the global gallery already matches across cameras (weakly); the first confident matches seed that camera's templates, and recognition on the new gate converges within days without re-enrolling everyone.
+  - **Correction after measurement (acc-eng, 2026-09-29):** adaptation GROWS a camera's templates (1 → 5 within a few grants once that camera has one), it cannot SEED a camera: on this site no cross-camera pair reaches the 0.65 floor (max 0.60) and fewer than 5% are granted at all cross-camera. The seed for a new camera is the operator's first merge of the person's stranger group on that camera (decision 5); after that, adaptation fills the remaining slots automatically. Also: one template per access event per camera (`onePerEvent`), so the five slots span days rather than one passage.
 
 ## 5. Part D: engine and model
 
@@ -85,6 +97,8 @@ Design:
 4. **N-gate model**: direction + door per gate as in section 6. Confirm that each future gate has its own physical door/controller.
 5. **C1 now**: have an operator enrol all 31 employees on both cameras this week.
 6. **`FACE_DETECT_UPSCALE` stays `none`** (closes review item 7). Recommended: yes.
+7. **Pipeline-only face floor** `PIPELINE_MIN_FACE_PX=40` on staging in shadow mode (door engine unchanged at 60 px), after the dev replay shows it lifts usable decisions. Recommended: yes, shadow only.
+8. **Flip TTA measurement** needs a read-only re-export of stored face crops from the live database (about 20 minutes of compute, biometric data kept under /data/test-clips, deleted after). Recommended: yes, once, by INT.
 
 ## 9. Contract (accuracy wave, base `release/accuracy`)
 
