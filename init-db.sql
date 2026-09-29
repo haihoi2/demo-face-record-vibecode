@@ -113,7 +113,8 @@ CREATE TABLE IF NOT EXISTS stranger_resolutions (
   "resolvedAt" VARCHAR(64) NOT NULL,
   "logIds" JSONB NOT NULL,
   "sourceLogId" VARCHAR(64),
-  metadata JSONB NOT NULL DEFAULT '{}'::jsonb
+  metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+  "faceIds" JSONB NOT NULL DEFAULT '[]'::jsonb  -- stranger_faces ids covered (sorted)
 );
 
 CREATE TABLE IF NOT EXISTS stranger_resolution_events (
@@ -125,10 +126,42 @@ CREATE TABLE IF NOT EXISTS stranger_resolution_events (
   "resolvedAt" VARCHAR(64) NOT NULL,
   "logIds" JSONB NOT NULL,
   "sourceLogId" VARCHAR(64),
-  metadata JSONB NOT NULL DEFAULT '{}'::jsonb
+  metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+  "faceIds" JSONB NOT NULL DEFAULT '[]'::jsonb  -- stranger_faces ids covered (sorted)
 );
 CREATE INDEX IF NOT EXISTS idx_stranger_resolution_events_cluster
   ON stranger_resolution_events ("clusterId", "resolvedAt");
+
+-- One row per unrecognised face of an access event (per-face stranger records).
+-- Biometric: crop (JPEG) and embedding are cleared by the retention purge,
+-- which sets "purgedAt" and keeps the row as an audit tombstone. Same DDL as
+-- PG_STRANGER_FACES_DDL in src/server/db.ts.
+CREATE TABLE IF NOT EXISTS stranger_faces (
+  id VARCHAR(64) COLLATE "C" PRIMARY KEY,
+  "logId" VARCHAR(64) NOT NULL REFERENCES access_logs (id) ON DELETE CASCADE,
+  "faceIndex" INTEGER NOT NULL,
+  "capturedAt" VARCHAR(64) COLLATE "C" NOT NULL,
+  gate VARCHAR(16) NOT NULL,
+  "streamId" VARCHAR(64),
+  engine VARCHAR(16) NOT NULL,     -- legacy | pipeline
+  "trackId" VARCHAR(64),
+  box JSONB NOT NULL,              -- [x1, y1, x2, y2] in source pixels
+  "sourceWidth" INTEGER,
+  "sourceHeight" INTEGER,
+  "detectorScore" REAL NOT NULL,
+  quality REAL NOT NULL,
+  "edgeEnergy" REAL,
+  "sizePx" INTEGER NOT NULL,
+  embedding BYTEA,                 -- float32 little-endian, like access_logs."faceEmbedding"
+  dims INTEGER,
+  "modelTag" VARCHAR(128),
+  crop BYTEA,                      -- JPEG face crop
+  "createdAt" VARCHAR(64) NOT NULL,
+  "purgedAt" VARCHAR(64)
+);
+CREATE INDEX IF NOT EXISTS idx_stranger_faces_captured ON stranger_faces ("capturedAt" DESC, id DESC)
+  WHERE "purgedAt" IS NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_stranger_faces_log ON stranger_faces ("logId", "faceIndex");
 
 -- AI recognition engine settings (engine mode, Gemini model, thresholds).
 -- Single row id = 'default'; the server hydrates it into memory at startup.
