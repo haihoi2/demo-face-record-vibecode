@@ -1,6 +1,6 @@
 # Plan: throughput, accuracy, N gates, shared faces
 
-Status: PROPOSED 2026-09-29. Owner request: "continue the plan: optimize system and increase the accuracy engine and model, extend to many gates (not fixed to 2), every gate can share person faces for check". Needs the decisions in section 8 before code is written. Sources: live counters on staging (both gates shadow, 18 vCPU, 10:08–11:45Z), the calibration handoffs (2026-09-27-rt-calib, rt-entry), and a read-only inventory of the code.
+Status: APPROVED 2026-09-29. Owner decisions: 1 yes, 2 yes, 3 automatic with audit + operator delete, 4 yes (each future gate has its own physical door), 5 NO manual enrolment - employees unrecognised on a camera appear there as stranger groups and the operator merges each group into the right person (per-camera templates come from those merges, from the face's own crop), 6 yes. Owner request: "continue the plan: optimize system and increase the accuracy engine and model, extend to many gates (not fixed to 2), every gate can share person faces for check". Needs the decisions in section 8 before code is written. Sources: live counters on staging (both gates shadow, 18 vCPU, 10:08–11:45Z), the calibration handoffs (2026-09-27-rt-calib, rt-entry), and a read-only inventory of the code.
 
 ## 1. What the live system says today
 
@@ -38,7 +38,7 @@ Status: PROPOSED 2026-09-29. Owner request: "continue the plan: optimize system 
 
 Calibration: recognition by templates per person 1 → 70.9%, 5 → 86.4%, 10 → 91.3%; a gallery built from stored face crops scores 85.6% vs 76.8% from full frames.
 
-- **C1 (operator, no code):** enrol every employee from each gate camera, 5 frames, using the existing per-camera capture in "Đăng ký khuôn mặt" (31 employees × 2 cameras, about a minute each). This alone should lift exit recognition from the 23% region towards 85%.
+- **C1 (operator, no code; owner decision 5):** no manual capture session. An employee the exit camera does not recognise is captured there as a stranger; the operator merges that group into the employee, which enrols a template from that camera's crop. C2 must make this visible: the group card shows the best-matching employee as a suggestion, and the employee list shows which cameras still lack templates.
 - **C2 (code):** template cap per camera instead of the global 12 (5 per camera + photo templates), eviction per camera, and a coverage indicator per employee per camera with a "missing on camera X" filter.
 - **C3 (code, decision 3): camera adaptation.** A guarded derivation job (the existing `planGalleryDerivation`) turns confident old-engine grants into per-camera templates from the stored face crop: fused cosine ≥ acceptSingle + 0.10, margin ≥ 0.15, quality ≥ 0.35, at most 5 per camera per employee, never from stranger merges, each template attributed to the job and deletable by an operator. Audit line per template.
   - This is also how a **new gate shares faces**: the day a camera is added, the global gallery already matches across cameras (weakly); the first confident matches seed that camera's templates, and recognition on the new gate converges within days without re-enrolling everyone.
