@@ -4229,6 +4229,7 @@ async function persistStrangerFaces(
   capturedAt: string,
   frameImage: string | undefined,
   gateKey: "entry" | "exit",
+  logSaved: Promise<boolean>,
 ): Promise<number> {
   if (!faces.length || !frameImage) return 0;
   try {
@@ -4267,6 +4268,11 @@ async function persistStrangerFaces(
       });
     }
     if (!rows.length) return 0;
+    // stranger_faces.logId references the access event: it must be stored first.
+    if (!(await logSaved)) {
+      console.error(`[Strangers] Sự kiện ${logId} chưa được lưu; bỏ qua ${rows.length} khuôn mặt người lạ của nó.`);
+      return 0;
+    }
     const saved = await db.saveStrangerFaces(rows);
     if (!saved) console.error(`[Strangers] Không lưu được ${rows.length} khuôn mặt người lạ của ${logId}.`);
     strangerWindowCache = null;
@@ -4538,6 +4544,7 @@ async function applyRecognitionOutcome(input: RecognitionOutcomeInput): Promise<
     stats.unlocks += 1;
 
     // 2. One GRANTED row per employee, each with the stored snapshot.
+    let firstGrantSaved: Promise<boolean> | undefined;
     for (const emp of grantable) {
       const faceMatch = authorizedFaces.find((f) => f.employeeId === emp.id);
       const accessLog: AccessLogRecord = {
@@ -4559,7 +4566,8 @@ async function applyRecognitionOutcome(input: RecognitionOutcomeInput): Promise<
           recognitionSourceSuffix(input),
       };
       accessLogs.unshift(accessLog);
-      db.saveAccessLog(accessLog);
+      const saving = db.saveAccessLog(accessLog);
+      if (!firstGrantSaved) firstGrantSaved = saving;
       result.logs.push(accessLog);
       summary.logIds.push(accessLog.id);
       stats.grantsWritten += 1;
@@ -4623,7 +4631,8 @@ async function applyRecognitionOutcome(input: RecognitionOutcomeInput): Promise<
     }
 
     if (tailgaterFaces.length && result.logs[0]) {
-      await persistStrangerFaces(tailgaterFaces, result.logs[0].id, result.logs[0].timestamp, input.frameImage, gateKey);
+      await persistStrangerFaces(tailgaterFaces, result.logs[0].id, result.logs[0].timestamp, input.frameImage, gateKey,
+        firstGrantSaved || Promise.resolve(false));
     }
     return result;
   }
@@ -4650,7 +4659,7 @@ async function applyRecognitionOutcome(input: RecognitionOutcomeInput): Promise<
     faceEmbeddingQuality: logStrangerObservation?.quality,
   };
   accessLogs.unshift(accessLog);
-  db.saveAccessLog(accessLog);
+  const deniedSaved = db.saveAccessLog(accessLog);
   result.logs.push(accessLog);
   result.log = accessLog;
   summary.logId = accessLog.id;
@@ -4713,7 +4722,7 @@ async function applyRecognitionOutcome(input: RecognitionOutcomeInput): Promise<
     })
     .catch(() => {});
 
-  if (deniedFaces.length) await persistStrangerFaces(deniedFaces, accessLog.id, accessLog.timestamp, input.frameImage, gateKey);
+  if (deniedFaces.length) await persistStrangerFaces(deniedFaces, accessLog.id, accessLog.timestamp, input.frameImage, gateKey, deniedSaved);
   return result;
 }
 
@@ -7658,7 +7667,27 @@ app.get("/api/strangers/lookup", requireOperatorRole("viewer"), async (req, res)
     res.status(400).json({ success: false, error: "logId không hợp lệ" });
     return;
   }
-  if (db.getRetiredStrangerObservationIds().includes(`log:${logId}`)) {
+  const retiredIds = db.getRetiredStrangerObservationIds();
+  // A frame stored with per-face records is represented by its faces.
+  const frameFaces = (await db.getStrangerFacesByLogIds([logId])).sort((a, b) => a.faceIndex - b.faceIndex);
+  if (frameFaces.length) {
+    const open = frameFaces.filter((f) => !f.purgedAt && !retiredIds.includes(faceObservationId(f.id)));
+    if (!open.length) {
+      res.status(410).json({ success: false, status: "RESOLVED", error: "Lượt quét đã được xử lý" });
+      return;
+    }
+    const { clusters } = await strangerWindow();
+    const inWindow = clusters.find((c) => c.photos.some((photo: any) => photo.faceId === open[0].id));
+    const cluster = inWindow || clusterStrangerObservations(observationsFromFaces([open[0]]), retiredIds)[0];
+    if (!cluster) {
+      res.status(404).json({ success: false, status: "MISSING", error: "Không tìm thấy cụm người lạ" });
+      return;
+    }
+    if (!inWindow) registerStrangerClusters([cluster], [], [open[0]]);
+    res.json({ success: true, cluster, frameFaceCount: frameFaces.length });
+    return;
+  }
+  if (retiredIds.includes(`log:${logId}`)) {
     res.status(410).json({ success: false, status: "RESOLVED", error: "Lượt quét đã được xử lý" });
     return;
   }
