@@ -14,7 +14,10 @@ describe("classifyShadowAgreement", () => {
     assert.equal(classifyShadowAgreement({ outcome: "employee", employeeId: "E1" }, { status: "DENIED" }), "shadow-only");
     assert.equal(classifyShadowAgreement({ outcome: "insufficient" }, { status: "GRANTED", employeeId: "E1" }), "legacy-only");
     assert.equal(classifyShadowAgreement({ outcome: "stranger" }, { status: "DENIED" }), "agree");
-    assert.equal(classifyShadowAgreement({ outcome: "employee", employeeId: "E1" }, null), "none");
+    // No door-engine event at all: the door engine scans continuously and writes nothing when it recognises nobody.
+    assert.equal(classifyShadowAgreement({ outcome: "employee", employeeId: "E1" }, null), "shadow-only");
+    assert.equal(classifyShadowAgreement({ outcome: "stranger" }, null), "none");
+    assert.equal(classifyShadowAgreement({ outcome: "insufficient" }, null), "none");
   });
 
   it("retention defaults to 30 days; blank unset; 0 disables", () => {
@@ -28,7 +31,7 @@ describe("server wiring", () => {
   const src = readFileSync(new URL("../server.ts", import.meta.url), "utf8");
 
   it("stores each shadow outcome after one match window, paired with the nearest door-engine event", () => {
-    assert.ok(SHADOW_MATCH_WINDOW_MS >= 3000);
+    assert.ok(SHADOW_MATCH_WINDOW_MS >= 15000, "a scan gap plus a scan must fit in the window");
     assert.match(src, /setTimeout\(\(\) => \{\n\s*persistShadowResult\(gate, r\)[\s\S]*?\}, SHADOW_MATCH_WINDOW_MS\)\.unref\(\);/);
     assert.match(src, /agreement: classifyShadowAgreement\(\{ outcome: sh\.outcome, employeeId: sh\.employeeId \}, legacy\)/);
   });
@@ -51,11 +54,31 @@ describe("server wiring", () => {
 
   it("a group suggestion is only ever a suggestion (evidence floor, no grant path)", () => {
     const fn = src.slice(src.indexOf("function attachClusterSuggestions"), src.indexOf("The members a resolve request names"));
-    assert.match(fn, /const floor = currentFusionThresholds\(\)\.minEvidence;/);
+    assert.match(src, /const SUGGESTION_MIN_COSINE = 0\.5;/);
+    assert.match(fn, /const floor = SUGGESTION_MIN_COSINE;/);
     assert.doesNotMatch(fn, /unlockDoor|GRANTED|saveAccessLog/);
   });
 
   it("recognised faces are stored only for employees actually granted in that frame", () => {
     assert.match(src, /\.filter\(\(f\) => grantable\.some\(\(e\) => e\.id === f\.employeeId\)\)/);
+  });
+});
+
+describe("accuracy follow-ups (2026-09-30)", () => {
+  const src = readFileSync(new URL("../server.ts", import.meta.url), "utf8");
+
+  it("adaptation never follows a lowered door threshold", () => {
+    assert.match(src, /const adaptBase = Math\.max\(DEFAULT_FUSION_THRESHOLDS\.acceptSingle, currentFusionThresholds\(\)\.acceptSingle\);/);
+    assert.match(src, /planAdaptation\(candidates, existing, adaptBase, DEFAULT_ADAPTATION_POLICY\)/);
+  });
+
+  it("a template made from a stranger face keeps that face's camera", () => {
+    assert.match(src, /source, sourceLogId: face\.logId, streamId: face\.streamId,/);
+    assert.match(src, /\.\.\.\(opts\.streamId \? \{ streamId: opts\.streamId \} : \{\}\),/);
+  });
+
+  it("pairs a shadow employee with the same employee's grant inside the grant cooldown", () => {
+    assert.match(src, /const reach = Math\.max\(SHADOW_MATCH_WINDOW_MS, FACE_GRANT_COOLDOWN_SECONDS \* 1000\);/);
+    assert.match(src, /nearestLegacyEvent\(gate, sh\.decidedAtMs, sh\.outcome === "employee" \? sh\.employeeId : undefined\)/);
   });
 });

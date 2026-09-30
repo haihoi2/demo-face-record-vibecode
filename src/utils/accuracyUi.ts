@@ -332,8 +332,12 @@ export function formatCosinePercent(cosine: number): string {
  * is omitted when the employee already has templates on every camera. This is
  * the wording of a hint; the caller must never render it as a result.
  */
+/** Below the door engine's single-view accept (0.55) a suggestion is weak: check the photos before merging. */
+export const SUGGESTION_WEAK_BELOW = 0.55;
+
 export function suggestionText(s: StrangerClusterSuggestion): string {
-  const head = `Có thể là ${s.name} (${s.employeeCode}) – ${formatCosinePercent(s.cosine)}`;
+  const weak = Number.isFinite(s.cosine) && s.cosine < SUGGESTION_WEAK_BELOW ? " (yếu – hãy so ảnh trước khi gộp)" : "";
+  const head = `Có thể là ${s.name} (${s.employeeCode}) – ${formatCosinePercent(s.cosine)}${weak}`;
   const cameras = (s.missingCameras || []).map((c) => String(c).trim()).filter(Boolean);
   return cameras.length > 0 ? `${head} – chưa có mẫu ở ${cameras.join(", ")}` : head;
 }

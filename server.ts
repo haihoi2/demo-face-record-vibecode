@@ -5871,17 +5871,29 @@ function reportPipelineResult(gate: Gate, r: TrackDecisionResult) {
   }, SHADOW_MATCH_WINDOW_MS).unref();
 }
 
-/** The door-engine event on the same gate nearest to `atMs` within the window (from the in-memory recent logs). */
-function nearestLegacyEvent(gate: Gate, atMs: number): { id: string; status: "GRANTED" | "DENIED"; employeeId?: string } | null {
+/**
+ * The door-engine event on the same gate that belongs to this passage: a grant
+ * of the SAME employee within the door engine's grant cooldown (it writes no
+ * repeat row inside it), else the nearest event within the window.
+ */
+function nearestLegacyEvent(gate: Gate, atMs: number, employeeId?: string): { id: string; status: "GRANTED" | "DENIED"; employeeId?: string } | null {
+  const reach = Math.max(SHADOW_MATCH_WINDOW_MS, FACE_GRANT_COOLDOWN_SECONDS * 1000);
   let best: AccessLogRecord | null = null;
   let bestDelta = Infinity;
+  let sameEmployee: AccessLogRecord | null = null;
+  let sameDelta = Infinity;
   for (let i = 0; i < accessLogs.length && i < 500; i++) {
     const log = accessLogs[i];
+    const t = new Date(log.timestamp).getTime();
+    if (t < atMs - reach) break;
     if (log.type !== gate || (log.status !== "GRANTED" && log.status !== "DENIED")) continue;
-    const delta = Math.abs(new Date(log.timestamp).getTime() - atMs);
+    const delta = Math.abs(t - atMs);
+    if (employeeId && log.status === "GRANTED" && log.employeeId === employeeId && delta <= reach && delta < sameDelta) {
+      sameEmployee = log; sameDelta = delta;
+    }
     if (delta <= SHADOW_MATCH_WINDOW_MS && delta < bestDelta) { best = log; bestDelta = delta; }
-    if (new Date(log.timestamp).getTime() < atMs - SHADOW_MATCH_WINDOW_MS) break;
   }
+  if (sameEmployee) best = sameEmployee;
   return best ? { id: best.id, status: best.status as "GRANTED" | "DENIED", employeeId: best.employeeId || undefined } : null;
 }
 
@@ -5898,7 +5910,7 @@ async function persistShadowResult(gate: Gate, r: TrackDecisionResult): Promise<
   const runnerUp = candidates
     .filter((c) => c.employeeId !== (o.kind === "employee" ? o.employeeId : ""))
     .sort((a, b) => b.fusedCosine - a.fusedCosine)[0];
-  const legacy = nearestLegacyEvent(gate, sh.decidedAtMs);
+  const legacy = nearestLegacyEvent(gate, sh.decidedAtMs, sh.outcome === "employee" ? sh.employeeId : undefined);
   const record: ShadowResultRecord = {
     id: newShadowResultId(),
     gate,
@@ -6658,6 +6670,8 @@ async function prepareTemplateFromImage(
   opts: {
     source: "enrollment" | "merge";
     sourceLogId?: string;
+    /** Camera the face was seen on, so per-camera coverage and adaptation count it. */
+    streamId?: string;
     /** The source log's stored stranger embedding: only the face matching it is enrolled (enrolFace.ts). */
     expectedEmbedding?: ArrayLike<number> | null;
   },
@@ -6712,6 +6726,7 @@ async function prepareTemplateFromImage(
       quality: Math.round(best.quality * 1000) / 1000,
       capturedAt: new Date().toISOString(),
       sourceLogId: opts.sourceLogId,
+      ...(opts.streamId ? { streamId: opts.streamId } : {}),
     };
     return {
       record,
@@ -7681,11 +7696,14 @@ async function strangerWindow(): Promise<{ logs: AccessLogRecord[]; faces: Stran
  * camera. A SUGGESTION for the operator only - it never grants anything and
  * the threshold is the evidence floor, well below the accept thresholds.
  */
+const SUGGESTION_MIN_COSINE = 0.5;
 function attachClusterSuggestions(clusters: any[], observations: Array<{ observationId: string; embedding?: number[]; modelTag?: string }>) {
   if (!faceEngineActive()) return;
   const tag = faceModelTag();
   const gallery = currentGallery();
-  const floor = currentFusionThresholds().minEvidence;
+  // 0.50, not the evidence floor: calibration measured different people up to
+  // 0.455, and live showed suggestions at 0.36-0.45 (2026-09-30).
+  const floor = SUGGESTION_MIN_COSINE;
   const byId = new Map(observations.map((o) => [o.observationId, o]));
   const cameras = configuredCameras();
   for (const cluster of clusters) {
@@ -7756,7 +7774,7 @@ async function enrolFromStrangerSource(
     const crop = face ? await db.getStrangerFaceCrop(face.id) : undefined;
     if (!face || !crop) return { rejected: "unsupported-image" };
     return prepareTemplateFromImage(employeeId, crop, {
-      source, sourceLogId: face.logId, expectedEmbedding: face.embedding?.length ? face.embedding : undefined,
+      source, sourceLogId: face.logId, streamId: face.streamId, expectedEmbedding: face.embedding?.length ? face.embedding : undefined,
     });
   }
   const sightingLog = validated.logs.find((log) => `log:${log.id}` === sourceObservation) ||
@@ -9506,7 +9524,11 @@ async function runCameraAdaptation(): Promise<number> {
       }));
     const existing = db.getFaceTemplates().filter((t) => t.modelTag === tag)
       .map((t) => ({ id: t.id, employeeId: t.employeeId, streamId: t.streamId, source: t.source, quality: t.quality, embedding: t.embedding, sourceLogId: t.sourceLogId }));
-    const plan = planAdaptation(candidates, existing, currentFusionThresholds().acceptSingle, DEFAULT_ADAPTATION_POLICY);
+    // The floor is acceptSingle + 0.10, but never below the calibrated 0.55 + 0.10:
+    // lowering the door threshold in the AI config must not loosen what becomes
+    // a permanent template (live 2026-09-30 ran at 0.45 and adapted at 0.618).
+    const adaptBase = Math.max(DEFAULT_FUSION_THRESHOLDS.acceptSingle, currentFusionThresholds().acceptSingle);
+    const plan = planAdaptation(candidates, existing, adaptBase, DEFAULT_ADAPTATION_POLICY);
     const touched = new Map<string, number>();
     for (const item of plan) {
       const o = item.observation;

@@ -23,8 +23,11 @@ export type ShadowOutcomeKind = "employee" | "stranger" | "insufficient";
  *  - shadow-only       shadow named an employee, the door engine granted nobody
  *  - legacy-only       the door engine granted, shadow found nobody usable
  *  - identity-mismatch both named an employee, a different one (look at these first)
- *  - none              no door-engine event in the window (shadow saw a track the
- *                      door engine never scanned)
+ *  - none              no door-engine event in the window and shadow named nobody
+ * A shadow employee with no door-engine event at all counts as shadow-only: the
+ * door engine scans continuously and writes nothing when it recognises nobody,
+ * so silence means it missed the person (a grant suppressed by its cooldown is
+ * paired by the caller before this is called).
  */
 export type ShadowAgreement = "agree" | "shadow-only" | "legacy-only" | "identity-mismatch" | "none";
 
@@ -92,8 +95,12 @@ export interface ShadowResultStore {
 
 export const newShadowResultId = () => `SR-${randomUUID()}`;
 
-/** Door-engine events this close (either side) to the shadow decision count as the same passage. */
-export const SHADOW_MATCH_WINDOW_MS = 5000;
+/**
+ * Door-engine events this close (either side) to the shadow decision count as
+ * the same passage. 15 s: the door engine scans with a 3 s gap and a scan takes
+ * 1.5-3 s, and live showed a genuine pair 12 s apart at 5 s (2026-09-30).
+ */
+export const SHADOW_MATCH_WINDOW_MS = 15000;
 
 export function shadowResultRetentionDays(env: NodeJS.ProcessEnv = process.env): number {
   return envNumber("SHADOW_RESULT_RETENTION_DAYS", 30, { min: 0, max: 3650, integer: true }, env);
@@ -107,7 +114,7 @@ export function classifyShadowAgreement(
   shadow: { outcome: ShadowOutcomeKind; employeeId?: string },
   legacy: { status: "GRANTED" | "DENIED"; employeeId?: string } | null,
 ): ShadowAgreement {
-  if (!legacy) return "none";
+  if (!legacy) return shadow.outcome === "employee" && shadow.employeeId ? "shadow-only" : "none";
   const shadowEmp = shadow.outcome === "employee" ? shadow.employeeId : undefined;
   const legacyEmp = legacy.status === "GRANTED" ? legacy.employeeId : undefined;
   if (shadowEmp && legacyEmp) return shadowEmp === legacyEmp ? "agree" : "identity-mismatch";

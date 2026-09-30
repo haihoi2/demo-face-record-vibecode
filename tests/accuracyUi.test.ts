@@ -316,3 +316,13 @@ describe("component sources", () => {
     assert.match(src, /Chỉ là gợi ý từ độ giống với mẫu đã có, không phải kết luận/);
   });
 });
+
+describe("weak suggestions (2026-09-30)", () => {
+  it("marks 0.50-0.55 as weak and asks for a photo check; 0.55 and up are plain", async () => {
+    const { suggestionText, SUGGESTION_WEAK_BELOW } = await import("../src/utils/accuracyUi");
+    const base = { employeeId: "E1", name: "CHINH", employeeCode: "NV-4106", missingCameras: [] as string[] };
+    assert.equal(SUGGESTION_WEAK_BELOW, 0.55);
+    assert.match(suggestionText({ ...base, cosine: 0.52 }), /52% \(yếu – hãy so ảnh trước khi gộp\)/);
+    assert.doesNotMatch(suggestionText({ ...base, cosine: 0.56 }), /yếu/);
+  });
+});
