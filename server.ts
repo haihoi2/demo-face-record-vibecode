@@ -1611,6 +1611,17 @@ const FACE_STRANGER_MIN_SIZE_PX = envInt("FACE_STRANGER_MIN_SIZE_PX", 60, 0, 200
 const FACE_STRANGER_MIN_DETECTOR_SCORE = envFloat("FACE_STRANGER_MIN_DETECTOR_SCORE", 0.8, 0, 1);
 /** Heavy-blur floor for stored stranger photos (faceEdgeEnergy); 0 disables. Storage only. */
 const FACE_STRANGER_MIN_EDGE_ENERGY = envFloat("FACE_STRANGER_MIN_EDGE_ENERGY", 0.16, 0, 10);
+/**
+ * Motion blur / weak faces (owner 2026-09-30: "remove too blur"): a stranger
+ * face is stored only when the recogniser's feature strength reaches this.
+ * Edge energy missed motion smear (a smeared example scored 0.65 vs floor
+ * 0.16); feature strength put it at 18.7. At 20: 20 of 159 stored stranger
+ * faces below, 0 of 49 recognised employee faces. Calibrated for
+ * arcface_w600k_r50 only (the scale is the model's); other models skip it.
+ * Storage only - never a door decision. 0 disables.
+ */
+const FACE_STRANGER_MIN_FEATURE_NORM = envFloat("FACE_STRANGER_MIN_FEATURE_NORM", 20, 0, 100);
+const FEATURE_NORM_MODEL_TAG = "arcface_w600k_r50";
 /** Maximum templates kept per employee; the lowest-quality one is evicted when full. */
 const FACE_TEMPLATE_MAX = envInt("FACE_TEMPLATE_MAX", 12, 1, 200);
 /**
@@ -1751,6 +1762,7 @@ async function observeFrame(
         quality: f.quality,
         detectorScore: f.score,
         edgeEnergy: f.edgeEnergy,
+        featureNorm: f.featureNorm,
         box: [f.box[0], f.box[1], f.box[2], f.box[3]] as [number, number, number, number],
       },
       face: f,
@@ -4224,6 +4236,12 @@ function strangerFaceFloor(o: FaceObservation): OutcomeSuppression | null {
   if (FACE_STRANGER_MIN_QUALITY > 0 && !(o.quality >= FACE_STRANGER_MIN_QUALITY)) return "stranger-quality";
   if (FACE_STRANGER_MIN_DETECTOR_SCORE > 0 && !(Number(o.detectorScore) >= FACE_STRANGER_MIN_DETECTOR_SCORE)) return "stranger-not-face";
   if (FACE_STRANGER_MIN_EDGE_ENERGY > 0 && typeof o.edgeEnergy === "number" && o.edgeEnergy < FACE_STRANGER_MIN_EDGE_ENERGY) return "stranger-blur";
+  if (
+    FACE_STRANGER_MIN_FEATURE_NORM > 0 &&
+    typeof o.featureNorm === "number" &&
+    faceModelTag() === FEATURE_NORM_MODEL_TAG &&
+    o.featureNorm < FACE_STRANGER_MIN_FEATURE_NORM
+  ) return "stranger-blur";
   if (o.box && FACE_STRANGER_MIN_SIZE_PX > 0 && Math.min(o.box[2] - o.box[0], o.box[3] - o.box[1]) < FACE_STRANGER_MIN_SIZE_PX) return "stranger-small";
   return null;
 }
@@ -8254,14 +8272,32 @@ app.post("/api/strangers/retire-non-faces", requireOperatorRole("admin"), requir
   try {
     const body = req.body && typeof req.body === "object" ? req.body : {};
     const ids = Array.isArray(body.logIds) ? body.logIds : [];
-    if (ids.length === 0 || ids.length > 500) {
-      res.status(400).json({ success: false, error: "logIds phải có từ 1 đến 500 phần tử" });
+    const faceIdsIn = Array.isArray(body.faceIds) ? body.faceIds : [];
+    if (ids.length + faceIdsIn.length === 0 || ids.length + faceIdsIn.length > 500) {
+      res.status(400).json({ success: false, error: "logIds và faceIds phải có tổng từ 1 đến 500 phần tử" });
       return;
     }
     const reason = typeof body.reason === "string" && body.reason.trim() ? body.reason.trim().slice(0, 120) : "không phải khuôn mặt rõ";
-    const retired = new Set(db.getRetiredStrangerObservationIds().map((x) => x.replace(/^log:/, "")));
+    const retiredAll = db.getRetiredStrangerObservationIds();
+    const retired = new Set(retiredAll.filter((x) => x.startsWith("log:")).map((x) => x.slice(4)));
+    const retiredFaces = new Set(retiredAll.filter((x) => x.startsWith("face:")).map((x) => x.slice(5)));
     const accepted: string[] = [];
+    const acceptedFaces: string[] = [];
     let invalid = 0, notCandidate = 0, alreadyRetired = 0;
+    // Per-face stranger records (plan 2026-09-29): only open stranger faces -
+    // never a recognised-employee observation, never a purged tombstone.
+    const faceRows = faceIdsIn.length
+      ? await db.getStrangerFacesByIds(faceIdsIn.filter((x: unknown): x is string => typeof x === "string"))
+      : [];
+    const faceById = new Map(faceRows.map((f) => [f.id, f]));
+    for (const raw of faceIdsIn) {
+      const id = typeof raw === "string" ? raw : "";
+      if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(id)) { invalid += 1; continue; }
+      if (retiredFaces.has(id) || acceptedFaces.includes(id)) { alreadyRetired += 1; continue; }
+      const f = faceById.get(id);
+      if (!f || f.employeeId || f.purgedAt) { notCandidate += 1; continue; }
+      acceptedFaces.push(id);
+    }
     for (const raw of ids) {
       const id = typeof raw === "string" ? raw : "";
       if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(id)) { invalid += 1; continue; }
@@ -8270,8 +8306,9 @@ app.post("/api/strangers/retire-non-faces", requireOperatorRole("admin"), requir
       accepted.push(id);
     }
     const skipped = { invalid, notCandidate, alreadyRetired };
-    if (body.dryRun === true || accepted.length === 0) {
-      res.json({ success: true, dryRun: body.dryRun === true, wouldRetire: accepted.length, skipped });
+    if (body.dryRun === true || accepted.length + acceptedFaces.length === 0) {
+      res.json({ success: true, dryRun: body.dryRun === true, wouldRetire: accepted.length + acceptedFaces.length,
+        wouldRetireLogs: accepted.length, wouldRetireFaces: acceptedFaces.length, skipped });
       return;
     }
     const clusterId = `NOTFACE-${randomUUID()}`;
@@ -8283,6 +8320,7 @@ app.post("/api/strangers/retire-non-faces", requireOperatorRole("admin"), requir
         actor: operatorActor(req),
         resolvedAt: new Date().toISOString(),
         logIds: accepted,
+        faceIds: acceptedFaces.sort(),
         metadata: { intent: { reason }, reason, kind: "not-a-face" },
       },
     });
@@ -8290,9 +8328,11 @@ app.post("/api/strangers/retire-non-faces", requireOperatorRole("admin"), requir
       res.status(409).json({ success: false, error: "Không ghi được quyết định ẩn ảnh" });
       return;
     }
-    console.log(`[Strangers] ${operatorActor(req)} ẩn ${accepted.length} ảnh người lạ không phải khuôn mặt rõ (${clusterId}); bỏ qua ${JSON.stringify(skipped)}`);
-    broadcastSSE("stranger_dismissed", { clusterId, clusterLogIds: accepted });
-    res.json({ success: true, clusterId, retired: accepted.length, skipped, resolution: commit.resolution });
+    console.log(`[Strangers] ${operatorActor(req)} ẩn ${accepted.length} ảnh và ${acceptedFaces.length} khuôn mặt người lạ không rõ (${clusterId}); bỏ qua ${JSON.stringify(skipped)}`);
+    strangerWindowCache = null;
+    broadcastSSE("stranger_dismissed", { clusterId, clusterLogIds: accepted, clusterObservationIds: acceptedFaces.map(faceObservationId) });
+    res.json({ success: true, clusterId, retired: accepted.length + acceptedFaces.length, retiredLogs: accepted.length,
+      retiredFaces: acceptedFaces.length, skipped, resolution: commit.resolution });
   } catch (err: any) {
     console.error("[Strangers] Lỗi ẩn ảnh không phải khuôn mặt:", err);
     res.status(500).json({ success: false, error: err?.message || "Lỗi ẩn ảnh người lạ" });

@@ -80,6 +80,8 @@ export interface ExtractedFace extends FaceBox {
    * Heavy blur flattens it; used only by storage floors, never by decisions.
    */
   edgeEnergy: number;
+  /** Recogniser feature strength before normalisation (embedFaceWithStrength); storage floors only. */
+  featureNorm?: number;
   /** Variance of the Laplacian over the aligned 112x112 crop (higher = sharper). */
   sharpness: number;
   /** Shorter side of the detected box, in original-image pixels. */
@@ -1254,6 +1256,19 @@ export function alignFace(
  * Returns null on failure.
  */
 export async function embedFace(aligned: RgbImage): Promise<Float32Array | null> {
+  return (await embedFaceWithStrength(aligned))?.embedding ?? null;
+}
+
+/**
+ * embedFace() plus the recogniser's raw feature strength: the L2 norm of its
+ * output BEFORE normalisation (first view). A face-quality signal: blurred,
+ * smeared, bowed or occluded faces produce weak features. Measured on this
+ * site 2026-09-30 with arcface_w600k_r50: recognised employee faces p10 22.7 /
+ * p50 24.9, stranger faces p10 19.7 / p50 22.5; below ~20 almost only motion-
+ * smeared, bowed or turned faces. The scale belongs to the model: re-measure
+ * before using it with another recogniser.
+ */
+export async function embedFaceWithStrength(aligned: RgbImage): Promise<{ embedding: Float32Array; featureNorm: number } | null> {
   try {
     const engine = await getFaceEngine();
     if (!engine) return null;
@@ -1263,7 +1278,10 @@ export async function embedFace(aligned: RgbImage): Promise<Float32Array | null>
     }
     const raw = await runRecognizer(engine, alignedToTensorData(aligned));
     if (!raw) return null;
-    if (!ttaFlipEnabled()) return l2Normalize(raw);
+    let sq = 0;
+    for (let i = 0; i < raw.length; i++) sq += raw[i] * raw[i];
+    const featureNorm = Math.sqrt(sq);
+    if (!ttaFlipEnabled()) return { embedding: l2Normalize(raw), featureNorm };
     // FACE_TTA_FLIP: l2(embed(x) + embed(flip(x))), each view unit length first
     // so both weigh equally. Fails closed to null if the mirrored run fails.
     const rawFlipped = await runRecognizer(engine, alignedToTensorData(flipHorizontal(aligned)));
@@ -1272,7 +1290,7 @@ export async function embedFace(aligned: RgbImage): Promise<Float32Array | null>
     const b = l2Normalize(rawFlipped);
     const sum = new Float32Array(EMBEDDING_DIM);
     for (let i = 0; i < EMBEDDING_DIM; i++) sum[i] = a[i] + b[i];
-    return l2Normalize(sum);
+    return { embedding: l2Normalize(sum), featureNorm };
   } catch (err) {
     log("error", "embedFace failed", err);
     return null;
@@ -1464,14 +1482,15 @@ export async function extractFaces(input: ImageInput): Promise<ExtractedFace[]> 
     for (const f of faces) {
       const aligned = alignFace(img, f.landmarks);
       if (!aligned) continue;
-      const embedding = await embedFace(aligned);
+      const embedded = await embedFaceWithStrength(aligned);
+      const embedding = embedded?.embedding ?? null;
       if (!embedding) continue;
       const boxSize = Math.min(f.box[2] - f.box[0], f.box[3] - f.box[1]);
       const { quality, sharpness } = faceQuality(aligned, boxSize);
       const edgeEnergy = faceEdgeEnergy(aligned);
       const pose = facePose(f.landmarks);
       const issue = clearFaceIssue(pose, CLEAR_FACE_LIMITS, boxSize);
-      out.push({ ...f, embedding, quality, sharpness, edgeEnergy, boxSize, pose, clear: issue === null, ...(issue ? { unclearReason: issue } : {}) });
+      out.push({ ...f, embedding, quality, sharpness, edgeEnergy, ...(embedded ? { featureNorm: Math.round(embedded.featureNorm * 100) / 100 } : {}), boxSize, pose, clear: issue === null, ...(issue ? { unclearReason: issue } : {}) });
     }
     out.sort((a, b) => b.score - a.score);
     return out;

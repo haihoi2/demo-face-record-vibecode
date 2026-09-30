@@ -510,6 +510,8 @@ export interface FaceObservation {
   detectorScore: number;
   /** Edge energy of the aligned face (faceEdgeEnergy); storage floors only. */
   edgeEnergy?: number;
+  /** Recogniser feature strength before normalisation (embedFaceWithStrength); storage floors only. */
+  featureNorm?: number;
   /** Face box in source-frame pixels [x1, y1, x2, y2]. */
   box?: [number, number, number, number];
 }

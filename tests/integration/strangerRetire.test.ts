@@ -67,6 +67,16 @@ describe("retire non-face stranger captures", () => {
     assert.equal(await lookupStatus(a), 200);
   });
 
+  it("accepts face-record ids too: unknown faces are counted, malformed ids are invalid", async () => {
+    const res = await postJson<any>("/api/strangers/retire-non-faces", { faceIds: ["SF-does-not-exist", "bad id!"], dryRun: true });
+    assert.equal(res.status, 200, res.text.slice(0, 300));
+    assert.equal(res.body.wouldRetire, 0);
+    assert.equal(res.body.wouldRetireFaces, 0);
+    assert.deepEqual(res.body.skipped, { invalid: 1, notCandidate: 1, alreadyRetired: 0 });
+    const big = Array.from({ length: 300 }, (_, i) => `SF-${i}`);
+    assert.equal((await postJson("/api/strangers/retire-non-faces", { logIds: big, faceIds: big })).status, 400, "logIds + faceIds capped at 500 together");
+  });
+
   it("refuses empty and oversized batches", async () => {
     assert.equal((await postJson("/api/strangers/retire-non-faces", { logIds: [] })).status, 400);
     assert.equal((await postJson("/api/strangers/retire-non-faces", {})).status, 400);

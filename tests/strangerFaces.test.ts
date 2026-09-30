@@ -136,3 +136,24 @@ describe("server wiring", () => {
     assert.match(src, /r\.action === "QUICK_REGISTER" \|\| r\.action === "MERGE"/);
   });
 });
+
+describe("motion-blur floor (feature strength, 2026-09-30)", () => {
+  const src = readFileSync(new URL("../server.ts", import.meta.url), "utf8");
+  const eng = readFileSync(new URL("../src/server/faceEmbedding.ts", import.meta.url), "utf8");
+
+  it("stores no stranger face whose recogniser feature strength is below the floor (r50 only)", () => {
+    assert.match(src, /const FACE_STRANGER_MIN_FEATURE_NORM = envFloat\("FACE_STRANGER_MIN_FEATURE_NORM", 20, 0, 100\);/);
+    assert.match(src, /faceModelTag\(\) === FEATURE_NORM_MODEL_TAG &&\s*o\.featureNorm < FACE_STRANGER_MIN_FEATURE_NORM/);
+    assert.match(src, /featureNorm: f\.featureNorm,/);
+  });
+
+  it("the embedding itself is unchanged: embedFace is embedFaceWithStrength's embedding", () => {
+    assert.match(eng, /export async function embedFace\(aligned: RgbImage\): Promise<Float32Array \| null> \{\n  return \(await embedFaceWithStrength\(aligned\)\)\?\.embedding \?\? null;\n\}/);
+    assert.match(eng, /if \(!ttaFlipEnabled\(\)\) return \{ embedding: l2Normalize\(raw\), featureNorm \};/);
+  });
+
+  it("the not-a-face cleanup retires individual face records, never an employee observation or a tombstone", () => {
+    assert.match(src, /if \(!f \|\| f\.employeeId \|\| f\.purgedAt\) \{ notCandidate \+= 1; continue; \}/);
+    assert.match(src, /faceIds: acceptedFaces\.sort\(\),/);
+  });
+});
