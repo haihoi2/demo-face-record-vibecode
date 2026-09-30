@@ -157,3 +157,25 @@ describe("motion-blur floor (feature strength, 2026-09-30)", () => {
     assert.match(src, /faceIds: acceptedFaces\.sort\(\),/);
   });
 });
+
+describe("employee merge keeps history (2026-09-30)", () => {
+  const src = readFileSync(new URL("../server.ts", import.meta.url), "utf8");
+  const route = src.slice(src.indexOf('app.post(["/api/employees/merge"'), src.indexOf('app.get("/api/employees/merges"'));
+
+  it("never rewrites access logs or notifications", () => {
+    assert.doesNotMatch(route, /reassignEmployeeReferences|log\.employeeId = |n\.employeeId = /);
+    assert.match(route, /reattributedLogs: 0,/);
+  });
+
+  it("moves templates, records an attributed merge before removing the source", () => {
+    const save = route.indexOf("await db.saveEmployeeMerge(merge)");
+    const remove = route.indexOf("db.deleteEmployee(source.id)");
+    assert.ok(route.includes("db.reassignFaceTemplates(source.id, target.id)"));
+    assert.ok(save > 0 && remove > save, "audit first, then removal");
+    assert.match(route, /actor: operatorActor\(req\),/);
+  });
+
+  it("history responses link events of a merged record to the record it belongs to now", () => {
+    assert.match(src, /const merged = mergedTargetOf\(log\.employeeId\);/);
+  });
+});

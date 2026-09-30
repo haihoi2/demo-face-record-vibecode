@@ -108,6 +108,7 @@ describe("permission table", () => {
     ["POST", "/config/ai", "admin"],
     ["DELETE", "/api/employees/EMP-1", "admin"],
     ["POST", "/api/employees/merge", "admin"],
+    ["GET", "/api/employees/merges", "admin"],
     ["POST", "/api/logs/clear", "admin"],
     ["POST", "/logs/clear", "admin"],
     ["POST", "/api/camera-streams/threads/scale", "admin"],

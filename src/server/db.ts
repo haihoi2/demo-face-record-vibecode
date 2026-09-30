@@ -566,6 +566,22 @@ function accumulateStats(rows: Array<Pick<AccessLogRecord, "timestamp" | "type" 
 
 export type StrangerResolutionAction = "QUICK_REGISTER" | "MERGE" | "DISMISS" | "RESTORE";
 
+/**
+ * One employee merge (duplicate records of the same person). Append-only:
+ * access history is NOT rewritten - past events keep the name/code they had;
+ * this record links the removed id to the kept one.
+ */
+export interface EmployeeMergeRecord {
+  id: string;
+  sourceId: string;
+  targetId: string;
+  /** The removed record as it was: name, employeeCode, department, position, registeredAt. */
+  sourceSnapshot: { name: string; employeeCode: string; department?: string; position?: string; registeredAt?: string };
+  movedTemplates: number;
+  actor: string;
+  mergedAt: string;
+}
+
 export interface StrangerResolutionRecord {
   id: string;
   clusterId: string;
@@ -1991,6 +2007,17 @@ class SQLiteStorage implements StrangerFaceStore, ShadowResultStore {
         CREATE INDEX IF NOT EXISTS idx_stranger_resolution_events_cluster
           ON stranger_resolution_events ("clusterId", "resolvedAt");
 
+        CREATE TABLE IF NOT EXISTS employee_merges (
+          id VARCHAR(64) PRIMARY KEY,
+          "sourceId" VARCHAR(64) NOT NULL,
+          "targetId" VARCHAR(64) NOT NULL,
+          "sourceSnapshot" JSONB NOT NULL,
+          "movedTemplates" INTEGER NOT NULL DEFAULT 0,
+          actor VARCHAR(255) NOT NULL,
+          "mergedAt" VARCHAR(64) NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_employee_merges_source ON employee_merges ("sourceId");
+
         CREATE TABLE IF NOT EXISTS face_templates (
           id VARCHAR(64) PRIMARY KEY,
           "employeeId" VARCHAR(64) NOT NULL,
@@ -2080,6 +2107,7 @@ class SQLiteStorage implements StrangerFaceStore, ShadowResultStore {
       await this.loadFaceTemplates();
       await this.loadUsers();
       await this.loadOrgCatalog();
+      await this.loadEmployeeMerges();
       console.log("[PostgreSQL] Các bảng dữ liệu đã sẵn sàng trên PostgreSQL!");
     } catch (err) {
       console.error("[PostgreSQL] Lỗi khởi tạo bảng:", err);
@@ -2256,6 +2284,16 @@ class SQLiteStorage implements StrangerFaceStore, ShadowResultStore {
         faceIds TEXT NOT NULL DEFAULT '[]'
       );
 
+      CREATE TABLE IF NOT EXISTS employee_merges (
+        id TEXT PRIMARY KEY,
+        sourceId TEXT NOT NULL,
+        targetId TEXT NOT NULL,
+        sourceSnapshot TEXT NOT NULL,
+        movedTemplates INTEGER NOT NULL DEFAULT 0,
+        actor TEXT NOT NULL,
+        mergedAt TEXT NOT NULL
+      );
+
       CREATE TABLE IF NOT EXISTS stranger_resolution_events (
         id TEXT PRIMARY KEY,
         clusterId TEXT NOT NULL,
@@ -2323,6 +2361,7 @@ class SQLiteStorage implements StrangerFaceStore, ShadowResultStore {
     resolved_stranger_clusters?: string[];
     stranger_resolutions?: StrangerResolutionRecord[];
     stranger_resolution_events?: StrangerResolutionRecord[];
+    employee_merges?: EmployeeMergeRecord[];
     face_templates?: FaceTemplateRecord[];
     ai_recognition_config?: AiRecognitionConfigRecord;
     app_users?: UserRecord[];
@@ -4533,6 +4572,80 @@ class SQLiteStorage implements StrangerFaceStore, ShadowResultStore {
     } catch (err) {
       console.error("[PostgreSQL] Lỗi nạp adjudication người lạ:", err);
     }
+  }
+
+  // --- Employee merges: append-only audit (history-preserving merge, 2026-09-30) ---
+  private employeeMergesCache: EmployeeMergeRecord[] | null = null;
+
+  private async loadEmployeeMerges(): Promise<void> {
+    if (!this.pgPool) return;
+    try {
+      const r = await this.pgPool.query(
+        'SELECT id, "sourceId", "targetId", "sourceSnapshot", "movedTemplates", actor, "mergedAt" FROM employee_merges ORDER BY "mergedAt"'
+      );
+      this.employeeMergesCache = r.rows.map((x: any) => ({
+        id: x.id, sourceId: x.sourceId, targetId: x.targetId,
+        sourceSnapshot: typeof x.sourceSnapshot === "string" ? JSON.parse(x.sourceSnapshot) : x.sourceSnapshot,
+        movedTemplates: Number(x.movedTemplates) || 0, actor: x.actor, mergedAt: x.mergedAt,
+      }));
+    } catch (err) {
+      console.error("[PostgreSQL] Lỗi nạp lịch sử gộp nhân viên:", err);
+    }
+  }
+
+  /** Every recorded employee merge, oldest first (copies). */
+  getEmployeeMerges(): EmployeeMergeRecord[] {
+    if (!this.employeeMergesCache) {
+      let rows: EmployeeMergeRecord[] = [];
+      if (this.isNativeSqlite && this.db) {
+        try {
+          rows = (this.db.prepare("SELECT * FROM employee_merges ORDER BY mergedAt").all() as any[]).map((x) => ({
+            id: x.id, sourceId: x.sourceId, targetId: x.targetId, sourceSnapshot: JSON.parse(x.sourceSnapshot || "{}"),
+            movedTemplates: Number(x.movedTemplates) || 0, actor: x.actor, mergedAt: x.mergedAt,
+          }));
+        } catch {
+          rows = [];
+        }
+      } else {
+        rows = [...(this.fallbackData.employee_merges || [])];
+      }
+      this.employeeMergesCache = rows;
+    }
+    return this.employeeMergesCache.map((m) => ({ ...m, sourceSnapshot: { ...m.sourceSnapshot } }));
+  }
+
+  /** Append one merge record to the authoritative store (never updated or deleted). */
+  async saveEmployeeMerge(m: EmployeeMergeRecord): Promise<boolean> {
+    const record: EmployeeMergeRecord = { ...m, sourceSnapshot: { ...m.sourceSnapshot } };
+    this.getEmployeeMerges();
+    this.employeeMergesCache!.push(record);
+    if (this.pgPool && this.isPostgres) {
+      try {
+        await this.pgPool.query(
+          `INSERT INTO employee_merges (id, "sourceId", "targetId", "sourceSnapshot", "movedTemplates", actor, "mergedAt")
+           VALUES ($1,$2,$3,$4::jsonb,$5,$6,$7) ON CONFLICT (id) DO NOTHING`,
+          [record.id, record.sourceId, record.targetId, JSON.stringify(record.sourceSnapshot), record.movedTemplates, record.actor, record.mergedAt],
+        );
+        return true;
+      } catch (err: any) {
+        console.error("[PostgreSQL] Lỗi lưu lịch sử gộp nhân viên:", err?.message || err);
+        return false;
+      }
+    }
+    if (this.isNativeSqlite && this.db) {
+      try {
+        this.db.prepare(
+          "INSERT OR IGNORE INTO employee_merges (id, sourceId, targetId, sourceSnapshot, movedTemplates, actor, mergedAt) VALUES (?,?,?,?,?,?,?)",
+        ).run(record.id, record.sourceId, record.targetId, JSON.stringify(record.sourceSnapshot), record.movedTemplates, record.actor, record.mergedAt);
+        return true;
+      } catch (err: any) {
+        console.error("[SQLite] Lỗi lưu lịch sử gộp nhân viên:", err?.message || err);
+        return false;
+      }
+    }
+    this.fallbackData.employee_merges = [...(this.fallbackData.employee_merges || []), record];
+    this.saveFallback();
+    return true;
   }
 
   getStrangerResolutions(): StrangerResolutionRecord[] {

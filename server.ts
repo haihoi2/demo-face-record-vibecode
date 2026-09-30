@@ -848,6 +848,19 @@ function redactedUrl(value: string): string {
   }
 }
 
+/** Removed employee id -> the id it was merged into (history links; employee_merges). */
+let employeeMergeMap = new Map<string, string>();
+function refreshEmployeeMergeMap() {
+  employeeMergeMap = new Map(db.getEmployeeMerges().map((m) => [m.sourceId, m.targetId]));
+}
+
+/** Follows chained merges (A -> B -> C) to the record that exists now. */
+function mergedTargetOf(employeeId: string | undefined): EmployeeRecord | undefined {
+  let id = employeeId;
+  for (let i = 0; id && i < 8 && employeeMergeMap.has(id); i++) id = employeeMergeMap.get(id);
+  return id && id !== employeeId ? employees.find((e) => e.id === id) : undefined;
+}
+
 function publicEmployee(employee: EmployeeRecord) {
   return {
     id: employee.id,
@@ -1184,6 +1197,7 @@ const DEFAULT_WEBHOOK_CONFIG = {
 
 // Persistent instances loaded from database (PostgreSQL / SQLite)
 let employees: EmployeeRecord[] = db.getEmployees(DEMO_DATA_ENABLED ? DEFAULT_EMPLOYEES : []);
+refreshEmployeeMergeMap();
 let accessLogs: AccessLogRecord[] = db.getAccessLogs(DEMO_DATA_ENABLED ? DEFAULT_ACCESS_LOGS : []);
 let mobileNotifications: MobileNotificationRecord[] = db.getNotifications(DEMO_DATA_ENABLED ? DEFAULT_NOTIFICATIONS : []);
 let smartLockState = db.getSmartLockState(DEFAULT_SMART_LOCK_STATE);
@@ -1526,6 +1540,7 @@ db.onCameraStreamsConfigLoaded(() => {
 db.onSync(() => {
   aiRecognitionConfig = db.getAiRecognitionConfig(DEFAULT_AI_RECOGNITION_CONFIG);
   employees = db.getEmployees(DEMO_DATA_ENABLED ? DEFAULT_EMPLOYEES : []);
+  refreshEmployeeMergeMap();
   accessLogs = db.getAccessLogs(DEMO_DATA_ENABLED ? DEFAULT_ACCESS_LOGS : []);
   mobileNotifications = db.getNotifications(DEMO_DATA_ENABLED ? DEFAULT_NOTIFICATIONS : []);
   smartLockState = db.getSmartLockState(DEFAULT_SMART_LOCK_STATE);
@@ -7116,89 +7131,94 @@ app.delete(["/api/employees/:id", "/employees/:id"], (req, res) => {
 // Merge two employee records that turn out to be the same person: every
 // access log and notification of `sourceId` is reattributed to `targetId`,
 // then the source record is removed. `keepPhoto` = "target" (default) | "source".
-app.post(["/api/employees/merge", "/employees/merge"], (req, res) => {
-  const { sourceId, targetId, keepPhoto = "target" } = req.body || {};
-  if (!sourceId || !targetId) {
-    res.status(400).json({ success: false, error: "Cần cả sourceId (hồ sơ bị gộp) và targetId (hồ sơ giữ lại)" });
-    return;
-  }
-  if (sourceId === targetId) {
-    res.status(400).json({ success: false, error: "sourceId và targetId phải khác nhau" });
-    return;
-  }
-  const sourceIdx = employees.findIndex((e) => e.id === sourceId);
-  const target = employees.find((e) => e.id === targetId);
-  if (sourceIdx === -1 || !target) {
-    res.status(404).json({ success: false, error: `Không tìm thấy nhân viên (${sourceIdx === -1 ? sourceId : targetId})` });
-    return;
-  }
-  const source = employees[sourceIdx];
-
-  if (keepPhoto === "source" && source.photoUrl) {
-    target.photoUrl = source.photoUrl;
-    db.saveEmployee(target);
-  }
-
-  let reattributedLogs = 0;
-  for (const log of accessLogs) {
-    if (log.employeeId === source.id) {
-      log.employeeId = target.id;
-      log.employeeName = target.name;
-      log.employeeCode = target.employeeCode;
-      log.department = target.department;
-      reattributedLogs++;
+/**
+ * Merge two employee records that are the same person (owner 2026-09-30: fix
+ * the duplicate records). History-preserving: past access events and
+ * notifications keep the id/name/code they had - they are immutable history.
+ * The source's face templates move to the target (camera coverage included),
+ * the source record is removed, and an append-only employee_merges record
+ * (actor, time, source snapshot) links the old id to the kept one; history
+ * responses carry `mergedInto` for events of a merged id.
+ */
+app.post(["/api/employees/merge", "/employees/merge"], requireOperatorRole("admin"), requireCsrf, async (req, res) => {
+  try {
+    const { sourceId, targetId, keepPhoto = "target" } = req.body || {};
+    if (typeof sourceId !== "string" || typeof targetId !== "string" || !sourceId || !targetId) {
+      res.status(400).json({ success: false, error: "Cần cả sourceId (hồ sơ bị gộp) và targetId (hồ sơ giữ lại)" });
+      return;
     }
-  }
-  let reattributedNotifications = 0;
-  for (const n of mobileNotifications) {
-    if (n.employeeId === source.id) {
-      n.employeeId = target.id;
-      n.employeeName = target.name;
-      reattributedNotifications++;
+    if (sourceId === targetId) {
+      res.status(400).json({ success: false, error: "sourceId và targetId phải khác nhau" });
+      return;
     }
+    const sourceIdx = employees.findIndex((e) => e.id === sourceId);
+    const target = employees.find((e) => e.id === targetId);
+    if (sourceIdx === -1 || !target) {
+      res.status(404).json({ success: false, error: `Không tìm thấy nhân viên (${sourceIdx === -1 ? sourceId : targetId})` });
+      return;
+    }
+    const source = employees[sourceIdx];
+    if (keepPhoto === "source" && source.photoUrl) {
+      target.photoUrl = source.photoUrl;
+      db.saveEmployee(target);
+    }
+    const movedTemplates = db.reassignFaceTemplates(source.id, target.id);
+    const evictedTemplates = enforceTemplateCap(target.id);
+    await db.settleFaceTemplateWrites();
+    const merge = {
+      id: `MRG-${randomUUID()}`,
+      sourceId: source.id,
+      targetId: target.id,
+      sourceSnapshot: {
+        name: source.name, employeeCode: source.employeeCode, department: source.department,
+        position: source.position, registeredAt: source.registeredAt,
+      },
+      movedTemplates,
+      actor: operatorActor(req),
+      mergedAt: new Date().toISOString(),
+    };
+    if (!(await db.saveEmployeeMerge(merge))) {
+      res.status(500).json({ success: false, error: "Không ghi được lịch sử gộp; hồ sơ nguồn chưa bị xóa" });
+      return;
+    }
+    employees.splice(sourceIdx, 1);
+    db.deleteEmployee(source.id);
+    refreshEmployeeMergeMap();
+    const notif: MobileNotificationRecord = {
+      id: "NOTIF-" + Date.now(),
+      title: "Đã gộp hồ sơ nhân viên",
+      body: `Hồ sơ ${source.name} (${source.employeeCode}) đã được gộp vào ${target.name} (${target.employeeCode}); ${movedTemplates} mẫu khuôn mặt được chuyển. Lịch sử ra vào giữ nguyên.`,
+      timestamp: new Date().toISOString(),
+      type: "SUCCESS",
+      read: false,
+      employeeId: target.id,
+      employeeName: target.name,
+    };
+    mobileNotifications.unshift(notif);
+    db.saveNotification(notif);
+    broadcastSSE("employee_deleted", { id: source.id });
+    broadcastSSE("employee_updated", target);
+    broadcastSSE("employee_merged", { sourceId: source.id, targetId: target.id, movedTemplates, mergeId: merge.id });
+    broadcastSSE("notification", notif);
+    console.log(`[Employees] ${merge.actor} gộp ${source.name} (${source.employeeCode}) -> ${target.name} (${target.employeeCode}): ${movedTemplates} mẫu chuyển, ${evictedTemplates.length} mẫu yếu bị loại; lịch sử giữ nguyên (${merge.id}).`);
+    res.json({
+      success: true,
+      message: `Đã gộp ${source.name} vào ${target.name}`,
+      target: publicEmployee(target),
+      merge,
+      movedTemplates,
+      evictedTemplates: evictedTemplates.length,
+      reattributedLogs: 0,
+    });
+  } catch (err: any) {
+    console.error("[Employees] Lỗi gộp hồ sơ nhân viên:", err);
+    res.status(500).json({ success: false, error: err?.message || "Lỗi gộp hồ sơ nhân viên" });
   }
-  // Store-wide, so rows beyond the cached window are covered as well.
-  db.reassignEmployeeReferences(source.id, target);
+});
 
-  // The two records are the same person, so the source's enrolled faces are
-  // valid samples of the target. Move them, then trim back to the per-employee
-  // cap by dropping the weakest captures.
-  const reassignedTemplates = db.reassignFaceTemplates(source.id, target.id);
-  const evictedTemplates = enforceTemplateCap(target.id);
-
-  employees.splice(sourceIdx, 1);
-  db.deleteEmployee(source.id);
-
-  const notif: MobileNotificationRecord = {
-    id: "NOTIF-" + Date.now(),
-    title: "Đã gộp hồ sơ nhân viên",
-    body: `Hồ sơ ${source.name} (${source.employeeCode}) đã được gộp vào ${target.name} (${target.employeeCode}); ${reattributedLogs} nhật ký được gán lại.`,
-    timestamp: new Date().toISOString(),
-    type: "SUCCESS",
-    read: false,
-    employeeId: target.id,
-    employeeName: target.name,
-  };
-  mobileNotifications.unshift(notif);
-  db.saveNotification(notif);
-
-  broadcastSSE("employee_deleted", { id: source.id });
-  broadcastSSE("employee_updated", target);
-  broadcastSSE("employee_merged", { sourceId: source.id, targetId: target.id, reattributedLogs, reattributedNotifications });
-  broadcastSSE("notification", notif);
-
-  console.log(`[Employees] Đã gộp ${source.name} (${source.employeeCode}) -> ${target.name} (${target.employeeCode}): ${reattributedLogs} logs, ${reattributedNotifications} thông báo.`);
-  res.json({
-    success: true,
-    message: `Đã gộp ${source.name} vào ${target.name}`,
-    target,
-    removed: { id: source.id, name: source.name, employeeCode: source.employeeCode },
-    reattributedLogs,
-    reattributedNotifications,
-    reassignedTemplates,
-    evictedTemplates,
-    photoKept: keepPhoto === "source" ? "source" : "target",
-  });
+/** Recorded employee merges (admin): who merged which record into which, and when. */
+app.get("/api/employees/merges", requireOperatorRole("admin"), (_req, res) => {
+  res.json({ success: true, merges: db.getEmployeeMerges() });
 });
 
 // --- Access Logs Endpoints ---
@@ -7221,7 +7241,13 @@ const publicAccessLog = (log: AccessLogRecord) => {
   const { photoSnapshot: _image, faceEmbedding: _embedding, faceEmbeddingDims: _dims,
     faceEmbeddingModelTag: _model, faceEmbeddingQuality: _quality, ...metadata } = log;
   const imageUrl = logImageUrl(log.id);
-  return { ...metadata, photoSnapshot: imageUrl, imageUrl, hasImage: Boolean(log.photoSnapshot) };
+  // An event of a merged (removed) employee record keeps its historical name;
+  // mergedInto names the record it belongs to now.
+  const merged = mergedTargetOf(log.employeeId);
+  return {
+    ...metadata, photoSnapshot: imageUrl, imageUrl, hasImage: Boolean(log.photoSnapshot),
+    ...(merged ? { mergedInto: { id: merged.id, name: merged.name, employeeCode: merged.employeeCode } } : {}),
+  };
 };
 
 // ---------------------------------------------------------------------------

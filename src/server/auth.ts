@@ -55,6 +55,8 @@ const WRITE = ["POST", "PUT", "PATCH", "DELETE"] as const;
 const RULES: readonly Rule[] = [
   // --- admin-only reads: account records and configuration that names secrets
   { methods: READ, pattern: /^\/api\/users(?:\/|$)/, role: "admin" },
+  // Who merged which employee record into which (names of removed records).
+  { methods: READ, pattern: /^\/api\/employees\/merges$/, role: "admin" },
   { methods: READ, pattern: /^\/api\/door-controller\/config$/, role: "admin" },
   { methods: READ, pattern: /^\/api\/webhook\/config$/, role: "admin" },
   { methods: READ, pattern: /^\/api\/system\//, role: "admin" },

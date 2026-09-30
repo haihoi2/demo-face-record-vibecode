@@ -39,6 +39,8 @@ export interface AccessLog {
   trackId?: string;
   /** NVR channel the gate was recorded on at the time of the event. Absent on older events. */
   recordingChannel?: string;
+  /** Set when this event's employee record was later merged into another (the name above stays historical). */
+  mergedInto?: { id: string; name: string; employeeCode: string };
 }
 
 export interface StrangerPhoto {
