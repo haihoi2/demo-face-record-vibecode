@@ -39,6 +39,8 @@ export interface AccessLog {
   trackId?: string;
   /** NVR channel the gate was recorded on at the time of the event. Absent on older events. */
   recordingChannel?: string;
+  /** Gate id (N-gate wave). Older events have none: "entry" for type ENTRY, "exit" for EXIT. */
+  gateId?: string;
   /** Set when this event's employee record was later merged into another (the name above stays historical). */
   mergedInto?: { id: string; name: string; employeeCode: string };
 }
@@ -128,6 +130,8 @@ export interface QuickRegisterStrangerPayload {
 }
 
 export interface SmartLockState {
+  /** Door this state belongs to (N-gate wave); absent = "main". */
+  doorId?: string;
   lockId: string;
   doorName: string;
   state: 'LOCKED' | 'UNLOCKED' | 'UNLOCKING' | 'LOCKING';
@@ -305,7 +309,15 @@ export const STRANGER_DEEP_LINK_HASH = "strangers";
 
 export type DoorAuthHeaderType = "BEARER" | "API_KEY" | "CUSTOM_HEADER" | "QUERY_PARAM";
 
+/** One door and its controller (N-gate wave). The legacy single door is id "main". */
+export interface DoorConfig extends DoorControllerConfig {
+  id: string;
+  label: string;
+}
+
 export interface DoorControllerConfig {
+  /** All doors (servers from the N-gate wave on); the top-level fields mirror door "main". */
+  doors?: DoorConfig[];
   enabled: boolean;
   apiUrl: string;
   apiToken: string;
@@ -389,6 +401,10 @@ export interface GateWatchConfig {
 
 /** Live state of a gate's backend watcher, for the dashboard and diagnostics. */
 export interface GateWatchRuntime {
+  /** Gate id (N-gate wave): key watchers by this, never by `gate` (several gates can share a direction). */
+  gateId?: string;
+  /** Display label of the gate. */
+  gateLabel?: string;
   gate: "ENTRY" | "EXIT";
   enabled: boolean;
   /** Real-time pipeline rollout for this gate: legacy watcher, shadow, or live. */
@@ -576,8 +592,26 @@ export interface GateStreamScanResult {
   error?: string;
 }
 
+/**
+ * A gate (N-gate wave, src/server/gates.ts): stable slug id, direction for
+ * reports, the door it opens. The legacy gates "entry" and "exit" always exist
+ * (they can be disabled, not deleted); further gates can be added and removed.
+ */
+export interface GateConfig extends GateStreamConfig {
+  id: string;
+  direction: ScanType;
+  /** Display name; falls back to `name`. */
+  label?: string;
+  /** Door this gate's grants open; absent = the legacy single door "main". */
+  doorId?: string;
+}
+
 export interface CameraStreamsConfig {
+  /** All gates, in display order (servers from the N-gate wave on). */
+  gates?: GateConfig[];
+  /** Legacy view of gate "entry" (kept for older clients). */
   entryGate: GateStreamConfig;
+  /** Legacy view of gate "exit" (kept for older clients). */
   exitGate: GateStreamConfig;
   workerThreadsCount: number;
   multiThreadEnabled: boolean;

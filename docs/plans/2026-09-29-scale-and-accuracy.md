@@ -128,3 +128,58 @@ Design:
 - API (INT): `GET /api/pipeline/shadow-summary?hours=24` → `{ success, since, gates: ShadowAccuracySummaryView[] }` (viewer); `GET /api/pipeline/shadow-results?gate=&agreement=&cursor=&limit=` (viewer); `GET /api/employees/:id/templates` gains `coverage: [{streamId, gate, count, adaptation}]`; `DELETE` of an adaptation template uses the existing template route; stranger cluster payloads gain `suggestion`.
 - db (data-migrations): `pipeline_shadow_results` table implementing `ShadowResultStore`; `stranger_faces` gains `employeeId`, `matchCosine`, `matchMargin` (nullable) and the candidate/grouping queries exclude rows with `employeeId`; `face_templates.source` accepts `"adaptation"`; a per-(employee, streamId) template count query.
 - Hotspot writers: db.ts data-migrations; server.ts, strangers.ts, types.ts, contracts INT; StrangerClusterModal.tsx, EmployeeRegistration.tsx, RealtimeEngineCard.tsx frontend.
+
+## 11. Contract (N-gate wave, base `release/n-gates`; owner go-ahead 2026-10-01)
+
+**Model:** `src/server/gates.ts` holds the helpers below (pure, tested in `tests/gates.test.ts`).
+- Gate ids: lowercase slug, 2–32 chars, starts with a letter, at most 16 gates.
+- `gatesFromStoredConfig` migrates the legacy `entryGate`/`exitGate` to gates `entry` (ENTRY) and `exit` (EXIT).
+- `legacyGateViews` gives older clients their `entryGate`/`exitGate` keys.
+- `gateIdForLegacyRow` gives old rows a gate id: `entry` for ENTRY, `exit` for EXIT.
+- `gateEnvSuffix`: env names become `PIPELINE_MODE_<ID>` and `RECORDING_<ID>_CHANNEL`, so the legacy names are unchanged.
+- `doorIdOf` returns the gate's door, falling back to `main`.
+
+**Fixed rules this wave:**
+- Gates `entry` and `exit` always exist. They can be disabled but not deleted. Further gates can be added and removed (admin).
+- Matching stays global, and per-camera templates are unchanged.
+- Each gate opens exactly its own door (owner decision 4). The legacy single door is `main`, and both legacy gates point at it until an admin assigns doors.
+- Access history is never rewritten. Old rows have no `gateId`, and readers derive it.
+
+**Types (`src/types.ts`):**
+- `GateConfig` (`id`, `direction`, `label`, `doorId`) and `CameraStreamsConfig.gates`, with `entryGate`/`exitGate` kept as views.
+- `DoorConfig` (`id`, `label`) and `DoorControllerConfig.doors`; the top-level fields mirror door `main`.
+- `SmartLockState.doorId`, `AccessLog.gateId`, and `GateWatchRuntime.gateId`/`gateLabel`.
+- UIs key gates by `gateId`, never by direction.
+
+**API (INT, `server.ts`):**
+- `GET`/`POST /api/camera-streams/config` carry `gates` plus the legacy views. `POST` accepts either shape, and `gates` wins.
+- `POST /api/gates`, `PUT`/`DELETE /api/gates/:gateId` (admin). Deleting a gate keeps its history.
+- `/api/camera-streams/:gateId/...` (streams, watch, pipeline-mode, snapshot, template capture) works for any configured gate. An unknown gate gets 400; there is no silent fallback to `entry`.
+- `GET`/`POST /api/door-controller/config` carry `doors`.
+- `GET /api/lock/state?doorId=` and `POST /api/lock/unlock|lock {doorId?}` (default `main`).
+- `GET /api/logs?gateId=` (the direction filter `type` is unchanged); events carry `gateId`.
+- Watch runtimes are one per configured gate.
+- Pipeline and recording env are per gate via `gateEnvSuffix`.
+
+**db (data-migrations, `db.ts` + `init-db.sql`):**
+- `access_logs."gateId"` (nullable, plus an index with timestamp), with no backfill writes, and the `AccessLogQuery.gateId` filter. Rows with a NULL `gateId` match `entry`/`exit` by `type`.
+- `stranger_faces."gateId"` (nullable).
+- `door_lock_states` (`doorId` PK, state JSON), with the legacy `smart_lock_state` read as door `main`.
+- Shadow results: `gate` holds the gate id from now on. Old rows read ENTRY → `entry` and EXIT → `exit`.
+- Camera config and door config stay JSON blobs.
+
+**Pipeline (`src/server/pipeline/**`):**
+- `Gate` becomes the gate id string and the direction travels separately.
+- Remove the ENTRY/EXIT coercions (`pipelineCore`).
+- The track-id prefix comes from the gate id.
+
+**Frontend:**
+- Gate list instead of two tabs: camera config with add/disable/remove gate, dashboard, engine card, scanner gate select, logs gate filter, enrolment camera list.
+- Door list on the door page, and gate→door binding.
+
+**Hotspot writers this wave:**
+- `server.ts`, `src/types.ts`, `auth.ts`, `recording.ts`, `gates.ts`: INT.
+- `db.ts`: data-migrations.
+- `pipeline/**`: pipeline agent.
+- Components: frontend.
+- N=3 black-box tests after the merge: security-tester.
