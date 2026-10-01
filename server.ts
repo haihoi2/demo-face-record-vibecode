@@ -4790,7 +4790,8 @@ async function persistStrangerFaces(
     const frameBytes = frameImage.startsWith("data:") ? Buffer.from(frameImage.split(",", 2)[1] || "", "base64") : null;
     if (!frameBytes?.length) return 0;
     const size = encodedImageSize(frameBytes);
-    const rows: StrangerFaceRecord[] = [];
+    // = db's StrangerFaceRecordWithGate (N-gate wave): the face row plus its gate id.
+    const rows: Array<StrangerFaceRecord & { gateId?: string }> = [];
     for (let i = 0; i < faces.length; i++) {
       const o = faces[i];
       if (!o.box || !o.embedding?.length) continue;
