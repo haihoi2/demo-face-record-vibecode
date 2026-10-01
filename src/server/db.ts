@@ -312,13 +312,15 @@ export interface DoorControllerConfigRecord {
   pulseDurationSeconds: number;
   triggerOnFaceRecognition: boolean;
   triggerOnManualUnlock: boolean;
-  /**
-   * N-gate wave: every door besides "main" (the top-level fields), with its own
-   * controller settings. Stored as JSON next to the legacy columns so the list
-   * survives a restart; tokens never leave the server (publicDoorConfig).
-   */
-  doors?: unknown[];
 }
+
+/**
+ * The stored door controller config: door "main" in the top-level fields plus
+ * (N-gate wave) every other door in `doors`, kept as JSON next to the legacy
+ * columns so the list survives a restart. Tokens never leave the server
+ * (server.ts publicDoorConfig).
+ */
+export type StoredDoorControllerConfig = DoorControllerConfigRecord & { doors?: unknown[] };
 
 export interface DoorApiLogRecord {
   id: string;
@@ -2648,7 +2650,7 @@ class SQLiteStorage implements StrangerFaceStore, ShadowResultStore {
     webhook_config?: WebhookConfigRecord;
     webhook_logs: WebhookLogRecord[];
     mobile_notifications: MobileNotificationRecord[];
-    door_controller_config?: DoorControllerConfigRecord;
+    door_controller_config?: StoredDoorControllerConfig;
     door_api_logs: DoorApiLogRecord[];
     camera_streams_config?: CameraStreamsConfigRecord;
     resolved_stranger_clusters?: string[];
@@ -4672,7 +4674,7 @@ class SQLiteStorage implements StrangerFaceStore, ShadowResultStore {
   }
 
   // ================= DOOR CONTROLLER API CONFIG =================
-  getDoorControllerConfig(defaults: DoorControllerConfigRecord): DoorControllerConfigRecord {
+  getDoorControllerConfig(defaults: DoorControllerConfigRecord): StoredDoorControllerConfig {
     if (this.isNativeSqlite && this.db) {
       try {
         const row: any = this.db.prepare("SELECT * FROM door_controller_config WHERE id = 'default'").get();
@@ -4706,7 +4708,7 @@ class SQLiteStorage implements StrangerFaceStore, ShadowResultStore {
     return this.fallbackData.door_controller_config;
   }
 
-  saveDoorControllerConfig(config: DoorControllerConfigRecord) {
+  saveDoorControllerConfig(config: StoredDoorControllerConfig) {
     if (this.isNativeSqlite && this.db) {
       try {
         const stmt = this.db.prepare(`
