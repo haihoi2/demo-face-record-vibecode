@@ -28,6 +28,8 @@ import {
   SmartLockState,
   DetectedFace,
   AiRecognitionConfig,
+  CameraStreamsConfig,
+  GateConfig,
 } from "../types";
 import { soundEffects } from "../utils/audio";
 import { safeJsonFetch, compressImage, getApiBaseUrl } from "../utils/api";
@@ -38,6 +40,13 @@ import {
 } from "../utils/offlineEngine";
 import { ProtectedImage } from "./ProtectedImage";
 import { hasRole, useOperatorSession } from "../utils/session";
+import { directionLabel, gateDisplayLabel, gatesOf } from "../utils/gates";
+
+/** Used until (or if) the camera config cannot be read: the two gates every installation has. */
+const LEGACY_SCANNER_GATES: GateConfig[] = gatesOf({
+  entryGate: { gateType: "ENTRY", name: "Cổng vào", enabled: true, sourceType: "CLIENT_UVC", autoStart: false, reconnectIntervalSeconds: 5 },
+  exitGate: { gateType: "EXIT", name: "Cổng ra", enabled: true, sourceType: "CLIENT_UVC", autoStart: false, reconnectIntervalSeconds: 5 },
+} as CameraStreamsConfig);
 
 interface FaceScannerProps {
   employees: Employee[];
@@ -62,7 +71,25 @@ export const FaceScanner: React.FC<FaceScannerProps> = ({
   const [streamActive, setStreamActive] = useState<boolean>(false);
   const [cameraError, setCameraError] = useState<string | null>(null);
   const [isScanning, setIsScanning] = useState<boolean>(false);
-  const [scanType, setScanType] = useState<ScanType>("ENTRY");
+  // The gate this manual scan is for, keyed by gate id; its DIRECTION is what the
+  // recognition API takes as `scanType` (several gates can share a direction).
+  const [scannerGates, setScannerGates] = useState<GateConfig[]>(LEGACY_SCANNER_GATES);
+  const [scanGateId, setScanGateId] = useState<string>("entry");
+  const scanGate = scannerGates.find((g) => g.id === scanGateId) || scannerGates[0];
+  const scanType: ScanType = scanGate?.direction ?? "ENTRY";
+
+  useEffect(() => {
+    let active = true;
+    (async () => {
+      const res = await safeJsonFetch<{ config?: CameraStreamsConfig }>("/api/camera-streams/config");
+      if (!active || !res.ok) return;
+      const list = gatesOf(res.data?.config).filter((g) => g.enabled !== false);
+      if (list.length > 0) setScannerGates(list);
+    })();
+    return () => {
+      active = false;
+    };
+  }, []);
   const [lastResult, setLastResult] = useState<FaceRecognitionResult | null>(null);
   // Message returned by the server when it REFUSED a recognition request (e.g. HTTP 400/403).
   // Shown verbatim to the operator; the client simulation is never used in this case.
@@ -219,6 +246,8 @@ export const FaceScanner: React.FC<FaceScannerProps> = ({
           body: JSON.stringify({
             imageBase64: imageToSend,
             scanType,
+            // The gate id where the server takes one; an older server ignores it.
+            gateId: scanGate?.id,
             testEmployeeId,
             clientEmployees: employees,
             config: aiConfig,
@@ -430,31 +459,25 @@ export const FaceScanner: React.FC<FaceScannerProps> = ({
                 <span>Webhook Eton: Bật</span>
               </div>
 
-              {/* Mode Toggle */}
-              <div className="flex items-center bg-black/50 backdrop-blur-md rounded-lg p-0.5 border border-white/10">
-                <button
-                  id="btn-mode-entry"
-                  onClick={() => setScanType("ENTRY")}
-                  className={`px-3 py-1 rounded text-xs font-semibold transition-all cursor-pointer ${
-                    scanType === "ENTRY"
-                      ? "bg-emerald-500 text-white shadow-xs"
-                      : "text-slate-300 hover:text-white"
+              {/* Gate picker: one entry per configured gate, keyed by gate id */}
+              <label className="flex items-center gap-1.5 bg-black/50 backdrop-blur-md rounded-lg px-2 py-0.5 border border-white/10 text-xs text-slate-300">
+                <span className="sr-only sm:not-sr-only">Cổng</span>
+                <select
+                  id="select-scanner-gate"
+                  value={scanGate?.id ?? ""}
+                  onChange={(e) => setScanGateId(e.target.value)}
+                  aria-label="Cổng của lượt quét thủ công"
+                  className={`bg-transparent font-semibold py-1 pr-1 focus:outline-hidden cursor-pointer ${
+                    scanType === "ENTRY" ? "text-emerald-300" : "text-blue-300"
                   }`}
                 >
-                  Vào (Check-in)
-                </button>
-                <button
-                  id="btn-mode-exit"
-                  onClick={() => setScanType("EXIT")}
-                  className={`px-3 py-1 rounded text-xs font-semibold transition-all cursor-pointer ${
-                    scanType === "EXIT"
-                      ? "bg-blue-500 text-white shadow-xs"
-                      : "text-slate-300 hover:text-white"
-                  }`}
-                >
-                  Ra (Check-out)
-                </button>
-              </div>
+                  {scannerGates.map((g) => (
+                    <option key={g.id} value={g.id} className="text-slate-900">
+                      {gateDisplayLabel(g)} – {directionLabel(g.direction)} ({g.direction === "ENTRY" ? "Check-in" : "Check-out"})
+                    </option>
+                  ))}
+                </select>
+              </label>
             </div>
           </div>
 

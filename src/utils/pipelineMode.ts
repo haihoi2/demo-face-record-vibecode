@@ -16,12 +16,25 @@ import {
   type PipelineMode,
   type PipelineRuntimeView,
 } from "./pipelineStatus";
+import {
+  LEGACY_GATE_IDS,
+  directionOf,
+  gateIdFromAny,
+  isGateId,
+  legacyGateLabel,
+  orderedGateIds,
+  runtimeGateId,
+} from "./gates";
+import type { GateConfig } from "../types";
 
-export type GateKey = "entry" | "exit";
+/** A gate id (N-gate wave): "entry", "exit" or any configured slug. Never a direction. */
+export type GateKey = string;
+/** A gate's DIRECTION; several gates can share one, so it is never a key. */
 export type GateType = "ENTRY" | "EXIT";
 export type PipelineModeSource = "config" | "env";
 
-export const GATE_KEYS: readonly GateKey[] = ["entry", "exit"];
+/** The two gates every installation has; the card's rows otherwise come from the gate list. */
+export const LEGACY_GATE_KEYS: readonly GateKey[] = LEGACY_GATE_IDS;
 export const PIPELINE_MODES: readonly PipelineMode[] = ["legacy", "shadow", "live"];
 
 /** `live` is not in this build: the server answers 409 PIPELINE_MODE_NOT_AVAILABLE. */
@@ -31,13 +44,23 @@ export function isPipelineModeSelectable(mode: PipelineMode): boolean {
   return mode !== "live";
 }
 
+/** Gate id from a slug or an older server's direction ("EXIT" -> "exit"); null otherwise. */
 export function gateKeyOf(gate: unknown): GateKey | null {
-  const v = typeof gate === "string" ? gate.trim().toUpperCase() : "";
-  return v === "ENTRY" ? "entry" : v === "EXIT" ? "exit" : null;
+  return gateIdFromAny(gate);
 }
 
-export function gateLabel(key: GateKey): string {
-  return key === "entry" ? "Cổng vào" : "Cổng ra";
+/** The gate's label from the server when known, else "Cổng vào"/"Cổng ra" for the legacy gates. */
+export function gateLabel(key: GateKey, label?: string | null): string {
+  const given = typeof label === "string" ? label.trim() : "";
+  return given || legacyGateLabel(key) || `Cổng ${key}`;
+}
+
+/**
+ * The card's rows (no fixed two-gate list any more): the configured gates in order,
+ * then any gate the watcher list reports that the config did not.
+ */
+export function gateKeysForCard(gates: readonly GateConfig[], rows: Readonly<Record<string, unknown>>): GateKey[] {
+  return orderedGateIds(gates, Object.keys(rows));
 }
 
 export function parsePipelineModeSource(raw: unknown): PipelineModeSource | null {
@@ -54,8 +77,12 @@ export function pipelineModeSourceLabel(source: PipelineModeSource | null): stri
 
 /** Everything the engine card shows for one gate, read from one watcher object. */
 export interface GatePipelineRow {
-  gate: GateType;
+  /** Direction reported by the server (null when it sent none). */
+  gate: GateType | null;
+  /** Gate id: the row's key. */
   key: GateKey;
+  /** Display label the server sent with the runtime (`gateLabel`), if any. */
+  label: string | null;
   /** The gate's backend watcher switch; a disabled gate runs no pipeline. */
   enabled: boolean | null;
   view: PipelineRuntimeView;
@@ -71,14 +98,15 @@ export interface GatePipelineRow {
 export function readGatePipelineRow(raw: unknown): GatePipelineRow | null {
   if (!raw || typeof raw !== "object") return null;
   const r = raw as Record<string, unknown>;
-  const key = gateKeyOf(r.gate);
+  const key = runtimeGateId(r);
   if (!key) return null;
   const view = readPipelineRuntime(r);
   const source = parsePipelineModeSource(r.pipelineModeSource);
   const configured = source === "config" ? view.requested ?? view.mode : null;
   return {
-    gate: key === "entry" ? "ENTRY" : "EXIT",
+    gate: directionOf(r.gate),
     key,
+    label: typeof r.gateLabel === "string" && r.gateLabel.trim() ? r.gateLabel.trim() : null,
     enabled: typeof r.enabled === "boolean" ? r.enabled : null,
     view,
     source,
@@ -87,8 +115,8 @@ export function readGatePipelineRow(raw: unknown): GatePipelineRow | null {
 }
 
 /** Rows keyed by gate from a `GET /api/camera-streams/watch` body. */
-export function readGatePipelineRows(payload: unknown): Partial<Record<GateKey, GatePipelineRow>> {
-  const out: Partial<Record<GateKey, GatePipelineRow>> = {};
+export function readGatePipelineRows(payload: unknown): Record<GateKey, GatePipelineRow> {
+  const out: Record<GateKey, GatePipelineRow> = {};
   const list = payload && typeof payload === "object" ? (payload as Record<string, unknown>).watchers : null;
   if (!Array.isArray(list)) return out;
   for (const raw of list) {
@@ -101,7 +129,7 @@ export function readGatePipelineRows(payload: unknown): Partial<Record<GateKey, 
 /** The exact request the card sends; `mode: null` clears the per-gate override. */
 export function buildPipelineModeRequest(key: GateKey, mode: PipelineMode | null): { url: string; init: RequestInit } {
   return {
-    url: `/api/camera-streams/${key}/pipeline-mode`,
+    url: `/api/camera-streams/${encodeURIComponent(key)}/pipeline-mode`,
     init: {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -121,8 +149,12 @@ export interface PipelineModeConfirmText {
  * way back to legacy are explicit (owner request); the two other targets get an
  * equally plain sentence so no click starts or stops a camera stream unannounced.
  */
-export function pipelineModeConfirmText(key: GateKey, target: PipelineMode | null): PipelineModeConfirmText {
-  const gate = gateLabel(key);
+export function pipelineModeConfirmText(
+  key: GateKey,
+  target: PipelineMode | null,
+  label?: string | null,
+): PipelineModeConfirmText {
+  const gate = gateLabel(key, label);
   switch (target) {
     case "shadow":
       return {
@@ -162,7 +194,10 @@ export function pipelineModeConfirmText(key: GateKey, target: PipelineMode | nul
 export type PipelineModeOutcome =
   | {
       kind: "applied";
+      /** Direction the server reported. */
       gate: GateType | null;
+      /** Gate id the answer is about (the server's, else the one asked for). */
+      gateId: GateKey;
       mode: PipelineMode | null;
       requested: PipelineMode | null;
       source: PipelineModeSource | null;
@@ -181,8 +216,9 @@ export type PipelineModeOutcome =
 export function interpretPipelineModeResponse(
   key: GateKey,
   res: { ok: boolean; status: number; data: unknown; error?: string },
+  label?: string | null,
 ): PipelineModeOutcome {
-  const gate = gateLabel(key);
+  const gate = gateLabel(key, label);
   const data = res.data && typeof res.data === "object" ? (res.data as Record<string, unknown>) : {};
   const serverError = typeof data.error === "string" && data.error.trim() ? data.error.trim() : null;
 
@@ -201,7 +237,9 @@ export function interpretPipelineModeResponse(
       : "";
     return {
       kind: "applied",
-      gate: gateKeyOf(data.gate) === "entry" ? "ENTRY" : gateKeyOf(data.gate) === "exit" ? "EXIT" : null,
+      gate: directionOf(data.gate),
+      // An older server answers with only the direction: trust the gate asked for.
+      gateId: isGateId(data.gateId) ? data.gateId : key,
       mode,
       requested,
       source,

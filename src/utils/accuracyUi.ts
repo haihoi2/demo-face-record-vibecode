@@ -74,7 +74,7 @@ export function readShadowSummary(payload: unknown): ShadowSummary | null {
   return { since: typeof p.since === "string" ? p.since : null, gates };
 }
 
-/** The row for one card gate; the server may spell the gate ENTRY/entry. */
+/** The row for one card gate: rows carry the gate id, older ones the direction (ENTRY -> "entry"). */
 export function shadowSummaryForGate(
   summary: ShadowSummary | null | undefined,
   key: GateKey

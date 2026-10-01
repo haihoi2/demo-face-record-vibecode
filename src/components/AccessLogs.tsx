@@ -25,11 +25,13 @@ import {
   Loader2,
   Film,
 } from "lucide-react";
-import { AccessLog } from "../types";
+import { AccessLog, CameraStreamsConfig, GateConfig } from "../types";
 import { EntryPatternAnalytics } from "./EntryPatternAnalytics";
 import { FaceThumb } from "./FaceImage";
 import { RecordingPlayer } from "./RecordingPlayer";
-import { useRecordingGates } from "../utils/recordings";
+import { gateHasRecording, useRecordingGates } from "../utils/recordings";
+import { safeJsonFetch } from "../utils/api";
+import { directionLabel, eventGateId, gateLabelMap, gatesOf, labelForGateId, serverHasGates } from "../utils/gates";
 import {
   AccessLogFilters,
   AccessLogStats,
@@ -74,6 +76,24 @@ export const AccessLogs: React.FC<AccessLogsProps> = ({
   const recordingGates = useRecordingGates();
   const [recordingOf, setRecordingOf] = useState<{ id: string; title: string } | null>(null);
   const [refreshKey, setRefreshKey] = useState<number>(0);
+  // Gate list for the gate filter and the gate label of each event. The filter is
+  // offered only by a server that knows gates (an older one would ignore it).
+  const [gates, setGates] = useState<GateConfig[]>([]);
+  const [gateFilterSupported, setGateFilterSupported] = useState<boolean>(false);
+  const gateLabels = gateLabelMap(gates);
+
+  useEffect(() => {
+    let active = true;
+    (async () => {
+      const res = await safeJsonFetch<{ config?: CameraStreamsConfig }>("/api/camera-streams/config");
+      if (!active || !res.ok) return;
+      setGates(gatesOf(res.data?.config));
+      setGateFilterSupported(serverHasGates(res.data?.config));
+    })();
+    return () => {
+      active = false;
+    };
+  }, []);
 
   const statusFilter = filters.status;
   const typeFilter = filters.type;
@@ -320,6 +340,29 @@ export const AccessLogs: React.FC<AccessLogsProps> = ({
             </button>
           </div>
 
+          {/* Gate Filter (by gate id; old events count as "entry"/"exit" by their direction) */}
+          {gateFilterSupported && (
+            <label className="flex items-center gap-1.5 text-xs text-slate-600">
+              <span className="font-medium">Cổng</span>
+              <select
+                id="select-logs-gate"
+                value={filters.gateId}
+                onChange={(e) => setFilters((f) => ({ ...f, gateId: e.target.value }))}
+                className="px-2 py-1.5 bg-slate-50 border border-slate-200 rounded-lg text-xs"
+              >
+                <option value="">Tất cả cổng</option>
+                {gates.map((g) => (
+                  <option key={g.id} value={g.id}>
+                    {gateLabels[g.id]} ({directionLabel(g.direction)})
+                  </option>
+                ))}
+                {filters.gateId && !gates.some((g) => g.id === filters.gateId) && (
+                  <option value={filters.gateId}>{labelForGateId(filters.gateId, gateLabels)}</option>
+                )}
+              </select>
+            </label>
+          )}
+
           {/* Type Filter */}
           <div className="flex bg-slate-100 p-1 rounded-xl text-xs font-medium">
             <button
@@ -420,6 +463,8 @@ export const AccessLogs: React.FC<AccessLogsProps> = ({
                 </tr>
               ) : (
                 rows.map((log) => {
+                  const gateId = eventGateId(log);
+                  const gateName = labelForGateId(gateId, gateLabels);
                   const logDate = new Date(log.timestamp);
                   const formattedDate = logDate.toLocaleDateString("vi-VN");
                   const formattedTime = logDate.toLocaleTimeString("vi-VN", {
@@ -438,17 +483,17 @@ export const AccessLogs: React.FC<AccessLogsProps> = ({
                         <FaceThumb
                           src={log.photoSnapshot}
                           alt={`Ảnh lượt quét ${log.employeeName || "người lạ"} lúc ${formattedTime}`}
-                          caption={`${log.type === "EXIT" ? "Cổng ra" : "Cổng vào"} · ${formattedTime} ${formattedDate}`}
+                          caption={`${gateName} · ${formattedTime} ${formattedDate}`}
                           className="w-12 h-12 rounded-lg"
                         />
-                        {recordingGates[log.type === "EXIT" ? "EXIT" : "ENTRY"] && (
+                        {gateHasRecording(recordingGates, gateId) && (
                           <button
                             type="button"
                             data-testid={`btn-recording-${log.id}`}
                             onClick={() =>
                               setRecordingOf({
                                 id: log.id,
-                                title: `${log.type === "EXIT" ? "Cổng ra" : "Cổng vào"} · ${formattedTime} ${formattedDate}`,
+                                title: `${gateName} · ${formattedTime} ${formattedDate}`,
                               })
                             }
                             className="mt-1 inline-flex items-center gap-1 px-1.5 py-0.5 rounded-md border border-slate-200 bg-white text-[10px] font-semibold text-slate-600 hover:bg-slate-50 hover:text-indigo-700"
@@ -499,8 +544,11 @@ export const AccessLogs: React.FC<AccessLogsProps> = ({
                         )}
                       </td>
 
-                      {/* Scan Type (Entry vs Exit) */}
-                      <td className="py-3 px-4">
+                      {/* Gate and direction (Entry vs Exit) */}
+                      <td className="py-3 px-4" data-gate-id={gateId}>
+                        <div className="text-[11px] font-semibold text-slate-800 mb-1 truncate max-w-[12rem]" title={`Mã cổng: ${gateId}`}>
+                          {gateName}
+                        </div>
                         <span
                           className={`inline-flex items-center gap-1 px-2.5 py-1 rounded-full text-xs font-semibold ${
                             log.type === "ENTRY"
