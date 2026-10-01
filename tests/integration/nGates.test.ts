@@ -71,17 +71,38 @@ describe("N gates: a third gate with its own door", () => {
     const fresh = await doorConfig();
     for (const res of [saved, fresh]) {
       assert.doesNotMatch(res.text, new RegExp(DOOR_TOKEN), "the door token never leaves the server");
-      assert.doesNotMatch(res.text, /"apiToken"/, "no apiToken key at all, only apiTokenConfigured");
+      assert.doesNotMatch(res.text, /"apiToken"/, "no apiToken key at all, only hasApiToken");
     }
     const kho = fresh.body.doors.find((d: any) => d.id === DOOR);
     assert.ok(kho, "door kho listed");
     assert.equal(kho.label, "Kho");
-    assert.equal(kho.apiTokenConfigured, true);
+    assert.equal(kho.hasApiToken, true);
+    assert.equal(typeof fresh.body.hasApiToken, "boolean", "door main (top level) says it too");
     assert.equal(fresh.body.doors[0].id, "main", "door main first, mirroring the legacy fields");
     // Saving again without the token (a client never has it) keeps it.
     const again = await postJson<any>("/api/door-controller/config", { doors: fresh.body.doors.map((d: any) => ({ id: d.id, label: d.label })) });
     assert.equal(again.status, 200, again.text.slice(0, 300));
-    assert.equal(again.body.config.doors.find((d: any) => d.id === DOOR).apiTokenConfigured, true);
+    assert.equal(again.body.config.doors.find((d: any) => d.id === DOOR).hasApiToken, true);
+  });
+
+  it("never dispatches a door command without a token scheme (auth NONE fails closed)", async () => {
+    const doors = (await doorConfig()).body.doors.map((d: any) =>
+      d.id === DOOR ? { id: d.id, enabled: true, authHeaderType: "NONE", apiUrl: "https://door.example.invalid/api/door/control" } : { id: d.id }
+    );
+    const saved = await postJson<any>("/api/door-controller/config", { doors });
+    assert.equal(saved.status, 200, saved.text.slice(0, 300));
+    try {
+      const test = await postJson<any>("/api/door-controller/test", { doorId: DOOR, action: "OPEN", source: "itest NONE" });
+      assert.equal(test.status, 200, test.text.slice(0, 300));
+      assert.equal(test.body.success, false);
+      assert.match(String(test.body.log?.error), /NONE/, "refused before any network call");
+      assert.equal(test.body.log?.statusCode, undefined, "nothing was sent");
+      assert.doesNotMatch(test.text, new RegExp(DOOR_TOKEN));
+      assert.doesNotMatch(test.text, /"apiToken"/);
+    } finally {
+      const off = (await doorConfig()).body.doors.map((d: any) => (d.id === DOOR ? { id: d.id, enabled: false, authHeaderType: "BEARER", apiUrl: "" } : { id: d.id }));
+      await postJson("/api/door-controller/config", { doors: off });
+    }
   });
 
   it("guards every door URL and validates the door list", async () => {
