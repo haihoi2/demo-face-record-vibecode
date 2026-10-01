@@ -135,6 +135,7 @@ import { gateAreaToPixels, normalizeGateArea } from "./src/server/pipeline/gateA
 import type { DecisionContext, TrackDecisionResult } from "./src/server/pipeline/trackDecision";
 import type { Gate, PipelineMode } from "./src/server/pipeline/contracts";
 import type { ExtractedFace, UnclearReason } from "./src/server/faceEmbedding";
+import { faceCutByFrameEdge } from "./src/server/faceFrameEdge";
 import { chooseEnrolFaces } from "./src/server/enrolFace";
 import {
   buildGallery,
@@ -1961,6 +1962,12 @@ const FACE_STRANGER_MIN_EDGE_ENERGY = envFloat("FACE_STRANGER_MIN_EDGE_ENERGY", 
  */
 const FACE_STRANGER_MIN_FEATURE_NORM = envFloat("FACE_STRANGER_MIN_FEATURE_NORM", 20, 0, 100);
 const FEATURE_NORM_MODEL_TAG = "arcface_w600k_r50";
+/**
+ * Heads cut off by the picture edge (owner 2026-10-01): a stranger face is
+ * stored only when its box stays this fraction of its own size inside every
+ * edge of the frame (faceCutByFrameEdge). Storage only. 0 disables.
+ */
+const FACE_STRANGER_MIN_EDGE_MARGIN = envFloat("FACE_STRANGER_MIN_EDGE_MARGIN", 0.1, 0, 1);
 /** Maximum templates kept per employee; the lowest-quality one is evicted when full. */
 const FACE_TEMPLATE_MAX = envInt("FACE_TEMPLATE_MAX", 12, 1, 200);
 /**
@@ -2103,6 +2110,7 @@ async function observeFrame(
         edgeEnergy: f.edgeEnergy,
         featureNorm: f.featureNorm,
         box: [f.box[0], f.box[1], f.box[2], f.box[3]] as [number, number, number, number],
+        frameSize: [rgb.width, rgb.height] as [number, number],
       },
       face: f,
       width: rgb.width,
@@ -4779,7 +4787,7 @@ async function grabRtspFrames(
 type RecognitionTrigger = "api" | "manual" | "watcher";
 
 /** Why a scan that DID decide something deliberately recorded nothing. */
-type OutcomeSuppression = "grant-cooldown" | "stranger-cooldown" | "stranger-quality" | "stranger-small" | "stranger-not-face" | "stranger-blur";
+type OutcomeSuppression = "grant-cooldown" | "stranger-cooldown" | "stranger-quality" | "stranger-small" | "stranger-not-face" | "stranger-blur" | "stranger-cut-off";
 
 /**
  * Re-unlock / re-log dedupe for ONE employee at ONE gate.
@@ -4937,6 +4945,7 @@ function strangerFaceFloor(o: FaceObservation): OutcomeSuppression | null {
     o.featureNorm < FACE_STRANGER_MIN_FEATURE_NORM
   ) return "stranger-blur";
   if (o.box && FACE_STRANGER_MIN_SIZE_PX > 0 && Math.min(o.box[2] - o.box[0], o.box[3] - o.box[1]) < FACE_STRANGER_MIN_SIZE_PX) return "stranger-small";
+  if (faceCutByFrameEdge(o.box, o.frameSize, FACE_STRANGER_MIN_EDGE_MARGIN)) return "stranger-cut-off";
   return null;
 }
 

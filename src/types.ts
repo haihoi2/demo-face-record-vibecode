@@ -536,6 +536,8 @@ export interface FaceObservation {
   featureNorm?: number;
   /** Face box in source-frame pixels [x1, y1, x2, y2]. */
   box?: [number, number, number, number];
+  /** Source frame [width, height] in pixels, for the cut-off-head storage floor. */
+  frameSize?: [number, number];
 }
 
 /** Best gallery match for one observation. */
