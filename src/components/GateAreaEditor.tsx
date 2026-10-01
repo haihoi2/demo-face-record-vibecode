@@ -21,7 +21,8 @@ import {
 } from "../utils/gateArea";
 
 interface GateAreaEditorProps {
-  gateKey: "entry" | "exit";
+  /** Gate id ("entry", "exit" or any configured gate). */
+  gateKey: string;
   gateName: string;
   stream: GateStreamSource;
   /** Receives the gate's stream list exactly as the server returned it after a save. */
