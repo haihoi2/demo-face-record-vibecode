@@ -15,6 +15,7 @@ import {
 import type { StrangerFacePage, StrangerFaceRecord, StrangerFaceStore } from "./strangerFaces";
 import type { ShadowAccuracySummary, ShadowAgreement, ShadowResultRecord, ShadowResultStore } from "./shadowResults";
 import type { FaceTemplate } from "../types";
+import { gateIdForLegacyRow, isDoorId, isGateId, LEGACY_DOOR_ID } from "./gates";
 
 // Safe dynamic loader for Node 22 native sqlite DatabaseSync
 function getDatabaseSyncClass(): any {
@@ -83,6 +84,13 @@ export interface AccessLogRecord {
   trackId?: string;
   /** NVR recording channel of the gate at event time (<= 16 chars). Undefined on older rows. */
   recordingChannel?: string;
+  /**
+   * Gate the event happened at (N-gate wave; slug, gates.ts isGateId). Stored
+   * only when valid (else NULL, never failing the event). Rows written before
+   * gate ids existed have NULL; every read returns the id derived from `type`
+   * by gateIdForLegacyRow() ("entry" / "exit") without rewriting the row.
+   */
+  gateId?: string;
 }
 
 /** Same limits as the PostgreSQL columns (VARCHAR 64 / 16), enforced here for SQLite and JSON too. */
@@ -94,7 +102,7 @@ const CAPTURED_AT_MIN_MS = Date.UTC(2000, 0, 1);
 const CAPTURED_AT_MAX_MS = Date.UTC(9999, 11, 31, 23, 59, 59, 999);
 
 /** What getAccessLogMetaById returns: time, gate and trace of an event, never its image or face data. */
-export type AccessLogMeta = Pick<AccessLogRecord, "id" | "timestamp" | "type" | "status" | "capturedAt" | "trackId" | "recordingChannel">;
+export type AccessLogMeta = Pick<AccessLogRecord, "id" | "timestamp" | "type" | "status" | "capturedAt" | "trackId" | "recordingChannel" | "gateId">;
 
 export interface AccessLogTrace {
   capturedAt?: string;
@@ -155,6 +163,8 @@ function accessLogTraceParams(log: AccessLogTrace): [string | null, string | nul
 }
 
 export interface SmartLockStateRecord {
+  /** Door this state belongs to (N-gate wave); absent = the legacy single door "main". */
+  doorId?: string;
   lockId: string;
   doorName: string;
   state: "LOCKED" | "UNLOCKED" | "UNLOCKING" | "LOCKING";
@@ -491,6 +501,13 @@ export interface AccessLogQuery {
   from?: string;
   /** ISO instant, exclusive. */
   to?: string;
+  /**
+   * Gate id (N-gate wave). Matches rows stored with that gateId and, for the
+   * legacy ids "entry" / "exit", also rows written before gate ids existed
+   * (NULL gateId) whose `type` maps to it, exactly as gateIdForLegacyRow()
+   * derives them on read. A value that is not a gate id matches nothing.
+   */
+  gateId?: string;
 }
 
 export interface AccessLogHourBucket {
@@ -511,6 +528,15 @@ export interface AccessLogStats {
   /** 24 buckets, hour of day in the site's time zone. */
   byHour: AccessLogHourBucket[];
   grantedEntriesByDepartment: Array<{ name: string; count: number }>;
+  /** Per gate (derived id for legacy rows), gate ids in bytewise order. */
+  byGate: AccessLogGateCount[];
+}
+
+export interface AccessLogGateCount {
+  gateId: string;
+  total: number;
+  granted: number;
+  denied: number;
 }
 
 const emptyHours = (): AccessLogHourBucket[] =>
@@ -526,9 +552,45 @@ function hourIn(iso: string, timeZone: string): number {
   return Number.isInteger(h) && h >= 0 && h < 24 ? h : -1;
 }
 
+/**
+ * The gate filter of a query: null = no gate filter, "" = a value that is not
+ * a gate id (matches nothing), else the id.
+ */
+function queryGateId(f: AccessLogQuery): string | null {
+  const v: unknown = f.gateId;
+  if (v === undefined || v === null || v === "") return null;
+  return isGateId(v) ? v : "";
+}
+
+/** The stored gateId when valid, else NULL (no truncation, no guessing: readers derive legacy rows). */
+const storableGateId = (v: unknown): string | null => (isGateId(v) ? v : null);
+
+/** A log as every read path returns it: gateId stored, or derived for rows written before gate ids. */
+const withGateId = <T extends { gateId?: string | null; type?: string | null }>(log: T): T & { gateId: string } =>
+  ({ ...log, gateId: gateIdForLegacyRow(log) });
+
+/**
+ * SQL for the gate filter. Rows with the id, plus (legacy ids only) rows with
+ * NULL gateId whose type derives to it - the same mapping as
+ * gateIdForLegacyRow(), so a filter returns exactly the rows a reader labels
+ * with that gate. Both branches are ranges of idx_access_logs_gate_ts.
+ */
+function gateWhereSql(gateId: string, param: string, quote: boolean): string {
+  const col = quote ? `"gateId"` : "gateId";
+  if (gateId === "entry") return `(${col} = ${param} OR (${col} IS NULL AND upper(type) <> 'EXIT'))`;
+  if (gateId === "exit") return `(${col} = ${param} OR (${col} IS NULL AND upper(type) = 'EXIT'))`;
+  return `${col} = ${param}`;
+}
+
+/** SQL expression of a row's gate id (stored, or derived from type), for GROUP BY. */
+const gateIdSqlExpr = (quote: boolean) =>
+  `COALESCE(${quote ? `"gateId"` : "gateId"}, CASE WHEN upper(type) = 'EXIT' THEN 'exit' ELSE 'entry' END)`;
+
 function matchesAccessLogQuery(log: AccessLogRecord, f: AccessLogQuery): boolean {
   if (f.status && log.status !== f.status) return false;
   if (f.type && log.type !== f.type) return false;
+  const gate = queryGateId(f);
+  if (gate !== null && (gate === "" || gateIdForLegacyRow(log) !== gate)) return false;
   if (f.from && !(log.timestamp >= f.from)) return false;
   if (f.to && !(log.timestamp < f.to)) return false;
   if (f.q) {
@@ -539,12 +601,22 @@ function matchesAccessLogQuery(log: AccessLogRecord, f: AccessLogQuery): boolean
   return true;
 }
 
-function accumulateStats(rows: Array<Pick<AccessLogRecord, "timestamp" | "type" | "status" | "department">>, timeZone: string): AccessLogStats {
-  const stats: AccessLogStats = { total: 0, granted: 0, denied: 0, entries: 0, exits: 0, byHour: emptyHours(), grantedEntriesByDepartment: [] };
+/** Per-gate counts in bytewise gate order (one definition for every store). */
+function sortGateCounts(byGate: Map<string, AccessLogGateCount>): AccessLogGateCount[] {
+  return [...byGate.values()].sort((a, b) => (a.gateId < b.gateId ? -1 : a.gateId > b.gateId ? 1 : 0));
+}
+
+function accumulateStats(rows: Array<Pick<AccessLogRecord, "timestamp" | "type" | "status" | "department" | "gateId">>, timeZone: string): AccessLogStats {
+  const stats: AccessLogStats = { total: 0, granted: 0, denied: 0, entries: 0, exits: 0, byHour: emptyHours(), grantedEntriesByDepartment: [], byGate: [] };
   const departments = new Map<string, number>();
+  const gates = new Map<string, AccessLogGateCount>();
   for (const r of rows) {
     stats.total += 1;
     if (r.status === "GRANTED") stats.granted += 1; else if (r.status === "DENIED") stats.denied += 1;
+    const gateId = gateIdForLegacyRow(r);
+    const g = gates.get(gateId) || gates.set(gateId, { gateId, total: 0, granted: 0, denied: 0 }).get(gateId)!;
+    g.total += 1;
+    if (r.status === "GRANTED") g.granted += 1; else if (r.status === "DENIED") g.denied += 1;
     if (r.type === "ENTRY") stats.entries += 1; else if (r.type === "EXIT") stats.exits += 1;
     const h = hourIn(r.timestamp, timeZone);
     if (h >= 0) {
@@ -561,6 +633,7 @@ function accumulateStats(rows: Array<Pick<AccessLogRecord, "timestamp" | "type" 
     }
   }
   stats.grantedEntriesByDepartment = [...departments].map(([name, count]) => ({ name, count })).sort((a, b) => b.count - a.count);
+  stats.byGate = sortGateCounts(gates);
   return stats;
 }
 
@@ -638,7 +711,7 @@ function rowToFaceTemplate(r: any): FaceTemplateRecord {
 }
 
 function rowToAccessLog(r: any): AccessLogRecord {
-  return {
+  const out = {
     ...r,
     confidence: Number(r.confidence) || 0,
     livenessScore: r.livenessScore == null ? undefined : Number(r.livenessScore),
@@ -648,7 +721,12 @@ function rowToAccessLog(r: any): AccessLogRecord {
     capturedAt: optionalText(r.capturedAt),
     trackId: optionalText(r.trackId),
     recordingChannel: optionalText(r.recordingChannel),
+    // Derived for rows written before gate ids existed; left out when the
+    // query loaded neither the column nor the direction (id + image lookups).
+    gateId: "gateId" in r || "type" in r ? gateIdForLegacyRow(r) : undefined,
   } as AccessLogRecord;
+  if (out.gateId === undefined) delete out.gateId;
+  return out;
 }
 
 function rowToStrangerResolution(r: any): StrangerResolutionRecord {
@@ -759,11 +837,23 @@ interface StrangerFaceRow {
   employeeId: string | null;
   matchCosine: number | null;
   matchMargin: number | null;
+  /** Gate id (N-gate wave); NULL when not given or not a gate id - readers derive it from `gate`. */
+  gateId: string | null;
 }
+
+/**
+ * A stranger face with its gate id (N-gate wave). StrangerFaceRecord
+ * (src/server/strangerFaces.ts) only carries the direction `gate`; until the
+ * contract gains `gateId?: string`, writers may pass it as this extra
+ * property and every read returns it (stored, or derived from `gate` for rows
+ * written before gate ids existed).
+ */
+export type StrangerFaceRecordWithGate = StrangerFaceRecord & { gateId?: string };
 
 /** JSON-fallback shape: embedding as numbers, crop as base64 (a Buffer would serialise as a byte list). */
 interface StrangerFaceJson extends Omit<StrangerFaceRecord, "crop"> {
   crop?: string;
+  gateId?: string;
 }
 
 const normIso = (value: unknown): string | undefined => {
@@ -784,7 +874,7 @@ const optionalInt = (v: unknown, max: number): number | null =>
  * edge energy) that are malformed are stored as NULL, never truncated.
  * `purgedAt` on input is ignored: a new face is never born purged.
  */
-export function normalizeStrangerFace(face: StrangerFaceRecord): { row?: StrangerFaceRow; error?: string } {
+export function normalizeStrangerFace(face: StrangerFaceRecordWithGate): { row?: StrangerFaceRow; error?: string } {
   if (!face || typeof face !== "object") return { error: "not-an-object" };
   if (typeof face.id !== "string" || !STRANGER_FACE_ID_RE.test(face.id)) return { error: "id" };
   if (typeof face.logId !== "string" || !ACCESS_LOG_ID_RE.test(face.logId)) return { error: "logId" };
@@ -857,6 +947,7 @@ export function normalizeStrangerFace(face: StrangerFaceRecord): { row?: Strange
       employeeId,
       matchCosine,
       matchMargin,
+      gateId: storableGateId(face.gateId),
     },
   };
 }
@@ -872,7 +963,7 @@ function parseBox(value: unknown): [number, number, number, number] {
 }
 
 /** A PostgreSQL/SQLite stranger_faces row -> record. Never carries the crop. */
-function rowToStrangerFace(r: any): StrangerFaceRecord {
+function rowToStrangerFace(r: any): StrangerFaceRecordWithGate {
   const embedding = r.embedding ? bufferToEmbedding(r.embedding, r.dims == null ? undefined : Number(r.dims)) : [];
   const out: StrangerFaceRecord = {
     id: String(r.id),
@@ -902,46 +993,51 @@ function rowToStrangerFace(r: any): StrangerFaceRecord {
   for (const key of Object.keys(out) as Array<keyof StrangerFaceRecord>) {
     if (out[key] === undefined) delete out[key];
   }
-  return out;
+  return withFaceGateId(out, r.gateId);
+}
+
+/** The face with its gate id: stored when valid, else derived from the direction `gate`. */
+function withFaceGateId(face: StrangerFaceRecord, stored: unknown): StrangerFaceRecordWithGate {
+  return Object.assign(face, { gateId: gateIdForLegacyRow({ gateId: isGateId(stored) ? stored : null, gate: face.gate }) });
 }
 
 function strangerFaceRowToJson(row: StrangerFaceRow): StrangerFaceJson {
-  const out: StrangerFaceJson = {
-    ...rowToStrangerFace({ ...row, box: row.box, purgedAt: null }),
-    crop: row.crop ? row.crop.toString("base64") : undefined,
-  };
+  // On disk exactly what a SQL row holds: gateId only when it was stored (no derived value is written).
+  const { gateId: _derived, ...record } = rowToStrangerFace({ ...row, box: row.box, purgedAt: null });
+  const out: StrangerFaceJson = { ...record, crop: row.crop ? row.crop.toString("base64") : undefined };
+  if (row.gateId) out.gateId = row.gateId;
   if (out.crop === undefined) delete out.crop;
   return out;
 }
 
-/** JSON-fallback face -> record, without the crop. */
-function jsonToStrangerFace(face: StrangerFaceJson): StrangerFaceRecord {
-  const { crop: _crop, embedding, ...rest } = face;
+/** JSON-fallback face -> record, without the crop; gateId stored or derived. */
+function jsonToStrangerFace(face: StrangerFaceJson): StrangerFaceRecordWithGate {
+  const { crop: _crop, embedding, gateId, ...rest } = face;
   const out: StrangerFaceRecord = { ...rest, box: [...face.box] as [number, number, number, number] };
   if (embedding?.length) out.embedding = [...embedding];
-  return out;
+  return withFaceGateId(out, gateId);
 }
 
 const STRANGER_FACE_COLUMNS_PG = `id, "logId", "faceIndex", "capturedAt", gate, "streamId", engine, "trackId", box,
   "sourceWidth", "sourceHeight", "detectorScore", quality, "edgeEnergy", "sizePx", embedding, dims, "modelTag",
-  "createdAt", "purgedAt", "employeeId", "matchCosine", "matchMargin"`;
+  "createdAt", "purgedAt", "employeeId", "matchCosine", "matchMargin", "gateId"`;
 const STRANGER_FACE_COLUMNS_SQLITE = `id, logId, faceIndex, capturedAt, gate, streamId, engine, trackId, box,
   sourceWidth, sourceHeight, detectorScore, quality, edgeEnergy, sizePx, embedding, dims, modelTag,
-  createdAt, purgedAt, employeeId, matchCosine, matchMargin`;
+  createdAt, purgedAt, employeeId, matchCosine, matchMargin, gateId`;
 
-/** Insert column lists (no purgedAt: a new face is never born purged). 23 parameters. */
+/** Insert column lists (no purgedAt: a new face is never born purged). 24 parameters. */
 const STRANGER_FACE_INSERT_COLUMNS_PG = `id, "logId", "faceIndex", "capturedAt", gate, "streamId", engine, "trackId", box,
   "sourceWidth", "sourceHeight", "detectorScore", quality, "edgeEnergy", "sizePx", embedding, dims, "modelTag",
-  crop, "createdAt", "employeeId", "matchCosine", "matchMargin"`;
+  crop, "createdAt", "employeeId", "matchCosine", "matchMargin", "gateId"`;
 const STRANGER_FACE_INSERT_COLUMNS_SQLITE = `id, logId, faceIndex, capturedAt, gate, streamId, engine, trackId, box,
   sourceWidth, sourceHeight, detectorScore, quality, edgeEnergy, sizePx, embedding, dims, modelTag,
-  crop, createdAt, employeeId, matchCosine, matchMargin`;
-const STRANGER_FACE_INSERT_PARAM_COUNT = 23;
+  crop, createdAt, employeeId, matchCosine, matchMargin, gateId`;
+const STRANGER_FACE_INSERT_PARAM_COUNT = 24;
 
 const strangerFaceInsertParams = (f: StrangerFaceRow, box: unknown): unknown[] => [
   f.id, f.logId, f.faceIndex, f.capturedAt, f.gate, f.streamId, f.engine, f.trackId, box,
   f.sourceWidth, f.sourceHeight, f.detectorScore, f.quality, f.edgeEnergy, f.sizePx,
-  f.embedding, f.dims, f.modelTag, f.crop, f.createdAt, f.employeeId, f.matchCosine, f.matchMargin,
+  f.embedding, f.dims, f.modelTag, f.crop, f.createdAt, f.employeeId, f.matchCosine, f.matchMargin, f.gateId,
 ];
 
 /**
@@ -980,7 +1076,8 @@ const PG_STRANGER_FACES_DDL = `
     "purgedAt" VARCHAR(64),
     "employeeId" VARCHAR(64),
     "matchCosine" REAL,
-    "matchMargin" REAL
+    "matchMargin" REAL,
+    "gateId" VARCHAR(32)
   );
   CREATE INDEX IF NOT EXISTS idx_stranger_faces_captured ON stranger_faces ("capturedAt" DESC, id DESC)
     WHERE "purgedAt" IS NULL;
@@ -993,6 +1090,10 @@ const PG_STRANGER_FACES_DDL = `
   ALTER TABLE stranger_faces ADD COLUMN IF NOT EXISTS "matchMargin" REAL;
   CREATE INDEX IF NOT EXISTS idx_stranger_faces_recognised ON stranger_faces ("employeeId", "capturedAt" DESC, id DESC)
     WHERE "employeeId" IS NOT NULL AND "purgedAt" IS NULL;
+  -- N gates (2026-10-01): the gate id of the face; additive, nullable, no
+  -- default (catalog-only), no backfill: old rows read NULL and readers derive
+  -- the id from gate (ENTRY -> entry, EXIT -> exit). Rollback: DROP COLUMN.
+  ALTER TABLE stranger_faces ADD COLUMN IF NOT EXISTS "gateId" VARCHAR(32);
 `;
 
 /**
@@ -1103,6 +1204,17 @@ interface ShadowResultRow {
   createdAt: string;
 }
 
+/**
+ * Shadow results written before gate ids existed name the direction ("ENTRY",
+ * "EXIT"); from the N-gate wave on, `gate` holds the gate id. Reads, filters
+ * and summaries map the legacy spelling to the gate id so one gate never
+ * shows twice; new writes are stored with the id. Old rows are not rewritten.
+ */
+export const shadowGateId = (gate: string): string => (gate === "ENTRY" ? "entry" : gate === "EXIT" ? "exit" : gate);
+/** Every stored spelling of a gate: the id, plus the legacy direction for "entry" / "exit". */
+const shadowGateSpellings = (gateId: string): string[] =>
+  gateId === "entry" ? ["entry", "ENTRY"] : gateId === "exit" ? ["exit", "EXIT"] : [gateId];
+
 const frameCount = (v: unknown): v is number => Number.isSafeInteger(v) && (v as number) >= 0 && (v as number) <= SHADOW_MAX_FRAMES;
 const optionalId = (v: unknown, re: RegExp): { value: string | null; ok: boolean } => {
   if (v === undefined || v === null || v === "") return { value: null, ok: true };
@@ -1144,7 +1256,7 @@ export function normalizeShadowResult(record: ShadowResultRecord): { row?: Shado
   return {
     row: {
       id: record.id,
-      gate: record.gate,
+      gate: shadowGateId(record.gate),
       trackId: record.trackId,
       outcome: record.outcome,
       employeeId: employeeId.value,
@@ -1173,7 +1285,7 @@ export function normalizeShadowResult(record: ShadowResultRecord): { row?: Shado
 function rowToShadowResult(r: any): ShadowResultRecord {
   const out: ShadowResultRecord = {
     id: String(r.id),
-    gate: String(r.gate),
+    gate: shadowGateId(String(r.gate)),
     trackId: String(r.trackId),
     outcome: r.outcome,
     employeeId: optionalText(r.employeeId),
@@ -1252,6 +1364,13 @@ function countShadowRow(s: ShadowAccuracySummary, r: { outcome: string; framesUs
   else if (r.agreement === "none") s.none += 1;
 }
 
+/** Add one aggregated SQL row's counts to its gate's summary (legacy and new spellings of a gate merge). */
+function mergeShadowCounts(byGate: Map<string, ShadowAccuracySummary>, gate: string, since: string, r: any): void {
+  const s = byGate.get(gate) || byGate.set(gate, emptyShadowSummary(gate, since)).get(gate)!;
+  const counts = pickShadowCounts(r);
+  for (const key of Object.keys(counts) as Array<keyof typeof counts>) s[key] += counts[key];
+}
+
 /** The count columns of an aggregated SQL row, as integers (SQLite sums come back as numbers, PostgreSQL ::int too). */
 function pickShadowCounts(r: any): Omit<ShadowAccuracySummary, "gate" | "since" | "decisionLatencyP50Ms"> {
   const n = (v: unknown) => Number(v) || 0;
@@ -1294,7 +1413,8 @@ const SQLITE_STRANGER_FACES_DDL = `
     purgedAt TEXT,
     employeeId TEXT,
     matchCosine REAL,
-    matchMargin REAL
+    matchMargin REAL,
+    gateId TEXT
   );
   CREATE INDEX IF NOT EXISTS idx_stranger_faces_captured ON stranger_faces (capturedAt DESC, id DESC)
     WHERE purgedAt IS NULL;
@@ -1305,12 +1425,113 @@ const SQLITE_STRANGER_FACES_MIGRATIONS = [
   "ALTER TABLE stranger_faces ADD COLUMN employeeId TEXT",
   "ALTER TABLE stranger_faces ADD COLUMN matchCosine REAL",
   "ALTER TABLE stranger_faces ADD COLUMN matchMargin REAL",
+  "ALTER TABLE stranger_faces ADD COLUMN gateId TEXT",
 ];
 /** After the columns exist (fresh or migrated). */
 const SQLITE_STRANGER_FACES_RECOGNISED_INDEX = `
   CREATE INDEX IF NOT EXISTS idx_stranger_faces_recognised ON stranger_faces (employeeId, capturedAt DESC, id DESC)
     WHERE employeeId IS NOT NULL AND purgedAt IS NULL;
 `;
+
+// ================= DOOR LOCK STATES (N-gate wave) =================
+// One lock state per door (decision 4: each gate opens its own door). The
+// legacy single-row smart_lock_state IS door "main": reads of "main" fall back
+// to it, and writes of "main" go to both tables in one transaction, so a
+// rollback to the previous image keeps the current lock state. Display and
+// relock-timer state only - nothing here authorises or actuates a door.
+
+/**
+ * door_lock_states on PostgreSQL. Run as its own statement after the main
+ * batch (a failure here cannot roll back the other migrations). The CHECK is
+ * the gates.ts DOOR_ID_RE, so the database refuses what the store refuses.
+ * Rollback: DROP TABLE (door "main" lives on in smart_lock_state).
+ */
+const PG_DOOR_LOCK_STATES_DDL = `
+  CREATE TABLE IF NOT EXISTS door_lock_states (
+    "doorId" VARCHAR(32) PRIMARY KEY CONSTRAINT door_lock_states_door_id_check CHECK ("doorId" ~ '^[a-z][a-z0-9-]{1,31}$'),
+    state JSONB NOT NULL,
+    "updatedAt" VARCHAR(64) NOT NULL
+  );
+`;
+const SQLITE_DOOR_LOCK_STATES_DDL = `
+  CREATE TABLE IF NOT EXISTS door_lock_states (
+    doorId TEXT PRIMARY KEY CHECK (length(doorId) BETWEEN 2 AND 32),
+    state TEXT NOT NULL,
+    updatedAt TEXT NOT NULL
+  );
+`;
+
+const LOCK_STATES: ReadonlySet<string> = new Set(["LOCKED", "UNLOCKED", "UNLOCKING", "LOCKING"]);
+const LOCK_STATUSES: ReadonlySet<string> = new Set(["ONLINE", "OFFLINE"]);
+/** smart_lock_state."lockId" is VARCHAR(64); printable ASCII, no spaces. */
+const LOCK_ID_RE = /^[\x21-\x7E]{1,64}$/;
+const INT32_MAX = 2_147_483_647;
+
+/**
+ * Validate one door's lock state for storage. Structural fields (lockId,
+ * state, isLocked, status) are required - a row without them could not drive
+ * the lock card or the relock timer - so a malformed one refuses the write.
+ * Descriptive text is cut to its smart_lock_state column (doorName and
+ * lastActionBy 255, firmwareVersion and lastActionAt 64); numbers that are
+ * not finite read 0. Only the known fields are kept (never a token or URL
+ * that rode along), and doorId is the key the state is stored under.
+ */
+export function normalizeDoorLockState(doorId: string, input: unknown): { state?: SmartLockStateRecord & { doorId: string }; error?: string } {
+  if (!isDoorId(doorId)) return { error: "doorId" };
+  if (!input || typeof input !== "object" || Array.isArray(input)) return { error: "not-an-object" };
+  const v = input as Record<string, unknown>;
+  if (typeof v.lockId !== "string" || !LOCK_ID_RE.test(v.lockId)) return { error: "lockId" };
+  if (typeof v.state !== "string" || !LOCK_STATES.has(v.state)) return { error: "state" };
+  if (typeof v.isLocked !== "boolean") return { error: "isLocked" };
+  if (typeof v.status !== "string" || !LOCK_STATUSES.has(v.status)) return { error: "status" };
+  const text = (x: unknown, max: number) => (typeof x === "string" ? x.slice(0, max) : "");
+  const int = (x: unknown) => (typeof x === "number" && Number.isFinite(x) ? Math.max(-INT32_MAX, Math.min(INT32_MAX, Math.round(x))) : 0);
+  return {
+    state: {
+      doorId,
+      lockId: v.lockId,
+      doorName: text(v.doorName, 255),
+      state: v.state as SmartLockStateRecord["state"],
+      isLocked: v.isLocked,
+      batteryLevel: int(v.batteryLevel),
+      signalDbm: int(v.signalDbm),
+      firmwareVersion: text(v.firmwareVersion, 64),
+      lastActionAt: text(v.lastActionAt, 64),
+      lastActionBy: text(v.lastActionBy, 255),
+      autoRelockSeconds: int(v.autoRelockSeconds),
+      remainingRelockSeconds: int(v.remainingRelockSeconds),
+      status: v.status as SmartLockStateRecord["status"],
+    },
+  };
+}
+
+/** A smart_lock_state row (PostgreSQL or SQLite) -> record of door "main". */
+function rowToLegacyLockState(row: any): SmartLockStateRecord {
+  return {
+    doorId: LEGACY_DOOR_ID,
+    lockId: String(row.lockId),
+    doorName: row.doorName == null ? "" : String(row.doorName),
+    state: row.state,
+    isLocked: Boolean(row.isLocked),
+    batteryLevel: Number(row.batteryLevel) || 0,
+    signalDbm: Number(row.signalDbm) || 0,
+    firmwareVersion: row.firmwareVersion == null ? "" : String(row.firmwareVersion),
+    lastActionAt: row.lastActionAt == null ? "" : String(row.lastActionAt),
+    lastActionBy: row.lastActionBy == null ? "" : String(row.lastActionBy),
+    autoRelockSeconds: Number(row.autoRelockSeconds) || 0,
+    remainingRelockSeconds: 0,
+    status: row.status,
+  };
+}
+
+/** A stored door_lock_states value (JSONB object or SQLite/JSON text) -> record, or null when unreadable. */
+function parseDoorLockState(doorId: string, raw: unknown): SmartLockStateRecord | null {
+  let value: unknown = raw;
+  if (typeof value === "string") {
+    try { value = JSON.parse(value); } catch { return null; }
+  }
+  return normalizeDoorLockState(doorId, value).state || null;
+}
 
 export interface CameraStreamsConfigRecord {
   entryGate: GateStreamConfigRecord;
@@ -1483,9 +1704,20 @@ class SQLiteStorage implements StrangerFaceStore, ShadowResultStore {
   private pgStrangerFacesReady = false;
   /** pipeline_shadow_results exists on PostgreSQL (same pattern: refuse writes until then). */
   private pgShadowResultsReady = false;
+  /**
+   * Resolves once the PostgreSQL schema migration has run (or failed, which is
+   * logged). PostgreSQL becomes the active store just before the migration, so
+   * an access-log or lock-state write in that window would name a column
+   * ("gateId") or table an upgraded database does not have yet; those writes
+   * wait for this first.
+   */
+  private pgSchemaSettled: Promise<void>;
+  private settlePgSchema: () => void = () => {};
 
   constructor() {
+    this.pgSchemaSettled = new Promise<void>((resolve) => { this.settlePgSchema = resolve; });
     this.init();
+    this.loadLocalDoorLockStates();
     this.initPostgres();
   }
 
@@ -1681,15 +1913,15 @@ class SQLiteStorage implements StrangerFaceStore, ShadowResultStore {
       const logCountRes = await this.pgPool.query('SELECT count(*) as count FROM access_logs');
       const logCount = parseInt(logCountRes.rows[0]?.count || "0", 10);
       if (logCount === 0) {
-        const existingLogs = this.getAccessLogs([]);
+        const existingLogs = this.localAccessLogsForPgSeed();
         for (const log of existingLogs) {
           await this.pgPool.query(`
             INSERT INTO access_logs (
               id, timestamp, type, status, "employeeId", "employeeName", "employeeCode",
               department, "photoSnapshot", confidence, "livenessScore", "lockAction", "doorName", reason,
               "faceEmbedding", "faceEmbeddingDims", "faceEmbeddingModelTag", "faceEmbeddingQuality",
-              "capturedAt", "trackId", "recordingChannel"
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)
+              "capturedAt", "trackId", "recordingChannel", "gateId"
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22)
             ON CONFLICT (id) DO NOTHING
           `, [
             log.id, log.timestamp, log.type, log.status,
@@ -1699,6 +1931,8 @@ class SQLiteStorage implements StrangerFaceStore, ShadowResultStore {
             log.faceEmbedding?.length ? embeddingToBuffer(log.faceEmbedding) : null,
             log.faceEmbedding?.length || null, log.faceEmbeddingModelTag || null, log.faceEmbeddingQuality ?? null,
             ...accessLogTraceParams(log),
+            // The stored value only: a legacy row stays NULL in PostgreSQL too.
+            storableGateId(log.storedGateId),
           ]);
         }
         console.log(`[PostgreSQL] Đã khởi tạo và đồng bộ ${existingLogs.length} bản ghi truy cập vào PostgreSQL!`);
@@ -1707,7 +1941,7 @@ class SQLiteStorage implements StrangerFaceStore, ShadowResultStore {
           SELECT id, timestamp, type, status, "employeeId", "employeeName", "employeeCode",
                  department, "photoSnapshot", confidence, "livenessScore", "lockAction", "doorName", reason,
                  "faceEmbedding", "faceEmbeddingDims", "faceEmbeddingModelTag", "faceEmbeddingQuality",
-                 "capturedAt", "trackId", "recordingChannel"
+                 "capturedAt", "trackId", "recordingChannel", "gateId"
           FROM access_logs ORDER BY timestamp DESC LIMIT 100
         `);
         for (const r of pgLogs.rows) {
@@ -1718,8 +1952,8 @@ class SQLiteStorage implements StrangerFaceStore, ShadowResultStore {
                   id, timestamp, type, status, employeeId, employeeName, employeeCode,
                   department, photoSnapshot, confidence, livenessScore, lockAction, doorName, reason,
                   faceEmbedding, faceEmbeddingDims, faceEmbeddingModelTag, faceEmbeddingQuality,
-                  capturedAt, trackId, recordingChannel
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                  capturedAt, trackId, recordingChannel, gateId
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(id) DO NOTHING
               `);
               stmt.run(
@@ -1729,7 +1963,7 @@ class SQLiteStorage implements StrangerFaceStore, ShadowResultStore {
                 r.livenessScore ?? null, r.lockAction, r.doorName, r.reason || null,
                 r.faceEmbedding || null, r.faceEmbeddingDims || null,
                 r.faceEmbeddingModelTag || null, r.faceEmbeddingQuality ?? null,
-                r.capturedAt ?? null, r.trackId ?? null, r.recordingChannel ?? null
+                r.capturedAt ?? null, r.trackId ?? null, r.recordingChannel ?? null, storableGateId(r.gateId)
               );
             } catch {}
           }
@@ -1885,6 +2119,14 @@ class SQLiteStorage implements StrangerFaceStore, ShadowResultStore {
   }
 
   private async createPostgresTables() {
+    try {
+      await this.migratePostgresTables();
+    } finally {
+      this.settlePgSchema();
+    }
+  }
+
+  private async migratePostgresTables() {
     if (!this.pgPool) return;
     try {
       await this.pgPool.query(`
@@ -1920,7 +2162,8 @@ class SQLiteStorage implements StrangerFaceStore, ShadowResultStore {
           "faceEmbeddingQuality" REAL,
           "capturedAt" VARCHAR(64),
           "trackId" VARCHAR(64),
-          "recordingChannel" VARCHAR(16)
+          "recordingChannel" VARCHAR(16),
+          "gateId" VARCHAR(32)
         );
 
         CREATE TABLE IF NOT EXISTS smart_lock_state (
@@ -2080,6 +2323,13 @@ class SQLiteStorage implements StrangerFaceStore, ShadowResultStore {
         -- Matches the history ordering (newest first, id as tie-break) so a page
         -- is an index range scan instead of a sort of the whole table.
         CREATE INDEX IF NOT EXISTS idx_access_logs_ts_id ON access_logs ("timestamp" DESC, id DESC);
+        -- N gates (2026-10-01): the gate of the event. Additive, nullable, no
+        -- default (catalog-only), and NO backfill: history is immutable, so
+        -- rows written before gate ids keep NULL and readers derive "entry" /
+        -- "exit" from type. The index serves the gate filter (both the id and
+        -- the NULL legacy branch) in history order. Rollback: DROP INDEX, DROP COLUMN.
+        ALTER TABLE access_logs ADD COLUMN IF NOT EXISTS "gateId" VARCHAR(32);
+        CREATE INDEX IF NOT EXISTS idx_access_logs_gate_ts ON access_logs ("gateId", "timestamp" DESC, id DESC);
         -- Per-face stranger records (2026-09-29): the faces an adjudication
         -- covers. A constant default makes the NOT NULL column catalog-only
         -- (no rewrite); old rows read '[]' and old code never names it.
@@ -2097,6 +2347,19 @@ class SQLiteStorage implements StrangerFaceStore, ShadowResultStore {
         this.pgShadowResultsReady = true;
       } catch (err) {
         console.error("[PostgreSQL] Lỗi khởi tạo bảng pipeline_shadow_results:", err);
+      }
+      try {
+        await this.pgPool.query(PG_DOOR_LOCK_STATES_DDL);
+        this.pgDoorLockStatesReady = true;
+      } catch (err) {
+        console.error("[PostgreSQL] Lỗi khởi tạo bảng door_lock_states:", err);
+      }
+      if (this.pgDoorLockStatesReady) {
+        try {
+          await this.loadDoorLockStates();
+        } catch (err) {
+          console.error("[PostgreSQL] Lỗi nạp trạng thái khóa cửa:", err);
+        }
       }
       this.warnStrandedLocalStrangerFaces();
       await this.loadResolvedStrangerClusters();
@@ -2167,7 +2430,8 @@ class SQLiteStorage implements StrangerFaceStore, ShadowResultStore {
         faceEmbeddingQuality REAL,
         capturedAt TEXT,
         trackId TEXT,
-        recordingChannel TEXT
+        recordingChannel TEXT,
+        gateId TEXT
       );
       CREATE INDEX IF NOT EXISTS idx_access_logs_ts_id ON access_logs (timestamp DESC, id DESC);
 
@@ -2326,10 +2590,17 @@ class SQLiteStorage implements StrangerFaceStore, ShadowResultStore {
       "ALTER TABLE access_logs ADD COLUMN capturedAt TEXT",
       "ALTER TABLE access_logs ADD COLUMN trackId TEXT",
       "ALTER TABLE access_logs ADD COLUMN recordingChannel TEXT",
+      "ALTER TABLE access_logs ADD COLUMN gateId TEXT",
       "ALTER TABLE stranger_resolutions ADD COLUMN faceIds TEXT NOT NULL DEFAULT '[]'",
       "ALTER TABLE stranger_resolution_events ADD COLUMN faceIds TEXT NOT NULL DEFAULT '[]'",
     ]) {
       try { this.db.exec(migration); } catch { /* column already present */ }
+    }
+    // After the gateId column exists (fresh or migrated database).
+    try {
+      this.db.exec("CREATE INDEX IF NOT EXISTS idx_access_logs_gate_ts ON access_logs (gateId, timestamp DESC, id DESC)");
+    } catch (err) {
+      console.error("[SQLite] Lỗi khởi tạo chỉ mục idx_access_logs_gate_ts:", err);
     }
     try {
       this.db.exec(SQLITE_STRANGER_FACES_DDL);
@@ -2344,6 +2615,11 @@ class SQLiteStorage implements StrangerFaceStore, ShadowResultStore {
       this.db.exec(SQLITE_SHADOW_RESULTS_DDL);
     } catch (err) {
       console.error("[SQLite] Lỗi khởi tạo bảng pipeline_shadow_results:", err);
+    }
+    try {
+      this.db.exec(SQLITE_DOOR_LOCK_STATES_DDL);
+    } catch (err) {
+      console.error("[SQLite] Lỗi khởi tạo bảng door_lock_states:", err);
     }
   }
 
@@ -2368,6 +2644,8 @@ class SQLiteStorage implements StrangerFaceStore, ShadowResultStore {
     org_catalog?: OrgCatalogRecord;
     stranger_faces?: StrangerFaceJson[];
     pipeline_shadow_results?: ShadowResultRecord[];
+    /** Lock state per door (N-gate wave); door "main" is also smart_lock_state. */
+    door_lock_states?: Record<string, { state: SmartLockStateRecord; updatedAt: string }>;
   } = {
     employees: [],
     access_logs: [],
@@ -2594,6 +2872,23 @@ class SQLiteStorage implements StrangerFaceStore, ShadowResultStore {
     if (timer) clearTimeout(timer);
   }
 
+  /**
+   * The local rows getAccessLogs() returns, with the gate id as STORED
+   * (`storedGateId`, null for rows from before gate ids) instead of the
+   * derived one, so seeding an empty PostgreSQL never backfills old rows.
+   */
+  private localAccessLogsForPgSeed(): Array<AccessLogRecord & { storedGateId: string | null }> {
+    if (this.isNativeSqlite && this.db) {
+      try {
+        const rows = this.db.prepare("SELECT * FROM access_logs ORDER BY timestamp DESC LIMIT 100").all() as any[];
+        return rows.map((r) => ({ ...rowToAccessLog(r), storedGateId: storableGateId(r.gateId) }));
+      } catch (err) {
+        console.error("[SQLite] Lỗi getAccessLogs:", err);
+      }
+    }
+    return this.fallbackData.access_logs.map((log) => ({ ...log, storedGateId: storableGateId(log.gateId) }));
+  }
+
   getAccessLogs(defaults: AccessLogRecord[]): AccessLogRecord[] {
     if (this.isNativeSqlite && this.db) {
       try {
@@ -2604,7 +2899,7 @@ class SQLiteStorage implements StrangerFaceStore, ShadowResultStore {
         for (const log of defaults) {
           this.saveAccessLog(log);
         }
-        return defaults;
+        return defaults.map(withGateId);
       } catch (err) {
         console.error("[SQLite] Lỗi getAccessLogs:", err);
       }
@@ -2614,7 +2909,11 @@ class SQLiteStorage implements StrangerFaceStore, ShadowResultStore {
       this.rebuildFallbackStrangerIndex();
       this.saveFallback();
     }
-    return this.fallbackData.access_logs;
+    // Copies with the derived gate id: the stored records are never rewritten
+    // (no backfill on the next save), and the caller's array is its own - a
+    // caller adding an event to it no longer hides that event from
+    // saveAccessLog's "already stored" check.
+    return this.fallbackData.access_logs.map(withGateId);
   }
 
   /** Authoritative metadata page; unlike startup hydration this is not capped at 100 rows. */
@@ -2626,7 +2925,7 @@ class SQLiteStorage implements StrangerFaceStore, ShadowResultStore {
         this.pgPool.query(
           `SELECT id, timestamp, type, status, "employeeId", "employeeName", "employeeCode", department,
                   confidence, "livenessScore", "lockAction", "doorName", reason,
-                  "capturedAt", "trackId", "recordingChannel",
+                  "capturedAt", "trackId", "recordingChannel", "gateId",
                   CASE WHEN "photoSnapshot" IS NOT NULL AND "photoSnapshot" <> '' THEN 1 ELSE 0 END AS "hasImage"
              FROM access_logs ORDER BY timestamp DESC, id DESC LIMIT $1 OFFSET $2`,
           [limit, offset],
@@ -2638,7 +2937,7 @@ class SQLiteStorage implements StrangerFaceStore, ShadowResultStore {
     if (this.isNativeSqlite && this.db) {
       const rows = this.db.prepare(`SELECT id, timestamp, type, status, employeeId, employeeName, employeeCode,
         department, confidence, livenessScore, lockAction, doorName, reason,
-        capturedAt, trackId, recordingChannel,
+        capturedAt, trackId, recordingChannel, gateId,
         CASE WHEN photoSnapshot IS NOT NULL AND photoSnapshot <> '' THEN 1 ELSE 0 END AS hasImage
         FROM access_logs ORDER BY timestamp DESC, id DESC LIMIT ? OFFSET ?`).all(limit, offset) as any[];
       const count = this.db.prepare("SELECT count(*) AS total FROM access_logs").get() as any;
@@ -2646,7 +2945,7 @@ class SQLiteStorage implements StrangerFaceStore, ShadowResultStore {
     }
     const sorted = this.fallbackData.access_logs.slice().sort((a, b) => b.timestamp.localeCompare(a.timestamp) || b.id.localeCompare(a.id));
     return { logs: sorted.slice(offset, offset + limit).map((log) => ({
-      ...log, photoSnapshot: log.photoSnapshot ? "stored" : "", faceEmbedding: undefined,
+      ...withGateId(log), photoSnapshot: log.photoSnapshot ? "stored" : "", faceEmbedding: undefined,
       faceEmbeddingModelTag: undefined, faceEmbeddingQuality: undefined,
     })), total: sorted.length };
   }
@@ -2656,6 +2955,9 @@ class SQLiteStorage implements StrangerFaceStore, ShadowResultStore {
     const add = (value: unknown) => { params.push(value); return `$${params.length}`; };
     if (f.status) where.push(`status = ${add(f.status)}`);
     if (f.type) where.push(`type = ${add(f.type)}`);
+    const gate = queryGateId(f);
+    if (gate === "") where.push("FALSE");
+    else if (gate !== null) where.push(gateWhereSql(gate, add(gate), true));
     if (f.from) where.push(`timestamp >= ${add(f.from)}`);
     if (f.to) where.push(`timestamp < ${add(f.to)}`);
     if (f.q) {
@@ -2669,6 +2971,9 @@ class SQLiteStorage implements StrangerFaceStore, ShadowResultStore {
     const where: string[] = [];
     if (f.status) { where.push("status = ?"); params.push(f.status); }
     if (f.type) { where.push("type = ?"); params.push(f.type); }
+    const gate = queryGateId(f);
+    if (gate === "") where.push("0");
+    else if (gate !== null) { where.push(gateWhereSql(gate, "?", false)); params.push(gate); }
     if (f.from) { where.push("timestamp >= ?"); params.push(f.from); }
     if (f.to) { where.push("timestamp < ?"); params.push(f.to); }
     if (f.q) {
@@ -2706,7 +3011,7 @@ class SQLiteStorage implements StrangerFaceStore, ShadowResultStore {
         this.pgPool.query(
           `SELECT id, timestamp, type, status, "employeeId", "employeeName", "employeeCode", department,
                   confidence, "livenessScore", "lockAction", "doorName", reason,
-                  "capturedAt", "trackId", "recordingChannel",
+                  "capturedAt", "trackId", "recordingChannel", "gateId",
                   CASE WHEN "photoSnapshot" IS NOT NULL AND "photoSnapshot" <> '' THEN 1 ELSE 0 END AS "hasImage"
              FROM access_logs ${where.length ? "WHERE " + where.join(" AND ") : ""}
             ORDER BY timestamp DESC, id DESC LIMIT $${params.length}`,
@@ -2727,7 +3032,7 @@ class SQLiteStorage implements StrangerFaceStore, ShadowResultStore {
       }
       const rows = this.db.prepare(`SELECT id, timestamp, type, status, employeeId, employeeName, employeeCode,
         department, confidence, livenessScore, lockAction, doorName, reason,
-        capturedAt, trackId, recordingChannel,
+        capturedAt, trackId, recordingChannel, gateId,
         CASE WHEN photoSnapshot IS NOT NULL AND photoSnapshot <> '' THEN 1 ELSE 0 END AS hasImage
         FROM access_logs ${where.length ? "WHERE " + where.join(" AND ") : ""}
         ORDER BY timestamp DESC, id DESC LIMIT ?`).all(...(params as any[]), n + 1) as any[];
@@ -2741,7 +3046,7 @@ class SQLiteStorage implements StrangerFaceStore, ShadowResultStore {
       ? matching.filter((l) => l.timestamp < cursor.timestamp || (l.timestamp === cursor.timestamp && l.id < cursor.id))
       : matching;
     const logs = after.slice(0, n).map((log) => ({
-      ...log, photoSnapshot: log.photoSnapshot ? "stored" : "", faceEmbedding: undefined,
+      ...withGateId(log), photoSnapshot: log.photoSnapshot ? "stored" : "", faceEmbedding: undefined,
       faceEmbeddingModelTag: undefined, faceEmbeddingQuality: undefined,
     }));
     return { logs, hasMore: after.length > n, total: matching.length };
@@ -2761,7 +3066,7 @@ class SQLiteStorage implements StrangerFaceStore, ShadowResultStore {
       const deptParams = [...params];
       params.push(timeZone);
       const tz = `$${params.length}::text`;
-      const [hours, depts] = await Promise.all([
+      const [hours, depts, gates] = await Promise.all([
         this.pgPool.query(
           `SELECT extract(hour FROM (timestamp::timestamptz AT TIME ZONE ${tz}))::int AS h,
                   count(*)::int AS scans,
@@ -2779,20 +3084,30 @@ class SQLiteStorage implements StrangerFaceStore, ShadowResultStore {
             GROUP BY 1 ORDER BY 2 DESC, 1 LIMIT 50`,
           deptParams,
         ),
+        this.pgPool.query(
+          `SELECT ${gateIdSqlExpr(true)} AS "gateId", count(*)::int AS total,
+                  count(*) FILTER (WHERE status = 'GRANTED')::int AS granted,
+                  count(*) FILTER (WHERE status = 'DENIED')::int AS denied
+             FROM access_logs ${clause} GROUP BY 1`,
+          deptParams,
+        ),
       ]);
-      const stats: AccessLogStats = { total: 0, granted: 0, denied: 0, entries: 0, exits: 0, byHour: emptyHours(), grantedEntriesByDepartment: [] };
+      const stats: AccessLogStats = { total: 0, granted: 0, denied: 0, entries: 0, exits: 0, byHour: emptyHours(), grantedEntriesByDepartment: [], byGate: [] };
       for (const r of hours.rows) {
         stats.total += r.scans; stats.granted += r.granted; stats.denied += r.denied; stats.entries += r.entries; stats.exits += r.exits;
         const b = stats.byHour[r.h];
         if (b) Object.assign(b, { totalScans: r.scans, totalEntries: r.entries, grantedEntries: r.granted_entries, deniedEntries: r.entries - r.granted_entries, exits: r.exits });
       }
       stats.grantedEntriesByDepartment = depts.rows.map((r: any) => ({ name: r.name, count: r.count }));
+      stats.byGate = sortGateCounts(new Map(gates.rows.map((r: any) => [String(r.gateId), {
+        gateId: String(r.gateId), total: Number(r.total) || 0, granted: Number(r.granted) || 0, denied: Number(r.denied) || 0,
+      }])));
       return stats;
     }
     if (this.isNativeSqlite && this.db) {
       const params: unknown[] = [];
       const where = this.sqliteAccessLogWhere(f, params);
-      const rows = this.db.prepare(`SELECT timestamp, type, status, department FROM access_logs ${where.length ? "WHERE " + where.join(" AND ") : ""}`).all(...(params as any[])) as any[];
+      const rows = this.db.prepare(`SELECT timestamp, type, status, department, gateId FROM access_logs ${where.length ? "WHERE " + where.join(" AND ") : ""}`).all(...(params as any[])) as any[];
       return accumulateStats(rows, timeZone);
     }
     return accumulateStats(this.fallbackData.access_logs.filter((log) => matchesAccessLogQuery(log, f)), timeZone);
@@ -2812,11 +3127,12 @@ class SQLiteStorage implements StrangerFaceStore, ShadowResultStore {
       capturedAt: optionalText(r.capturedAt),
       trackId: optionalText(r.trackId),
       recordingChannel: optionalText(r.recordingChannel),
+      gateId: gateIdForLegacyRow(r),
     });
     if (this.pgPool && this.isPostgres) {
       await this.settleAccessLogWrites(id);
       const result = await this.pgPool.query(
-        `SELECT id, timestamp, type, status, "capturedAt", "trackId", "recordingChannel"
+        `SELECT id, timestamp, type, status, "capturedAt", "trackId", "recordingChannel", "gateId"
            FROM access_logs WHERE id = $1`,
         [id],
       );
@@ -2824,7 +3140,7 @@ class SQLiteStorage implements StrangerFaceStore, ShadowResultStore {
     }
     if (this.isNativeSqlite && this.db) {
       const row = this.db.prepare(
-        "SELECT id, timestamp, type, status, capturedAt, trackId, recordingChannel FROM access_logs WHERE id = ?",
+        "SELECT id, timestamp, type, status, capturedAt, trackId, recordingChannel, gateId FROM access_logs WHERE id = ?",
       ).get(id) as any;
       return row ? meta(row) : undefined;
     }
@@ -2846,7 +3162,7 @@ class SQLiteStorage implements StrangerFaceStore, ShadowResultStore {
       return row ? rowToAccessLog(row) : undefined;
     }
     const row = this.fallbackData.access_logs.find((log) => log.id === id);
-    return row ? { ...row, faceEmbedding: row.faceEmbedding ? [...row.faceEmbedding] : undefined } : undefined;
+    return row ? { ...withGateId(row), faceEmbedding: row.faceEmbedding ? [...row.faceEmbedding] : undefined } : undefined;
   }
 
   /**
@@ -2876,7 +3192,7 @@ class SQLiteStorage implements StrangerFaceStore, ShadowResultStore {
                   CASE WHEN "photoSnapshot" IS NOT NULL AND "photoSnapshot" <> '' THEN 'stored' ELSE '' END AS "photoSnapshot",
                   confidence, "livenessScore", "lockAction", "doorName", reason,
                   "faceEmbedding", "faceEmbeddingDims", "faceEmbeddingModelTag", "faceEmbeddingQuality",
-                  "capturedAt", "trackId", "recordingChannel"
+                  "capturedAt", "trackId", "recordingChannel", "gateId"
              FROM access_logs
             WHERE "photoSnapshot" IS NOT NULL AND "photoSnapshot" <> ''
               AND (status = 'DENIED' OR "employeeId" IS NULL OR "employeeName" = 'Không xác định')${cursorWhere}
@@ -2895,7 +3211,7 @@ class SQLiteStorage implements StrangerFaceStore, ShadowResultStore {
                 CASE WHEN photoSnapshot IS NOT NULL AND photoSnapshot <> '' THEN 'stored' ELSE '' END AS photoSnapshot,
                 confidence, livenessScore, lockAction, doorName, reason,
                 faceEmbedding, faceEmbeddingDims, faceEmbeddingModelTag, faceEmbeddingQuality,
-                capturedAt, trackId, recordingChannel FROM access_logs
+                capturedAt, trackId, recordingChannel, gateId FROM access_logs
           WHERE photoSnapshot IS NOT NULL AND photoSnapshot <> ''
             AND (status = 'DENIED' OR employeeId IS NULL OR employeeName = 'Không xác định')${cursorWhere}
             AND NOT EXISTS (SELECT 1 FROM stranger_faces sf WHERE sf.logId = access_logs.id)
@@ -2910,7 +3226,7 @@ class SQLiteStorage implements StrangerFaceStore, ShadowResultStore {
       node = node.next;
     }
     return {
-      logs: rows.slice(0, boundedLimit).map((log) => ({ ...log, photoSnapshot: "stored", faceEmbedding: log.faceEmbedding ? [...log.faceEmbedding] : undefined })),
+      logs: rows.slice(0, boundedLimit).map((log) => ({ ...withGateId(log), photoSnapshot: "stored", faceEmbedding: log.faceEmbedding ? [...log.faceEmbedding] : undefined })),
       hasMore: rows.length > boundedLimit,
     };
   }
@@ -2918,7 +3234,7 @@ class SQLiteStorage implements StrangerFaceStore, ShadowResultStore {
   async getStrangerCandidateLogById(id: string): Promise<AccessLogRecord | undefined> {
     if (!this.pgPool && !this.isNativeSqlite) {
       const log = this.fallbackStrangerNodes.get(id)?.log;
-      return log ? { ...log, photoSnapshot: "stored", faceEmbedding: log.faceEmbedding ? [...log.faceEmbedding] : undefined } : undefined;
+      return log ? { ...withGateId(log), photoSnapshot: "stored", faceEmbedding: log.faceEmbedding ? [...log.faceEmbedding] : undefined } : undefined;
     }
     const log = await this.getAccessLogById(id);
     if (!log?.photoSnapshot || !(log.status === "DENIED" || !log.employeeId || log.employeeName === "Không xác định")) return undefined;
@@ -3405,7 +3721,7 @@ class SQLiteStorage implements StrangerFaceStore, ShadowResultStore {
   ): Promise<{ results: ShadowResultRecord[]; hasMore: boolean }> {
     const n = Math.min(SHADOW_PAGE_MAX, Math.max(1, Number.isFinite(limit) ? Math.trunc(limit) : 1));
     const after = cursor ? { decidedAt: String(cursor.decidedAt), id: String(cursor.id) } : null;
-    const gate = typeof filter?.gate === "string" && filter.gate !== "" ? filter.gate : null;
+    const gate = typeof filter?.gate === "string" && filter.gate !== "" ? shadowGateSpellings(shadowGateId(filter.gate)) : null;
     const rawAgreement: unknown = filter?.agreement;
     const agreement = typeof rawAgreement === "string" && rawAgreement.length ? rawAgreement : null;
     if (agreement && !SHADOW_AGREEMENTS.has(agreement)) return { results: [], hasMore: false };
@@ -3419,7 +3735,7 @@ class SQLiteStorage implements StrangerFaceStore, ShadowResultStore {
     if (mode === "postgresql") {
       const params: unknown[] = [];
       const where: string[] = [];
-      if (gate) { params.push(gate); where.push(`gate = $${params.length}`); }
+      if (gate) { params.push(gate); where.push(`gate = ANY($${params.length}::varchar[])`); }
       if (agreement) { params.push(agreement); where.push(`agreement = $${params.length}`); }
       if (since) { params.push(since); where.push(`"decidedAt" >= $${params.length}`); }
       if (after) { params.push(after.decidedAt, after.id); where.push(`("decidedAt", id) < ($${params.length - 1}, $${params.length})`); }
@@ -3433,7 +3749,7 @@ class SQLiteStorage implements StrangerFaceStore, ShadowResultStore {
     } else if (mode === "sqlite") {
       const params: unknown[] = [];
       const where: string[] = [];
-      if (gate) { params.push(gate); where.push("gate = ?"); }
+      if (gate) { params.push(...gate); where.push(`gate IN (${gate.map(() => "?").join(", ")})`); }
       if (agreement) { params.push(agreement); where.push("agreement = ?"); }
       if (since) { params.push(since); where.push("decidedAt >= ?"); }
       if (after) { params.push(after.decidedAt, after.decidedAt, after.id); where.push("(decidedAt < ? OR (decidedAt = ? AND id < ?))"); }
@@ -3443,7 +3759,7 @@ class SQLiteStorage implements StrangerFaceStore, ShadowResultStore {
       ).all(...params, n + 1) as any[]).map(rowToShadowResult);
     } else if (mode === "json") {
       rows = (this.fallbackData.pipeline_shadow_results || [])
-        .filter((r) => (!gate || r.gate === gate) && (!agreement || r.agreement === agreement) && (!since || r.decidedAt >= since))
+        .filter((r) => (!gate || gate.includes(r.gate)) && (!agreement || r.agreement === agreement) && (!since || r.decidedAt >= since))
         .filter((r) => !after || r.decidedAt < after.decidedAt || (r.decidedAt === after.decidedAt && r.id < after.id))
         .sort(shadowNewestFirst)
         .slice(0, n + 1)
@@ -3486,13 +3802,13 @@ class SQLiteStorage implements StrangerFaceStore, ShadowResultStore {
          FROM pipeline_shadow_results WHERE "decidedAt" >= $1 GROUP BY gate`,
         [since],
       );
-      for (const r of counts.rows) byGate.set(String(r.gate), { ...emptyShadowSummary(String(r.gate), since), ...pickShadowCounts(r) });
+      for (const r of counts.rows) mergeShadowCounts(byGate, shadowGateId(String(r.gate)), since, r);
       const emp = await this.pgPool!.query(
         `SELECT gate, "decidedAt", "firstUsableAt" FROM pipeline_shadow_results
           WHERE "decidedAt" >= $1 AND outcome = 'employee' AND "firstUsableAt" IS NOT NULL`,
         [since],
       );
-      for (const r of emp.rows) addLatency(String(r.gate), { outcome: "employee", decidedAt: String(r.decidedAt), firstUsableAt: r.firstUsableAt });
+      for (const r of emp.rows) addLatency(shadowGateId(String(r.gate)), { outcome: "employee", decidedAt: String(r.decidedAt), firstUsableAt: r.firstUsableAt });
     } else if (mode === "sqlite") {
       const counts = this.db.prepare(
         `SELECT gate, count(*) AS decisions,
@@ -3507,18 +3823,19 @@ class SQLiteStorage implements StrangerFaceStore, ShadowResultStore {
            sum(agreement = 'none') AS none
          FROM pipeline_shadow_results WHERE decidedAt >= ? GROUP BY gate`,
       ).all(since) as any[];
-      for (const r of counts) byGate.set(String(r.gate), { ...emptyShadowSummary(String(r.gate), since), ...pickShadowCounts(r) });
+      for (const r of counts) mergeShadowCounts(byGate, shadowGateId(String(r.gate)), since, r);
       const emp = this.db.prepare(
         `SELECT gate, decidedAt, firstUsableAt FROM pipeline_shadow_results
           WHERE decidedAt >= ? AND outcome = 'employee' AND firstUsableAt IS NOT NULL`,
       ).all(since) as any[];
-      for (const r of emp) addLatency(String(r.gate), { outcome: "employee", decidedAt: String(r.decidedAt), firstUsableAt: r.firstUsableAt });
+      for (const r of emp) addLatency(shadowGateId(String(r.gate)), { outcome: "employee", decidedAt: String(r.decidedAt), firstUsableAt: r.firstUsableAt });
     } else if (mode === "json") {
       for (const r of this.fallbackData.pipeline_shadow_results || []) {
         if (!(r.decidedAt >= since)) continue;
-        const s = byGate.get(r.gate) || byGate.set(r.gate, emptyShadowSummary(r.gate, since)).get(r.gate)!;
+        const gate = shadowGateId(r.gate);
+        const s = byGate.get(gate) || byGate.set(gate, emptyShadowSummary(gate, since)).get(gate)!;
         countShadowRow(s, r);
-        addLatency(r.gate, r);
+        addLatency(gate, r);
       }
     }
     for (const [gate, s] of byGate) s.decisionLatencyP50Ms = medianMs(latencies.get(gate) || []);
@@ -3569,19 +3886,23 @@ class SQLiteStorage implements StrangerFaceStore, ShadowResultStore {
     const embedding = log.faceEmbedding?.length ? embeddingToBuffer(log.faceEmbedding) : null;
     const embeddingDims = log.faceEmbedding?.length || null;
     const trace = normalizeAccessLogTrace(log);
-    if (trace.rejected.length) {
-      console.warn(`[AccessLog] ${String(log.id).slice(0, 64)}: bỏ giá trị không hợp lệ (${trace.rejected.join(", ")}), bản ghi vẫn được lưu.`);
+    const gateId = storableGateId(log.gateId);
+    const rejected: string[] = [...trace.rejected];
+    if (!gateId && log.gateId !== undefined && log.gateId !== null && log.gateId !== "") rejected.push("gateId");
+    if (rejected.length) {
+      console.warn(`[AccessLog] ${String(log.id).slice(0, 64)}: bỏ giá trị không hợp lệ (${rejected.join(", ")}), bản ghi vẫn được lưu.`);
     }
-    const traceParams = [trace.capturedAt ?? null, trace.trackId ?? null, trace.recordingChannel ?? null];
+    const traceParams = [trace.capturedAt ?? null, trace.trackId ?? null, trace.recordingChannel ?? null, gateId];
     let authoritative: Promise<boolean> | null = null;
     if (this.pgPool && this.isPostgres) {
-      authoritative = this.pgPool.query(`
+      const pool = this.pgPool;
+      authoritative = this.pgSchemaSettled.then(() => pool.query(`
         INSERT INTO access_logs (
           id, timestamp, type, status, "employeeId", "employeeName", "employeeCode",
           department, "photoSnapshot", confidence, "livenessScore", "lockAction", "doorName", reason,
           "faceEmbedding", "faceEmbeddingDims", "faceEmbeddingModelTag", "faceEmbeddingQuality",
-          "capturedAt", "trackId", "recordingChannel"
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)
+          "capturedAt", "trackId", "recordingChannel", "gateId"
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22)
         ON CONFLICT (id) DO NOTHING
       `, [
         log.id, log.timestamp, log.type, log.status,
@@ -3590,7 +3911,7 @@ class SQLiteStorage implements StrangerFaceStore, ShadowResultStore {
         log.livenessScore ?? null, log.lockAction, log.doorName, log.reason || null,
         embedding, embeddingDims, log.faceEmbeddingModelTag || null, log.faceEmbeddingQuality ?? null,
         ...traceParams,
-      ]).then(
+      ])).then(
         () => true,
         (e) => {
           console.error("[PostgreSQL] Lỗi saveAccessLog:", e.message);
@@ -3611,8 +3932,8 @@ class SQLiteStorage implements StrangerFaceStore, ShadowResultStore {
             id, timestamp, type, status, employeeId, employeeName, employeeCode,
             department, photoSnapshot, confidence, livenessScore, lockAction, doorName, reason,
             faceEmbedding, faceEmbeddingDims, faceEmbeddingModelTag, faceEmbeddingQuality,
-            capturedAt, trackId, recordingChannel
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            capturedAt, trackId, recordingChannel, gateId
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         `);
         stmt.run(
           log.id,
@@ -3647,6 +3968,7 @@ class SQLiteStorage implements StrangerFaceStore, ShadowResultStore {
         capturedAt: trace.capturedAt,
         trackId: trace.trackId,
         recordingChannel: trace.recordingChannel,
+        gateId: gateId ?? undefined,
       };
       this.fallbackData.access_logs.unshift(stored);
       this.prependFallbackStrangerCandidate(stored);
@@ -3707,8 +4029,13 @@ class SQLiteStorage implements StrangerFaceStore, ShadowResultStore {
   }
 
   saveSmartLockState(state: SmartLockStateRecord) {
+    // This row IS door "main": keep the in-memory view getDoorLockState("main") reads in step.
+    this.legacyMainLock = { ...state, doorId: LEGACY_DOOR_ID };
+    this.legacyMainSavedHere = true;
     if (this.pgPool && this.isPostgres) {
-      this.pgPool.query(`
+      // Same write queue as the door lock states, so the stored row is always the last one saved.
+      const pool = this.pgPool;
+      const write = this.doorLockWrites.then(() => pool.query(`
         INSERT INTO smart_lock_state (
           "lockId", "doorName", state, "isLocked", "batteryLevel", "signalDbm",
           "firmwareVersion", "lastActionAt", "lastActionBy", "autoRelockSeconds", status
@@ -3726,7 +4053,8 @@ class SQLiteStorage implements StrangerFaceStore, ShadowResultStore {
         state.lockId, state.doorName, state.state, state.isLocked,
         state.batteryLevel, state.signalDbm, state.firmwareVersion,
         state.lastActionAt, state.lastActionBy, state.autoRelockSeconds, state.status
-      ]).catch((e) => console.error("[PostgreSQL] Lỗi saveSmartLockState:", e.message));
+      ])).catch((e) => console.error("[PostgreSQL] Lỗi saveSmartLockState:", e?.message));
+      this.doorLockWrites = write;
     }
 
     if (this.isNativeSqlite && this.db) {
@@ -3766,6 +4094,281 @@ class SQLiteStorage implements StrangerFaceStore, ShadowResultStore {
     }
     this.fallbackData.smart_lock_state = state;
     this.saveFallback();
+  }
+
+  // ================= DOOR LOCK STATES (N-gate wave) =================
+  // Reads are synchronous (the lock card and the relock timer read them on
+  // every tick), so they come from memory: loaded from the local store at
+  // startup and REPLACED by PostgreSQL's rows once it is the active authority
+  // (doors only the local store knows - a first run on PostgreSQL - are
+  // copied up). Writes go to the authority (awaited, one transaction for door
+  // "main" and its legacy row) and through to the local store, like the
+  // legacy smart_lock_state, so a gateway that later boots without PostgreSQL
+  // still shows the last state. Writes run in call order (one chain), so the
+  // stored state is always the last one saved.
+
+  private doorLocks = new Map<string, SmartLockStateRecord>();
+  /** smart_lock_state as door "main" (local at startup, PostgreSQL once loaded, every legacy write). */
+  private legacyMainLock: SmartLockStateRecord | null = null;
+  private pgDoorLockStatesReady = false;
+  private doorLockWrites: Promise<unknown> = Promise.resolve();
+  /** Doors (and the legacy row) saved by this process: newer than anything a later PostgreSQL hydrate reads. */
+  private doorLocksSavedHere = new Set<string>();
+  private doorLocksDeletedHere = new Set<string>();
+  private legacyMainSavedHere = false;
+
+  private loadLocalDoorLockStates(): void {
+    try {
+      if (this.isNativeSqlite && this.db) {
+        for (const row of this.db.prepare("SELECT doorId, state FROM door_lock_states").all() as any[]) {
+          const state = parseDoorLockState(String(row.doorId), row.state);
+          if (state) this.doorLocks.set(String(row.doorId), state);
+        }
+        const legacy = this.db.prepare("SELECT * FROM smart_lock_state ORDER BY lastActionAt DESC LIMIT 1").get() as any;
+        this.legacyMainLock = legacy ? rowToLegacyLockState(legacy) : null;
+        return;
+      }
+    } catch (err: any) {
+      console.error("[SQLite] Lỗi nạp trạng thái khóa cửa:", err?.message);
+    }
+    for (const [doorId, entry] of Object.entries(this.fallbackData.door_lock_states || {})) {
+      const state = parseDoorLockState(doorId, entry?.state);
+      if (state) this.doorLocks.set(doorId, state);
+    }
+    const legacy = this.fallbackData.smart_lock_state;
+    this.legacyMainLock = legacy ? { ...legacy, doorId: LEGACY_DOOR_ID } : null;
+  }
+
+  /** PostgreSQL is the authority: its rows replace the startup view; local-only doors are copied up (first run). */
+  private async loadDoorLockStates(): Promise<void> {
+    if (!this.pgPool) return;
+    const pool = this.pgPool;
+    const rows = (await pool.query(`SELECT "doorId", state FROM door_lock_states`)).rows;
+    const legacy = (await pool.query(`SELECT * FROM smart_lock_state ORDER BY "lastActionAt" DESC NULLS LAST LIMIT 1`)).rows[0];
+    const fromPg = new Map<string, SmartLockStateRecord>();
+    for (const row of rows) {
+      const state = parseDoorLockState(String(row.doorId), row.state);
+      if (state) fromPg.set(String(row.doorId), state);
+      else console.warn(`[PostgreSQL] Bỏ qua trạng thái khóa không đọc được của cửa ${String(row.doorId).slice(0, 32)}.`);
+    }
+    // Kept from memory: doors saved by this process (their write to PostgreSQL
+    // is queued behind the migration) and doors only the local store knows
+    // (first run on PostgreSQL; door "main" not when PostgreSQL has the legacy row).
+    const keep = [...this.doorLocks].filter(([doorId]) =>
+      this.doorLocksSavedHere.has(doorId) || (!fromPg.has(doorId) && !(doorId === LEGACY_DOOR_ID && legacy)));
+    for (const doorId of this.doorLocksDeletedHere) fromPg.delete(doorId); // their DELETE is queued too
+    this.doorLocks = fromPg;
+    if (legacy && !this.legacyMainSavedHere && !this.doorLocksSavedHere.has(LEGACY_DOOR_ID)) this.legacyMainLock = rowToLegacyLockState(legacy);
+    // Not awaited: the writes wait for the end of this migration (pgSchemaSettled).
+    for (const [doorId, state] of keep) void this.saveDoorLockState(doorId, state);
+    const copied = keep.filter(([doorId]) => !this.doorLocksSavedHere.has(doorId)).length;
+    if (copied) console.log(`[PostgreSQL] Đã chuyển trạng thái khóa của ${copied} cửa từ bộ lưu cục bộ.`);
+  }
+
+  /**
+   * Lock state of one door. Door "main" without a door_lock_states row reads
+   * the legacy smart_lock_state row; when both exist the newer lastActionAt
+   * wins (ties: the door row), so a state written by the previous release
+   * after a rollback is not hidden by an older door row. Unknown door (or a
+   * malformed id): `fallback` with the doorId set.
+   */
+  getDoorLockState(doorId: string, fallback: SmartLockStateRecord): SmartLockStateRecord {
+    if (!isDoorId(doorId)) return { ...fallback };
+    const row = this.doorLocks.get(doorId);
+    if (doorId === LEGACY_DOOR_ID && this.legacyMainLock) {
+      const legacy: SmartLockStateRecord = { ...fallback, ...this.legacyMainLock, doorId };
+      if (!row || String(legacy.lastActionAt || "") > String(row.lastActionAt || "")) return legacy;
+    }
+    return row ? { ...row } : { ...fallback, doorId };
+  }
+
+  /** Every door with a stored state (door "main" also from the legacy row), by doorId. */
+  listDoorLockStates(): SmartLockStateRecord[] {
+    const ids = new Set(this.doorLocks.keys());
+    if (this.legacyMainLock) ids.add(LEGACY_DOOR_ID);
+    return [...ids].sort().map((doorId) => {
+      const known = this.doorLocks.get(doorId) || this.legacyMainLock!;
+      return this.getDoorLockState(doorId, known);
+    });
+  }
+
+  /**
+   * Store one door's lock state. Resolves true once the authority has it
+   * (PostgreSQL when active, else the local store); false for an invalid
+   * doorId/state (nothing written) or a failed write. Never rejects. Door
+   * "main" also writes the legacy smart_lock_state row in the same
+   * transaction. The in-memory view changes immediately (the door's state is
+   * a fact of the moment, not of the write).
+   */
+  saveDoorLockState(doorId: string, state: SmartLockStateRecord): Promise<boolean> {
+    const { state: clean, error } = normalizeDoorLockState(doorId, state);
+    if (!clean) {
+      console.warn(`[DoorLock] Từ chối lưu trạng thái khóa (${error}).`);
+      return Promise.resolve(false);
+    }
+    this.doorLocks.set(doorId, clean);
+    this.doorLocksSavedHere.add(doorId);
+    this.doorLocksDeletedHere.delete(doorId);
+    if (doorId === LEGACY_DOOR_ID) this.legacyMainLock = { ...clean };
+    const updatedAt = new Date().toISOString();
+    const write = this.doorLockWrites.then(() => this.writeDoorLockState(clean, updatedAt));
+    this.doorLockWrites = write.catch(() => {});
+    return write.catch((err: any) => {
+      console.error("[DoorLock] Lỗi lưu trạng thái khóa:", err?.message);
+      return false;
+    });
+  }
+
+  /** Remove a door's stored state (orphan cleanup after an admin removes the door). Door "main" cannot be removed. */
+  deleteDoorLockState(doorId: string): Promise<boolean> {
+    if (!isDoorId(doorId) || doorId === LEGACY_DOOR_ID) return Promise.resolve(false);
+    this.doorLocks.delete(doorId);
+    this.doorLocksSavedHere.delete(doorId);
+    this.doorLocksDeletedHere.add(doorId);
+    const write = this.doorLockWrites.then(() => this.removeDoorLockState(doorId));
+    this.doorLockWrites = write.catch(() => {});
+    return write.catch((err: any) => {
+      console.error("[DoorLock] Lỗi xoá trạng thái khóa:", err?.message);
+      return false;
+    });
+  }
+
+  private async writeDoorLockState(state: SmartLockStateRecord & { doorId: string }, updatedAt: string): Promise<boolean> {
+    const json = JSON.stringify(state);
+    const main = state.doorId === LEGACY_DOOR_ID;
+    let authoritative: boolean | null = null;
+    if (this.pgPool && this.isPostgres) {
+      await this.pgSchemaSettled;
+      authoritative = this.pgDoorLockStatesReady ? await this.writeDoorLockStatePg(state, json, updatedAt) : false;
+      if (!this.pgDoorLockStatesReady) console.warn("[PostgreSQL] Bảng door_lock_states chưa sẵn sàng; chưa lưu trạng thái khóa.");
+    }
+    const local = this.writeDoorLockStateLocal(state, json, updatedAt, main);
+    return authoritative ?? local;
+  }
+
+  private async writeDoorLockStatePg(state: SmartLockStateRecord & { doorId: string }, json: string, updatedAt: string): Promise<boolean> {
+    const client = await this.pgPool!.connect();
+    try {
+      await client.query("BEGIN");
+      await client.query(
+        `INSERT INTO door_lock_states ("doorId", state, "updatedAt") VALUES ($1, $2::jsonb, $3)
+         ON CONFLICT ("doorId") DO UPDATE SET state = EXCLUDED.state, "updatedAt" = EXCLUDED."updatedAt"`,
+        [state.doorId, json, updatedAt],
+      );
+      if (state.doorId === LEGACY_DOOR_ID) {
+        await client.query(
+          `INSERT INTO smart_lock_state (
+             "lockId", "doorName", state, "isLocked", "batteryLevel", "signalDbm",
+             "firmwareVersion", "lastActionAt", "lastActionBy", "autoRelockSeconds", status
+           ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+           ON CONFLICT ("lockId") DO UPDATE SET
+             "doorName" = EXCLUDED."doorName", state = EXCLUDED.state, "isLocked" = EXCLUDED."isLocked",
+             "batteryLevel" = EXCLUDED."batteryLevel", "signalDbm" = EXCLUDED."signalDbm",
+             "firmwareVersion" = EXCLUDED."firmwareVersion", "lastActionAt" = EXCLUDED."lastActionAt",
+             "lastActionBy" = EXCLUDED."lastActionBy", "autoRelockSeconds" = EXCLUDED."autoRelockSeconds", status = EXCLUDED.status`,
+          [
+            state.lockId, state.doorName, state.state, state.isLocked, state.batteryLevel, state.signalDbm,
+            state.firmwareVersion, state.lastActionAt, state.lastActionBy, state.autoRelockSeconds, state.status,
+          ],
+        );
+      }
+      await client.query("COMMIT");
+      return true;
+    } catch (err: any) {
+      await client.query("ROLLBACK").catch(() => {});
+      console.error(`[PostgreSQL] Lỗi lưu trạng thái khóa cửa (${err?.code || "?"}): ${err?.message}`);
+      return false;
+    } finally {
+      client.release();
+    }
+  }
+
+  private writeDoorLockStateLocal(state: SmartLockStateRecord & { doorId: string }, json: string, updatedAt: string, main: boolean): boolean {
+    if (this.isNativeSqlite && this.db) {
+      try {
+        this.db.exec("BEGIN IMMEDIATE");
+      } catch (err: any) {
+        console.error("[SQLite] Lỗi lưu trạng thái khóa cửa:", err?.message);
+        return false;
+      }
+      try {
+        this.db.prepare(
+          `INSERT INTO door_lock_states (doorId, state, updatedAt) VALUES (?, ?, ?)
+           ON CONFLICT(doorId) DO UPDATE SET state = excluded.state, updatedAt = excluded.updatedAt`,
+        ).run(state.doorId, json, updatedAt);
+        if (main) {
+          this.db.prepare(
+            `INSERT INTO smart_lock_state (
+               lockId, doorName, state, isLocked, batteryLevel, signalDbm, firmwareVersion,
+               lastActionAt, lastActionBy, autoRelockSeconds, status
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT(lockId) DO UPDATE SET
+               doorName = excluded.doorName, state = excluded.state, isLocked = excluded.isLocked,
+               batteryLevel = excluded.batteryLevel, signalDbm = excluded.signalDbm,
+               firmwareVersion = excluded.firmwareVersion, lastActionAt = excluded.lastActionAt,
+               lastActionBy = excluded.lastActionBy, autoRelockSeconds = excluded.autoRelockSeconds, status = excluded.status`,
+          ).run(
+            state.lockId, state.doorName, state.state, state.isLocked ? 1 : 0, state.batteryLevel, state.signalDbm,
+            state.firmwareVersion, state.lastActionAt, state.lastActionBy, state.autoRelockSeconds, state.status,
+          );
+        }
+        this.db.exec("COMMIT");
+        return true;
+      } catch (err: any) {
+        try { this.db.exec("ROLLBACK"); } catch {}
+        console.error("[SQLite] Lỗi lưu trạng thái khóa cửa:", err?.message);
+        return false;
+      }
+    }
+    const staged = {
+      ...this.fallbackData,
+      door_lock_states: { ...(this.fallbackData.door_lock_states || {}), [state.doorId]: { state, updatedAt } },
+      // The legacy key keeps its previous-release shape (no doorId).
+      ...(main ? { smart_lock_state: (({ doorId: _door, ...legacy }) => legacy)(state) } : {}),
+    };
+    try {
+      this.writeFallback(staged);
+    } catch (err: any) {
+      console.error("[JSON] Lỗi lưu trạng thái khóa cửa:", err?.message);
+      return false;
+    }
+    this.fallbackData = staged;
+    return true;
+  }
+
+  private async removeDoorLockState(doorId: string): Promise<boolean> {
+    let authoritative: boolean | null = null;
+    if (this.pgPool && this.isPostgres) {
+      await this.pgSchemaSettled;
+      try {
+        if (!this.pgDoorLockStatesReady) throw new Error("door_lock_states not ready");
+        await this.pgPool.query(`DELETE FROM door_lock_states WHERE "doorId" = $1`, [doorId]);
+        authoritative = true;
+      } catch (err: any) {
+        console.error("[PostgreSQL] Lỗi xoá trạng thái khóa cửa:", err?.message);
+        authoritative = false;
+      }
+    }
+    let local = true;
+    if (this.isNativeSqlite && this.db) {
+      try {
+        this.db.prepare("DELETE FROM door_lock_states WHERE doorId = ?").run(doorId);
+      } catch (err: any) {
+        console.error("[SQLite] Lỗi xoá trạng thái khóa cửa:", err?.message);
+        local = false;
+      }
+    } else if (this.fallbackData.door_lock_states?.[doorId]) {
+      const { [doorId]: _removed, ...rest } = this.fallbackData.door_lock_states;
+      const staged = { ...this.fallbackData, door_lock_states: rest };
+      try {
+        this.writeFallback(staged);
+        this.fallbackData = staged;
+      } catch (err: any) {
+        console.error("[JSON] Lỗi xoá trạng thái khóa cửa:", err?.message);
+        local = false;
+      }
+    }
+    return authoritative ?? local;
   }
 
   // ================= WEBHOOK CONFIG =================

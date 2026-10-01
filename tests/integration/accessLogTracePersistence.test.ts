@@ -153,16 +153,16 @@ const STARTUP_FAILURE = /Lỗi khởi tạo bảng|Lỗi đồng bộ dữ liệ
 
 const EXPECTED_T1 = {
   id: "LOG-T1", timestamp: "2026-09-26T03:00:05.000Z", type: "ENTRY", status: "GRANTED",
-  capturedAt: "2026-09-26T03:00:01.250Z", trackId: "entry-000017", recordingChannel: "2201",
+  capturedAt: "2026-09-26T03:00:01.250Z", trackId: "entry-000017", recordingChannel: "2201", gateId: "entry",
 };
 
 function assertRoundTrip(out: any) {
   assert.deepEqual(out.t1, EXPECTED_T1);
   assert.deepEqual(out.t2, {
     id: "LOG-T2", timestamp: "2026-09-26T03:00:06.000Z", type: "EXIT", status: "DENIED",
-    capturedAt: "2026-09-26T03:00:02.000Z", trackId: "exit-000003", recordingChannel: "501",
+    capturedAt: "2026-09-26T03:00:02.000Z", trackId: "exit-000003", recordingChannel: "501", gateId: "exit",
   });
-  assert.deepEqual(out.bad, { id: "LOG-BAD", timestamp: "2026-09-26T03:00:05.000Z", type: "ENTRY", status: "GRANTED" },
+  assert.deepEqual(out.bad, { id: "LOG-BAD", timestamp: "2026-09-26T03:00:05.000Z", type: "ENTRY", status: "GRANTED", gateId: "entry" },
     "invalid trace values are dropped, the event is kept");
   assert.equal(out.queryT1.trackId, "entry-000017");
   assert.equal(out.queryT1.capturedAt, "2026-09-26T03:00:01.250Z");
@@ -238,7 +238,7 @@ describe("PostgreSQL: access-log trace migration and persistence", () => {
     assert.equal(afterRow.trackId, null);
     assert.equal(afterRow.recordingChannel, null);
 
-    assert.deepEqual(r.out.legacy, { id: "LOG-LEGACY-1", timestamp: "2026-09-20T01:02:03.000Z", type: "EXIT", status: "DENIED" });
+    assert.deepEqual(r.out.legacy, { id: "LOG-LEGACY-1", timestamp: "2026-09-20T01:02:03.000Z", type: "EXIT", status: "DENIED", gateId: "exit" });
     assert.equal(r.out.queryLegacy.capturedAt, undefined);
     assert.deepEqual(r.out.strangerLegacyEmbedding, [0.6, 0.8], "legacy embedding still decodes");
   });
@@ -293,7 +293,7 @@ describe("PostgreSQL: access-log trace migration and persistence", () => {
     const r = await boot("read");
     assert.equal(r.code, 0, r.stderr.slice(-2000));
     assert.doesNotMatch(r.stdout + r.stderr, STARTUP_FAILURE);
-    assert.deepEqual(r.out.t1, { id: "LOG-T1", timestamp: "2026-09-26T03:00:05.000Z", type: "ENTRY", status: "GRANTED" },
+    assert.deepEqual(r.out.t1, { id: "LOG-T1", timestamp: "2026-09-26T03:00:05.000Z", type: "ENTRY", status: "GRANTED", gateId: "entry" },
       "dropping the columns loses only the trace, never the event");
     const again = await boot("read");
     assert.equal(again.code, 0, again.stderr.slice(-2000));
@@ -327,7 +327,7 @@ describe("SQLite: access-log trace migration and persistence", () => {
     assert.equal(first.out.rywMeta, 10);
     assert.equal(first.out.rywStranger, 10);
     assertRoundTrip(first.out);
-    assert.deepEqual(first.out.legacy, { id: "LOG-LEGACY-1", timestamp: "2026-09-20T01:02:03.000Z", type: "EXIT", status: "DENIED" });
+    assert.deepEqual(first.out.legacy, { id: "LOG-LEGACY-1", timestamp: "2026-09-20T01:02:03.000Z", type: "EXIT", status: "DENIED", gateId: "exit" });
     assert.deepEqual(first.out.strangerLegacyEmbedding, [0.6, 0.8]);
 
     const second = await runChild({ DATABASE_URL: "", DATA_DIR: dataDir, PHASE: "read" });
@@ -337,7 +337,8 @@ describe("SQLite: access-log trace migration and persistence", () => {
     const inspect = new DatabaseSync(dbFile);
     try {
       const cols = (inspect.prepare("PRAGMA table_info(access_logs)").all() as Array<{ name: string }>).map((c) => c.name);
-      assert.deepEqual(cols.slice(-3), ["capturedAt", "trackId", "recordingChannel"]);
+      // The trace columns, then the N-gate wave's gateId (appended after them by its own migration).
+      assert.deepEqual(cols.slice(-4), ["capturedAt", "trackId", "recordingChannel", "gateId"]);
       const legacy = inspect.prepare("SELECT photoSnapshot, reason, faceEmbeddingModelTag FROM access_logs WHERE id = 'LOG-LEGACY-1'").get();
       assert.deepEqual({ ...legacy }, { photoSnapshot: "data:image/jpeg;base64,/9j/legacy", reason: "legacy stranger", faceEmbeddingModelTag: "arcface_legacy" });
       assert.equal((inspect.prepare("SELECT count(*) AS n FROM access_logs WHERE id = 'LOG-DUP'").get() as any).n, 1);

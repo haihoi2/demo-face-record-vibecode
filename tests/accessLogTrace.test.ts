@@ -161,7 +161,8 @@ describe("SQLite: database from the previous release", () => {
     const meta = await db.getAccessLogMetaById(LEGACY_ROW.id);
     assert.deepEqual(
       { ...meta },
-      { id: LEGACY_ROW.id, timestamp: LEGACY_ROW.timestamp, type: "EXIT", status: "DENIED", capturedAt: undefined, trackId: undefined, recordingChannel: undefined },
+      { id: LEGACY_ROW.id, timestamp: LEGACY_ROW.timestamp, type: "EXIT", status: "DENIED", capturedAt: undefined, trackId: undefined, recordingChannel: undefined, gateId: "exit" },
+      "gateId is derived from type for a row written before gate ids (N-gate wave)",
     );
     const full = await db.getAccessLogById(LEGACY_ROW.id);
     assert.equal(full?.photoSnapshot, LEGACY_ROW.photoSnapshot, "image untouched");
@@ -192,7 +193,7 @@ describe("SQLite: trace round trip", () => {
   it("getAccessLogMetaById returns the trace", async () => {
     assert.deepEqual({ ...(await db.getAccessLogMetaById("LOG-T1")) }, {
       id: "LOG-T1", timestamp: "2026-09-26T03:00:05.000Z", type: "ENTRY", status: "GRANTED",
-      capturedAt: "2026-09-26T03:00:01.250Z", trackId: "entry-000017", recordingChannel: "2201",
+      capturedAt: "2026-09-26T03:00:01.250Z", trackId: "entry-000017", recordingChannel: "2201", gateId: "entry",
     });
     assert.equal(await db.getAccessLogMetaById("LOG-NOPE"), undefined);
   });
@@ -295,10 +296,10 @@ describe("JSON fallback (SQLite unavailable)", () => {
       assert.deepEqual([out.saved, out.replay, out.bad], [true, true, true]);
       assert.deepEqual(out.meta, {
         id: "LOG-J1", timestamp: "2026-09-26T03:00:05.000Z", type: "EXIT", status: "DENIED",
-        capturedAt: "2026-09-26T03:00:01.000Z", trackId: "exit-1", recordingChannel: "501",
+        capturedAt: "2026-09-26T03:00:01.000Z", trackId: "exit-1", recordingChannel: "501", gateId: "exit",
       });
-      assert.deepEqual(out.legacy, { id: LEGACY_ROW.id, timestamp: LEGACY_ROW.timestamp, type: "EXIT", status: "DENIED" });
-      assert.deepEqual(out.bad2, { id: "LOG-J2", timestamp: "2026-09-26T03:00:05.000Z", type: "EXIT", status: "DENIED" });
+      assert.deepEqual(out.legacy, { id: LEGACY_ROW.id, timestamp: LEGACY_ROW.timestamp, type: "EXIT", status: "DENIED", gateId: "exit" });
+      assert.deepEqual(out.bad2, { id: "LOG-J2", timestamp: "2026-09-26T03:00:05.000Z", type: "EXIT", status: "DENIED", gateId: "exit" });
       assert.equal(out.query.trackId, "exit-1");
       assert.equal(out.query.photoSnapshot, "stored");
       assert.equal(out.page.recordingChannel, "501");

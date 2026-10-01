@@ -247,12 +247,14 @@ export async function readBackShadowScenario(db: Db): Promise<Record<string, any
   };
 }
 
+// The rows are written with the legacy direction spelling ("ENTRY"/"EXIT");
+// since the N-gate wave they are stored and read as gate ids "entry"/"exit".
 const SUMMARY_ENTRY = {
-  gate: "ENTRY", since: "2026-09-29T00:00:00.000Z", decisions: 2, employees: 1, strangers: 0, insufficient: 1, framesUsedZero: 1,
+  gate: "entry", since: "2026-09-29T00:00:00.000Z", decisions: 2, employees: 1, strangers: 0, insufficient: 1, framesUsedZero: 1,
   agree: 1, shadowOnly: 0, legacyOnly: 0, identityMismatch: 0, none: 1, decisionLatencyP50Ms: 500,
 };
 const SUMMARY_EXIT = {
-  gate: "EXIT", since: "2026-09-29T00:00:00.000Z", decisions: 9, employees: 5, strangers: 3, insufficient: 1, framesUsedZero: 2,
+  gate: "exit", since: "2026-09-29T00:00:00.000Z", decisions: 9, employees: 5, strangers: 3, insufficient: 1, framesUsedZero: 2,
   agree: 4, shadowOnly: 1, legacyOnly: 1, identityMismatch: 1, none: 2, decisionLatencyP50Ms: 2500,
 };
 const SUMMARY_LONG_GATE = {
@@ -297,7 +299,7 @@ export function assertShadowScenario(out: Record<string, any>, assert: Assert): 
   assert.equal(out.unknownGate, 0);
   assert.match(out.badSince, /invalid sinceIso/);
   assert.deepEqual(out.sr6, {
-    id: "SR-6", gate: "EXIT", trackId: "exit-000042", outcome: "stranger", fusedCosine: 0.71, margin: 0.2,
+    id: "SR-6", gate: "exit", trackId: "exit-000042", outcome: "stranger", fusedCosine: 0.71, margin: 0.2,
     runnerUpEmployeeId: "EMP-B", runnerUpCosine: 0.51, basis: "rejected-ambiguous", fusionBasis: "rejected-ambiguous",
     meanCheckRefused: true, framesSeen: 9, framesUsed: 2, firstSeenAt: AT("00.000"), decidedAt: AT("38.000"),
     legacyLogId: "LOG-1", legacyStatus: "GRANTED", legacyEmployeeId: "EMP-A", agreement: "legacy-only", createdAt: AT("59.000"),
@@ -306,7 +308,7 @@ export function assertShadowScenario(out: Record<string, any>, assert: Assert): 
   assert.deepEqual(out.srE2keys, ["agreement", "basis", "createdAt", "decidedAt", "firstSeenAt", "framesSeen", "framesUsed", "gate", "id", "outcome", "trackId"],
     "absent optionals stay absent");
 
-  assert.deepEqual(out.summary, [SUMMARY_ENTRY, SUMMARY_EXIT, SUMMARY_LONG_GATE], "per-gate counts and the p50 of (decidedAt - firstUsableAt) over employee outcomes");
+  assert.deepEqual(out.summary, [SUMMARY_LONG_GATE, SUMMARY_ENTRY, SUMMARY_EXIT], "bytewise gate order ('G' < 'e'); per-gate counts and the p50 of (decidedAt - firstUsableAt) over employee outcomes");
   assert.deepEqual(out.summarySince20, [
     { ...SUMMARY_ENTRY, since: AT("20.000"), decisions: 1, employees: 0, agree: 0, decisionLatencyP50Ms: null },
     { ...SUMMARY_EXIT, since: AT("20.000"), decisions: 7, employees: 3, agree: 3, identityMismatch: 0, decisionLatencyP50Ms: 5000 },
