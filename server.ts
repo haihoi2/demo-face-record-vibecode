@@ -28,6 +28,7 @@ import {
   OrgCatalogRecord,
   OrgEntryRecord,
   AccessLogQuery,
+  SmartLockStateRecord,
 } from "./src/server/db";
 import { envNumber } from "./src/server/env";
 import {
@@ -54,6 +55,7 @@ import {
   playbackFailure,
   playbackFfmpegArgs,
   playbackUrl,
+  recordingChannelFor,
   recordingConfigFromEnv,
   recordingWindow,
   recordingWindowFailure,
@@ -84,6 +86,20 @@ import {
   ROLE_LABELS,
 } from "./src/server/auth";
 import { STRANGER_DEEP_LINK_HASH } from "./src/types";
+import {
+  doorIdOf,
+  gateIdForLegacyRow,
+  gatesFromStoredConfig,
+  isDoorId,
+  isGateDirection,
+  isGateId,
+  legacyDirectionOf,
+  LEGACY_DOOR_ID,
+  LEGACY_GATE_IDS,
+  MAX_DOORS,
+  MAX_GATES,
+  type GateDirection,
+} from "./src/server/gates";
 import type {
   FaceObservation,
   FusionDecision,
@@ -879,7 +895,7 @@ function sanitizePublicJson(value: any): any {
   if (typeof value.id === "string" && value.status && value.lockAction && value.timestamp) {
     const imageUrl = `/api/logs/${encodeURIComponent(value.id)}/image`;
     return {
-      id: value.id, timestamp: value.timestamp, type: value.type, status: value.status,
+      id: value.id, timestamp: value.timestamp, type: value.type, gateId: gateIdForLegacyRow(value), status: value.status,
       employeeId: value.employeeId, employeeName: value.employeeName, employeeCode: value.employeeCode,
       department: value.department, confidence: value.confidence, livenessScore: value.livenessScore,
       lockAction: value.lockAction, doorName: value.doorName, reason: value.reason,
@@ -1011,6 +1027,8 @@ export interface AccessLogRecord {
   lockAction: string;
   doorName: string;
   reason?: string;
+  /** Gate id (N-gate wave); older rows have none - read them with gateIdForLegacyRow(). */
+  gateId?: string;
   faceEmbedding?: number[];
   faceEmbeddingDims?: number;
   faceEmbeddingModelTag?: string;
@@ -1195,6 +1213,99 @@ const DEFAULT_WEBHOOK_CONFIG = {
   strangerCooldownSeconds: DEFAULT_STRANGER_WEBHOOK_CONFIG.strangerCooldownSeconds,
 };
 
+// ---- Doors (N-gate wave; owner decision 4: each gate opens its own door) ----
+// The door controller config keeps its legacy top-level fields - they ARE door
+// "main", the single door of an existing installation - and gains `doors`
+// (door "main" first, mirrored from the top level). A gate names the door its
+// grants open (doorIdOf); "main" is the fallback. Tokens never leave the
+// server: every response goes through sanitizePublicJson (apiToken ->
+// apiTokenConfigured, URLs redacted).
+const DOOR_LABEL_MAX = 80;
+const DOOR_AUTH_TYPES: ReadonlyArray<DoorControllerConfigRecord["authHeaderType"]> = ["BEARER", "API_KEY", "CUSTOM_HEADER", "QUERY_PARAM"];
+const DOOR_METHODS: ReadonlyArray<DoorControllerConfigRecord["openMethod"]> = ["POST", "GET", "PUT"];
+
+/** One door and its controller. */
+type DoorRecord = DoorControllerConfigRecord & { id: string; label: string };
+/** The door controller config as the server holds it: legacy fields (= door "main") plus every door. */
+type DoorControllerState = DoorControllerConfigRecord & { doors: DoorRecord[] };
+
+/** Exactly the controller fields of a door (drops id, label, doors and anything else). */
+function pickDoorFields(src: DoorControllerConfigRecord): DoorControllerConfigRecord {
+  return {
+    enabled: Boolean(src.enabled),
+    apiUrl: String(src.apiUrl || ""),
+    apiToken: String(src.apiToken || ""),
+    authHeaderType: src.authHeaderType,
+    customHeaderName: src.customHeaderName,
+    openMethod: src.openMethod,
+    closeMethod: src.closeMethod,
+    openPayloadTemplate: src.openPayloadTemplate,
+    closePayloadTemplate: src.closePayloadTemplate,
+    pulseDurationSeconds: src.pulseDurationSeconds,
+    triggerOnFaceRecognition: src.triggerOnFaceRecognition,
+    triggerOnManualUnlock: src.triggerOnManualUnlock,
+  };
+}
+
+/**
+ * The controller fields of a door from a request body. Absent fields keep
+ * `current` (the client never sees a token, so it cannot echo one back: an
+ * absent apiToken keeps the stored token, "" clears it - as before).
+ */
+function doorFieldsFrom(body: any, current: DoorControllerConfigRecord): DoorControllerConfigRecord {
+  const b = body && typeof body === "object" ? body : {};
+  return {
+    enabled: typeof b.enabled === "boolean" ? b.enabled : current.enabled,
+    apiUrl: typeof b.apiUrl === "string" ? b.apiUrl.trim() : current.apiUrl,
+    apiToken: typeof b.apiToken === "string" ? b.apiToken.trim() : current.apiToken,
+    authHeaderType: DOOR_AUTH_TYPES.includes(b.authHeaderType) ? b.authHeaderType : current.authHeaderType,
+    customHeaderName: typeof b.customHeaderName === "string" ? b.customHeaderName.trim() : current.customHeaderName,
+    openMethod: DOOR_METHODS.includes(b.openMethod) ? b.openMethod : current.openMethod,
+    closeMethod: DOOR_METHODS.includes(b.closeMethod) ? b.closeMethod : current.closeMethod,
+    openPayloadTemplate: typeof b.openPayloadTemplate === "string" ? b.openPayloadTemplate : current.openPayloadTemplate,
+    closePayloadTemplate: typeof b.closePayloadTemplate === "string" ? b.closePayloadTemplate : current.closePayloadTemplate,
+    pulseDurationSeconds: typeof b.pulseDurationSeconds === "number" ? b.pulseDurationSeconds : current.pulseDurationSeconds,
+    triggerOnFaceRecognition: typeof b.triggerOnFaceRecognition === "boolean" ? b.triggerOnFaceRecognition : current.triggerOnFaceRecognition,
+    triggerOnManualUnlock: typeof b.triggerOnManualUnlock === "boolean" ? b.triggerOnManualUnlock : current.triggerOnManualUnlock,
+  };
+}
+
+function doorLabelFrom(raw: unknown, fallback: string): string {
+  return optionalTrimmedString(raw)?.slice(0, DOOR_LABEL_MAX) || fallback;
+}
+
+/**
+ * The server's door list from a stored config. Door "main" is always first and
+ * always mirrors the top-level fields; its label is the main lock's doorName.
+ * Other doors come from the stored `doors` - or, when the store does not carry
+ * them, from `previous` (the in-memory list), so a store that only keeps the
+ * legacy columns cannot make configured doors vanish while the process runs.
+ */
+function normalizeDoorControllerConfig(
+  stored: DoorControllerConfigRecord & { doors?: unknown },
+  previous: DoorControllerState | null
+): DoorControllerState {
+  const top = pickDoorFields({ ...DEFAULT_DOOR_CONTROLLER_CONFIG, ...stored });
+  const doors: DoorRecord[] = [{ ...top, id: LEGACY_DOOR_ID, label: smartLockState?.doorName || LEGACY_DOOR_ID }];
+  const rawDoors: unknown[] = Array.isArray(stored?.doors) ? stored.doors : previous?.doors || [];
+  for (const d of rawDoors) {
+    if (!d || typeof d !== "object") continue;
+    const id = (d as any).id;
+    if (!isDoorId(id) || id === LEGACY_DOOR_ID || doors.some((x) => x.id === id) || doors.length >= MAX_DOORS) continue;
+    doors.push({
+      ...pickDoorFields({ ...DEFAULT_DOOR_CONTROLLER_CONFIG, ...(d as DoorControllerConfigRecord) }),
+      id,
+      label: doorLabelFrom((d as any).label, id),
+    });
+  }
+  return { ...top, doors };
+}
+
+/** Re-reads the stored config (only after `doorControllerConfig` below is initialised). */
+function loadDoorControllerConfig(): DoorControllerState {
+  return normalizeDoorControllerConfig(db.getDoorControllerConfig(DEFAULT_DOOR_CONTROLLER_CONFIG), doorControllerConfig);
+}
+
 // Persistent instances loaded from database (PostgreSQL / SQLite)
 let employees: EmployeeRecord[] = db.getEmployees(DEMO_DATA_ENABLED ? DEFAULT_EMPLOYEES : []);
 refreshEmployeeMergeMap();
@@ -1203,7 +1314,7 @@ let mobileNotifications: MobileNotificationRecord[] = db.getNotifications(DEMO_D
 let smartLockState = db.getSmartLockState(DEFAULT_SMART_LOCK_STATE);
 let webhookConfig = db.getWebhookConfig(DEFAULT_WEBHOOK_CONFIG);
 let webhookLogs: WebhookLogRecord[] = db.getWebhookLogs();
-let doorControllerConfig = db.getDoorControllerConfig(DEFAULT_DOOR_CONTROLLER_CONFIG);
+let doorControllerConfig: DoorControllerState = normalizeDoorControllerConfig(db.getDoorControllerConfig(DEFAULT_DOOR_CONTROLLER_CONFIG), null);
 let doorApiLogs: DoorApiLogRecord[] = db.getDoorApiLogs();
 // =========================================================================
 // MULTI-STREAM GATE CONFIG NORMALISATION
@@ -1243,10 +1354,6 @@ const CAMERA_RESOLUTIONS: ReadonlyArray<NonNullable<GateStreamSourceRecord["reso
 const STREAM_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 const MAX_STREAMS_PER_GATE = 16;
 
-function normalizeGateKey(value: unknown): "entry" | "exit" {
-  return String(value || "entry").toLowerCase() === "exit" ? "exit" : "entry";
-}
-
 function isRtspUrl(value: unknown): boolean {
   return typeof value === "string" && value.trim().toLowerCase().startsWith("rtsp://");
 }
@@ -1259,7 +1366,8 @@ function rtspChannelSegment(url: unknown): string | null {
   return last && /^[A-Za-z0-9._-]{1,40}$/.test(last) ? last : null;
 }
 
-function deriveStreamId(gateKey: "entry" | "exit", rtspUrl: unknown, fallbackSuffix: string): string {
+/** Stream ids are prefixed with the gate id ("exit-501", "side-door-primary"). */
+function deriveStreamId(gateKey: string, rtspUrl: unknown, fallbackSuffix: string): string {
   const channel = rtspChannelSegment(rtspUrl);
   return `${gateKey}-${channel || fallbackSuffix}`;
 }
@@ -1292,7 +1400,7 @@ function sanitizeStreamMediaFields(raw: any): GateLegacyStreamFields {
 function sanitizeStreamSource(
   raw: any,
   index: number,
-  gateKey: "entry" | "exit",
+  gateKey: string,
   fallbackLabel: string
 ): GateStreamSourceRecord {
   const media = sanitizeStreamMediaFields(raw);
@@ -1312,7 +1420,7 @@ function sanitizeStreamSource(
 }
 
 /** Builds the single stream an old (streams-less) gate config implies. */
-function streamFromLegacyGateFields(gate: GateStreamConfigRecord, gateKey: "entry" | "exit"): GateStreamSourceRecord {
+function streamFromLegacyGateFields(gate: GateStreamConfigRecord, gateKey: string): GateStreamSourceRecord {
   const media = sanitizeStreamMediaFields(gate);
   return {
     id: deriveStreamId(gateKey, media.rtspUrl, "primary"),
@@ -1393,15 +1501,17 @@ function normalizeGateWatchConfig(
 /**
  * Pure normalisation of one gate:
  *   1. missing/empty `streams` -> one stream derived from the legacy fields
- *      (id `${gate}-${rtsp channel}` e.g. `exit-501`, else `${gate}-primary`);
+ *      (id `${gate id}-${rtsp channel}` e.g. `exit-501`, else `${gate id}-primary`);
  *   2. every stream gets id / label / enabled / priority and whitelisted fields;
  *   3. duplicates by id are dropped (first wins), list capped, sorted by priority;
  *   4. the primary stream is mirrored back onto the legacy fields;
  *   5. the backend watch block is filled in (default: disabled, 3 s, 1 frame).
  */
-function normalizeGateConfig(gate: GateStreamConfigRecord): GateStreamConfigRecord {
+function normalizeGateConfig(gate: GateStreamConfigRecord, gateId?: string): GateStreamConfigRecord {
   const gateType: "ENTRY" | "EXIT" = gate.gateType === "EXIT" ? "EXIT" : "ENTRY";
-  const gateKey = gateType.toLowerCase() as "entry" | "exit";
+  // Stream-id prefix = the gate id. Without one (a legacy gate object) it is the
+  // direction's legacy id, so ids such as "exit-501" never change.
+  const gateKey = gateId && isGateId(gateId) ? gateId : gateType.toLowerCase();
   const fallbackLabel = String(gate.name || "").trim();
 
   const rawStreams = Array.isArray(gate.streams) ? gate.streams.filter((s) => s && typeof s === "object") : [];
@@ -1430,18 +1540,119 @@ function normalizeGateConfig(gate: GateStreamConfigRecord): GateStreamConfigReco
   return normalized;
 }
 
-/** Normalises both gates of a (possibly older / partial) persisted config. */
-function normalizeCameraStreamsConfig(config: CameraStreamsConfigRecord): CameraStreamsConfigRecord {
-  const source = config && typeof config === "object" ? config : DEFAULT_CAMERA_STREAMS_CONFIG;
-  return {
-    ...source,
-    entryGate: normalizeGateConfig({ ...(source.entryGate || DEFAULT_CAMERA_STREAMS_CONFIG.entryGate), gateType: "ENTRY" }),
-    exitGate: normalizeGateConfig({ ...(source.exitGate || DEFAULT_CAMERA_STREAMS_CONFIG.exitGate), gateType: "EXIT" }),
-  };
+// ---- N gates (plan 2026-09-29 Part E, contract in src/server/gates.ts) ----
+// The camera config holds `gates` (display order). Gates "entry" and "exit"
+// always exist - they can be disabled, never deleted - and `entryGate` /
+// `exitGate` stay in the object (and in storage) as views of those two, so
+// older clients and a rollback to the previous image keep working.
+const GATE_LABEL_MAX = 64;
+
+/** One configured gate: its streams/watch/pipeline settings plus id, direction, label and door. */
+type GateRecord = GateStreamConfigRecord & {
+  id: string;
+  direction: GateDirection;
+  label?: string;
+  doorId?: string;
+};
+
+/** The in-memory camera config: every gate plus the two legacy views. */
+type CameraConfig = CameraStreamsConfigRecord & {
+  gates: GateRecord[];
+  entryGate: GateRecord;
+  exitGate: GateRecord;
+};
+
+/**
+ * Normalises one gate under a known id and direction. The direction of the two
+ * legacy gates is fixed (entry = ENTRY, exit = EXIT) whatever the stored value.
+ */
+function normalizeGateRecord(raw: unknown, id: string, direction: GateDirection): GateRecord {
+  const src = (raw && typeof raw === "object" ? raw : {}) as Record<string, any>;
+  const dir: GateDirection = legacyDirectionOf(id) ?? direction;
+  const base = normalizeGateConfig({ ...(src as GateStreamConfigRecord), gateType: dir }, id);
+  const out: GateRecord = { ...base, id, direction: dir };
+  const label = optionalTrimmedString(src.label)?.slice(0, GATE_LABEL_MAX);
+  if (label) out.label = label;
+  else delete out.label;
+  if (isDoorId(src.doorId)) out.doorId = src.doorId;
+  else delete out.doorId;
+  return out;
 }
 
-function loadCameraStreamsConfig(): CameraStreamsConfigRecord {
+/** Display name of a gate: label, else the legacy name, else the id. */
+function gateLabelOf(gate: { id: string; label?: string; name?: string }): string {
+  return String(gate.label || gate.name || gate.id);
+}
+
+const reportedDroppedGates = new Set<string>();
+
+/**
+ * Normalises a (possibly older / partial) persisted config. Accepts both the
+ * new `{ gates }` shape and the legacy `{ entryGate, exitGate }` one (gates
+ * wins when both are present); re-creates a missing "entry"/"exit" from the
+ * legacy key or the defaults; keeps the legacy keys as views.
+ */
+function normalizeCameraStreamsConfig(config: unknown): CameraConfig {
+  const source = (config && typeof config === "object" ? config : DEFAULT_CAMERA_STREAMS_CONFIG) as Record<string, any>;
+  // gatesFromStoredConfig is generic over plain records; GateRecord is an interface type.
+  const parsed = gatesFromStoredConfig(source, (g, id, direction) => normalizeGateRecord(g, id, direction) as unknown as Record<string, unknown>);
+  const gates = parsed.gates as unknown as GateRecord[];
+  const dropped = parsed.dropped;
+  for (const reason of dropped) {
+    if (reportedDroppedGates.has(reason)) continue;
+    reportedDroppedGates.add(reason);
+    console.warn(`[Camera Config] Bỏ qua cổng không hợp lệ trong cấu hình đã lưu: ${reason}`);
+  }
+  if (!gates.some((g) => g.id === "entry")) {
+    gates.unshift(normalizeGateRecord(source.entryGate || DEFAULT_CAMERA_STREAMS_CONFIG.entryGate, "entry", "ENTRY"));
+  }
+  if (!gates.some((g) => g.id === "exit")) {
+    const at = gates.findIndex((g) => g.id === "entry") + 1;
+    gates.splice(at, 0, normalizeGateRecord(source.exitGate || DEFAULT_CAMERA_STREAMS_CONFIG.exitGate, "exit", "EXIT"));
+  }
+  // Re-created legacy gates may push a full list over the cap: drop the last added ones.
+  for (let i = gates.length - 1; gates.length > MAX_GATES && i >= 0; i--) {
+    if (!legacyDirectionOf(gates[i].id)) gates.splice(i, 1);
+  }
+  const entryGate = gates.find((g) => g.id === "entry")!;
+  const exitGate = gates.find((g) => g.id === "exit")!;
+  return { ...(source as CameraStreamsConfigRecord), gates, entryGate, exitGate };
+}
+
+function loadCameraStreamsConfig(): CameraConfig {
   return normalizeCameraStreamsConfig(db.getCameraStreamsConfig(DEFAULT_CAMERA_STREAMS_CONFIG));
+}
+
+/** A configured gate by id (case-insensitive for old callers sending "EXIT"); null when unknown/malformed. */
+function gateFromConfig(config: CameraConfig, raw: unknown): GateRecord | null {
+  const id = typeof raw === "string" ? raw.trim().toLowerCase() : "";
+  if (!isGateId(id)) return null;
+  return config.gates.find((g) => g.id === id) || null;
+}
+
+/** The 400 answer for a gate parameter that names no configured gate. Never echoes more than 40 chars. */
+function unknownGateError(raw: unknown, config: CameraConfig = cameraStreamsConfig): string {
+  const shown = typeof raw === "string" ? raw.slice(0, 40) : raw === undefined ? "" : typeof raw;
+  return `Cổng không hợp lệ: "${shown}". Các cổng đã cấu hình: ${config.gates.map((g) => g.id).join(", ")}`;
+}
+
+/** The config with one gate replaced (re-normalised); the gate must already exist. */
+function withGate(config: CameraConfig, gate: GateRecord): CameraConfig {
+  return normalizeCameraStreamsConfig({
+    ...config,
+    gates: config.gates.map((g) => (g.id === gate.id ? normalizeGateRecord(gate, gate.id, gate.direction) : g)),
+  });
+}
+
+/**
+ * Saves a camera config: memory, every store (both `gates` and the legacy
+ * `entryGate`/`exitGate` keys), SSE. Watchers/pipelines are re-synced by the caller.
+ */
+function commitCameraConfig(updated: CameraConfig): CameraConfig {
+  cameraStreamsConfig = updated;
+  db.saveCameraStreamsConfig(updated);
+  broadcastSSE("camera_config_updated", updated);
+  return updated;
 }
 
 /**
@@ -1453,11 +1664,22 @@ function loadCameraStreamsConfig(): CameraStreamsConfigRecord {
  *     values that actually differ from the current primary are applied, so a
  *     stale echo never overrides an edited `streams` list.
  */
-function applyGateConfigPatch(current: GateStreamConfigRecord, patch: any): GateStreamConfigRecord {
-  const base = normalizeGateConfig(current);
+function applyGateConfigPatch(current: GateRecord, patch: any): GateRecord {
+  const base = normalizeGateRecord(current, current.id, current.direction);
   if (!patch || typeof patch !== "object") return base;
 
-  const { streams: patchStreams, gateType: _ignoredGateType, ...rest } = patch;
+  // id and direction are fixed here; the door a gate opens and its pipeline
+  // rollout are admin decisions (PUT /api/gates/:id, /pipeline-mode), never
+  // something this operator route may change - their current values are kept.
+  const {
+    streams: patchStreams,
+    gateType: _ignoredGateType,
+    id: _ignoredId,
+    direction: _ignoredDirection,
+    doorId: _ignoredDoorId,
+    pipelineMode: _ignoredPipelineMode,
+    ...rest
+  } = patch;
   const currentPrimary = pickPrimaryStream(base.streams!);
   const legacyChanges: Partial<GateLegacyStreamFields> = {};
   for (const field of GATE_LEGACY_STREAM_FIELDS) {
@@ -1468,14 +1690,20 @@ function applyGateConfigPatch(current: GateStreamConfigRecord, patch: any): Gate
   const hasLegacyChanges = Object.keys(legacyChanges).length > 0;
 
   const replaced = Array.isArray(patchStreams) && patchStreams.length > 0;
-  const working = normalizeGateConfig({
-    ...base,
-    ...rest,
-    gateType: base.gateType,
-    // A partial `watch` patch ({ enabled: true }) keeps the gate's other watch values.
-    watch: "watch" in rest ? normalizeGateWatchConfig(rest.watch, base.watch) : base.watch,
-    streams: replaced ? patchStreams : base.streams,
-  });
+  const working = normalizeGateRecord(
+    {
+      ...base,
+      ...rest,
+      gateType: base.gateType,
+      doorId: base.doorId,
+      pipelineMode: base.pipelineMode,
+      // A partial `watch` patch ({ enabled: true }) keeps the gate's other watch values.
+      watch: "watch" in rest ? normalizeGateWatchConfig(rest.watch, base.watch) : base.watch,
+      streams: replaced ? patchStreams : base.streams,
+    },
+    base.id,
+    base.direction
+  );
 
   if (!hasLegacyChanges) return working;
 
@@ -1483,10 +1711,10 @@ function applyGateConfigPatch(current: GateStreamConfigRecord, patch: any): Gate
   const streams = working.streams!.map((s) =>
     s.id === primary.id ? { ...s, ...sanitizeStreamMediaFields({ ...s, ...legacyChanges }) } : s
   );
-  return normalizeGateConfig({ ...working, streams });
+  return normalizeGateRecord({ ...working, streams }, working.id, working.direction);
 }
 
-let cameraStreamsConfig: CameraStreamsConfigRecord = loadCameraStreamsConfig();
+let cameraStreamsConfig: CameraConfig = loadCameraStreamsConfig();
 
 // --- AI recognition engine configuration (persisted, see db.getAiRecognitionConfig) ---
 type ServerAiConfig = AiRecognitionConfigRecord;
@@ -1529,8 +1757,8 @@ db.onAiRecognitionConfigLoaded(() => {
 db.onCameraStreamsConfigLoaded(() => {
   cameraStreamsConfig = loadCameraStreamsConfig();
   syncGateWatchers(); // the hydrated row may carry a different gate/watch config
-  const gates = (["entryGate", "exitGate"] as const)
-    .map((k) => `${k}=${cameraStreamsConfig[k].streams.length} luồng`)
+  const gates = cameraStreamsConfig.gates
+    .map((g) => `${g.id}=${(g.streams || []).length} luồng${g.enabled === false ? " (tắt)" : ""}`)
     .join(", ");
   console.log(`[Camera Config] Đã khôi phục cấu hình luồng camera từ PostgreSQL: ${gates}`);
   void auditStoredDestinations().catch(() => {});
@@ -1546,7 +1774,7 @@ db.onSync(() => {
   smartLockState = db.getSmartLockState(DEFAULT_SMART_LOCK_STATE);
   webhookConfig = db.getWebhookConfig(DEFAULT_WEBHOOK_CONFIG);
   webhookLogs = db.getWebhookLogs();
-  doorControllerConfig = db.getDoorControllerConfig(DEFAULT_DOOR_CONTROLLER_CONFIG);
+  doorControllerConfig = loadDoorControllerConfig();
   doorApiLogs = db.getDoorApiLogs();
   cameraStreamsConfig = loadCameraStreamsConfig();
   syncGateWatchers(); // a PostgreSQL rehydrate may carry a different watch config
@@ -2112,11 +2340,14 @@ async function sendEtonWebhook({
   employeeCode,
   scanType,
   timestamp,
+  gateId,
 }: {
   userName: string;
   employeeCode?: string;
   scanType: "ENTRY" | "EXIT";
   timestamp?: string;
+  /** Gate of the event. The title stays per direction; a gate beyond entry/exit is named in the text. */
+  gateId?: string;
 }): Promise<WebhookLogRecord | null> {
   // Always load latest config and auto-heal corrupted or truncated URL
   webhookConfig = db.getWebhookConfig(DEFAULT_WEBHOOK_CONFIG);
@@ -2142,11 +2373,15 @@ async function sendEtonWebhook({
       second: "2-digit",
     });
 
-  // Parameter format requested: "USER - TIMESTAMP"
+  // Parameter format requested: "USER - TIMESTAMP". The two legacy gates keep
+  // exactly that text; any other gate appends its label, since several gates
+  // now share the same direction title.
+  const extraGate = gateId && !legacyDirectionOf(gateId) ? cameraStreamsConfig.gates.find((g) => g.id === gateId) : undefined;
+  const gateSuffix = gateId && !legacyDirectionOf(gateId) ? ` - ${extraGate ? gateLabelOf(extraGate) : gateId}` : "";
   const userText =
-    webhookConfig.includeEmployeeCode && employeeCode
+    (webhookConfig.includeEmployeeCode && employeeCode
       ? `${userName} (${employeeCode}) - ${formattedTime}`
-      : `${userName} - ${formattedTime}`;
+      : `${userName} - ${formattedTime}`) + gateSuffix;
 
   // [[GATE]]: title in attachments
   const gateTitle =
@@ -2494,9 +2729,6 @@ async function sendStrangerWebhook({
   return logEntry;
 }
 
-let autoRelockTimer: NodeJS.Timeout | null = null;
-let countdownInterval: NodeJS.Timeout | null = null;
-
 // SSE Client list. Each connection keeps its own API origin so protected image
 // links remain credentialed and usable when the dashboard and API are split.
 let sseClients: Array<{ res: Response; origin: string }> = [];
@@ -2531,22 +2763,110 @@ function broadcastSSE(eventType: string, data: any) {
 faceWorkerPool.setBroadcastSSE(broadcastSSE);
 faceWorkerPool.initWorkerPool(cameraStreamsConfig.workerThreadsCount || 4);
 
+// ----------------- DOORS: LOCK STATE PER DOOR -----------------
+// Door "main" keeps the legacy smart_lock_state row (`smartLockState`); every
+// other door has its own row in door_lock_states (db.getDoorLockState /
+// saveDoorLockState), cached here. Lock state is display/audit state - the
+// physical command is the controller call - so a store error is logged, never
+// thrown into an unlock.
+const doorLockStates = new Map<string, SmartLockStateRecord>();
+let doorLockStoreWarned = false;
+function warnDoorLockStore(err: unknown) {
+  if (doorLockStoreWarned) return;
+  doorLockStoreWarned = true;
+  console.error("[Door] Không đọc/ghi được trạng thái khóa của cửa phụ:", (err as any)?.message || err);
+}
+
+/** A configured door (null when the id names none). */
+function doorConfigOf(doorId: string): DoorRecord | null {
+  return doorControllerConfig.doors.find((d) => d.id === doorId) || null;
+}
+
+function lockStateOf(doorId: string): SmartLockStateRecord {
+  if (doorId === LEGACY_DOOR_ID) return smartLockState;
+  let state = doorLockStates.get(doorId);
+  if (!state) {
+    const label = doorConfigOf(doorId)?.label || doorId;
+    const defaults: SmartLockStateRecord = {
+      ...DEFAULT_SMART_LOCK_STATE,
+      lockId: `SL-${doorId}`,
+      doorName: label,
+      state: "LOCKED",
+      isLocked: true,
+      lastActionAt: new Date().toISOString(),
+      lastActionBy: "Hệ thống bảo mật tự động",
+      remainingRelockSeconds: 0,
+    };
+    try {
+      state = { ...defaults, ...db.getDoorLockState(doorId, defaults), doorName: label };
+    } catch (err) {
+      warnDoorLockStore(err);
+      state = defaults;
+    }
+    doorLockStates.set(doorId, state);
+  }
+  return state;
+}
+
+function saveLockState(doorId: string, state: SmartLockStateRecord) {
+  if (doorId === LEGACY_DOOR_ID) {
+    db.saveSmartLockState(state);
+    return;
+  }
+  // db.saveDoorLockState resolves false on a failed/refused write and never rejects.
+  try {
+    void Promise.resolve(db.saveDoorLockState(doorId, state))
+      .then((ok) => {
+        if (ok === false) warnDoorLockStore(new Error(`door ${doorId}: state not stored`));
+      })
+      .catch(warnDoorLockStore);
+  } catch (err) {
+    warnDoorLockStore(err);
+  }
+}
+
+/** A lock state as clients see it: the legacy shape plus its door id. */
+function publicLockState(doorId: string, state: SmartLockStateRecord = lockStateOf(doorId)) {
+  return { ...state, doorId };
+}
+
+/**
+ * Door "main" keeps the `lock_state` / `lock_countdown` events older dashboards
+ * listen to; other doors use `door_lock_state` / `door_lock_countdown`, so an
+ * older dashboard never shows another door's state as the main lock's.
+ */
+function broadcastLockState(doorId: string, state: SmartLockStateRecord) {
+  broadcastSSE(doorId === LEGACY_DOOR_ID ? "lock_state" : "door_lock_state", publicLockState(doorId, state));
+}
+
+const doorTimers = new Map<string, { relock: NodeJS.Timeout | null; countdown: NodeJS.Timeout | null }>();
+function clearDoorTimers(doorId: string) {
+  const t = doorTimers.get(doorId);
+  if (!t) return;
+  if (t.relock) clearTimeout(t.relock);
+  if (t.countdown) clearInterval(t.countdown);
+  doorTimers.delete(doorId);
+}
+
 // ----------------- AUTOMATIC DOOR CONTROLLER API DISPATCH -----------------
 async function sendDoorControllerCommand(
   action: "OPEN" | "CLOSE",
-  triggeredBy: string
+  triggeredBy: string,
+  doorId: string = LEGACY_DOOR_ID
 ): Promise<DoorApiLogRecord | null> {
-  doorControllerConfig = db.getDoorControllerConfig(DEFAULT_DOOR_CONTROLLER_CONFIG);
-  if (!doorControllerConfig.enabled) {
+  doorControllerConfig = loadDoorControllerConfig();
+  // The controller of THIS door only; an unknown door has none (fail closed).
+  const door = doorConfigOf(doorId);
+  if (!door || !door.enabled) {
     return null;
   }
 
-  if (!doorControllerConfig.apiUrl || !doorControllerConfig.apiUrl.trim()) {
+  if (!door.apiUrl || !door.apiUrl.trim()) {
     return null;
   }
 
   const startTime = Date.now();
-  const baseUrl = doorControllerConfig.apiUrl.trim();
+  const baseUrl = door.apiUrl.trim();
   let targetUrl = baseUrl;
   // What logs, the door_api_logs row and SSE see: never the token (N1). The
   // token may be appended as ?token= below (QUERY_PARAM auth) or be part of the
@@ -2554,25 +2874,25 @@ async function sendDoorControllerCommand(
   const logUrl = redactedUrl(baseUrl);
 
   // If QUERY_PARAM auth is chosen
-  if (doorControllerConfig.authHeaderType === "QUERY_PARAM" && doorControllerConfig.apiToken) {
+  if (door.authHeaderType === "QUERY_PARAM" && door.apiToken) {
     const separator = targetUrl.includes("?") ? "&" : "?";
-    targetUrl = `${targetUrl}${separator}token=${encodeURIComponent(doorControllerConfig.apiToken.trim())}`;
+    targetUrl = `${targetUrl}${separator}token=${encodeURIComponent(door.apiToken.trim())}`;
   }
 
-  const method = action === "OPEN" ? doorControllerConfig.openMethod : doorControllerConfig.closeMethod;
+  const method = action === "OPEN" ? door.openMethod : door.closeMethod;
   const headers: Record<string, string> = {
     "Content-Type": "application/json",
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) EtonSmartLockDoorGateway/1.0",
   };
 
-  if (doorControllerConfig.apiToken && doorControllerConfig.apiToken.trim()) {
-    const token = doorControllerConfig.apiToken.trim();
-    if (doorControllerConfig.authHeaderType === "BEARER") {
+  if (door.apiToken && door.apiToken.trim()) {
+    const token = door.apiToken.trim();
+    if (door.authHeaderType === "BEARER") {
       headers["Authorization"] = `Bearer ${token}`;
-    } else if (doorControllerConfig.authHeaderType === "API_KEY") {
+    } else if (door.authHeaderType === "API_KEY") {
       headers["X-Api-Key"] = token;
-    } else if (doorControllerConfig.authHeaderType === "CUSTOM_HEADER") {
-      const headerKey = doorControllerConfig.customHeaderName?.trim() || "X-Door-Token";
+    } else if (door.authHeaderType === "CUSTOM_HEADER") {
+      const headerKey = door.customHeaderName?.trim() || "X-Door-Token";
       headers[headerKey] = token;
     }
   }
@@ -2581,8 +2901,8 @@ async function sendDoorControllerCommand(
   if (method !== "GET") {
     const rawTemplate =
       action === "OPEN"
-        ? doorControllerConfig.openPayloadTemplate
-        : doorControllerConfig.closePayloadTemplate;
+        ? door.openPayloadTemplate
+        : door.closePayloadTemplate;
 
     if (rawTemplate && rawTemplate.trim()) {
       try {
@@ -2590,16 +2910,16 @@ async function sendDoorControllerCommand(
           .replace(/\{\{ACTION\}\}/g, action)
           .replace(/\{\{TRIGGERED_BY\}\}/g, triggeredBy)
           .replace(/\{\{TIMESTAMP\}\}/g, new Date().toISOString())
-          .replace(/\{\{PULSE\}\}/g, String(doorControllerConfig.pulseDurationSeconds || 6))
-          .replace(/\{\{DOOR\}\}/g, smartLockState.doorName);
+          .replace(/\{\{PULSE\}\}/g, String(door.pulseDurationSeconds || 6))
+          .replace(/\{\{DOOR\}\}/g, lockStateOf(doorId).doorName);
       } catch {
         requestBody = rawTemplate;
       }
     } else {
       requestBody = JSON.stringify({
         action,
-        door: smartLockState.doorName,
-        pulseDuration: doorControllerConfig.pulseDurationSeconds || 6,
+        door: lockStateOf(doorId).doorName,
+        pulseDuration: door.pulseDurationSeconds || 6,
         triggeredBy,
         timestamp: new Date().toISOString(),
       });
@@ -2609,20 +2929,22 @@ async function sendDoorControllerCommand(
   const maskedHeaders: Record<string, string> = { ...headers };
   if (maskedHeaders["Authorization"]) maskedHeaders["Authorization"] = "Bearer ****";
   if (maskedHeaders["X-Api-Key"]) maskedHeaders["X-Api-Key"] = "****";
-  if (doorControllerConfig.customHeaderName && maskedHeaders[doorControllerConfig.customHeaderName]) {
-    maskedHeaders[doorControllerConfig.customHeaderName] = "****";
+  if (door.customHeaderName && maskedHeaders[door.customHeaderName]) {
+    maskedHeaders[door.customHeaderName] = "****";
   }
   // Whatever the header is called (a blank custom name falls back to
   // X-Door-Token), the token itself never reaches the log or the DB row.
-  const secret = String(doorControllerConfig.apiToken || "");
+  const secret = String(door.apiToken || "");
   if (secret) {
     for (const key of Object.keys(maskedHeaders)) {
       if (String(maskedHeaders[key]).includes(secret)) maskedHeaders[key] = "****";
     }
   }
 
-  const logEntry: DoorApiLogRecord = {
+  // doorId rides along for SSE/dashboards (the door_api_logs columns do not store it).
+  const logEntry: DoorApiLogRecord & { doorId?: string } = {
     id: "DOOR-API-" + Date.now() + "-" + Math.floor(Math.random() * 1000),
+    doorId,
     timestamp: new Date().toISOString(),
     action,
     url: logUrl,
@@ -2637,7 +2959,7 @@ async function sendDoorControllerCommand(
   // Fail closed: every supported auth scheme needs a token. Without one the
   // command would go out unauthenticated, so it is not sent - and the reason
   // is logged where the operator looks, instead of an opaque network error.
-  if (!doorControllerConfig.apiToken || !doorControllerConfig.apiToken.trim()) {
+  if (!door.apiToken || !door.apiToken.trim()) {
     logEntry.error = "Chưa cấu hình mã xác thực bộ điều khiển cửa - lệnh không được gửi";
     doorApiLogs.unshift(logEntry);
     if (doorApiLogs.length > 60) doorApiLogs = doorApiLogs.slice(0, 60);
@@ -2694,74 +3016,77 @@ async function sendDoorControllerCommand(
   return logEntry;
 }
 
-function unlockDoor(source: string, employeeName?: string, employeeId?: string) {
-  if (autoRelockTimer) clearTimeout(autoRelockTimer);
-  if (countdownInterval) clearInterval(countdownInterval);
+/**
+ * Opens ONE door: its lock state, its controller, its relock timer. `doorId`
+ * defaults to the legacy single door "main"; a grant opens the gate's door
+ * (doorIdOf). A door without a configured controller only changes state.
+ */
+function unlockDoor(source: string, employeeName?: string, employeeId?: string, doorId: string = LEGACY_DOOR_ID) {
+  clearDoorTimers(doorId);
+  const state = lockStateOf(doorId);
 
-  smartLockState.state = "UNLOCKED";
-  smartLockState.isLocked = false;
-  smartLockState.lastActionAt = new Date().toISOString();
-  smartLockState.lastActionBy = employeeName
+  state.state = "UNLOCKED";
+  state.isLocked = false;
+  state.lastActionAt = new Date().toISOString();
+  state.lastActionBy = employeeName
     ? `${employeeName} (${source})`
     : `Lệnh mở từ ${source}`;
-  smartLockState.remainingRelockSeconds = smartLockState.autoRelockSeconds;
+  state.remainingRelockSeconds = state.autoRelockSeconds;
 
-  broadcastSSE("lock_state", smartLockState);
-  db.saveSmartLockState(smartLockState);
+  broadcastLockState(doorId, state);
+  saveLockState(doorId, state);
 
   // Trigger automated hardware door opening via API if enabled
-  if (doorControllerConfig.enabled) {
+  const door = doorConfigOf(doorId);
+  if (door?.enabled) {
     const isFace = source.includes("Nhận diện");
     const shouldTrigger = isFace
-      ? doorControllerConfig.triggerOnFaceRecognition
-      : doorControllerConfig.triggerOnManualUnlock;
+      ? door.triggerOnFaceRecognition
+      : door.triggerOnManualUnlock;
 
     if (shouldTrigger) {
-      sendDoorControllerCommand("OPEN", employeeName || source).catch((err) => {
-        console.warn("[Door Controller] Lỗi gửi lệnh OPEN:", err?.message);
+      sendDoorControllerCommand("OPEN", employeeName || source, doorId).catch((err) => {
+        console.warn(`[Door Controller ${doorId}] Lỗi gửi lệnh OPEN:`, err?.message);
       });
     }
   }
 
+  const timers: { relock: NodeJS.Timeout | null; countdown: NodeJS.Timeout | null } = { relock: null, countdown: null };
+  doorTimers.set(doorId, timers);
   // Start countdown interval
-  countdownInterval = setInterval(() => {
-    if (smartLockState.remainingRelockSeconds > 0) {
-      smartLockState.remainingRelockSeconds -= 1;
-      broadcastSSE("lock_countdown", {
-        remainingSeconds: smartLockState.remainingRelockSeconds,
+  timers.countdown = setInterval(() => {
+    if (state.remainingRelockSeconds > 0) {
+      state.remainingRelockSeconds -= 1;
+      broadcastSSE(doorId === LEGACY_DOOR_ID ? "lock_countdown" : "door_lock_countdown", {
+        doorId,
+        remainingSeconds: state.remainingRelockSeconds,
       });
     }
   }, 1000);
 
   // Auto-lock timer
-  autoRelockTimer = setTimeout(() => {
-    lockDoor("Tự động khóa sau " + smartLockState.autoRelockSeconds + "s");
-  }, smartLockState.autoRelockSeconds * 1000);
+  timers.relock = setTimeout(() => {
+    lockDoor("Tự động khóa sau " + state.autoRelockSeconds + "s", doorId);
+  }, state.autoRelockSeconds * 1000);
 }
 
-function lockDoor(source: string) {
-  if (autoRelockTimer) {
-    clearTimeout(autoRelockTimer);
-    autoRelockTimer = null;
-  }
-  if (countdownInterval) {
-    clearInterval(countdownInterval);
-    countdownInterval = null;
-  }
+function lockDoor(source: string, doorId: string = LEGACY_DOOR_ID) {
+  clearDoorTimers(doorId);
+  const state = lockStateOf(doorId);
 
-  smartLockState.state = "LOCKED";
-  smartLockState.isLocked = true;
-  smartLockState.remainingRelockSeconds = 0;
-  smartLockState.lastActionAt = new Date().toISOString();
-  smartLockState.lastActionBy = source;
+  state.state = "LOCKED";
+  state.isLocked = true;
+  state.remainingRelockSeconds = 0;
+  state.lastActionAt = new Date().toISOString();
+  state.lastActionBy = source;
 
-  broadcastSSE("lock_state", smartLockState);
-  db.saveSmartLockState(smartLockState);
+  broadcastLockState(doorId, state);
+  saveLockState(doorId, state);
 
   // Trigger automated hardware door closing via API if enabled
-  if (doorControllerConfig.enabled) {
-    sendDoorControllerCommand("CLOSE", source).catch((err) => {
-      console.warn("[Door Controller] Lỗi gửi lệnh CLOSE:", err?.message);
+  if (doorConfigOf(doorId)?.enabled) {
+    sendDoorControllerCommand("CLOSE", source, doorId).catch((err) => {
+      console.warn(`[Door Controller ${doorId}] Lỗi gửi lệnh CLOSE:`, err?.message);
     });
   }
 }
@@ -2799,7 +3124,7 @@ app.get(
   // Send initial state
   res.write(`event: connected\ndata: {"status":"connected"}\n\n`);
   res.write(
-    `event: lock_state\ndata: ${JSON.stringify(smartLockState)}\n\n`
+    `event: lock_state\ndata: ${JSON.stringify(publicLockState(LEGACY_DOOR_ID))}\n\n`
   );
 
   const keepAlive = setInterval(() => {
@@ -2817,28 +3142,48 @@ app.get(
 });
 
 // --- Smart Lock Endpoints ---
+// Every lock route takes an optional door id (query `doorId` for reads, body
+// `doorId` for commands); absent = the legacy single door "main". An unknown or
+// malformed door id is a 400 - never a silent fallback to another door.
+function doorIdFromRequest(raw: unknown): { doorId: string } | { error: string } {
+  if (raw === undefined || raw === null || raw === "") return { doorId: LEGACY_DOOR_ID };
+  if (!isDoorId(raw)) return { error: "doorId không hợp lệ" };
+  if (!doorConfigOf(raw)) {
+    return { error: `Cửa "${raw}" chưa được cấu hình. Các cửa hiện có: ${doorControllerConfig.doors.map((d) => d.id).join(", ")}` };
+  }
+  return { doorId: raw };
+}
+
 app.get(
   [
     "/api/lock/status",
     "/api/lock/status/",
+    "/api/lock/state",
+    "/api/lock/state/",
     "/lock/status",
     "/lock/status/",
     "/api/status",
     "/status",
   ],
-  (_req, res) => {
-    res.json(smartLockState);
+  (req, res) => {
+    const door = doorIdFromRequest(req.query.doorId);
+    if ("error" in door) return res.status(400).json({ success: false, error: door.error });
+    res.json(publicLockState(door.doorId));
   }
 );
 
 app.post("/api/lock/unlock", (req, res) => {
-  const { source = "API Remote", employeeName, employeeId } = req.body;
-  unlockDoor(source, employeeName, employeeId);
+  const { source = "API Remote", employeeName, employeeId } = req.body || {};
+  const door = doorIdFromRequest(req.body?.doorId);
+  if ("error" in door) return res.status(400).json({ success: false, error: door.error });
+  unlockDoor(source, employeeName, employeeId, door.doorId);
+  const doorName = lockStateOf(door.doorId).doorName;
+  console.log(`[Lock] ${operatorActor(req) || "unknown"} mở cửa ${door.doorId} (${doorName}) qua API: ${String(source).slice(0, 80)}`);
 
   const notif: MobileNotificationRecord = {
     id: "NOTIF-" + Date.now(),
     title: "Khóa cửa thông minh mở",
-    body: `Cửa đã được mở qua ${source}`,
+    body: door.doorId === LEGACY_DOOR_ID ? `Cửa đã được mở qua ${source}` : `${doorName} đã được mở qua ${source}`,
     timestamp: new Date().toISOString(),
     type: "INFO",
     read: false,
@@ -2849,18 +3194,22 @@ app.post("/api/lock/unlock", (req, res) => {
   res.json({
     success: true,
     message: "Khóa cửa đã mở thành công qua API",
-    lockState: smartLockState,
+    lockState: publicLockState(door.doorId),
   });
 });
 
 app.post("/api/lock/lock", (req, res) => {
-  const { source = "API Remote Lock" } = req.body;
-  lockDoor(source);
+  const { source = "API Remote Lock" } = req.body || {};
+  const door = doorIdFromRequest(req.body?.doorId);
+  if ("error" in door) return res.status(400).json({ success: false, error: door.error });
+  lockDoor(source, door.doorId);
+  const doorName = lockStateOf(door.doorId).doorName;
+  console.log(`[Lock] ${operatorActor(req) || "unknown"} khóa cửa ${door.doorId} (${doorName}) qua API: ${String(source).slice(0, 80)}`);
 
   const notif: MobileNotificationRecord = {
     id: "NOTIF-" + Date.now(),
     title: "Cửa đã khóa an toàn",
-    body: `Cửa chính đã đóng chốt khóa an toàn (${source})`,
+    body: door.doorId === LEGACY_DOOR_ID ? `Cửa chính đã đóng chốt khóa an toàn (${source})` : `${doorName} đã đóng chốt khóa an toàn (${source})`,
     timestamp: new Date().toISOString(),
     type: "INFO",
     read: false,
@@ -2871,7 +3220,7 @@ app.post("/api/lock/lock", (req, res) => {
   res.json({
     success: true,
     message: "Đã khóa cửa thành công",
-    lockState: smartLockState,
+    lockState: publicLockState(door.doorId),
   });
 });
 
@@ -3267,41 +3616,113 @@ const DOOR_LOGS_ROUTES = [
 ];
 
 app.get(DOOR_CONFIG_ROUTES, (_req, res) => {
-  doorControllerConfig = db.getDoorControllerConfig(DEFAULT_DOOR_CONTROLLER_CONFIG);
+  doorControllerConfig = loadDoorControllerConfig();
+  // Tokens are never returned: sanitizePublicJson turns every apiToken (top
+  // level and per door) into apiTokenConfigured and redacts the URLs.
   res.json(doorControllerConfig);
 });
 
-app.post(DOOR_CONFIG_ROUTES, async (req, res) => {
-  const body = req.body || {};
-  // Destination guard on a NEW controller URL: refused -> 400, nothing saved.
-  let destWarning: Record<string, unknown> | undefined;
-  if (typeof body.apiUrl === "string" && body.apiUrl.trim() && body.apiUrl.trim() !== db.getDoorControllerConfig(DEFAULT_DOOR_CONTROLLER_CONFIG).apiUrl) {
-    const check = await destinationSaveCheck(body.apiUrl.trim(), NET_POLICY.door, "apiUrl");
-    if (check.refused) return res.status(400).json(check.refused);
-    destWarning = check.warning;
+/**
+ * The doors a POST asks for. With `doors` (new clients) the list is the whole
+ * door set: missing doors are removed, door "main" stays (its fields from its
+ * entry, or unchanged when absent). Without it (older clients) the top-level
+ * fields patch door "main" and the other doors are untouched.
+ */
+function requestedDoors(body: any, current: DoorControllerState): { doors: DoorRecord[] } | { status: number; error: string } {
+  if (body.doors === undefined) {
+    return {
+      doors: current.doors.map((d) =>
+        d.id === LEGACY_DOOR_ID ? { ...doorFieldsFrom(body, d), id: d.id, label: d.label } : d
+      ),
+    };
   }
-  const current = db.getDoorControllerConfig(DEFAULT_DOOR_CONTROLLER_CONFIG);
+  if (!Array.isArray(body.doors)) return { status: 400, error: "doors phải là một danh sách" };
+  if (body.doors.length > MAX_DOORS) return { status: 400, error: `Tối đa ${MAX_DOORS} cửa` };
+  const doors: DoorRecord[] = [];
+  for (const item of body.doors) {
+    if (!item || typeof item !== "object") return { status: 400, error: "Mỗi cửa phải là một đối tượng" };
+    if (!isDoorId(item.id)) return { status: 400, error: `Mã cửa không hợp lệ: "${String(item.id).slice(0, 40)}" (chữ thường, số, gạch ngang; 2-32 ký tự; bắt đầu bằng chữ)` };
+    if (doors.some((d) => d.id === item.id)) return { status: 400, error: `Mã cửa bị trùng: "${item.id}"` };
+    const existing = current.doors.find((d) => d.id === item.id);
+    const base: DoorControllerConfigRecord = existing || { ...DEFAULT_DOOR_CONTROLLER_CONFIG, apiUrl: "", apiToken: "", enabled: false };
+    doors.push({ ...doorFieldsFrom(item, base), id: item.id, label: doorLabelFrom(item.label, existing?.label || item.id) });
+  }
+  if (!doors.some((d) => d.id === LEGACY_DOOR_ID)) doors.unshift(current.doors.find((d) => d.id === LEGACY_DOOR_ID)!);
+  // Door "main" first, the rest in the order given.
+  doors.sort((a, b) => (a.id === LEGACY_DOOR_ID ? -1 : b.id === LEGACY_DOOR_ID ? 1 : 0));
+  const removed = current.doors.filter((d) => !doors.some((n) => n.id === d.id)).map((d) => d.id);
+  const inUse = cameraStreamsConfig.gates.filter((g) => removed.includes(doorIdOf(g)));
+  if (inUse.length) {
+    return {
+      status: 409,
+      error: `Không thể xóa cửa đang được cổng sử dụng: ${inUse.map((g) => `${g.id} -> ${doorIdOf(g)}`).join(", ")}. Hãy gán cổng sang cửa khác trước.`,
+    };
+  }
+  return { doors };
+}
 
-  const updated: DoorControllerConfigRecord = {
-    enabled: typeof body.enabled === "boolean" ? body.enabled : current.enabled,
-    apiUrl: typeof body.apiUrl === "string" ? body.apiUrl.trim() : current.apiUrl,
-    apiToken: typeof body.apiToken === "string" ? body.apiToken.trim() : current.apiToken,
-    authHeaderType: body.authHeaderType || current.authHeaderType,
-    customHeaderName: typeof body.customHeaderName === "string" ? body.customHeaderName.trim() : current.customHeaderName,
-    openMethod: body.openMethod || current.openMethod,
-    closeMethod: body.closeMethod || current.closeMethod,
-    openPayloadTemplate: typeof body.openPayloadTemplate === "string" ? body.openPayloadTemplate : current.openPayloadTemplate,
-    closePayloadTemplate: typeof body.closePayloadTemplate === "string" ? body.closePayloadTemplate : current.closePayloadTemplate,
-    pulseDurationSeconds: typeof body.pulseDurationSeconds === "number" ? body.pulseDurationSeconds : current.pulseDurationSeconds,
-    triggerOnFaceRecognition: typeof body.triggerOnFaceRecognition === "boolean" ? body.triggerOnFaceRecognition : current.triggerOnFaceRecognition,
-    triggerOnManualUnlock: typeof body.triggerOnManualUnlock === "boolean" ? body.triggerOnManualUnlock : current.triggerOnManualUnlock,
-  };
+app.post(DOOR_CONFIG_ROUTES, async (req, res) => {
+  const body = req.body && typeof req.body === "object" ? req.body : {};
+  const before = loadDoorControllerConfig();
+  const wanted = requestedDoors(body, before);
+  if ("error" in wanted) return res.status(wanted.status).json({ success: false, error: wanted.error });
+
+  // Destination guard on every NEW controller URL (any door): refused -> 400,
+  // nothing saved. Runs before the commit below re-reads the stored config.
+  const warnings: Record<string, unknown>[] = [];
+  for (const d of wanted.doors) {
+    const previousUrl = before.doors.find((p) => p.id === d.id)?.apiUrl || "";
+    if (!d.apiUrl || d.apiUrl === previousUrl) continue;
+    const field = d.id === LEGACY_DOOR_ID && body.doors === undefined ? "apiUrl" : `doors.${d.id}.apiUrl`;
+    const check = await destinationSaveCheck(d.apiUrl, NET_POLICY.door, field, d.id === LEGACY_DOOR_ID ? {} : { doorId: d.id });
+    if (check.refused) return res.status(400).json(check.refused);
+    if (check.warning) warnings.push(check.warning);
+  }
+
+  const current = loadDoorControllerConfig();
+  const again = requestedDoors(body, current);
+  if ("error" in again) return res.status(again.status).json({ success: false, error: again.error });
+  const main = again.doors.find((d) => d.id === LEGACY_DOOR_ID)!;
+  const updated: DoorControllerState = { ...pickDoorFields(main), doors: again.doors };
+
+  // A door being removed while open is closed first, through its own
+  // controller, while that controller is still configured.
+  for (const d of current.doors) {
+    if (!updated.doors.some((n) => n.id === d.id) && doorLockStates.get(d.id)?.isLocked === false) {
+      lockDoor(`Cửa ${d.id} bị xóa khỏi cấu hình`, d.id);
+    }
+  }
 
   doorControllerConfig = updated;
   db.saveDoorControllerConfig(updated);
-  broadcastSSE("door_config_updated", updated);
 
-  res.json({ success: true, config: updated, ...(destWarning ? { warnings: [destWarning] } : {}) });
+  // Labels are the doors' names on events, notifications and lock states.
+  for (const d of updated.doors) {
+    const state = d.id === LEGACY_DOOR_ID ? smartLockState : doorLockStates.get(d.id);
+    if (state && state.doorName !== d.label) {
+      state.doorName = d.label;
+      saveLockState(d.id, state);
+      broadcastLockState(d.id, state);
+    }
+  }
+  for (const d of current.doors) {
+    if (!updated.doors.some((n) => n.id === d.id)) {
+      clearDoorTimers(d.id);
+      doorLockStates.delete(d.id);
+      try {
+        void Promise.resolve(db.deleteDoorLockState(d.id)).catch(warnDoorLockStore);
+      } catch (err) {
+        warnDoorLockStore(err);
+      }
+    }
+  }
+  broadcastSSE("door_config_updated", updated);
+  console.log(
+    `[Door Config] ${operatorActor(req) || "unknown"} lưu cấu hình ${updated.doors.length} cửa: ` +
+      updated.doors.map((d) => `${d.id}${d.enabled ? "" : " (tắt)"}`).join(", ")
+  );
+
+  res.json({ success: true, config: updated, ...(warnings.length ? { warnings } : {}) });
 });
 
 app.post(DOOR_TEST_ROUTES, async (req, res) => {
@@ -3314,10 +3735,12 @@ app.post(DOOR_TEST_ROUTES, async (req, res) => {
 
   const action: "OPEN" | "CLOSE" = body.action === "CLOSE" ? "CLOSE" : "OPEN";
   const source = body.source || "Test Console (Dashboard)";
+  const door = doorIdFromRequest(body.doorId);
+  if ("error" in door) return res.status(400).json({ success: false, error: door.error });
 
   // If temporary config is supplied in test body, allow testing before saving
   let tempConfig = false;
-  let originalConfig: DoorControllerConfigRecord | null = null;
+  let originalConfig: DoorControllerState | null = null;
   if (body.testConfig) {
     tempConfig = true;
     originalConfig = { ...doorControllerConfig };
@@ -3325,6 +3748,7 @@ app.post(DOOR_TEST_ROUTES, async (req, res) => {
       ...doorControllerConfig,
       ...body.testConfig,
       enabled: true, // Force enabled for explicit test button
+      doors: doorControllerConfig.doors,
     };
   }
 
@@ -3332,13 +3756,13 @@ app.post(DOOR_TEST_ROUTES, async (req, res) => {
     // If testing OPEN, also trigger door state update so the user sees UI feedback if desired
     if (body.updateDoorState) {
       if (action === "OPEN") {
-        unlockDoor(`Test API: ${source}`);
+        unlockDoor(`Test API: ${source}`, undefined, undefined, door.doorId);
       } else {
-        lockDoor(`Test API: ${source}`);
+        lockDoor(`Test API: ${source}`, door.doorId);
       }
     }
 
-    const result = await sendDoorControllerCommand(action, source);
+    const result = await sendDoorControllerCommand(action, source, door.doorId);
 
     if (tempConfig && originalConfig) {
       doorControllerConfig = originalConfig;
@@ -3428,11 +3852,11 @@ function guardedUrlFields(stream: { sourceType?: string }): ReadonlyArray<(typeo
  * dial time instead. Returns the first refusal (400 body) or the warnings.
  */
 async function cameraStreamsSaveCheck(
-  current: CameraStreamsConfigRecord,
-  candidates: Array<{ gate: "entry" | "exit"; stream: GateStreamSourceRecord }>
+  current: CameraConfig,
+  candidates: Array<{ gate: string; stream: GateStreamSourceRecord }>
 ): Promise<{ refused?: Record<string, unknown>; warnings: Record<string, unknown>[] }> {
   const known = new Set<string>();
-  for (const g of [current.entryGate, current.exitGate]) {
+  for (const g of current.gates) {
     for (const st of g?.streams || []) for (const f of CAMERA_URL_FIELDS) if (st[f]) known.add(String(st[f]));
   }
   const warnings: Record<string, unknown>[] = [];
@@ -3448,6 +3872,50 @@ async function cameraStreamsSaveCheck(
   return { warnings };
 }
 
+/**
+ * The gate patches of a POST /api/camera-streams/config body. `gates` (new
+ * clients) wins over the legacy `entryGate`/`exitGate` keys. This operator
+ * route edits configured gates only: it never creates or removes a gate (that
+ * is POST/DELETE /api/gates, admin) - an unknown id is a 400.
+ *
+ * A body can carry both: an older dashboard echoes the whole config it was
+ * served - `gates` included - with its edit in `entryGate`. So when both name
+ * the same gate, a legacy field that differs from the `gates` entry is taken
+ * when the `gates` entry still holds what the client was served (it is the
+ * edit); when both changed the field, `gates` wins.
+ */
+function gatePatchesFrom(body: any, current: CameraConfig): { patches: Map<string, any> } | { error: string } {
+  const patches = new Map<string, any>();
+  if (Array.isArray(body.gates)) {
+    for (const item of body.gates) {
+      if (!item || typeof item !== "object") return { error: "Mỗi cổng trong gates phải là một đối tượng" };
+      const gate = gateFromConfig(current, item.id);
+      if (!gate) return { error: unknownGateError(item.id, current) };
+      if (patches.has(gate.id)) return { error: `Cổng "${gate.id}" xuất hiện hai lần trong gates` };
+      patches.set(gate.id, item);
+    }
+  }
+  const same = (a: unknown, b: unknown) => JSON.stringify(a) === JSON.stringify(b);
+  for (const [key, id] of [["entryGate", "entry"], ["exitGate", "exit"]] as const) {
+    const legacy = body[key];
+    if (legacy === undefined) continue;
+    const fromGates = patches.get(id);
+    if (!fromGates || !legacy || typeof legacy !== "object") {
+      if (!fromGates) patches.set(id, legacy);
+      continue;
+    }
+    // What the client was served for this gate (URLs redacted, tokens masked).
+    const served = sanitizePublicJson(gateFromConfig(current, id));
+    const merged = { ...fromGates };
+    for (const field of Object.keys(legacy)) {
+      if (same(legacy[field], fromGates[field])) continue;
+      if (same(fromGates[field], served?.[field])) merged[field] = legacy[field];
+    }
+    patches.set(id, merged);
+  }
+  return { patches };
+}
+
 app.post(CAMERA_CONFIG_ROUTES, async (req, res) => {
   let body = req.body || {};
   if (typeof body === "string") {
@@ -3455,29 +3923,33 @@ app.post(CAMERA_CONFIG_ROUTES, async (req, res) => {
       body = JSON.parse(body);
     } catch {}
   }
+  if (!body || typeof body !== "object") body = {};
   const current = loadCameraStreamsConfig();
-  const { entryGate: entryPatch, exitGate: exitPatch, ...rootPatch } = body || {};
-  const updated: CameraStreamsConfigRecord = normalizeCameraStreamsConfig({
+  const parsed = gatePatchesFrom(body, current);
+  if ("error" in parsed) return res.status(400).json({ success: false, error: parsed.error });
+  const { entryGate: _entryPatch, exitGate: _exitPatch, gates: _gatesPatch, ...rootPatch } = body;
+  const updated = normalizeCameraStreamsConfig({
     ...current,
     ...rootPatch,
-    entryGate: applyGateConfigPatch(current.entryGate, entryPatch),
-    exitGate: applyGateConfigPatch(current.exitGate, exitPatch),
+    gates: current.gates.map((g) => (parsed.patches.has(g.id) ? applyGateConfigPatch(g, parsed.patches.get(g.id)) : g)),
   });
 
-  const destCheck = await cameraStreamsSaveCheck(current, [
-    ...(updated.entryGate.streams || []).map((stream) => ({ gate: "entry" as const, stream })),
-    ...(updated.exitGate.streams || []).map((stream) => ({ gate: "exit" as const, stream })),
-  ]);
+  const destCheck = await cameraStreamsSaveCheck(
+    current,
+    updated.gates.flatMap((g) => (g.streams || []).map((stream) => ({ gate: g.id, stream })))
+  );
   if (destCheck.refused) return res.status(400).json(destCheck.refused);
 
   if (typeof body.workerThreadsCount === "number" && body.workerThreadsCount !== current.workerThreadsCount) {
     faceWorkerPool.scaleWorkerPool(body.workerThreadsCount);
   }
 
-  cameraStreamsConfig = updated;
-  db.saveCameraStreamsConfig(updated);
-  broadcastSSE("camera_config_updated", updated);
+  commitCameraConfig(updated);
   syncGateWatchers();
+  console.log(
+    `[Camera Config] ${operatorActor(req) || "unknown"} lưu cấu hình camera` +
+      (parsed.patches.size ? ` (cổng: ${[...parsed.patches.keys()].join(", ")})` : "")
+  );
 
   res.json({
     success: true,
@@ -3488,27 +3960,15 @@ app.post(CAMERA_CONFIG_ROUTES, async (req, res) => {
 });
 
 // ---- Per-stream convenience endpoints: /api/camera-streams/:gate/streams[/:streamId] ----
-type GateConfigKey = "entryGate" | "exitGate";
-
-function gateConfigKeyFromParam(param: unknown): GateConfigKey | null {
-  const key = String(param || "").toLowerCase();
-  if (key === "entry") return "entryGate";
-  if (key === "exit") return "exitGate";
-  return null;
-}
+// `:gate` is any configured gate id; anything else is a 400.
 
 /** Persists a gate whose stream list was edited, broadcasts, and returns the normalised gate. */
-function commitGateStreams(gateKey: GateConfigKey, streams: GateStreamSourceRecord[]): GateStreamConfigRecord {
+function commitGateStreams(gateId: string, streams: GateStreamSourceRecord[]): GateRecord {
   const current = loadCameraStreamsConfig();
-  const updated = normalizeCameraStreamsConfig({
-    ...current,
-    [gateKey]: normalizeGateConfig({ ...current[gateKey], streams }),
-  });
-  cameraStreamsConfig = updated;
-  db.saveCameraStreamsConfig(updated);
-  broadcastSSE("camera_config_updated", updated);
+  const gate = gateFromConfig(current, gateId)!;
+  const updated = commitCameraConfig(withGate(current, { ...gate, streams }));
   syncGateWatchers(); // the watcher may now have (or have lost) something to scan
-  return updated[gateKey];
+  return gateFromConfig(updated, gateId)!;
 }
 
 function findDuplicateStream(
@@ -3530,9 +3990,8 @@ const STREAM_ROUTE = ["/api/camera-streams/:gate/streams", "/api/camera-streams/
 const STREAM_ITEM_ROUTE = ["/api/camera-streams/:gate/streams/:streamId", "/api/camera-streams/:gate/streams/:streamId/"];
 
 app.get(STREAM_ROUTE, (req, res) => {
-  const gateKey = gateConfigKeyFromParam(req.params.gate);
-  if (!gateKey) return res.status(400).json({ success: false, error: "Cổng không hợp lệ: chỉ chấp nhận entry hoặc exit" });
-  const gate = loadCameraStreamsConfig()[gateKey];
+  const gate = gateFromConfig(loadCameraStreamsConfig(), req.params.gate);
+  if (!gate) return res.status(400).json({ success: false, error: unknownGateError(req.params.gate) });
   res.json({ success: true, gate, streams: gate.streams, primaryStreamId: pickPrimaryStream(gate.streams!).id });
 });
 
@@ -3543,7 +4002,7 @@ app.get(STREAM_ROUTE, (req, res) => {
  */
 async function streamUrlSaveCheck(
   fields: Partial<Record<(typeof CAMERA_URL_FIELDS)[number], string | undefined>> & { sourceType?: string },
-  gate: "entry" | "exit",
+  gate: string,
   streamId?: string
 ): Promise<{ refused?: Record<string, unknown>; warnings: Record<string, unknown>[] }> {
   const warnings: Record<string, unknown>[] = [];
@@ -3556,18 +4015,20 @@ async function streamUrlSaveCheck(
 }
 
 app.post(STREAM_ROUTE, async (req, res) => {
-  const gateKey = gateConfigKeyFromParam(req.params.gate);
-  if (!gateKey) return res.status(400).json({ success: false, error: "Cổng không hợp lệ: chỉ chấp nhận entry hoặc exit" });
+  const requested = gateFromConfig(loadCameraStreamsConfig(), req.params.gate);
+  if (!requested) return res.status(400).json({ success: false, error: unknownGateError(req.params.gate) });
+  const gateParam = requested.id;
   const body = req.body && typeof req.body === "object" ? req.body : {};
-  const destCheck = await streamUrlSaveCheck(sanitizeStreamMediaFields(body), gateKey === "exitGate" ? "exit" : "entry");
+  const destCheck = await streamUrlSaveCheck(sanitizeStreamMediaFields(body), gateParam);
   if (destCheck.refused) return res.status(400).json(destCheck.refused);
-  const gate = loadCameraStreamsConfig()[gateKey];
+  // Re-read after the await: the gate may have been removed meanwhile.
+  const gate = gateFromConfig(loadCameraStreamsConfig(), gateParam);
+  if (!gate) return res.status(400).json({ success: false, error: unknownGateError(gateParam) });
   const existing = gate.streams!;
   if (existing.length >= MAX_STREAMS_PER_GATE) {
     return res.status(400).json({ success: false, error: `Mỗi cổng chỉ hỗ trợ tối đa ${MAX_STREAMS_PER_GATE} luồng video` });
   }
 
-  const gateParam = gateKey === "exitGate" ? "exit" : "entry";
   const hasPriority = Number.isFinite(Number(body.priority));
   const nextPriority = existing.reduce((max, s) => Math.max(max, s.priority), 0) + 10;
   const rawId = optionalTrimmedString(body.id);
@@ -3601,7 +4062,8 @@ app.post(STREAM_ROUTE, async (req, res) => {
     });
   }
 
-  const updatedGate = commitGateStreams(gateKey, [...existing, candidate]);
+  const updatedGate = commitGateStreams(gateParam, [...existing, candidate]);
+  console.log(`[Camera Config] ${operatorActor(req) || "unknown"} thêm luồng ${candidate.id} vào cổng ${gateParam}`);
   res.status(201).json({
     success: true,
     gate: updatedGate,
@@ -3612,12 +4074,13 @@ app.post(STREAM_ROUTE, async (req, res) => {
 });
 
 app.put(STREAM_ITEM_ROUTE, async (req, res) => {
-  const gateKey = gateConfigKeyFromParam(req.params.gate);
-  if (!gateKey) return res.status(400).json({ success: false, error: "Cổng không hợp lệ: chỉ chấp nhận entry hoặc exit" });
+  const requested = gateFromConfig(loadCameraStreamsConfig(), req.params.gate);
+  if (!requested) return res.status(400).json({ success: false, error: unknownGateError(req.params.gate) });
+  const gateParam = requested.id;
   const streamId = String(req.params.streamId || "");
   // Destination guard on the URL fields this request CHANGES only: a stored
   // stream the policy now refuses can still be disabled or relabelled.
-  const before = loadCameraStreamsConfig()[gateKey].streams!.find((s) => s.id === streamId);
+  const before = requested.streams!.find((s) => s.id === streamId);
   let destCheck: { refused?: Record<string, unknown>; warnings: Record<string, unknown>[] } = { warnings: [] };
   if (before && req.body && typeof req.body === "object") {
     const next = sanitizeStreamMediaFields({ ...before, ...req.body });
@@ -3628,10 +4091,11 @@ app.put(STREAM_ITEM_ROUTE, async (req, res) => {
       // A source-type switch to HTTP_MJPEG makes an old httpUrl the destination: check it too.
       if (next[f] !== before[f] || (f === "httpUrl" && next.sourceType !== before.sourceType)) changed[f] = next[f];
     }
-    destCheck = await streamUrlSaveCheck(changed, gateKey === "exitGate" ? "exit" : "entry", streamId);
+    destCheck = await streamUrlSaveCheck(changed, gateParam, streamId);
     if (destCheck.refused) return res.status(400).json(destCheck.refused);
   }
-  const gate = loadCameraStreamsConfig()[gateKey];
+  const gate = gateFromConfig(loadCameraStreamsConfig(), gateParam);
+  if (!gate) return res.status(400).json({ success: false, error: unknownGateError(gateParam) });
   const existing = gate.streams!;
   const index = existing.findIndex((s) => s.id === streamId);
   if (index === -1) {
@@ -3640,7 +4104,6 @@ app.put(STREAM_ITEM_ROUTE, async (req, res) => {
 
   const body = req.body && typeof req.body === "object" ? req.body : {};
   const { id: _ignoredId, ...patch } = body; // ids are immutable (used in URLs / SSE clients)
-  const gateParam = gateKey === "exitGate" ? "exit" : "entry";
   const updatedStream = sanitizeStreamSource({ ...existing[index], ...patch, id: streamId }, index, gateParam, gate.name);
 
   const duplicate = findDuplicateStream(existing, updatedStream, streamId);
@@ -3654,7 +4117,8 @@ app.put(STREAM_ITEM_ROUTE, async (req, res) => {
   }
 
   const streams = existing.map((s, i) => (i === index ? updatedStream : s));
-  const updatedGate = commitGateStreams(gateKey, streams);
+  const updatedGate = commitGateStreams(gateParam, streams);
+  console.log(`[Camera Config] ${operatorActor(req) || "unknown"} sửa luồng ${streamId} của cổng ${gateParam}`);
   res.json({
     success: true,
     gate: updatedGate,
@@ -3665,10 +4129,9 @@ app.put(STREAM_ITEM_ROUTE, async (req, res) => {
 });
 
 app.delete(STREAM_ITEM_ROUTE, (req, res) => {
-  const gateKey = gateConfigKeyFromParam(req.params.gate);
-  if (!gateKey) return res.status(400).json({ success: false, error: "Cổng không hợp lệ: chỉ chấp nhận entry hoặc exit" });
+  const gate = gateFromConfig(loadCameraStreamsConfig(), req.params.gate);
+  if (!gate) return res.status(400).json({ success: false, error: unknownGateError(req.params.gate) });
   const streamId = String(req.params.streamId || "");
-  const gate = loadCameraStreamsConfig()[gateKey];
   const existing = gate.streams!;
   if (!existing.some((s) => s.id === streamId)) {
     return res.status(404).json({ success: false, error: `Không tìm thấy luồng "${streamId}" ở cổng này` });
@@ -3679,7 +4142,8 @@ app.delete(STREAM_ITEM_ROUTE, (req, res) => {
       error: "Không thể xoá luồng video cuối cùng của cổng. Hãy thêm luồng khác trước hoặc tắt (enabled=false) luồng này.",
     });
   }
-  const updatedGate = commitGateStreams(gateKey, existing.filter((s) => s.id !== streamId));
+  const updatedGate = commitGateStreams(gate.id, existing.filter((s) => s.id !== streamId));
+  console.log(`[Camera Config] ${operatorActor(req) || "unknown"} xóa luồng ${streamId} của cổng ${gate.id}`);
   res.json({
     success: true,
     gate: updatedGate,
@@ -3696,9 +4160,14 @@ app.delete(STREAM_ITEM_ROUTE, (req, res) => {
 function resolveGateStream(
   gateParam: unknown,
   streamParam?: unknown
-): { gateKey: "entry" | "exit"; gate: GateStreamConfigRecord; stream: GateStreamSourceRecord; error?: string } {
-  const gateKey = normalizeGateKey(gateParam);
-  const gate = normalizeGateConfig(gateKey === "exit" ? cameraStreamsConfig.exitGate : cameraStreamsConfig.entryGate);
+):
+  | { gateKey: string; gate: GateRecord; stream: GateStreamSourceRecord; error?: undefined }
+  | { gateKey?: undefined; gate?: undefined; stream?: undefined; error: string } {
+  // A configured gate id only: an unknown, malformed or missing gate is an
+  // error - it used to fall back to "entry" silently.
+  const gate = gateFromConfig(cameraStreamsConfig, gateParam);
+  if (!gate) return { error: unknownGateError(gateParam) };
+  const gateKey = gate.id;
   const streams = gate.streams!;
   const primary = pickPrimaryStream(streams);
   const wanted = optionalTrimmedString(streamParam);
@@ -3706,10 +4175,7 @@ function resolveGateStream(
   const found = streams.find((s) => s.id === wanted);
   if (!found) {
     return {
-      gateKey,
-      gate,
-      stream: primary,
-      error: `Luồng "${wanted}" không tồn tại ở cổng ${gateKey === "exit" ? "ra" : "vào"}. Các luồng hiện có: ${streams.map((s) => s.id).join(", ")}`,
+      error: `Luồng "${wanted}" không tồn tại ở cổng ${gateLabelOf(gate)}. Các luồng hiện có: ${streams.map((s) => s.id).join(", ")}`,
     };
   }
   return { gateKey, gate, stream: found };
@@ -3977,7 +4443,7 @@ app.get("/api/camera-streams/snapshot", async (req, res) => {
   if (resolved.error) {
     return res.status(400).json({ success: false, error: resolved.error });
   }
-  const gateParam = resolved.gateKey;
+  const gateParam = encodeURIComponent(resolved.gateKey);
   const stream = resolved.stream;
   // Only the configured stream: a caller-supplied ?url= let any signed-in
   // viewer make the gateway dial an arbitrary RTSP destination (SSRF).
@@ -4169,10 +4635,16 @@ function newRecognitionOutcomeStats(): RecognitionOutcomeStats {
   };
 }
 
-const gateOutcomeStats: Record<"entry" | "exit", RecognitionOutcomeStats> = {
-  entry: newRecognitionOutcomeStats(),
-  exit: newRecognitionOutcomeStats(),
-};
+/** Recorder counters per gate id (created on first use; dropped when a gate is removed). */
+const gateOutcomeStats = new Map<string, RecognitionOutcomeStats>();
+function outcomeStatsOf(gateId: string): RecognitionOutcomeStats {
+  let stats = gateOutcomeStats.get(gateId);
+  if (!stats) {
+    stats = newRecognitionOutcomeStats();
+    gateOutcomeStats.set(gateId, stats);
+  }
+  return stats;
+}
 
 interface RecognitionOutcomeInput {
   /** Faces exactly as the engine reported them. Never re-decided here. */
@@ -4192,8 +4664,12 @@ interface RecognitionOutcomeInput {
   annotateFaces?: Array<{ box2d: [number, number, number, number]; boxSource?: "detector" }>;
   scanType: "ENTRY" | "EXIT";
   trigger: RecognitionTrigger;
-  /** Which gate the decision belongs to; the cooldowns are keyed on it. */
-  gate?: "entry" | "exit";
+  /**
+   * Which gate (id) the decision belongs to; the cooldowns are keyed on it and
+   * its door is the one a grant opens. Absent (the API path without a gate) =
+   * the legacy gate of `scanType`.
+   */
+  gate?: string;
   streamId?: string;
   streamLabel?: string;
   processingTimeMs: number;
@@ -4269,7 +4745,7 @@ function strangerFaceFloor(o: FaceObservation): OutcomeSuppression | null {
  */
 function acceptStrangerFaces(
   faces: FaceObservation[],
-  gateKey: "entry" | "exit",
+  gateKey: string,
   nowMs: number,
   cooldowns: boolean,
 ): { accepted: FaceObservation[]; firstReason: OutcomeSuppression | null } {
@@ -4305,7 +4781,8 @@ async function persistStrangerFaces(
   logId: string,
   capturedAt: string,
   frameImage: string | undefined,
-  gateKey: "entry" | "exit",
+  gateKey: string,
+  direction: GateDirection,
   logSaved: Promise<boolean>,
 ): Promise<number> {
   if (!faces.length || !frameImage) return 0;
@@ -4327,7 +4804,8 @@ async function persistStrangerFaces(
         logId,
         faceIndex: i,
         capturedAt,
-        gate: gateKey === "exit" ? "EXIT" : "ENTRY",
+        gate: direction,
+        gateId: gateKey,
         streamId: o.streamId || undefined,
         engine: "legacy",
         box: [Math.round(o.box[0]), Math.round(o.box[1]), Math.round(o.box[2]), Math.round(o.box[3])],
@@ -4364,7 +4842,10 @@ async function persistStrangerFaces(
 /** JSON-safe outcome report: ids, flags and counters - never image bytes. */
 interface RecognitionOutcomeSummary {
   trigger: RecognitionTrigger;
-  gate: "entry" | "exit";
+  /** Gate id. */
+  gate: string;
+  /** Door the decision acted on (a grant opens it). */
+  doorId: string;
   scanType: "ENTRY" | "EXIT";
   granted: boolean;
   /** True when THIS outcome actually drove `unlockDoor`. */
@@ -4402,8 +4883,10 @@ interface RecognitionOutcomeResult {
  * door controller's `triggerOnFaceRecognition` policy over
  * `triggerOnManualUnlock`. A watcher unlock is a face-recognition unlock.
  */
-function recognitionUnlockSource(trigger: RecognitionTrigger, gateKey: "entry" | "exit"): string {
-  const gateLabel = gateKey === "exit" ? "cổng ra" : "cổng vào";
+function recognitionUnlockSource(trigger: RecognitionTrigger, gateKey: string): string {
+  const legacy = legacyDirectionOf(gateKey);
+  const gate = legacy ? undefined : cameraStreamsConfig.gates.find((g) => g.id === gateKey);
+  const gateLabel = legacy === "EXIT" ? "cổng ra" : legacy === "ENTRY" ? "cổng vào" : `cổng ${gate ? gateLabelOf(gate) : gateKey}`;
   if (trigger === "watcher") return `Watcher ${gateLabel} - Nhận diện khuôn mặt tự động`;
   if (trigger === "manual") return `Quét RTSP thủ công ${gateLabel} - Nhận diện khuôn mặt`;
   return "Nhận diện khuôn mặt AI (Đa nhân viên)";
@@ -4419,12 +4902,17 @@ async function applyRecognitionOutcome(input: RecognitionOutcomeInput): Promise<
   const detectedFaces = input.detectedFaces || [];
   const actionType: "ENTRY" | "EXIT" = input.scanType === "EXIT" ? "EXIT" : "ENTRY";
   const typeLabel = actionType === "ENTRY" ? "Vào" : "Ra";
-  const gateKey: "entry" | "exit" = input.gate || (actionType === "EXIT" ? "exit" : "entry");
+  const gateKey: string = input.gate || (actionType === "EXIT" ? "exit" : "entry");
+  // The door this gate's grants open (owner decision 4). Resolved from the
+  // configured gate; "entry"/"exit" always exist, so the API path always has one.
+  const gateRecord = cameraStreamsConfig.gates.find((g) => g.id === gateKey);
+  const doorId = gateRecord ? doorIdOf(gateRecord) : LEGACY_DOOR_ID;
+  const doorName = lockStateOf(doorId).doorName;
   // The counters describe the GATE SCAN recorder (watcher + scan-rtsp), which
   // is the path with cooldowns to explain. /api/recognize-face is driven one
   // frame at a time by a caller that already sees its own answer, so it writes
   // into a throwaway so it cannot muddy a gate's suppressed/written ratio.
-  const stats = input.trigger === "api" ? newRecognitionOutcomeStats() : gateOutcomeStats[gateKey];
+  const stats = input.trigger === "api" ? newRecognitionOutcomeStats() : outcomeStatsOf(gateKey);
   const processingTimeMs = input.processingTimeMs;
   const nowMs = Date.now();
 
@@ -4440,6 +4928,7 @@ async function applyRecognitionOutcome(input: RecognitionOutcomeInput): Promise<
   const summary: RecognitionOutcomeSummary = {
     trigger: input.trigger,
     gate: gateKey,
+    doorId,
     scanType: actionType,
     granted: hasAuthorized,
     lockUnlocked: false,
@@ -4616,7 +5105,7 @@ async function applyRecognitionOutcome(input: RecognitionOutcomeInput): Promise<
     // 1. Unlock ONCE for everybody who passed the cooldown.
     const namesList = grantable.map((e) => e.name).join(", ");
     const unlockSource = input.unlockSource || recognitionUnlockSource(input.trigger, gateKey);
-    unlockDoor(unlockSource, namesList, grantable[0]?.id);
+    unlockDoor(unlockSource, namesList, grantable[0]?.id, doorId);
     result.lockUnlocked = true;
     summary.lockUnlocked = true;
     stats.unlocks += 1;
@@ -4629,6 +5118,7 @@ async function applyRecognitionOutcome(input: RecognitionOutcomeInput): Promise<
         id: "LOG-" + Date.now() + "-" + Math.floor(Math.random() * 1000),
         timestamp: new Date().toISOString(),
         type: actionType,
+        gateId: gateKey,
         status: "GRANTED",
         employeeId: emp.id,
         employeeName: emp.name,
@@ -4638,7 +5128,7 @@ async function applyRecognitionOutcome(input: RecognitionOutcomeInput): Promise<
         confidence: faceMatch ? faceMatch.confidence : 95,
         livenessScore: faceMatch ? faceMatch.livenessScore : 98,
         lockAction: "Mở chốt tự động qua API (SmartLock Gateway)",
-        doorName: smartLockState.doorName,
+        doorName,
         reason:
           `Nhận diện khuôn mặt trong khung hình (${faceMatch?.confidence || 95}% khớp - Xử lý trong ${processingTimeMs}ms)` +
           recognitionSourceSuffix(input),
@@ -4661,6 +5151,7 @@ async function applyRecognitionOutcome(input: RecognitionOutcomeInput): Promise<
         userName: emp.name,
         employeeCode: emp.employeeCode,
         scanType: actionType,
+        gateId: gateKey,
       }).catch((webhookErr) => {
         console.warn("[Webhook] Background dispatch warning:", webhookErr);
       });
@@ -4675,7 +5166,7 @@ async function applyRecognitionOutcome(input: RecognitionOutcomeInput): Promise<
         : `Mở cửa tự động (${typeLabel})`;
     const notifBody =
       grantable.length > 1
-        ? `Phát hiện đồng thời ${grantable.map((e) => e.name).join(" & ")} điểm danh ${typeLabel} tại ${smartLockState.doorName}`
+        ? `Phát hiện đồng thời ${grantable.map((e) => e.name).join(" & ")} điểm danh ${typeLabel} tại ${doorName}`
         : `${grantable[0].name} (${grantable[0].employeeCode}) vừa điểm danh ${typeLabel} qua nhận diện khuôn mặt`;
 
     const mobileNotif: MobileNotificationRecord = {
@@ -4698,7 +5189,7 @@ async function applyRecognitionOutcome(input: RecognitionOutcomeInput): Promise<
       const warnNotif: MobileNotificationRecord = {
         id: "NOTIF-" + (Date.now() + 1),
         title: "Lưu ý an ninh: Người lạ đi cùng",
-        body: `Phát hiện ${unauthorizedFaces.length} người chưa đăng ký đi cùng nhóm nhân viên qua ${smartLockState.doorName}`,
+        body: `Phát hiện ${unauthorizedFaces.length} người chưa đăng ký đi cùng nhóm nhân viên qua ${doorName}`,
         timestamp: new Date().toISOString(),
         type: "WARNING",
         read: false,
@@ -4715,7 +5206,7 @@ async function applyRecognitionOutcome(input: RecognitionOutcomeInput): Promise<
       ...tailgaterFaces,
     ];
     if (grantedFaces.length && result.logs[0]) {
-      await persistStrangerFaces(grantedFaces, result.logs[0].id, result.logs[0].timestamp, input.frameImage, gateKey,
+      await persistStrangerFaces(grantedFaces, result.logs[0].id, result.logs[0].timestamp, input.frameImage, gateKey, actionType,
         firstGrantSaved || Promise.resolve(false));
     }
     return result;
@@ -4729,12 +5220,13 @@ async function applyRecognitionOutcome(input: RecognitionOutcomeInput): Promise<
     id: `LOG-${Date.now()}-${randomUUID().slice(0, 8)}`,
     timestamp,
     type: actionType,
+    gateId: gateKey,
     status: "DENIED",
     photoSnapshot: snapshotForLog,
     confidence: detectedFaces[0]?.confidence || 25,
     livenessScore: detectedFaces[0]?.livenessScore || 85,
     lockAction: "Khóa giữ nguyên trạng thái LOCKED",
-    doorName: smartLockState.doorName,
+    doorName,
     reason:
       (detectedFaces[0]?.message || "Không có khuôn mặt nào khớp với cơ sở dữ liệu nhân viên") +
       recognitionSourceSuffix(input),
@@ -4755,7 +5247,7 @@ async function applyRecognitionOutcome(input: RecognitionOutcomeInput): Promise<
   const mobileNotif: MobileNotificationRecord = {
     id: "NOTIF-" + Date.now(),
     title: "🚨 Cảnh báo an ninh: Phát hiện người lạ chụp hình",
-    body: `Phát hiện khuôn mặt không xác định tại ${smartLockState.doorName} (Khóa cửa giữ an toàn). Đã tự động lưu trữ ảnh vào cụm giám sát người lạ.`,
+    body: `Phát hiện khuôn mặt không xác định tại ${doorName} (Khóa cửa giữ an toàn). Đã tự động lưu trữ ảnh vào cụm giám sát người lạ.`,
     timestamp: new Date().toISOString(),
     type: "ALERT",
     read: false,
@@ -4774,7 +5266,7 @@ async function applyRecognitionOutcome(input: RecognitionOutcomeInput): Promise<
     // them. A gate scan broadcasts on every tick, so it sends no pixels - the
     // stored snapshot is fetched from the log / cluster endpoints instead.
     snapshot: input.sseSnapshot,
-    doorName: smartLockState.doorName,
+    doorName,
     timestamp: accessLog.timestamp,
   });
   broadcastSSE("notification", mobileNotif);
@@ -4796,7 +5288,7 @@ async function applyRecognitionOutcome(input: RecognitionOutcomeInput): Promise<
   summary.strangerWebhookDispatched = true;
   sendStrangerWebhook({
     log: { id: accessLog.id, type: accessLog.type, reason: accessLog.reason },
-    doorName: smartLockState.doorName,
+    doorName,
     faceCount: detectedFaces.length,
     baseUrl: input.baseUrl,
     embedding: logStrangerObservation?.embedding,
@@ -4806,7 +5298,7 @@ async function applyRecognitionOutcome(input: RecognitionOutcomeInput): Promise<
     })
     .catch(() => {});
 
-  if (deniedFaces.length) await persistStrangerFaces(deniedFaces, accessLog.id, accessLog.timestamp, input.frameImage, gateKey, deniedSaved);
+  if (deniedFaces.length) await persistStrangerFaces(deniedFaces, accessLog.id, accessLog.timestamp, input.frameImage, gateKey, actionType, deniedSaved);
   return result;
 }
 
@@ -4850,7 +5342,7 @@ interface GateScanResult {
  * decision than a manual one.
  */
 async function performGateScan(input: GateScanRequest): Promise<GateScanResult> {
-  const { gate, stream, url, scanType, frames, frameIntervalMs } = input || {};
+  const { gate, stream, url, frames, frameIntervalMs } = input || {};
   const resolved = resolveGateStream(gate, stream);
   if (resolved.error) {
     return { status: 400, body: { success: false, error: resolved.error } };
@@ -4884,8 +5376,9 @@ async function performGateScan(input: GateScanRequest): Promise<GateScanResult> 
     }
   }
 
-  const resolvedScanType: "ENTRY" | "EXIT" =
-    String(scanType || "").toUpperCase() === "EXIT" || (!scanType && gateParam === "exit") ? "EXIT" : "ENTRY";
+  // The gate's direction decides the event type. A body `scanType` (older
+  // dashboards send the gate's own direction) cannot relabel a gate's events.
+  const resolvedScanType: "ENTRY" | "EXIT" = targetGate.direction;
 
   const faceEngine = activeFaceEngine();
   const fusionThresholds = currentFusionThresholds();
@@ -5197,6 +5690,16 @@ async function performGateScan(input: GateScanRequest): Promise<GateScanResult> 
     }
   }
 
+  // The gate was removed while its frames were being captured: record nothing
+  // and open nothing (its door may be gone too). Synchronous from here to the
+  // door resolution inside applyRecognitionOutcome, so this cannot race.
+  if (!gateFromConfig(cameraStreamsConfig, gateParam)) {
+    return {
+      status: 409,
+      body: { success: false, recognized: false, gate: gateParam, code: "GATE_REMOVED", error: `Cổng "${gateParam}" đã bị xóa trong lúc quét; không ghi nhận kết quả.` },
+    };
+  }
+
   // The recording + unlocking side of the decision, shared verbatim with
   // POST /api/recognize-face. Nothing below re-decides anything.
   const outcome = await applyRecognitionOutcome({
@@ -5319,10 +5822,12 @@ const GATE_WATCH_START_DELAY_MS = 500;
  */
 const GATE_WATCH_IDLE_RECHECK_MS = 15_000;
 
-type GateWatchKey = "entry" | "exit";
+/** A configured gate id (N-gate wave; was "entry" | "exit"). */
+type GateWatchKey = string;
 
 interface GateWatcherState {
   gateKey: GateWatchKey;
+  /** The gate's direction (kept in sync with the config by syncGateWatchers). */
   gate: "ENTRY" | "EXIT";
   enabled: boolean;
   intervalSeconds: number;
@@ -5351,10 +5856,10 @@ interface GateWatcherState {
   lastOutcome?: RecognitionOutcomeSummary;
 }
 
-function newGateWatcherState(gateKey: GateWatchKey): GateWatcherState {
+function newGateWatcherState(gateKey: GateWatchKey, direction: GateDirection): GateWatcherState {
   return {
     gateKey,
-    gate: gateKey === "exit" ? "EXIT" : "ENTRY",
+    gate: direction,
     enabled: false,
     intervalSeconds: DEFAULT_GATE_WATCH.intervalSeconds,
     frames: DEFAULT_GATE_WATCH.frames,
@@ -5366,18 +5871,13 @@ function newGateWatcherState(gateKey: GateWatchKey): GateWatcherState {
   };
 }
 
-const gateWatchers: Record<GateWatchKey, GateWatcherState> = {
-  entry: newGateWatcherState("entry"),
-  exit: newGateWatcherState("exit"),
-};
-
-function gateConfigKeyOf(gateKey: GateWatchKey): "entryGate" | "exitGate" {
-  return gateKey === "exit" ? "exitGate" : "entryGate";
-}
+/** One watcher per configured gate, created/removed by syncGateWatchers. */
+const gateWatchers = new Map<GateWatchKey, GateWatcherState>();
 
 function gateWatchConfigOf(gateKey: GateWatchKey): GateWatchConfigRecord {
-  const gate = cameraStreamsConfig[gateConfigKeyOf(gateKey)];
-  return normalizeGateWatchConfig(gate?.watch);
+  const gate = cameraStreamsConfig.gates.find((g) => g.id === gateKey);
+  // A gate that is gone has nothing to watch.
+  return gate ? normalizeGateWatchConfig(gate.watch) : { ...DEFAULT_GATE_WATCH, enabled: false };
 }
 
 /**
@@ -5398,30 +5898,34 @@ interface GateWatchOutcomeRuntime {
 /** The public runtime view (src/types.ts `GateWatchRuntime`) + outcome telemetry. */
 /**
  * Per-gate pipeline rollout. The camera config's `pipelineMode` (set by an
- * admin in the app) wins over PIPELINE_MODE_<GATE> from the environment; a
- * mode this build cannot run is downgraded to legacy and reported as such.
+ * admin in the app) wins over PIPELINE_MODE_<gateEnvSuffix(id)> from the
+ * environment (PIPELINE_MODE_ENTRY / _EXIT for the legacy gates); a mode this
+ * build cannot run is downgraded to legacy and reported as such.
  */
 const pipelineDowngradeWarned = new Set<string>();
-function pipelineModeFor(gate: "ENTRY" | "EXIT"): { mode: PipelineMode; requested: PipelineMode; source: "config" | "env" } {
-  const configured = parsePipelineMode(cameraStreamsConfig[gate === "EXIT" ? "exitGate" : "entryGate"]?.pipelineMode);
+function pipelineModeFor(gate: Gate): { mode: PipelineMode; requested: PipelineMode; source: "config" | "env" } {
+  const configured = parsePipelineMode(cameraStreamsConfig.gates.find((g) => g.id === gate)?.pipelineMode);
   const requested = configured ?? pipelineModeFromEnv(gate);
   const effective = effectivePipelineMode(requested);
   if (effective.downgraded && !pipelineDowngradeWarned.has(`${gate}:${requested}`)) {
     pipelineDowngradeWarned.add(`${gate}:${requested}`);
-    console.warn(`[Pipeline ${gate}] Chế độ ${requested} chưa có trong bản này; cổng chạy chế độ legacy.`);
+    console.warn(`[Pipeline ${gateLogTag(gate)}] Chế độ ${requested} chưa có trong bản này; cổng chạy chế độ legacy.`);
   }
   return { mode: effective.mode, requested, source: configured ? "config" : "env" };
 }
 
 function gateWatchRuntime(state: GateWatcherState): GateWatchRuntime & GateWatchOutcomeRuntime {
-  const pipeline = pipelineModeFor(state.gate);
+  const pipeline = pipelineModeFor(state.gateKey);
+  const gateConfig = cameraStreamsConfig.gates.find((g) => g.id === state.gateKey);
   return {
+    gateId: state.gateKey,
+    gateLabel: gateConfig ? gateLabelOf(gateConfig) : state.gateKey,
     gate: state.gate,
     enabled: state.enabled,
     pipelineMode: pipeline.mode,
     ...(pipeline.requested !== pipeline.mode ? { pipelineModeRequested: pipeline.requested } : {}),
     pipelineModeSource: pipeline.source,
-    ...pipelineRuntime(state.gate),
+    ...pipelineRuntime(state.gateKey),
     intervalSeconds: state.intervalSeconds,
     frames: state.frames,
     running: state.running,
@@ -5438,8 +5942,16 @@ function gateWatchRuntime(state: GateWatcherState): GateWatchRuntime & GateWatch
     lastAccessLogId: state.lastOutcome?.logId,
     lastUnlocked: state.lastOutcome?.lockUnlocked,
     lastSuppressed: state.lastOutcome?.suppressed,
-    outcomeStats: gateOutcomeStats[state.gateKey],
+    outcomeStats: outcomeStatsOf(state.gateKey),
   };
+}
+
+/**
+ * Log tag of a gate: the legacy gates keep their "ENTRY"/"EXIT" tags (existing
+ * log searches keep working); any other gate is tagged by its id.
+ */
+function gateLogTag(gateId: string): string {
+  return legacyDirectionOf(gateId) ?? gateId;
 }
 
 function broadcastGateWatchState(state: GateWatcherState) {
@@ -5451,7 +5963,8 @@ function broadcastGateWatchState(state: GateWatcherState) {
  * work idles (and says why) instead of burning ffmpeg processes.
  */
 function gateWatchBlockedReason(gateKey: GateWatchKey): string | null {
-  const gate = normalizeGateConfig(cameraStreamsConfig[gateConfigKeyOf(gateKey)]);
+  const gate = cameraStreamsConfig.gates.find((g) => g.id === gateKey);
+  if (!gate) return "Cổng đã bị xóa";
   if (!gate.enabled) return "Cổng đang tắt (gate disabled)";
   const rtspStreams = (gate.streams || []).filter(
     (s) => s.enabled && (s.sourceType === "RTSP" || !s.sourceType) && isRtspUrl(s.rtspUrl)
@@ -5519,7 +6032,7 @@ async function runGateWatchTick(state: GateWatcherState, generation: number) {
   if (blocked) {
     state.idleReason = blocked;
     if (state.loggedIdleReason !== blocked) {
-      console.warn(`[Gate Watch ${state.gate}] Tạm dừng quét: ${blocked}`);
+      console.warn(`[Gate Watch ${gateLogTag(state.gateKey)}] Tạm dừng quét: ${blocked}`);
       state.loggedIdleReason = blocked;
       broadcastGateWatchState(state);
     }
@@ -5529,7 +6042,7 @@ async function runGateWatchTick(state: GateWatcherState, generation: number) {
     return;
   }
   if (state.idleReason) {
-    console.log(`[Gate Watch ${state.gate}] Tiếp tục quét (điều kiện tạm dừng đã hết).`);
+    console.log(`[Gate Watch ${gateLogTag(state.gateKey)}] Tiếp tục quét (điều kiện tạm dừng đã hết).`);
   }
   state.idleReason = undefined;
   state.loggedIdleReason = undefined;
@@ -5577,6 +6090,7 @@ async function runGateWatchTick(state: GateWatcherState, generation: number) {
   // base64 data URL. That keeps an event at a few KB.
   broadcastSSE("gate_watch_result", {
     gate: state.gate,
+    gateId: state.gateKey,
     at: state.lastRunAt,
     durationMs,
     status: result.status,
@@ -5655,7 +6169,8 @@ function applyGateWatchConfig(
   gateKey: GateWatchKey,
   options: { silent?: boolean } = {}
 ): GateWatchRuntime & GateWatchOutcomeRuntime {
-  const state = gateWatchers[gateKey];
+  const state = gateWatchers.get(gateKey);
+  if (!state) throw new Error(`no watcher for gate ${gateKey}`);
   const cfg = gateWatchConfigOf(gateKey);
   const unchanged =
     state.enabled === cfg.enabled &&
@@ -5675,19 +6190,39 @@ function applyGateWatchConfig(
     state.lastError = undefined;
     scheduleGateWatch(state, GATE_WATCH_START_DELAY_MS);
     console.log(
-      `[Gate Watch ${state.gate}] Bật: quét lại sau mỗi ${cfg.intervalSeconds}s (khoảng nghỉ giữa 2 lần quét), ${cfg.frames} khung/luồng.`
+      `[Gate Watch ${gateLogTag(state.gateKey)}] Bật: quét lại sau mỗi ${cfg.intervalSeconds}s (khoảng nghỉ giữa 2 lần quét), ${cfg.frames} khung/luồng.`
     );
   } else if (wasEnabled) {
-    console.log(`[Gate Watch ${state.gate}] Tắt.`);
+    console.log(`[Gate Watch ${gateLogTag(state.gateKey)}] Tắt.`);
   }
   if (!options.silent) broadcastGateWatchState(state);
   return gateWatchRuntime(state);
 }
 
-/** Reconciles BOTH watchers with the current camera config (boot, config writes, DB sync). */
+/**
+ * Reconciles the watchers with the configured gates (boot, config writes, DB
+ * sync, gate add/remove): one watcher per gate, a removed gate's watcher
+ * stopped and dropped (an in-flight scan of it records nothing - see
+ * performGateScan), a gate's direction kept current.
+ */
 function syncGateWatchers() {
-  applyGateWatchConfig("entry");
-  applyGateWatchConfig("exit");
+  for (const [gateId, state] of gateWatchers) {
+    if (cameraStreamsConfig.gates.some((g) => g.id === gateId)) continue;
+    const wasEnabled = state.enabled;
+    stopGateWatcher(state);
+    gateWatchers.delete(gateId);
+    gateOutcomeStats.delete(gateId);
+    if (wasEnabled) console.log(`[Gate Watch ${gateLogTag(gateId)}] Dừng: cổng đã bị xóa.`);
+  }
+  for (const gate of cameraStreamsConfig.gates) {
+    let state = gateWatchers.get(gate.id);
+    if (!state) {
+      state = newGateWatcherState(gate.id, gate.direction);
+      gateWatchers.set(gate.id, state);
+    }
+    state.gate = gate.direction;
+    applyGateWatchConfig(gate.id);
+  }
   syncPipelines();
 }
 
@@ -5712,12 +6247,13 @@ const PIPELINE_STATS_LOG_MS = envInt("PIPELINE_STATS_LOG_MS", 60_000, 0, 3_600_0
 const PIPELINE_ERROR_LOG_MS = 10_000;
 
 /** Pipeline error lines, at most one per gate per PIPELINE_ERROR_LOG_MS (the rest are counted). */
-const pipelineErrorLog: Record<Gate, { at: number; suppressed: number }> = {
-  ENTRY: { at: 0, suppressed: 0 },
-  EXIT: { at: 0, suppressed: 0 },
-};
+const pipelineErrorLog = new Map<Gate, { at: number; suppressed: number }>();
 function logPipelineError(gate: Gate, message: string) {
-  const l = pipelineErrorLog[gate];
+  let l = pipelineErrorLog.get(gate);
+  if (!l) {
+    l = { at: 0, suppressed: 0 };
+    pipelineErrorLog.set(gate, l);
+  }
   const now = Date.now();
   if (now - l.at < PIPELINE_ERROR_LOG_MS) {
     l.suppressed += 1;
@@ -5726,7 +6262,7 @@ function logPipelineError(gate: Gate, message: string) {
   const extra = l.suppressed ? ` (+${l.suppressed} lỗi tương tự bị lược)` : "";
   l.at = now;
   l.suppressed = 0;
-  console.warn(`[Pipeline ${gate}] ${redactRtsp(message)}${extra}`);
+  console.warn(`[Pipeline ${gateLogTag(gate)}] ${redactRtsp(message)}${extra}`);
 }
 
 /** Same gallery, thresholds and engine the legacy watcher decides with; null = fail closed. */
@@ -5758,17 +6294,23 @@ interface GatePipelineSlot {
   /** The destination guard refused the stream: not started until the config changes. */
   blocked: { code: string; reason: string; since: string } | null;
 }
-const gatePipelines: Record<Gate, GatePipelineSlot> = {
-  ENTRY: { key: "", pipeline: null, starting: false, retry: null, statsLog: null, blocked: null },
-  EXIT: { key: "", pipeline: null, starting: false, retry: null, statsLog: null, blocked: null },
-};
+/** One slot per gate id that has (or had) a pipeline; a removed gate's slot is stopped and dropped. */
+const gatePipelines = new Map<Gate, GatePipelineSlot>();
+function pipelineSlotOf(gate: Gate): GatePipelineSlot {
+  let slot = gatePipelines.get(gate);
+  if (!slot) {
+    slot = { key: "", pipeline: null, starting: false, retry: null, statsLog: null, blocked: null };
+    gatePipelines.set(gate, slot);
+  }
+  return slot;
+}
 
 interface DesiredPipeline { key: string; url: string; streamId: string; area: ReturnType<typeof normalizeGateArea> }
 
 function desiredPipeline(gate: Gate): DesiredPipeline | null {
   const mode = pipelineModeFor(gate).mode;
   if (mode === "legacy") return null;
-  const { gate: gateConfig, stream } = resolveGateStream(gate === "EXIT" ? "exit" : "entry");
+  const { gate: gateConfig, stream } = resolveGateStream(gate);
   // A disabled gate runs nothing - same rule as the legacy watcher (review item 8).
   if (!gateConfig?.enabled) return null;
   const url = String(stream?.rtspUrl || "").trim();
@@ -5778,7 +6320,7 @@ function desiredPipeline(gate: Gate): DesiredPipeline | null {
 }
 
 async function startGatePipeline(gate: Gate, want: DesiredPipeline): Promise<void> {
-  const slot = gatePipelines[gate];
+  const slot = pipelineSlotOf(gate);
   slot.starting = true;
   try {
     // Destination guard before any FFmpeg/ffprobe process touches the URL.
@@ -5786,14 +6328,14 @@ async function startGatePipeline(gate: Gate, want: DesiredPipeline): Promise<voi
     if (slot.key !== want.key) return; // reconfigured while checking
     if (refusal) {
       slot.blocked = { code: refusal.code, reason: refusal.reason, since: new Date().toISOString() };
-      console.warn(`[Pipeline ${gate}] Luồng ${want.streamId} bị chặn (${refusal.code}) host=${refusal.host || "?"}: không khởi động.`);
+      console.warn(`[Pipeline ${gateLogTag(gate)}] Luồng ${want.streamId} bị chặn (${refusal.code}) host=${refusal.host || "?"}: không khởi động.`);
       return;
     }
     slot.blocked = null;
     const size = await probeStreamSize(want.url, { timeoutMs: 15_000 });
     if (slot.key !== want.key) return; // reconfigured while probing
     if (!size) {
-      console.warn(`[Pipeline ${gate}] Không đọc được kích thước khung hình của luồng ${want.streamId}; thử lại sau ${PIPELINE_PROBE_RETRY_MS / 1000}s.`);
+      console.warn(`[Pipeline ${gateLogTag(gate)}] Không đọc được kích thước khung hình của luồng ${want.streamId}; thử lại sau ${PIPELINE_PROBE_RETRY_MS / 1000}s.`);
       slot.retry = setTimeout(() => {
         slot.retry = null;
         if (slot.key === want.key && !slot.pipeline && !slot.starting) void startGatePipeline(gate, want);
@@ -5811,7 +6353,7 @@ async function startGatePipeline(gate: Gate, want: DesiredPipeline): Promise<voi
       roi,
       fps: PIPELINE_FPS,
       // F12: stale/reconnect/recovery transitions, without URL or host, rate-limited by the reader.
-      log: (line) => console.warn(`[Pipeline ${gate}] ${line}`),
+      log: (line) => console.warn(`[Pipeline ${gateLogTag(gate)}] ${line}`),
     });
     const pipeline = new GatePipeline({
       gate,
@@ -5830,23 +6372,29 @@ async function startGatePipeline(gate: Gate, want: DesiredPipeline): Promise<voi
       slot.statsLog.unref?.();
     }
     console.log(
-      `[Pipeline ${gate}] Chạy chế độ ${pipelineModeFor(gate).mode}: luồng ${want.streamId}, ${size.width}x${size.height}, ` +
+      `[Pipeline ${gateLogTag(gate)}] Chạy chế độ ${pipelineModeFor(gate).mode}: luồng ${want.streamId}, ${size.width}x${size.height}, ` +
         `${roi ? `vùng cổng ${roi.join(",")}` : "toàn khung hình"}, ${PIPELINE_FPS} khung/giây.`
     );
   } catch (err: any) {
-    console.warn(`[Pipeline ${gate}] Không khởi động được: ${redactRtsp(String(err?.message || err))}`);
+    console.warn(`[Pipeline ${gateLogTag(gate)}] Không khởi động được: ${redactRtsp(String(err?.message || err))}`);
   } finally {
     slot.starting = false;
   }
 }
 
-/** Starts, restarts or stops each gate's pipeline to match mode + camera config. */
+/** Starts, restarts or stops each gate's pipeline to match mode + camera config (and removed gates). */
 function syncPipelines() {
-  for (const gate of ["ENTRY", "EXIT"] as const) {
-    const slot = gatePipelines[gate];
-    const want = desiredPipeline(gate);
+  const gateIds = new Set<Gate>([...gatePipelines.keys(), ...cameraStreamsConfig.gates.map((g) => g.id)]);
+  for (const gate of gateIds) {
+    const slot = pipelineSlotOf(gate);
+    const configured = cameraStreamsConfig.gates.some((g) => g.id === gate);
+    const want = configured ? desiredPipeline(gate) : null;
     const wantKey = want?.key ?? "";
-    if (slot.key === wantKey) continue;
+    if (slot.key === wantKey) {
+      // A removed gate whose pipeline is already stopped: forget its slot.
+      if (!configured && !slot.pipeline && !slot.starting) gatePipelines.delete(gate);
+      continue;
+    }
     slot.key = wantKey;
     slot.blocked = null;
     if (slot.retry) clearTimeout(slot.retry);
@@ -5855,18 +6403,19 @@ function syncPipelines() {
     slot.statsLog = null;
     const old = slot.pipeline;
     slot.pipeline = null;
-    if (old) void old.stop().then(() => console.log(`[Pipeline ${gate}] Đã dừng luồng cũ.`));
+    if (old) void old.stop().then(() => console.log(`[Pipeline ${gateLogTag(gate)}] Đã dừng luồng cũ.`));
     if (want) void startGatePipeline(gate, want);
+    if (!configured && !slot.pipeline && !slot.starting) gatePipelines.delete(gate);
   }
 }
 
 /** Periodic counters of one gate's pipeline (no ids, no URLs): throughput, drops, worker health. */
 function logPipelineStats(gate: Gate, pipeline: GatePipeline) {
-  if (gatePipelines[gate].pipeline !== pipeline) return;
+  if (gatePipelines.get(gate)?.pipeline !== pipeline) return;
   const st = pipeline.stats();
   const src = pipeline.sourceState();
   console.log(
-    `[Pipeline ${gate}] stats ${JSON.stringify({
+    `[Pipeline ${gateLogTag(gate)}] stats ${JSON.stringify({
       status: src.status,
       fps: src.fps,
       reconnects: src.reconnects,
@@ -5895,7 +6444,7 @@ function reportPipelineResult(gate: Gate, r: TrackDecisionResult) {
     mode: pipelineModeFor(gate).mode,
   };
   broadcastSSE("pipeline_shadow_result", payload);
-  console.log(`[Pipeline ${gate}] shadow ${JSON.stringify(payload)}`);
+  console.log(`[Pipeline ${gateLogTag(gate)}] shadow ${JSON.stringify(payload)}`);
   // The door engine scans with a gap of a few seconds, so its event for the
   // same passage can arrive AFTER the shadow decision: wait one window, then
   // pair and store. Never blocks the pipeline; never throws.
@@ -5919,7 +6468,7 @@ function nearestLegacyEvent(gate: Gate, atMs: number, employeeId?: string): { id
     const log = accessLogs[i];
     const t = new Date(log.timestamp).getTime();
     if (t < atMs - reach) break;
-    if (log.type !== gate || (log.status !== "GRANTED" && log.status !== "DENIED")) continue;
+    if (gateIdForLegacyRow(log) !== gate || (log.status !== "GRANTED" && log.status !== "DENIED")) continue;
     const delta = Math.abs(t - atMs);
     if (employeeId && log.status === "GRANTED" && log.employeeId === employeeId && delta <= reach && delta < sameDelta) {
       sameEmployee = log; sameDelta = delta;
@@ -5970,14 +6519,14 @@ async function persistShadowResult(gate: Gate, r: TrackDecisionResult): Promise<
   };
   await db.saveShadowResult(record);
   if (record.agreement === "identity-mismatch") {
-    console.warn(`[Pipeline ${gate}] shadow nhận ${record.employeeId} nhưng cửa đã mở cho ${record.legacyEmployeeId} (${record.legacyLogId}) - cần kiểm tra.`);
+    console.warn(`[Pipeline ${gateLogTag(gate)}] shadow nhận ${record.employeeId} nhưng cửa đã mở cho ${record.legacyEmployeeId} (${record.legacyLogId}) - cần kiểm tra.`);
   }
 }
 
 /** Watcher-runtime fields for the dashboard: stream health + decision counters. */
-function pipelineRuntime(gate: "ENTRY" | "EXIT"): Pick<GateWatchRuntime, "pipelineState" | "pipelineStats"> {
-  const p = gatePipelines[gate].pipeline;
-  const blocked = gatePipelines[gate].blocked;
+function pipelineRuntime(gate: Gate): Pick<GateWatchRuntime, "pipelineState" | "pipelineStats"> {
+  const p = gatePipelines.get(gate)?.pipeline;
+  const blocked = gatePipelines.get(gate)?.blocked;
   if (!p && blocked) {
     return {
       pipelineState: { status: "stopped", fps: 0, newestFrameAgeMs: null, reconnects: 0, lastError: `${blocked.code}: ${blocked.reason}`, since: blocked.since },
@@ -6012,8 +6561,17 @@ function pipelineRuntime(gate: "ENTRY" | "EXIT"): Pick<GateWatchRuntime, "pipeli
   };
 }
 
+/** One runtime per configured gate, in display order. */
 function listGateWatchRuntimes(): Array<GateWatchRuntime & GateWatchOutcomeRuntime> {
-  return [gateWatchRuntime(gateWatchers.entry), gateWatchRuntime(gateWatchers.exit)];
+  return cameraStreamsConfig.gates.map((g) => {
+    let state = gateWatchers.get(g.id);
+    if (!state) {
+      // Before the first sync (or right after an add): an idle watcher, started by syncGateWatchers.
+      state = newGateWatcherState(g.id, g.direction);
+      gateWatchers.set(g.id, state);
+    }
+    return gateWatchRuntime(state);
+  });
 }
 
 // ---- Watch endpoints ----
@@ -6023,11 +6581,11 @@ app.get(["/api/camera-streams/watch", "/api/camera-streams/watch/"], (_req, res)
 });
 
 app.post(["/api/camera-streams/:gate/watch", "/api/camera-streams/:gate/watch/"], (req, res) => {
-  const configKey = gateConfigKeyFromParam(req.params.gate);
-  if (!configKey) {
-    return res.status(400).json({ success: false, error: `Cổng không hợp lệ: "${req.params.gate}". Chỉ chấp nhận entry hoặc exit.` });
+  const requested = gateFromConfig(cameraStreamsConfig, req.params.gate);
+  if (!requested) {
+    return res.status(400).json({ success: false, error: unknownGateError(req.params.gate) });
   }
-  const gateKey: GateWatchKey = configKey === "exitGate" ? "exit" : "entry";
+  const gateKey: GateWatchKey = requested.id;
   const body = req.body && typeof req.body === "object" ? req.body : {};
 
   // Explicit 400 on out-of-range values instead of silently clamping a value
@@ -6051,31 +6609,27 @@ app.post(["/api/camera-streams/:gate/watch", "/api/camera-streams/:gate/watch/"]
   }
 
   const current = loadCameraStreamsConfig();
-  const updated = normalizeCameraStreamsConfig({
-    ...current,
-    [configKey]: normalizeGateConfig({
-      ...current[configKey],
-      watch: normalizeGateWatchConfig(body, normalizeGateWatchConfig(current[configKey].watch)),
-    }),
-  });
-  cameraStreamsConfig = updated;
-  db.saveCameraStreamsConfig(updated);
-  broadcastSSE("camera_config_updated", updated);
+  const gate = gateFromConfig(current, gateKey);
+  if (!gate) return res.status(400).json({ success: false, error: unknownGateError(gateKey, current) });
+  const updated = commitCameraConfig(
+    withGate(current, { ...gate, watch: normalizeGateWatchConfig(body, normalizeGateWatchConfig(gate.watch)) })
+  );
+  console.log(`[Gate Watch ${gateLogTag(gateKey)}] ${operatorActor(req) || "unknown"} đổi cấu hình watcher: ${JSON.stringify(gateFromConfig(updated, gateKey)!.watch)}`);
 
+  if (!gateWatchers.has(gateKey)) gateWatchers.set(gateKey, newGateWatcherState(gateKey, gate.direction));
   const runtime = applyGateWatchConfig(gateKey);
-  res.json({ success: true, gate: runtime.gate, watch: updated[configKey].watch, watcher: runtime });
+  res.json({ success: true, gate: runtime.gate, gateId: gateKey, watch: gateFromConfig(updated, gateKey)!.watch, watcher: runtime });
 });
 
 // Admin switch for a gate's real-time pipeline mode (the separate engine
 // flow). Saved in the camera config, applied at once, audited; the
-// environment's PIPELINE_MODE_<GATE> stays the default when the field is cleared.
+// environment's PIPELINE_MODE_<GATE ID> stays the default when the field is cleared.
 app.post(["/api/camera-streams/:gate/pipeline-mode", "/api/camera-streams/:gate/pipeline-mode/"], (req, res) => {
-  const configKey = gateConfigKeyFromParam(req.params.gate);
-  if (!configKey) {
-    return res.status(400).json({ success: false, error: `Cổng không hợp lệ: "${req.params.gate}". Chỉ chấp nhận entry hoặc exit.` });
+  const requested = gateFromConfig(cameraStreamsConfig, req.params.gate);
+  if (!requested) {
+    return res.status(400).json({ success: false, error: unknownGateError(req.params.gate) });
   }
-  const gateKey: GateWatchKey = configKey === "exitGate" ? "exit" : "entry";
-  const gate: "ENTRY" | "EXIT" = configKey === "exitGate" ? "EXIT" : "ENTRY";
+  const gateKey: GateWatchKey = requested.id;
   const body = req.body && typeof req.body === "object" ? req.body : {};
   let mode: PipelineMode | null = null;
   if (body.mode !== null && body.mode !== undefined && body.mode !== "") {
@@ -6090,29 +6644,174 @@ app.post(["/api/camera-streams/:gate/pipeline-mode", "/api/camera-streams/:gate/
   }
 
   const current = loadCameraStreamsConfig();
-  const gateConfig: GateStreamConfigRecord = { ...current[configKey] };
+  const found = gateFromConfig(current, gateKey);
+  if (!found) return res.status(400).json({ success: false, error: unknownGateError(gateKey, current) });
+  const gateConfig: GateRecord = { ...found };
   if (mode) gateConfig.pipelineMode = mode;
   else delete gateConfig.pipelineMode;
-  const updated = normalizeCameraStreamsConfig({ ...current, [configKey]: normalizeGateConfig(gateConfig) });
-  cameraStreamsConfig = updated;
-  db.saveCameraStreamsConfig(updated);
-  broadcastSSE("camera_config_updated", updated);
+  commitCameraConfig(withGate(current, gateConfig));
 
   const session = readOperatorSession(req);
   const actor = session ? `${session.actor}${session.displayName ? ` (${session.displayName})` : ""}, ${session.role}` : "unknown";
-  const resolved = pipelineModeFor(gate);
-  console.log(`[Pipeline ${gate}] ${actor} đặt chế độ pipeline: ${mode ?? "mặc định máy chủ"} -> hiệu lực ${resolved.mode} (nguồn: ${resolved.source})`);
+  const resolved = pipelineModeFor(gateKey);
+  console.log(`[Pipeline ${gateLogTag(gateKey)}] ${actor} đặt chế độ pipeline: ${mode ?? "mặc định máy chủ"} -> hiệu lực ${resolved.mode} (nguồn: ${resolved.source})`);
   syncPipelines();
 
-  const runtime = gateWatchRuntime(gateWatchers[gateKey]);
+  if (!gateWatchers.has(gateKey)) gateWatchers.set(gateKey, newGateWatcherState(gateKey, found.direction));
+  const runtime = gateWatchRuntime(gateWatchers.get(gateKey)!);
   res.json({
     success: true,
-    gate,
+    gate: found.direction,
+    gateId: gateKey,
     pipelineMode: runtime.pipelineMode,
     ...(runtime.pipelineModeRequested ? { pipelineModeRequested: runtime.pipelineModeRequested } : {}),
     pipelineModeSource: runtime.pipelineModeSource,
     watcher: runtime,
   });
+});
+
+// ---- Gates (admin): add, edit, remove. Plan 2026-09-29 section 11. ----
+// "entry" and "exit" always exist: they can be disabled and relabelled, never
+// deleted, and their direction is fixed. Removing any other gate stops its
+// watcher and pipeline; its access history stays (events keep their gateId).
+
+/** A gate as the gate list shows it: no stream URLs. */
+function publicGateSummary(g: GateRecord) {
+  return {
+    id: g.id,
+    label: gateLabelOf(g),
+    direction: g.direction,
+    doorId: doorIdOf(g),
+    doorLabel: doorConfigOf(doorIdOf(g))?.label || doorIdOf(g),
+    enabled: g.enabled !== false,
+    permanent: Boolean(legacyDirectionOf(g.id)),
+    streams: (g.streams || []).length,
+    watch: g.watch,
+    ...(g.pipelineMode ? { pipelineMode: g.pipelineMode } : {}),
+  };
+}
+
+app.get(["/api/gates", "/api/gates/"], (_req, res) => {
+  res.json({ success: true, gates: cameraStreamsConfig.gates.map(publicGateSummary), max: MAX_GATES });
+});
+
+/** Validates a door binding: absent = keep, null/"" = back to "main", otherwise a configured door. */
+function doorBindingFrom(raw: unknown): { doorId?: string | null } | { error: string } {
+  if (raw === undefined) return {};
+  if (raw === null || raw === "") return { doorId: null };
+  if (!isDoorId(raw)) return { error: "doorId không hợp lệ" };
+  if (!doorConfigOf(raw)) {
+    return { error: `Cửa "${raw}" chưa được cấu hình (thêm cửa ở trang Bộ điều khiển cửa trước). Các cửa hiện có: ${doorControllerConfig.doors.map((d) => d.id).join(", ")}` };
+  }
+  return { doorId: raw };
+}
+
+/** Path words under /api/camera-streams/ that a gate id must not shadow. */
+const RESERVED_GATE_IDS = new Set(["config", "threads", "watch", "snapshot", "scan-rtsp", "test-stream", "test-frame", "benchmark", "streams", "all"]);
+
+app.post(["/api/gates", "/api/gates/"], (req, res) => {
+  const body = req.body && typeof req.body === "object" ? req.body : {};
+  const id = typeof body.id === "string" ? body.id.trim() : "";
+  if (!isGateId(id) || RESERVED_GATE_IDS.has(id)) {
+    return res.status(400).json({ success: false, error: "Mã cổng không hợp lệ: chữ thường, số, gạch ngang; 2-32 ký tự; bắt đầu bằng chữ (không dùng từ dành riêng như config, watch, snapshot)" });
+  }
+  if (!isGateDirection(body.direction)) {
+    return res.status(400).json({ success: false, error: "direction phải là ENTRY hoặc EXIT" });
+  }
+  const label = optionalTrimmedString(body.label)?.slice(0, GATE_LABEL_MAX);
+  if (!label) return res.status(400).json({ success: false, error: "label (tên cổng) là bắt buộc" });
+  const door = doorBindingFrom(body.doorId);
+  if ("error" in door) return res.status(400).json({ success: false, error: door.error });
+
+  const current = loadCameraStreamsConfig();
+  if (current.gates.some((g) => g.id === id)) {
+    return res.status(409).json({ success: false, error: `Cổng "${id}" đã tồn tại` });
+  }
+  if (current.gates.length >= MAX_GATES) {
+    return res.status(400).json({ success: false, error: `Tối đa ${MAX_GATES} cổng` });
+  }
+  const template = DEFAULT_CAMERA_STREAMS_CONFIG.entryGate;
+  // A new gate starts enabled with one empty RTSP stream (`<id>-primary`) and
+  // its watcher OFF: nothing is dialled until an operator adds a stream URL
+  // (destination-guarded) and an operator/admin switches the watcher on.
+  const raw: Record<string, unknown> = {
+    gateType: body.direction,
+    name: label,
+    label,
+    enabled: true,
+    autoStart: false,
+    reconnectIntervalSeconds: template.reconnectIntervalSeconds,
+    sourceType: "RTSP",
+    rtspTransport: "TCP",
+    watch: { ...DEFAULT_GATE_WATCH },
+    streams: [],
+    ...(door.doorId ? { doorId: door.doorId } : {}),
+  };
+  const gate = normalizeGateRecord(raw, id, body.direction);
+  const updated = commitCameraConfig(normalizeCameraStreamsConfig({ ...current, gates: [...current.gates, gate] }));
+  syncGateWatchers();
+  console.log(`[Gates] ${operatorActor(req) || "unknown"} thêm cổng ${id} (${body.direction}, "${label}", cửa ${doorIdOf(gate)})`);
+  res.status(201).json({ success: true, gate: gateFromConfig(updated, id), summary: publicGateSummary(gateFromConfig(updated, id)!) });
+});
+
+app.put(["/api/gates/:gateId", "/api/gates/:gateId/"], (req, res) => {
+  const current = loadCameraStreamsConfig();
+  const gate = gateFromConfig(current, req.params.gateId);
+  if (!gate) return res.status(400).json({ success: false, error: unknownGateError(req.params.gateId, current) });
+  const body = req.body && typeof req.body === "object" ? req.body : {};
+  const next: GateRecord = { ...gate };
+  const changes: string[] = [];
+
+  if (body.label !== undefined) {
+    const label = optionalTrimmedString(body.label)?.slice(0, GATE_LABEL_MAX);
+    if (!label) return res.status(400).json({ success: false, error: "label không được để trống" });
+    next.label = label;
+    changes.push(`label="${label}"`);
+  }
+  if (body.direction !== undefined) {
+    if (!isGateDirection(body.direction)) return res.status(400).json({ success: false, error: "direction phải là ENTRY hoặc EXIT" });
+    if (legacyDirectionOf(gate.id) && body.direction !== gate.direction) {
+      return res.status(400).json({ success: false, error: `Không đổi được hướng của cổng cố định "${gate.id}"` });
+    }
+    next.direction = body.direction;
+    next.gateType = body.direction;
+    if (body.direction !== gate.direction) changes.push(`direction=${body.direction}`);
+  }
+  if (body.enabled !== undefined) {
+    if (typeof body.enabled !== "boolean") return res.status(400).json({ success: false, error: "enabled phải là true hoặc false" });
+    next.enabled = body.enabled;
+    changes.push(`enabled=${body.enabled}`);
+  }
+  const door = doorBindingFrom(body.doorId);
+  if ("error" in door) return res.status(400).json({ success: false, error: door.error });
+  if (door.doorId !== undefined) {
+    if (door.doorId) next.doorId = door.doorId;
+    else delete next.doorId;
+    changes.push(`door=${doorIdOf(next)}`);
+  }
+
+  const updated = commitCameraConfig(withGate(current, next));
+  syncGateWatchers();
+  console.log(`[Gates] ${operatorActor(req) || "unknown"} sửa cổng ${gate.id}: ${changes.join(", ") || "không đổi"}`);
+  const saved = gateFromConfig(updated, gate.id)!;
+  res.json({ success: true, gate: saved, summary: publicGateSummary(saved) });
+});
+
+app.delete(["/api/gates/:gateId", "/api/gates/:gateId/"], (req, res) => {
+  const current = loadCameraStreamsConfig();
+  const gate = gateFromConfig(current, req.params.gateId);
+  if (!gate) return res.status(400).json({ success: false, error: unknownGateError(req.params.gateId, current) });
+  if (legacyDirectionOf(gate.id)) {
+    return res.status(400).json({ success: false, error: `Cổng "${gate.id}" là cổng cố định: chỉ có thể tắt, không thể xóa` });
+  }
+  commitCameraConfig(normalizeCameraStreamsConfig({ ...current, gates: current.gates.filter((g) => g.id !== gate.id) }));
+  // Stops and drops its watcher and pipeline. Access events keep their gateId.
+  syncGateWatchers();
+  for (const key of [...lastGrantAtByGateEmployee.keys()]) if (key.startsWith(`${gate.id}:`)) lastGrantAtByGateEmployee.delete(key);
+  recentStrangersByGate.delete(gate.id);
+  lastStrangerLogAtByGate.delete(gate.id);
+  console.log(`[Gates] ${operatorActor(req) || "unknown"} xóa cổng ${gate.id} ("${gateLabelOf(gate)}"); lịch sử ra vào được giữ nguyên`);
+  res.json({ success: true, removedGateId: gate.id, gates: cameraStreamsConfig.gates.map(publicGateSummary) });
 });
 
 // Simulated RTSP/HTTP live test frame generator (SVG/JPEG)
@@ -6793,12 +7492,18 @@ function publicTemplate(t: FaceTemplateRecord) {
   };
 }
 
-/** Enabled camera streams of both gates, as the coverage and suggestion features name them. */
-function configuredCameras(): Array<{ streamId: string; gate: "ENTRY" | "EXIT"; label: string }> {
-  const out: Array<{ streamId: string; gate: "ENTRY" | "EXIT"; label: string }> = [];
-  for (const [gate, cfg] of [["ENTRY", cameraStreamsConfig.entryGate], ["EXIT", cameraStreamsConfig.exitGate]] as const) {
+/**
+ * Enabled camera streams of every gate, as the coverage and suggestion
+ * features name them. `gate` stays the direction (older clients); `gateId`
+ * and `gateLabel` name the gate.
+ */
+function configuredCameras(): Array<{ streamId: string; gate: "ENTRY" | "EXIT"; gateId: string; gateLabel: string; label: string }> {
+  const out: Array<{ streamId: string; gate: "ENTRY" | "EXIT"; gateId: string; gateLabel: string; label: string }> = [];
+  for (const cfg of cameraStreamsConfig.gates) {
     for (const st of cfg?.streams || []) {
-      if (st?.id && st.enabled !== false) out.push({ streamId: st.id, gate, label: st.label || st.id });
+      if (st?.id && st.enabled !== false) {
+        out.push({ streamId: st.id, gate: cfg.direction, gateId: cfg.id, gateLabel: gateLabelOf(cfg), label: st.label || st.id });
+      }
     }
   }
   return out;
@@ -6808,7 +7513,10 @@ function templateCoverageFor(employeeId: string) {
   const rows = db.getFaceTemplatesForEmployee(employeeId);
   return configuredCameras().map((c) => {
     const mine = rows.filter((t) => t.streamId === c.streamId);
-    return { streamId: c.streamId, gate: c.gate, label: c.label, count: mine.length, adaptation: mine.filter((t) => t.source === "adaptation").length };
+    return {
+      streamId: c.streamId, gate: c.gate, gateId: c.gateId, gateLabel: c.gateLabel, label: c.label,
+      count: mine.length, adaptation: mine.filter((t) => t.source === "adaptation").length,
+    };
   });
 }
 
@@ -7245,7 +7953,7 @@ const publicAccessLog = (log: AccessLogRecord) => {
   // mergedInto names the record it belongs to now.
   const merged = mergedTargetOf(log.employeeId);
   return {
-    ...metadata, photoSnapshot: imageUrl, imageUrl, hasImage: Boolean(log.photoSnapshot),
+    ...metadata, gateId: gateIdForLegacyRow(log), photoSnapshot: imageUrl, imageUrl, hasImage: Boolean(log.photoSnapshot),
     ...(merged ? { mergedInto: { id: merged.id, name: merged.name, employeeCode: merged.employeeCode } } : {}),
   };
 };
@@ -7279,6 +7987,12 @@ function accessLogQueryFrom(q: Record<string, unknown>): { query: AccessLogQuery
   if (q.type !== undefined && q.type !== "" && q.type !== "ALL") {
     if (q.type !== "ENTRY" && q.type !== "EXIT") return { error: "type phải là ENTRY hoặc EXIT" };
     query.type = q.type;
+  }
+  // A gate id (N-gate wave). A removed gate's id is still a valid filter: its
+  // history is kept. Old rows without one match "entry"/"exit" by direction.
+  if (q.gateId !== undefined && q.gateId !== "" && q.gateId !== "ALL") {
+    if (!isGateId(q.gateId)) return { error: "gateId không hợp lệ" };
+    query.gateId = q.gateId;
   }
   for (const key of ["from", "to"] as const) {
     const raw = q[key];
@@ -7358,13 +8072,16 @@ app.get("/api/logs/export.csv", requireOperatorRole("viewer"), async (req: Reque
     res.setHeader("Content-Disposition", `attachment; filename="${name}"`);
     res.setHeader("Cache-Control", "private, no-store");
     res.setHeader("X-Total-Count", String(first.total));
-    const header = ["ID", "Thời gian", "Loại", "Trạng thái", "Mã NV", "Họ tên", "Phòng ban", "Độ trùng khớp (%)", "Cửa", "Hành động khóa", "Lý do"];
+    const header = ["ID", "Thời gian", "Loại", "Cổng", "Trạng thái", "Mã NV", "Họ tên", "Phòng ban", "Độ trùng khớp (%)", "Cửa", "Hành động khóa", "Lý do"];
+    // Gate label as configured now; a removed gate shows its id.
+    const gateLabels = new Map(cameraStreamsConfig.gates.map((g) => [g.id, gateLabelOf(g)] as const));
     res.write("\uFEFF" + header.map(csvCell).join(",") + "\n"); // BOM so Excel reads UTF-8
     let page = first;
     for (;;) {
       for (const l of page.logs) {
         res.write([
           l.id, when.format(new Date(l.timestamp)), l.type === "ENTRY" ? "Vào" : "Ra",
+          gateLabels.get(gateIdForLegacyRow(l)) || gateIdForLegacyRow(l),
           l.status === "GRANTED" ? "Thành công" : "Từ chối", l.employeeCode || "", l.employeeName || "",
           l.department || "", l.confidence, l.doorName || "", l.lockAction || "", l.reason || "",
         ].map(csvCell).join(",") + "\n");
@@ -7386,7 +8103,7 @@ app.get(LOG_ROUTES, requireOperatorRole("viewer"), async (req, res) => {
     // Keyset mode: any filter, a cursor, or ?paging=cursor. The page-number mode
     // below is kept for callers that only want the newest rows.
     const keyset = req.query.paging === "cursor" || req.query.cursor !== undefined ||
-      ["q", "status", "type", "from", "to"].some((k) => req.query[k] !== undefined && req.query[k] !== "");
+      ["q", "status", "type", "gateId", "from", "to"].some((k) => req.query[k] !== undefined && req.query[k] !== "");
     if (keyset) {
       const parsed = accessLogQueryFrom(req.query as any);
       if ("error" in parsed) {
@@ -7452,10 +8169,17 @@ let activeRecordings = 0;
 app.get("/api/recordings/config", async (_req, res) => {
   await recordingGuard;
   const recordingConfig = nvrRecordingConfig;
+  // Per configured gate id, plus the legacy ENTRY/EXIT keys (= gates "entry"/"exit")
+  // older clients read. Gate ids are lower-case, so the two never collide.
+  const gates: Record<string, boolean> = {
+    ENTRY: Boolean(recordingConfig && recordingChannelFor(recordingConfig, "entry")),
+    EXIT: Boolean(recordingConfig && recordingChannelFor(recordingConfig, "exit")),
+  };
+  for (const g of cameraStreamsConfig.gates) gates[g.id] = Boolean(recordingConfig && recordingChannelFor(recordingConfig, g.id));
   res.json({
     success: true,
     enabled: Boolean(recordingConfig),
-    gates: { ENTRY: Boolean(recordingConfig?.channels.ENTRY), EXIT: Boolean(recordingConfig?.channels.EXIT) },
+    gates,
     windowSeconds: {
       before: DEFAULT_RECORDING_WINDOW.beforeMs / 1000,
       after: DEFAULT_RECORDING_WINDOW.afterMs / 1000,
@@ -7499,8 +8223,9 @@ app.get("/api/logs/:id/recording", requireOperatorRole("viewer"), async (req, re
     res.status(503).json({ success: false, code: "RECORDING_NOT_CONFIGURED", error: "Chưa cấu hình đầu ghi để xem lại (RECORDING_NVR_URL)." });
     return;
   }
-  const gate = log.type === "EXIT" ? "EXIT" : "ENTRY";
-  const channel = recordingConfig.channels[gate];
+  // The event's gate (old rows: derived from the direction) picks the channel.
+  const gate = gateIdForLegacyRow(log);
+  const channel = recordingChannelFor(recordingConfig, gate);
   if (!channel) {
     res.status(404).json({ success: false, code: "RECORDING_NO_CHANNEL", error: "Cổng này chưa được gán kênh ghi hình trên đầu ghi." });
     return;
@@ -7979,7 +8704,9 @@ app.get("/api/pipeline/shadow-summary", requireOperatorRole("viewer"), async (re
 
 app.get("/api/pipeline/shadow-results", requireOperatorRole("viewer"), async (req, res) => {
   const limit = boundedInt(req.query.limit, 50, 1, 100);
-  const gate = typeof req.query.gate === "string" && /^[A-Z]{2,16}$/.test(req.query.gate) ? req.query.gate : undefined;
+  // A gate id; the old direction spellings name the legacy gates.
+  const gateRaw = typeof req.query.gate === "string" ? req.query.gate : "";
+  const gate = gateRaw === "ENTRY" || gateRaw === "EXIT" ? gateRaw.toLowerCase() : isGateId(gateRaw) ? gateRaw : undefined;
   const agreement = typeof req.query.agreement === "string" && ["agree", "shadow-only", "legacy-only", "identity-mismatch", "none"].includes(req.query.agreement)
     ? (req.query.agreement as any) : undefined;
   const sinceIso = typeof req.query.since === "string" && !Number.isNaN(Date.parse(req.query.since)) ? new Date(req.query.since).toISOString() : undefined;
@@ -9173,7 +9900,18 @@ app.post(RECOGNIZE_FACE_ROUTES, async (req, res) => {
       body.data ||
       body.image_base64;
 
-    const scanType: "ENTRY" | "EXIT" = body.scanType === "EXIT" ? "EXIT" : "ENTRY";
+    // Optional gate id (N-gate wave): that gate's direction is the event type
+    // and its door is the one a grant opens. Without it: the legacy gate of
+    // `scanType`, as before. A gate id that names no configured gate is a 400.
+    let apiGate: GateRecord | null = null;
+    if (body.gateId !== undefined && body.gateId !== null && body.gateId !== "") {
+      apiGate = gateFromConfig(cameraStreamsConfig, body.gateId);
+      if (!apiGate) {
+        res.status(400).json({ success: false, recognized: false, error: unknownGateError(body.gateId) });
+        return;
+      }
+    }
+    const scanType: "ENTRY" | "EXIT" = apiGate ? apiGate.direction : body.scanType === "EXIT" ? "EXIT" : "ENTRY";
     // Simulation shortcuts below fabricate a successful recognition from a
     // name/code alone, with no image. Reachable from the request body, that is
     // a remote door-unlock bypass: POST {"employeeCode":"NV-5588"} was enough.
@@ -9201,7 +9939,7 @@ app.post(RECOGNIZE_FACE_ROUTES, async (req, res) => {
         error: "Không nhận được hình ảnh từ camera hoặc mã kiểm thử",
         message:
           "Endpoint /api/recognize-face hoạt động bình thường. Vui lòng gửi trường 'imageBase64' (Data URL hoặc base64) hoặc 'testEmployeeId'.",
-        supportedFields: ["imageBase64", "scanType", "testEmployeeId"],
+        supportedFields: ["imageBase64", "scanType", "gateId", "testEmployeeId"],
       });
       return;
     }
@@ -9368,6 +10106,7 @@ app.post(RECOGNIZE_FACE_ROUTES, async (req, res) => {
       frameImage: imageBase64,
       annotateFaces: detectedFaces,
       scanType,
+      ...(apiGate ? { gate: apiGate.id } : {}),
       trigger: "api",
       processingTimeMs,
       unlockSource: "Nhận diện khuôn mặt AI (Đa nhân viên)",
@@ -9498,17 +10237,21 @@ app.use((err: any, req: Request, res: Response, next: any) => {
 const auditedRefusals = new Set<string>();
 async function auditStoredDestinations(): Promise<void> {
   const items: Array<{ label: string; url: unknown; policy: DestinationPolicy }> = [];
-  for (const gateKey of ["entryGate", "exitGate"] as const) {
-    for (const st of cameraStreamsConfig[gateKey]?.streams || []) {
+  for (const gate of cameraStreamsConfig.gates) {
+    for (const st of gate.streams || []) {
       for (const f of guardedUrlFields(st)) {
-        if (st[f]) items.push({ label: `camera ${gateKey === "exitGate" ? "exit" : "entry"}/${st.id} ${f}`, url: st[f], policy: NET_POLICY.camera });
+        if (st[f]) items.push({ label: `camera ${gate.id}/${st.id} ${f}`, url: st[f], policy: NET_POLICY.camera });
       }
     }
   }
   const wh = db.getWebhookConfig(DEFAULT_WEBHOOK_CONFIG);
   if (wh.url) items.push({ label: `webhook${wh.enabled ? "" : " (đang tắt)"}`, url: wh.url, policy: NET_POLICY.webhook });
-  const door = db.getDoorControllerConfig(DEFAULT_DOOR_CONTROLLER_CONFIG);
-  if (door.apiUrl) items.push({ label: `door${door.enabled ? "" : " (đang tắt)"}`, url: door.apiUrl, policy: NET_POLICY.door });
+  for (const door of loadDoorControllerConfig().doors) {
+    if (door.apiUrl) {
+      const name = door.id === LEGACY_DOOR_ID ? "door" : `door ${door.id}`;
+      items.push({ label: `${name}${door.enabled ? "" : " (đang tắt)"}`, url: door.apiUrl, policy: NET_POLICY.door });
+    }
+  }
   for (const item of items) {
     const r = await destinationRefusal(item.url, item.policy);
     if (!r) continue;
