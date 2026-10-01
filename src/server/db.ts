@@ -312,6 +312,12 @@ export interface DoorControllerConfigRecord {
   pulseDurationSeconds: number;
   triggerOnFaceRecognition: boolean;
   triggerOnManualUnlock: boolean;
+  /**
+   * N-gate wave: every door besides "main" (the top-level fields), with its own
+   * controller settings. Stored as JSON next to the legacy columns so the list
+   * survives a restart; tokens never leave the server (publicDoorConfig).
+   */
+  doors?: unknown[];
 }
 
 export interface DoorApiLogRecord {
@@ -653,6 +659,16 @@ export interface EmployeeMergeRecord {
   movedTemplates: number;
   actor: string;
   mergedAt: string;
+}
+
+/** A stored door list; anything that is not an array of objects reads as empty. */
+function parseDoorList(raw: string): unknown[] {
+  try {
+    const v = JSON.parse(raw);
+    return Array.isArray(v) ? v.filter((d) => d && typeof d === "object") : [];
+  } catch {
+    return [];
+  }
 }
 
 export interface StrangerResolutionRecord {
@@ -2583,6 +2599,7 @@ class SQLiteStorage implements StrangerFaceStore, ShadowResultStore {
       // column already present
     }
     for (const migration of [
+      "ALTER TABLE door_controller_config ADD COLUMN doors TEXT",
       "ALTER TABLE access_logs ADD COLUMN faceEmbedding BLOB",
       "ALTER TABLE access_logs ADD COLUMN faceEmbeddingDims INTEGER",
       "ALTER TABLE access_logs ADD COLUMN faceEmbeddingModelTag TEXT",
@@ -4673,6 +4690,7 @@ class SQLiteStorage implements StrangerFaceStore, ShadowResultStore {
             pulseDurationSeconds: Number(row.pulseDurationSeconds) || defaults.pulseDurationSeconds,
             triggerOnFaceRecognition: row.triggerOnFaceRecognition !== undefined ? Boolean(row.triggerOnFaceRecognition) : defaults.triggerOnFaceRecognition,
             triggerOnManualUnlock: row.triggerOnManualUnlock !== undefined ? Boolean(row.triggerOnManualUnlock) : defaults.triggerOnManualUnlock,
+            ...(typeof row.doors === "string" && row.doors ? { doors: parseDoorList(row.doors) } : {}),
           };
         }
         this.saveDoorControllerConfig(defaults);
@@ -4695,8 +4713,8 @@ class SQLiteStorage implements StrangerFaceStore, ShadowResultStore {
           INSERT INTO door_controller_config (
             id, enabled, apiUrl, apiToken, authHeaderType, customHeaderName,
             openMethod, closeMethod, openPayloadTemplate, closePayloadTemplate,
-            pulseDurationSeconds, triggerOnFaceRecognition, triggerOnManualUnlock
-          ) VALUES ('default', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            pulseDurationSeconds, triggerOnFaceRecognition, triggerOnManualUnlock, doors
+          ) VALUES ('default', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
           ON CONFLICT(id) DO UPDATE SET
             enabled = excluded.enabled,
             apiUrl = excluded.apiUrl,
@@ -4709,7 +4727,8 @@ class SQLiteStorage implements StrangerFaceStore, ShadowResultStore {
             closePayloadTemplate = excluded.closePayloadTemplate,
             pulseDurationSeconds = excluded.pulseDurationSeconds,
             triggerOnFaceRecognition = excluded.triggerOnFaceRecognition,
-            triggerOnManualUnlock = excluded.triggerOnManualUnlock
+            triggerOnManualUnlock = excluded.triggerOnManualUnlock,
+            doors = excluded.doors
         `);
         stmt.run(
           config.enabled ? 1 : 0,
@@ -4723,8 +4742,11 @@ class SQLiteStorage implements StrangerFaceStore, ShadowResultStore {
           config.closePayloadTemplate || "",
           config.pulseDurationSeconds,
           config.triggerOnFaceRecognition ? 1 : 0,
-          config.triggerOnManualUnlock ? 1 : 0
+          config.triggerOnManualUnlock ? 1 : 0,
+          JSON.stringify(Array.isArray(config.doors) ? config.doors : [])
         );
+        // Keep the JSON fallback in step, so a later fallback start sees the same doors.
+        this.fallbackData.door_controller_config = { ...config };
         return;
       } catch (err) {
         console.error("[SQLite] Lỗi saveDoorControllerConfig:", err);

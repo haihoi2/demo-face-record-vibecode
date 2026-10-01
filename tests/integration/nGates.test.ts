@@ -36,6 +36,19 @@ async function cleanup() {
   }
 }
 
+describe("a deleted gate id is never reused", () => {
+  it("re-creating a deleted gate's id is refused with 409", async () => {
+    const id = `reuse-${Date.now().toString(36)}`;
+    const created = await postJson<any>("/api/gates", { id, label: "Tạm", direction: "ENTRY" });
+    assert.equal(created.status, 201, created.text.slice(0, 300));
+    const removed = await api<any>(`/api/gates/${id}`, { method: "DELETE", body: "{}" });
+    assert.equal(removed.status, 200, removed.text.slice(0, 300));
+    const again = await postJson<any>("/api/gates", { id, label: "Lại", direction: "ENTRY" });
+    assert.equal(again.status, 409, again.text.slice(0, 300));
+    assert.match(String(again.body?.error || ""), /đã dùng cho một cổng đã xóa/);
+  });
+});
+
 describe("N gates: a third gate with its own door", () => {
   let exitNameBefore = "";
   let sideLogId = "";

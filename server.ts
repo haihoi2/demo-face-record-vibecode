@@ -1684,6 +1684,12 @@ function loadCameraStreamsConfig(): CameraConfig {
   return normalizeCameraStreamsConfig(stored && typeof stored === "object" ? adoptLegacyEdits(stored) : stored);
 }
 
+/** Ids of deleted gates (kept in the stored camera config); never reused for a new gate. */
+function retiredGateIdsOf(config: CameraConfig): string[] {
+  const raw = (config as unknown as { retiredGateIds?: unknown }).retiredGateIds;
+  return Array.isArray(raw) ? raw.filter(isGateId) : [];
+}
+
 /** A configured gate by id (case-insensitive for old callers sending "EXIT"); null when unknown/malformed. */
 function gateFromConfig(config: CameraConfig, raw: unknown): GateRecord | null {
   const id = typeof raw === "string" ? raw.trim().toLowerCase() : "";
@@ -6801,6 +6807,10 @@ app.post(["/api/gates", "/api/gates/"], (req, res) => {
   if (current.gates.some((g) => g.id === id)) {
     return res.status(409).json({ success: false, error: `Cổng "${id}" đã tồn tại` });
   }
+  // History is filed by gate id: a deleted gate's id is never handed to a new gate.
+  if (retiredGateIdsOf(current).includes(id)) {
+    return res.status(409).json({ success: false, error: `Mã cổng "${id}" đã dùng cho một cổng đã xóa (lịch sử vẫn mang mã này); hãy chọn mã khác` });
+  }
   if (current.gates.length >= MAX_GATES) {
     return res.status(400).json({ success: false, error: `Tối đa ${MAX_GATES} cổng` });
   }
@@ -6878,7 +6888,11 @@ app.delete(["/api/gates/:gateId", "/api/gates/:gateId/"], (req, res) => {
   if (legacyDirectionOf(gate.id)) {
     return res.status(400).json({ success: false, error: `Cổng "${gate.id}" là cổng cố định: chỉ có thể tắt, không thể xóa` });
   }
-  commitCameraConfig(normalizeCameraStreamsConfig({ ...current, gates: current.gates.filter((g) => g.id !== gate.id) }));
+  commitCameraConfig(normalizeCameraStreamsConfig({
+    ...current,
+    gates: current.gates.filter((g) => g.id !== gate.id),
+    retiredGateIds: [...new Set([...retiredGateIdsOf(current), gate.id])].slice(-256),
+  }));
   // Stops and drops its watcher and pipeline. Access events keep their gateId.
   syncGateWatchers();
   for (const key of [...lastGrantAtByGateEmployee.keys()]) if (key.startsWith(`${gate.id}:`)) lastGrantAtByGateEmployee.delete(key);
