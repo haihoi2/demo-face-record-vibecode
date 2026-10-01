@@ -18,22 +18,36 @@
  * The live stream a gate is WATCHED from can differ from the channel it is
  * RECORDED on (the entry camera is read directly, and recorded by the NVR as
  * channel 2201), so the recording channel is configured per gate.
+ *
+ * N-gate wave: the channel is per gate ID, from RECORDING_<SUFFIX>_CHANNEL
+ * where SUFFIX = gateEnvSuffix(id) (src/server/gates.ts): gate "entry" reads
+ * RECORDING_ENTRY_CHANNEL and "exit" RECORDING_EXIT_CHANNEL (the legacy names,
+ * unchanged), gate "side-door" reads RECORDING_SIDE_DOOR_CHANNEL.
  */
 
-export type RecordedGate = "ENTRY" | "EXIT";
+import { gateEnvSuffix, isGateId } from "./gates";
 
 export interface RecordingConfig {
   /** rtsp://login@host:port of the NVR, no path. Server-side only. */
   baseUrl: string;
-  channels: Record<RecordedGate, string | null>;
+  /** NVR channel per gate id; only gates with a valid (numeric) channel are present. */
+  channels: Record<string, string>;
 }
 
 const CHANNEL_RE = /^[0-9]{1,5}$/;
+/** RECORDING_<SUFFIX>_CHANNEL; the suffix is an upper-cased gate id with "-" as "_". */
+const CHANNEL_ENV_RE = /^RECORDING_([A-Z][A-Z0-9_]{1,31})_CHANNEL$/;
+
+/** The gate id an env suffix names (SIDE_DOOR -> side-door), or null when it is not a gate id. */
+function gateIdFromEnvSuffix(suffix: string): string | null {
+  const id = suffix.toLowerCase().replace(/_/g, "-");
+  return isGateId(id) && gateEnvSuffix(id) === suffix ? id : null;
+}
 
 /**
- * Reads RECORDING_NVR_URL / RECORDING_ENTRY_CHANNEL / RECORDING_EXIT_CHANNEL.
- * Null (feature off) unless the NVR URL is a plain rtsp:// origin and at least
- * one gate has a numeric channel. Never throws; never echoes the URL.
+ * Reads RECORDING_NVR_URL and every RECORDING_<GATE>_CHANNEL. Null (feature
+ * off) unless the NVR URL is a plain rtsp:// origin and at least one gate has
+ * a numeric channel. Never throws; never echoes the URL.
  */
 export function recordingConfigFromEnv(env: Record<string, string | undefined> = process.env): RecordingConfig | null {
   const raw = String(env.RECORDING_NVR_URL || "").trim();
@@ -46,14 +60,21 @@ export function recordingConfigFromEnv(env: Record<string, string | undefined> =
   }
   if (url.protocol !== "rtsp:" || !url.hostname) return null;
   if ((url.pathname && url.pathname !== "/") || url.search || url.hash) return null;
-  const channel = (v: string | undefined) => {
-    const c = String(v || "").trim();
-    return CHANNEL_RE.test(c) ? c : null;
-  };
-  const channels = { ENTRY: channel(env.RECORDING_ENTRY_CHANNEL), EXIT: channel(env.RECORDING_EXIT_CHANNEL) };
-  if (!channels.ENTRY && !channels.EXIT) return null;
+  const channels: Record<string, string> = {};
+  for (const [name, value] of Object.entries(env)) {
+    const m = CHANNEL_ENV_RE.exec(name);
+    const gateId = m ? gateIdFromEnvSuffix(m[1]) : null;
+    const c = String(value || "").trim();
+    if (gateId && CHANNEL_RE.test(c)) channels[gateId] = c;
+  }
+  if (Object.keys(channels).length === 0) return null;
   const auth = url.username ? `${url.username}${url.password ? `:${url.password}` : ""}@` : "";
   return { baseUrl: `rtsp://${auth}${url.hostname}${url.port ? `:${url.port}` : ""}`, channels };
+}
+
+/** The NVR channel a gate is recorded on, or null when that gate has none. */
+export function recordingChannelFor(cfg: RecordingConfig, gateId: string): string | null {
+  return Object.prototype.hasOwnProperty.call(cfg.channels, gateId) ? cfg.channels[gateId] : null;
 }
 
 /** NVR playback time: UTC, `YYYYMMDDTHHMMSSZ`. */

@@ -7,6 +7,7 @@ import {
   playbackFailure,
   playbackFfmpegArgs,
   playbackUrl,
+  recordingChannelFor,
   recordingConfigFromEnv,
   recordingWindow,
   redactRtsp,
@@ -21,10 +22,26 @@ describe("recording config from the environment", () => {
     assert.equal(recordingConfigFromEnv({ RECORDING_ENTRY_CHANNEL: "2201" }), null);
   });
 
-  it("keeps the login server-side and maps each gate to its own channel", () => {
+  it("keeps the login server-side and maps each gate to its own channel (legacy env names = gates entry/exit)", () => {
     const cfg = recordingConfigFromEnv({ RECORDING_NVR_URL: NVR, RECORDING_ENTRY_CHANNEL: "2201", RECORDING_EXIT_CHANNEL: " 501 " })!;
     assert.equal(cfg.baseUrl, NVR);
-    assert.deepEqual(cfg.channels, { ENTRY: "2201", EXIT: "501" });
+    assert.deepEqual(cfg.channels, { entry: "2201", exit: "501" });
+    assert.equal(recordingChannelFor(cfg, "entry"), "2201");
+    assert.equal(recordingChannelFor(cfg, "exit"), "501");
+  });
+
+  it("reads RECORDING_<GATE>_CHANNEL for any gate id (N gates), dashes as underscores", () => {
+    const cfg = recordingConfigFromEnv({ RECORDING_NVR_URL: NVR, RECORDING_SIDE_DOOR_CHANNEL: "2401" })!;
+    assert.deepEqual(cfg.channels, { "side-door": "2401" });
+    assert.equal(recordingChannelFor(cfg, "side-door"), "2401");
+    assert.equal(recordingChannelFor(cfg, "entry"), null, "a gate without a channel has none");
+    assert.equal(recordingChannelFor(cfg, "constructor"), null, "no prototype keys");
+  });
+
+  it("ignores env names that are not a gate id", () => {
+    for (const name of ["RECORDING__X_CHANNEL", "RECORDING_1A_CHANNEL", "RECORDING_A_CHANNEL", `RECORDING_${"A".repeat(40)}_CHANNEL`]) {
+      assert.equal(recordingConfigFromEnv({ RECORDING_NVR_URL: NVR, [name]: "501" }), null, name);
+    }
   });
 
   it("refuses anything but a bare rtsp:// origin, and non-numeric channels", () => {
@@ -32,7 +49,8 @@ describe("recording config from the environment", () => {
       assert.equal(recordingConfigFromEnv({ RECORDING_NVR_URL: bad, RECORDING_EXIT_CHANNEL: "501" }), null, bad);
     }
     const cfg = recordingConfigFromEnv({ RECORDING_NVR_URL: NVR, RECORDING_ENTRY_CHANNEL: "22/../1", RECORDING_EXIT_CHANNEL: "501" })!;
-    assert.equal(cfg.channels.ENTRY, null);
+    assert.equal(recordingChannelFor(cfg, "entry"), null);
+    assert.equal(recordingChannelFor(cfg, "exit"), "501");
   });
 });
 
