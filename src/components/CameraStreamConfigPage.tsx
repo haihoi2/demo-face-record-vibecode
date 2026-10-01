@@ -55,18 +55,23 @@ import { ModalDialog } from "./ModalDialog";
 import { formatGateArea, streamGateArea } from "../utils/gateArea";
 import { hasRole, useOperatorSession } from "../utils/session";
 import {
+  GATE_OFF_BADGE,
   LEGACY_DOOR_ID,
   buildCreateGateRequest,
   buildDeleteGateRequest,
+  buildSetGateEnabledRequest,
   buildUpdateGateRequest,
   canDeleteGate,
   deleteGateConfirmText,
   directionLabel,
+  disableGateConfirmText,
   enabledGates,
   gateDisplayLabel,
   gateDoorId,
+  gateScalarsForSave,
   gatesOf,
   interpretGateMutation,
+  isGateEnabled,
   isLegacyGateId,
   legacyGateLabel,
   serverHasGates,
@@ -323,6 +328,8 @@ export const CameraStreamConfigPage: React.FC = () => {
   const [gateBusy, setGateBusy] = useState<boolean>(false);
   const [gateNotice, setGateNotice] = useState<{ tone: "ok" | "error" | "warn"; text: string } | null>(null);
   const [deleteGateId, setDeleteGateId] = useState<string | null>(null);
+  /** Gate waiting for the admin to confirm switching it off. */
+  const [disableGateId, setDisableGateId] = useState<string | null>(null);
   const [availableCameras, setAvailableCameras] = useState<AvailableMediaDevice[]>([]);
   const [loading, setLoading] = useState<boolean>(true);
   const [saving, setSaving] = useState<boolean>(false);
@@ -470,14 +477,13 @@ export const CameraStreamConfigPage: React.FC = () => {
       setSaveError(null);
       setSaveSuccess(false);
 
-      const gateScalars = <G extends GateStreamConfig>(gate: G) => {
-        const { streams: _streams, ...rest } = gate;
-        return rest;
-      };
-      // A server that sends `gates` gets `gates` (it wins over the legacy views);
-      // an older one gets entryGate/exitGate exactly as before.
+      // A server that sends `gates` gets `gates` (it wins over the legacy views)
+      // without `enabled` (the admin's on/off switch owns it); an older one gets
+      // entryGate/exitGate exactly as before.
+      const multiGateServer = serverHasGates(config);
+      const gateScalars = <G extends GateStreamConfig>(gate: G) => gateScalarsForSave(gate, multiGateServer);
       const { gates: _gates, entryGate: _entry, exitGate: _exit, ...globals } = config;
-      const payload = serverHasGates(config)
+      const payload = multiGateServer
         ? { ...globals, gates: gatesOf(config).map(gateScalars) }
         : { ...globals, entryGate: gateScalars(config.entryGate), exitGate: gateScalars(config.exitGate) };
 
@@ -1121,6 +1127,35 @@ export const CameraStreamConfigPage: React.FC = () => {
     } finally {
       setGateBusy(false);
     }
+  };
+
+  /**
+   * Gate on/off (admin): `PUT /api/gates/:gateId { enabled }`. Switching off
+   * goes through the confirmation dialog first; switching on is sent at once.
+   * The switch shows the server's answer only - a refusal leaves it as it was.
+   */
+  const handleSetGateEnabled = async (gateId: string, enabled: boolean) => {
+    const target = gates.find((g) => g.id === gateId);
+    if (!target) {
+      setDisableGateId(null);
+      return;
+    }
+    setGateBusy(true);
+    setGateNotice(null);
+    try {
+      const { url, init } = buildSetGateEnabledRequest(target.id, enabled);
+      const res = await operatorJsonFetch<unknown>(url, init);
+      const outcome = interpretGateMutation(enabled ? "enable" : "disable", gateDisplayLabel(target), res);
+      setDisableGateId(null);
+      await applyGateOutcome(outcome);
+    } finally {
+      setGateBusy(false);
+    }
+  };
+
+  const requestGateSwitch = (gate: GateConfig) => {
+    if (isGateEnabled(gate)) setDisableGateId(gate.id);
+    else void handleSetGateEnabled(gate.id, true);
   };
 
   /** Tabs in order: every gate, then the overview. Arrow keys / Home / End move between them. */
@@ -2141,10 +2176,16 @@ export const CameraStreamConfigPage: React.FC = () => {
                   <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-slate-100 text-slate-600 border border-slate-200 font-mono">
                     {deriveGateStreams(g, g.id).filter((s) => s.enabled).length} luồng
                   </span>
-                  <span
-                    className={`w-2 h-2 rounded-full ${g.enabled ? "bg-emerald-500" : "bg-slate-300"}`}
-                    aria-label={g.enabled ? "đang bật" : "đang tắt"}
-                  />
+                  {isGateEnabled(g) ? (
+                    <span className="w-2 h-2 rounded-full bg-emerald-500" aria-label="đang bật" />
+                  ) : (
+                    <span
+                      className="text-[10px] px-1.5 py-0.5 rounded-full bg-amber-100 text-amber-800 border border-amber-300 font-bold whitespace-nowrap"
+                      data-testid={`gate-off-badge-${g.id}`}
+                    >
+                      {GATE_OFF_BADGE}
+                    </span>
+                  )}
                 </button>
               );
             })}
@@ -2237,6 +2278,52 @@ export const CameraStreamConfigPage: React.FC = () => {
                     Xóa cổng
                   </button>
                 </div>
+                {multiGate && (
+                  <div
+                    className={`flex flex-wrap items-center justify-between gap-3 rounded-lg border px-3 py-2.5 ${
+                      isGateEnabled(currentGateConfig) ? "border-slate-200 bg-white" : "border-amber-300 bg-amber-50"
+                    }`}
+                    data-testid="gate-enabled-switch-row"
+                  >
+                    <div className="min-w-0">
+                      <div id="gate-enabled-label" className="text-xs font-semibold text-slate-800">
+                        Bật/tắt cổng
+                      </div>
+                      <p id="gate-enabled-desc" className="text-[11px] text-slate-600">
+                        {isGateEnabled(currentGateConfig)
+                          ? "Đang bật: cổng hoạt động bình thường. Tắt để cổng ngừng quét và không mở cửa bằng nhận diện."
+                          : "Đang tắt: cổng không quét và cửa của cổng không mở bằng nhận diện khuôn mặt cho đến khi bật lại."}
+                      </p>
+                    </div>
+                    <button
+                      id={`switch-gate-enabled-${currentGateKey}`}
+                      type="button"
+                      role="switch"
+                      aria-checked={isGateEnabled(currentGateConfig)}
+                      aria-labelledby="gate-enabled-label"
+                      aria-describedby="gate-enabled-desc"
+                      disabled={gateBusy}
+                      onClick={() => requestGateSwitch(currentGateConfig)}
+                      className="inline-flex items-center gap-2 rounded-full px-1 py-1 text-xs font-semibold focus:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500 disabled:opacity-40 disabled:cursor-not-allowed"
+                    >
+                      <span
+                        className={`w-12 h-6 rounded-full transition-colors relative p-0.5 ${
+                          isGateEnabled(currentGateConfig) ? "bg-emerald-600" : "bg-slate-300"
+                        }`}
+                        aria-hidden="true"
+                      >
+                        <span
+                          className={`block w-5 h-5 rounded-full bg-white shadow-xs transition-transform ${
+                            isGateEnabled(currentGateConfig) ? "translate-x-6" : "translate-x-0"
+                          }`}
+                        />
+                      </span>
+                      <span className={isGateEnabled(currentGateConfig) ? "text-emerald-700" : "text-amber-800"}>
+                        {isGateEnabled(currentGateConfig) ? "Đang bật" : GATE_OFF_BADGE}
+                      </span>
+                    </button>
+                  </div>
+                )}
                 {!multiGate ? (
                   <p className="text-xs text-slate-600">
                     Máy chủ này chưa hỗ trợ nhiều cổng: chỉ có Cổng vào và Cổng ra, dùng chung một cửa. Tên camera của cổng
@@ -2299,8 +2386,8 @@ export const CameraStreamConfigPage: React.FC = () => {
                     </div>
                     <div className="md:col-span-4 flex flex-wrap items-center justify-between gap-2">
                       <p className="text-[11px] text-slate-500">
-                        Hướng Vào/Ra dùng cho báo cáo và bộ lọc; mỗi cổng chỉ mở đúng cửa đã chọn. Bật/tắt cổng bằng công tắc
-                        bên dưới rồi bấm "Lưu Cấu Hình".
+                        Hướng Vào/Ra dùng cho báo cáo và bộ lọc; mỗi cổng chỉ mở đúng cửa đã chọn. Công tắc Bật/tắt cổng ở
+                        trên có hiệu lực ngay, không cần bấm "Lưu Cấu Hình".
                       </p>
                       <button
                         id="btn-save-gate-info"
@@ -2343,6 +2430,31 @@ export const CameraStreamConfigPage: React.FC = () => {
                   />
                   Tự động khởi chạy (Auto Start)
                 </label>
+                {multiGate ? (
+                  /* N-gate server: on/off is the admin switch above (PUT /api/gates/:id); everyone sees the state here. */
+                  <div className="text-right" data-testid="gate-enabled-state">
+                    <div className="text-sm font-semibold text-slate-800 flex items-center justify-end gap-2">
+                      Trạng Thái Kích Hoạt Cổng
+                      {isGateEnabled(currentGateConfig) ? (
+                        <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-emerald-50 text-emerald-700 border border-emerald-200 font-bold">
+                          Đang bật
+                        </span>
+                      ) : (
+                        <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-amber-100 text-amber-800 border border-amber-300 font-bold">
+                          {GATE_OFF_BADGE}
+                        </span>
+                      )}
+                    </div>
+                    <div className="text-xs text-slate-700">
+                      {isGateEnabled(currentGateConfig)
+                        ? "Đang bật nhận diện cho cổng này"
+                        : "Cổng không quét; cửa không mở bằng nhận diện khuôn mặt"}
+                    </div>
+                    <div className="text-[11px] text-slate-500">
+                      {isAdmin ? "Bật/tắt ở phần Thông tin cổng phía trên." : "Chỉ Quản trị bật/tắt được cổng."}
+                    </div>
+                  </div>
+                ) : (
                 <div className="flex items-center gap-4">
                   <div className="text-right">
                     <div className="text-sm font-semibold text-slate-800">Trạng Thái Kích Hoạt Cổng</div>
@@ -2366,6 +2478,7 @@ export const CameraStreamConfigPage: React.FC = () => {
                     />
                   </button>
                 </div>
+                )}
               </div>
             </div>
 
@@ -2666,6 +2779,20 @@ export const CameraStreamConfigPage: React.FC = () => {
               </p>
             </div>
 
+            {gates.some((g) => !isGateEnabled(g)) && (
+              <div
+                className="px-3 py-2 rounded-lg border border-amber-300 bg-amber-50 text-xs text-amber-900"
+                data-testid="overview-gates-off"
+              >
+                <span className="font-bold">{GATE_OFF_BADGE}:</span>{" "}
+                {gates
+                  .filter((g) => !isGateEnabled(g))
+                  .map((g) => `${gateDisplayLabel(g)} (${g.id})`)
+                  .join(", ")}
+                . Các cổng này không quét và cửa của chúng không mở bằng nhận diện khuôn mặt.
+              </div>
+            )}
+
             {enabledGates(gates).length === 0 ? (
               <div className="p-4 rounded-xl border border-dashed border-slate-300 text-xs text-slate-500 text-center">
                 Chưa có cổng nào đang bật.
@@ -2959,6 +3086,50 @@ export const CameraStreamConfigPage: React.FC = () => {
                     className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold rounded-lg bg-rose-600 text-white hover:bg-rose-700 disabled:opacity-40"
                   >
                     {gateBusy ? <RefreshCw className="w-3.5 h-3.5 animate-spin" /> : <Trash2 className="w-3.5 h-3.5" />}
+                    {text.confirmLabel}
+                  </button>
+                </>
+              }
+            />
+          );
+        })()}
+
+      {disableGateId &&
+        (() => {
+          const target = gates.find((g) => g.id === disableGateId);
+          if (!target) return null;
+          const text = disableGateConfirmText(gateDisplayLabel(target), target.id);
+          return (
+            <ModalDialog
+              id="disable-gate-dialog"
+              role="alertdialog"
+              title={
+                <>
+                  <AlertTriangle className="w-4 h-4 text-amber-600" /> {text.title}
+                </>
+              }
+              description={text.body}
+              busy={gateBusy}
+              onClose={() => setDisableGateId(null)}
+              footer={
+                <>
+                  <button
+                    type="button"
+                    data-autofocus
+                    onClick={() => setDisableGateId(null)}
+                    disabled={gateBusy}
+                    className="px-3 py-1.5 text-xs font-semibold rounded-lg border border-slate-200 text-slate-700 hover:bg-slate-50 disabled:opacity-40"
+                  >
+                    Hủy
+                  </button>
+                  <button
+                    id="btn-confirm-disable-gate"
+                    type="button"
+                    onClick={() => void handleSetGateEnabled(target.id, false)}
+                    disabled={gateBusy}
+                    className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold rounded-lg bg-amber-600 text-white hover:bg-amber-700 disabled:opacity-40"
+                  >
+                    {gateBusy ? <RefreshCw className="w-3.5 h-3.5 animate-spin" /> : <Square className="w-3.5 h-3.5" />}
                     {text.confirmLabel}
                   </button>
                 </>
