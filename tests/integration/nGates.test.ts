@@ -242,6 +242,11 @@ describe("N gates: a third gate with its own door", () => {
     }
     const legacy = await api<any>("/api/lock/status");
     assert.equal(legacy.body.doorId, "main", "no doorId = the legacy single door");
+    const all = await api<any>("/api/lock/states");
+    assert.equal(all.status, 200);
+    assert.deepEqual(all.body.doors.slice(0, 1).map((d: any) => d.doorId), ["main"]);
+    assert.equal(all.body.doors.find((d: any) => d.doorId === DOOR)?.isLocked, true);
+    assert.doesNotMatch(all.text, new RegExp(DOOR_TOKEN));
   });
 
   it("writes the gate id (and the gate's door name) on its events; logs filter by gateId", async () => {
