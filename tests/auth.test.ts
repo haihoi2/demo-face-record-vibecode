@@ -132,8 +132,27 @@ describe("permission table", () => {
     assert.equal(requiredRoleFor("GET", "/api/some-route-added-next-month"), "viewer");
   });
 
-  it("does not let a stream-shaped path on an unknown gate slip through as operator", () => {
-    assert.equal(requiredRoleFor("POST", "/api/camera-streams/side-door/streams"), "admin");
+  it("treats any gate-id slug like entry/exit (N gates); the route answers 400 for an unconfigured one", () => {
+    assert.equal(requiredRoleFor("POST", "/api/camera-streams/side-door/streams"), "operator");
+    assert.equal(requiredRoleFor("PUT", "/api/camera-streams/side-door/streams/side-door-primary"), "operator");
+    assert.equal(requiredRoleFor("POST", "/api/camera-streams/side-door/watch"), "operator");
+    assert.equal(requiredRoleFor("POST", "/api/camera-streams/side-door/pipeline-mode"), "admin");
+  });
+
+  it("does not let a path segment that is not a gate id slip through as operator", () => {
+    for (const bad of ["x", "1gate", "side_door", "-gate", "a".repeat(33), "side%2Fdoor"]) {
+      assert.equal(requiredRoleFor("POST", `/api/camera-streams/${bad}/streams`), "admin", bad);
+      assert.equal(requiredRoleFor("POST", `/api/camera-streams/${bad}/watch`), "admin", bad);
+    }
+    assert.equal(requiredRoleFor("POST", "/api/camera-streams/side-door/streams/a/b"), "admin");
+  });
+
+  it("gates: the list is readable by every role, every change is admin", () => {
+    assert.equal(requiredRoleFor("GET", "/api/gates"), "viewer");
+    assert.equal(requiredRoleFor("GET", "/api/gates/"), "viewer");
+    for (const [method, path] of [["POST", "/api/gates"], ["PUT", "/api/gates/side-door"], ["DELETE", "/api/gates/side-door"], ["PATCH", "/api/gates/x"]]) {
+      assert.equal(requiredRoleFor(method, path), "admin", `${method} ${path}`);
+    }
   });
 
   it("canonicalises legacy spellings and trailing slashes", () => {

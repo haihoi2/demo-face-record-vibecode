@@ -33,7 +33,7 @@ export const roleAtLeast = (role: UserRole, required: UserRole): boolean =>
 //
 //   admin     everything
 //   operator  view history; add/edit/remove camera streams and gate watch
-//             settings; approve new members (create employee, stranger
+//             settings (any configured gate); approve new members (create employee, stranger
 //             register/merge/dismiss/restore); register faces (enrol, capture,
 //             remove a template); manage departments and positions;
 //             run recognition
@@ -52,6 +52,14 @@ interface Rule {
 const READ = ["GET", "HEAD"] as const;
 const WRITE = ["POST", "PUT", "PATCH", "DELETE"] as const;
 
+/**
+ * A gate id in a path (N-gate wave; src/server/gates.ts GATE_ID_RE without
+ * anchors): any configured gate, not only entry/exit. The route itself answers
+ * 400 for a slug that names no configured gate; a path segment that is not a
+ * slug at all matches no rule here and stays at the admin default.
+ */
+const GATE = "[a-z][a-z0-9-]{1,31}";
+
 const RULES: readonly Rule[] = [
   // --- admin-only reads: account records and configuration that names secrets
   { methods: READ, pattern: /^\/api\/users(?:\/|$)/, role: "admin" },
@@ -65,11 +73,16 @@ const RULES: readonly Rule[] = [
   { methods: ["POST"], pattern: /^\/api\/operator\/password$/, role: "viewer" },
 
   // --- operator: camera streams and gate watching
-  { methods: WRITE, pattern: /^\/api\/camera-streams\/(?:entry|exit)\/streams(?:\/[^/]+)?$/, role: "operator" },
+  { methods: WRITE, pattern: new RegExp(`^/api/camera-streams/${GATE}/streams(?:/[^/]+)?$`), role: "operator" },
   { methods: ["POST"], pattern: /^\/api\/camera-streams\/config$/, role: "operator" },
-  { methods: ["POST"], pattern: /^\/api\/camera-streams\/(?:entry|exit)\/watch$/, role: "operator" },
+  { methods: ["POST"], pattern: new RegExp(`^/api/camera-streams/${GATE}/watch$`), role: "operator" },
   // Switching a gate's real-time pipeline mode is a rollout decision: admin only.
-  { methods: ["POST"], pattern: /^\/api\/camera-streams\/(?:entry|exit)\/pipeline-mode$/, role: "admin" },
+  { methods: ["POST"], pattern: new RegExp(`^/api/camera-streams/${GATE}/pipeline-mode$`), role: "admin" },
+
+  // --- gates: adding, editing (direction, door binding) and removing a gate is
+  // admin; the gate list is readable by every signed-in role.
+  { methods: WRITE, pattern: /^\/api\/gates(?:\/[^/]+)?$/, role: "admin" },
+  { methods: READ, pattern: /^\/api\/gates$/, role: "viewer" },
   { methods: ["POST"], pattern: /^\/api\/camera-streams\/(?:test-stream|scan-rtsp)$/, role: "operator" },
   // A snapshot is a full camera frame: operator+ only (owner decision: the app shows faces only).
   { methods: ["GET", "HEAD"], pattern: /^\/api\/camera-streams\/snapshot$/, role: "operator" },
