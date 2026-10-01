@@ -43,7 +43,7 @@ async function loadFactory(): Promise<{ factory: Factory | null; why?: string }>
 const SRC_W = 1280;
 const SRC_H = 720;
 
-function sourceOptions(url: string, gate: "ENTRY" | "EXIT" = "EXIT") {
+function sourceOptions(url: string, gate: "entry" | "exit" = "exit") {
   // STR's StreamReaderOptions (createStreamReader) plus a few aliases an
   // implementation ignores. The synthetic publisher below is 1280x720.
   return { gate, streamId: `mt-contract-${gate.toLowerCase()}`, url, rtspUrl: url, sourceWidth: SRC_W, sourceHeight: SRC_H, fps: 8, staleMs: 1000 };
@@ -206,7 +206,7 @@ describe("pipeline-contract: FrameSource over the replay harness", () => {
     if (!factory || !MTX) return t.skip(why);
     const host = MTX.replace(/^rtsp:\/\//, "");
     const url = `rtsp://mt:${CANARY}@${host}/${path}-nonexistent`;
-    const src = factory(sourceOptions(url, "ENTRY"));
+    const src = factory(sourceOptions(url, "entry"));
     const seen: string[] = [];
     src.on("state", (s) => seen.push(JSON.stringify(s)));
     src.on("frame", (f) => seen.push(f.streamId));

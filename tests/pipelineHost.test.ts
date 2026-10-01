@@ -26,7 +26,7 @@ async function until(cond: () => boolean, ms = 2000, what = "condition") {
 }
 
 class FakeSource extends EventEmitter implements FrameSource {
-  readonly gate: Gate = "ENTRY";
+  readonly gate: Gate = "entry";
   moving = true;
   stopped = 0;
   private newest: Frame | null = null;
@@ -36,11 +36,11 @@ class FakeSource extends EventEmitter implements FrameSource {
   latest() { return this.newest; }
   motion() { return this.moving; }
   getState(): SourceState {
-    return { gate: "ENTRY", status: "streaming", fps: 8, newestFrameAgeMs: 0, reconnects: 0, since: new Date(0).toISOString() };
+    return { gate: "entry", status: "streaming", fps: 8, newestFrameAgeMs: 0, reconnects: 0, since: new Date(0).toISOString() };
   }
   push(): Frame {
     const f: Frame = {
-      gate: "ENTRY", streamId: "entry-test", seq: this.seq++, capturedAtMs: Date.now(), width: 4, height: 2,
+      gate: "entry", streamId: "entry-test", seq: this.seq++, capturedAtMs: Date.now(), width: 4, height: 2,
       roi: [0, 0, 4, 2], sourceWidth: 4, sourceHeight: 2, rgb: new Uint8Array(24).fill(this.seq),
     };
     this.newest = f;
@@ -95,7 +95,7 @@ function setup(over: Partial<GatePipelineOptions> = {}) {
   const errors: string[] = [];
   let ctx: DecisionContext | null = ctxOf(gallery(2));
   const pipeline = new GatePipeline({
-    gate: "ENTRY",
+    gate: "entry",
     source,
     context: () => ctx,
     onResult: (r) => results.push(r),
@@ -116,14 +116,14 @@ function setup(over: Partial<GatePipelineOptions> = {}) {
 
 const employeeWire = (trackId: string, crop?: Uint8Array): WireResult => ({
   outcome: {
-    kind: "employee", gate: "ENTRY", trackId, employeeId: "E1", decidedAtMs: 2000, fused: { basis: "multi-agree" },
+    kind: "employee", gate: "entry", trackId, employeeId: "E1", decidedAtMs: 2000, fused: { basis: "multi-agree" },
     best: {
-      frame: { gate: "ENTRY", streamId: "entry-test", seq: 3, capturedAtMs: 1900, width: 4, height: 2, roi: [0, 0, 4, 2], sourceWidth: 4, sourceHeight: 2 },
+      frame: { gate: "entry", streamId: "entry-test", seq: 3, capturedAtMs: 1900, width: 4, height: 2, roi: [0, 0, 4, 2], sourceWidth: 4, sourceHeight: 2 },
       detection: { box: [0, 0, 2, 2], landmarks: [], score: 0.9, sizePx: 80, clear: true }, quality: 0.8,
       ...(crop ? { crop } : {}),
     },
   },
-  shadow: { gate: "ENTRY", outcome: "employee", trackId, employeeId: "E1", firstSeenAtMs: 1000, firstUsableAtMs: 1500, decidedAtMs: 2000, framesSeen: 5, framesUsed: 2 },
+  shadow: { gate: "entry", outcome: "employee", trackId, employeeId: "E1", firstSeenAtMs: 1000, firstUsableAtMs: 1500, decidedAtMs: 2000, framesSeen: 5, framesUsed: 2 },
   basis: "multi-agree",
   fusionBasis: "multi-agree",
 });
@@ -257,7 +257,7 @@ describe("GatePipeline host: results", () => {
   it("turns wire results back into TrackDecisionResult (no pixels; crop as Buffer) and counts them", async () => {
     const { pipeline, w, results } = setup();
     pipeline.start();
-    w().reply({ type: "results", results: [employeeWire("E-1", new Uint8Array([0xff, 0xd8, 0xff])), { outcome: { kind: "insufficient", gate: "ENTRY", trackId: "E-2", decidedAtMs: 3000 }, shadow: { gate: "ENTRY", outcome: "insufficient", trackId: "E-2", firstSeenAtMs: 1, decidedAtMs: 3000, framesSeen: 2, framesUsed: 0 }, basis: "insufficient-evidence" }] });
+    w().reply({ type: "results", results: [employeeWire("E-1", new Uint8Array([0xff, 0xd8, 0xff])), { outcome: { kind: "insufficient", gate: "entry", trackId: "E-2", decidedAtMs: 3000 }, shadow: { gate: "entry", outcome: "insufficient", trackId: "E-2", firstSeenAtMs: 1, decidedAtMs: 3000, framesSeen: 2, framesUsed: 0 }, basis: "insufficient-evidence" }] });
     assert.equal(results.length, 2);
     const emp = results[0].outcome as any;
     assert.equal(emp.kind, "employee");
@@ -376,5 +376,22 @@ describe("GatePipeline host: stop()", () => {
     await pipeline.stop();
     await sleep(100);
     assert.equal(workers.length, 1);
+  });
+});
+
+describe("GatePipeline host: gate ids", () => {
+  it("sends its gate id in init and drops worker results of another gate", async () => {
+    const { pipeline, w, results, errors } = setup();
+    pipeline.start();
+    const init = w().of("init");
+    assert.equal(init.length, 1);
+    assert.equal((init[0] as Extract<HostToWorker, { type: "init" }>).gate, "entry");
+    const foreign = employeeWire("S0abc-1");
+    (foreign.outcome as { gate: string }).gate = "side-door";
+    w().reply({ type: "results", results: [foreign, employeeWire("E-1")] });
+    assert.deepEqual(results.map((r) => r.outcome.trackId), ["E-1"], "only this gate's outcomes leave the pipeline");
+    assert.ok(errors.some((e) => /another gate dropped/.test(e)), errors.join("; "));
+    assert.equal(pipeline.stats().decisions, 1);
+    await pipeline.stop();
   });
 });

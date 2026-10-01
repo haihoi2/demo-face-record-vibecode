@@ -13,6 +13,7 @@
  * for a frame that will not come back.
  */
 import type { Frame, Gate } from "./contracts";
+import { isGateId, trackIdPrefix } from "./gateId";
 import type { FaceBox, RgbImage } from "../faceEmbedding";
 import { GateTrackSession, type DecisionContext, type TrackDecisionResult } from "./trackDecision";
 import type { TrackerInput } from "./tracker";
@@ -53,7 +54,8 @@ export interface PipelineCoreOptions {
 }
 
 export class PipelineCore {
-  private gate: Gate = "ENTRY";
+  /** Set by a valid `init` only; until then no session exists and nothing is decided. */
+  private gate: Gate | null = null;
   private crops = false;
   private tickMs = 250;
   private statsMs = 1000;
@@ -142,8 +144,16 @@ export class PipelineCore {
 
   private init(msg: InitMessage): void {
     if (this.initialized) return;
+    // Refused, never coerced to a default gate: without a valid gate id the
+    // worker never builds a session, so every frame is answered unprocessed.
+    if (!isGateId(msg.gate)) {
+      this.contextOk = false;
+      this.contextReason = "pipeline worker: init refused (invalid gate id)";
+      this.fail(`init refused: invalid gate id ${JSON.stringify(String(msg.gate).slice(0, 40))}`);
+      return;
+    }
     this.initialized = true;
-    this.gate = msg.gate === "EXIT" ? "EXIT" : "ENTRY";
+    this.gate = msg.gate;
     this.crops = msg.crops === true;
     this.tickMs = Math.max(10, Number(msg.tickMs) || 250);
     this.statsMs = Math.max(50, Number(msg.statsMs) || 1000);
@@ -151,6 +161,14 @@ export class PipelineCore {
     this.statsTimer = setInterval(() => this.postStats(), this.statsMs);
     (this.tickTimer as any).unref?.();
     (this.statsTimer as any).unref?.();
+    // A context that arrived before init could not open a session yet.
+    if (this.context) {
+      const ctx = this.context;
+      this.enqueue(() => {
+        this.applyContext(ctx);
+        this.postStats();
+      });
+    }
   }
 
   private enqueue(job: () => Promise<void> | void): void {
@@ -183,6 +201,11 @@ export class PipelineCore {
   private applyContext(ctx: DecisionContext | null): void {
     this.context = ctx;
     const engine = this.opts.engine;
+    if (this.gate === null) {
+      this.contextOk = false;
+      if (!this.contextReason?.startsWith("pipeline worker: init refused")) this.contextReason = "pipeline worker: no gate yet (waiting for init)";
+      return;
+    }
     if (!ctx) {
       this.contextOk = false;
       this.contextReason = "no decision context (engine or gallery not ready)";
@@ -208,7 +231,8 @@ export class PipelineCore {
         modelTag: tag,
         context: ctx,
         clock: this.now,
-        idPrefix: this.gate === "ENTRY" ? "E" : "X",
+        // "E"/"X" for the legacy gates "entry"/"exit", derived from the id otherwise.
+        idPrefix: trackIdPrefix(this.gate),
       });
       this.sessionTag = tag;
       const st = this.session.contextStatus();

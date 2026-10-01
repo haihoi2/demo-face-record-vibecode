@@ -63,7 +63,7 @@ function reader(extra: Partial<StreamReaderOptions> = {}) {
   const states: SourceState[] = [];
   const frames: Frame[] = [];
   const source = createStreamReader({
-    gate: "EXIT",
+    gate: "exit",
     streamId: "exit-main",
     url: SECRET_URL,
     sourceWidth: W,
@@ -159,7 +159,7 @@ describe("StreamReader frame slicing", () => {
       assert.equal(f.width, W);
       assert.equal(f.height, H);
       assert.deepEqual(f.roi, [0, 0, W, H]);
-      assert.equal(f.gate, "EXIT");
+      assert.equal(f.gate, "exit");
       assert.equal(f.streamId, "exit-main");
       assert.equal(f.capturedAtMs, Date.now());
     });
@@ -218,7 +218,7 @@ describe("StreamReader frame slicing", () => {
     assert.equal(statuses()[1], "streaming");
     const s = (source as any).getState() as SourceState;
     assert.equal(s.status, "streaming");
-    assert.equal(s.gate, "EXIT");
+    assert.equal(s.gate, "exit");
     assert.ok(s.fps >= 7 && s.fps <= 9, `fps ${s.fps}`);
     assert.equal(s.newestFrameAgeMs, 125);
     assert.equal(s.reconnects, 0);
@@ -279,7 +279,7 @@ describe("StreamReader reconnects", () => {
       if (n === 2) throw new Error("spawn ffmpeg ENOENT");
       return fake.spawn(cmd, args, o);
     };
-    const source = createStreamReader({ gate: "ENTRY", streamId: "entry", url: SECRET_URL, sourceWidth: W, sourceHeight: H, spawn });
+    const source = createStreamReader({ gate: "entry", streamId: "entry", url: SECRET_URL, sourceWidth: W, sourceHeight: H, spawn });
     assert.doesNotThrow(() => source.start());
     fake.last().stderr.emit("data", Buffer.from(`[rtsp @ 0x1] method DESCRIBE failed: 401 Unauthorized for ${SECRET_URL}\n`));
     fake.last().emit("exit", 1, null);
@@ -558,15 +558,39 @@ describe("StreamReader configuration and secrets", () => {
   it("refuses to run on an invalid configuration without throwing or spawning", () => {
     const fake = fakeSpawner();
     const states: SourceState[] = [];
-    const source = createStreamReader({ gate: "ENTRY", streamId: "e", url: SECRET_URL, sourceWidth: 0, sourceHeight: 1080, spawn: fake.spawn });
+    const source = createStreamReader({ gate: "entry", streamId: "e", url: SECRET_URL, sourceWidth: 0, sourceHeight: 1080, spawn: fake.spawn });
     source.on("state", (s) => states.push(s));
     assert.doesNotThrow(() => source.start());
     assert.equal(fake.children.length, 0);
     assert.equal(states[0].status, "stopped");
     assert.match(states[0].lastError || "", /invalid source size/);
-    const noUrl = createStreamReader({ gate: "ENTRY", streamId: "e", url: "", sourceWidth: 4, sourceHeight: 2, spawn: fake.spawn });
+    const noUrl = createStreamReader({ gate: "entry", streamId: "e", url: "", sourceWidth: 4, sourceHeight: 2, spawn: fake.spawn });
     noUrl.start();
     assert.equal(fake.children.length, 0);
+  });
+
+  it("refuses an invalid gate id at construction (never coerced to another gate), before spawning", () => {
+    const fake = fakeSpawner();
+    for (const bad of ["ENTRY", "EXIT", "", "Side-Door", undefined]) {
+      assert.throws(
+        () => createStreamReader({ gate: bad as string, streamId: "s", url: SECRET_URL, sourceWidth: W, sourceHeight: H, spawn: fake.spawn }),
+        (e: Error) => e instanceof TypeError && /invalid gate id/.test(e.message) && !e.message.includes(SECRET_URL),
+        String(bad),
+      );
+    }
+    assert.equal(fake.children.length, 0);
+  });
+
+  it("a third gate's frames and states carry its id; the default stream id is the gate id", () => {
+    const { source, fake, frames } = reader({ gate: "side-door", streamId: "" });
+    source.start();
+    fake.last().write(frameBytes(1));
+    assert.equal(frames.length, 1);
+    assert.equal(frames[0].gate, "side-door");
+    assert.equal(frames[0].streamId, "side-door");
+    assert.equal(source.gate, "side-door");
+    assert.equal(((source as any).getState() as SourceState).gate, "side-door");
+    source.stop();
   });
 
   it("uses the normalized ROI for frame size and metadata", () => {

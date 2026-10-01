@@ -36,6 +36,7 @@ import { EventEmitter } from "node:events";
 import { spawn as nodeSpawn } from "node:child_process";
 
 import type { Frame, FrameSource, Gate, SourceState, SourceStatus } from "./contracts";
+import { assertGateId } from "./gateId";
 import { MotionDetector, type MotionOptions, type MotionResult } from "./motion";
 import { RingBuffer } from "./ringBuffer";
 import { redactRtsp } from "../recording";
@@ -55,6 +56,7 @@ export type SpawnLike = (command: string, args: string[], options: { stdio: ["ig
 export type Roi = [number, number, number, number];
 
 export interface StreamReaderOptions {
+  /** Gate id (src/server/gates.ts); anything else makes the constructor throw. */
   gate: Gate;
   /** Identity for logs/fusion (never a URL). */
   streamId: string;
@@ -163,7 +165,7 @@ export function normalizeRoi(roi: Roi | null | undefined, sourceWidth: number, s
 function buildConfig(opts: StreamReaderOptions): { config: ReaderConfig | null; error?: string } {
   const sw = Math.floor(Number(opts?.sourceWidth));
   const sh = Math.floor(Number(opts?.sourceHeight));
-  const gate: Gate = opts?.gate === "EXIT" ? "EXIT" : "ENTRY";
+  const gate: Gate = opts.gate;
   if (!Number.isFinite(sw) || !Number.isFinite(sh) || sw < 2 || sh < 2 || sw > MAX_SOURCE_SIDE || sh > MAX_SOURCE_SIDE) {
     return { config: null, error: "invalid source size (sourceWidth/sourceHeight)" };
   }
@@ -174,7 +176,7 @@ function buildConfig(opts: StreamReaderOptions): { config: ReaderConfig | null; 
   return {
     config: {
       gate,
-      streamId: String(opts.streamId || gate.toLowerCase()),
+      streamId: String(opts.streamId || gate),
       url: opts.url,
       sourceWidth: sw,
       sourceHeight: sh,
@@ -315,10 +317,11 @@ class StreamReader extends EventEmitter implements FrameSource {
 
   constructor(opts: StreamReaderOptions) {
     super();
+    // Refused, never coerced: frames and states of this source carry this id.
+    this.gate = assertGateId(opts?.gate, "stream reader gate");
     const built = buildConfig(opts);
     this.cfg = built.config;
     this.configError = built.error;
-    this.gate = opts?.gate === "EXIT" ? "EXIT" : "ENTRY";
     this.spawnFn = opts?.spawn || (nodeSpawn as unknown as SpawnLike);
     this.now = opts?.now || (() => Date.now());
     this.sinceMs = this.now();

@@ -22,6 +22,7 @@ import { PipelineCore, type PipelineEngine } from "../src/server/pipeline/pipeli
 import type { WorkerToHost } from "../src/server/pipeline/pipelineProtocol";
 import type { FaceBox } from "../src/server/faceEmbedding";
 import { lowerThreadPriority } from "../src/server/pipeline/pipelineWorker";
+import { trackIdPrefix } from "../src/server/pipeline/gateId";
 
 const TAG = "arcface_test";
 const DIMS = 512;
@@ -35,7 +36,7 @@ async function until(cond: () => boolean, ms: number, what: string) {
 }
 
 class FakeSource extends EventEmitter implements FrameSource {
-  readonly gate: Gate = "EXIT";
+  readonly gate: Gate = "exit";
   private newest: Frame | null = null;
   private seq = 0;
   start() {}
@@ -43,11 +44,11 @@ class FakeSource extends EventEmitter implements FrameSource {
   latest() { return this.newest; }
   motion() { return true; }
   getState(): SourceState {
-    return { gate: "EXIT", status: "streaming", fps: 8, newestFrameAgeMs: 0, reconnects: 0, since: new Date(0).toISOString() };
+    return { gate: "exit", status: "streaming", fps: 8, newestFrameAgeMs: 0, reconnects: 0, since: new Date(0).toISOString() };
   }
   push(bytes = 640 * 360 * 3): Frame {
     const f: Frame = {
-      gate: "EXIT", streamId: "exit-test", seq: this.seq++, capturedAtMs: Date.now(), width: 640, height: 360,
+      gate: "exit", streamId: "exit-test", seq: this.seq++, capturedAtMs: Date.now(), width: 640, height: 360,
       roi: [0, 0, 640, 360], sourceWidth: 640, sourceHeight: 360, rgb: new Uint8Array(bytes),
     };
     this.newest = f;
@@ -137,7 +138,7 @@ describe("pipeline worker thread", () => {
     const fixture = path.resolve("tests/fixtures/blockingPipelineWorker.ts");
     const source = new FakeSource();
     const pipeline = new GatePipeline({
-      gate: "EXIT",
+      gate: "exit",
       source,
       context: ctx,
       onResult: () => {},
@@ -171,7 +172,7 @@ describe("pipeline worker thread", () => {
     process.env.FACE_MODEL_DIR = "/nonexistent-models-for-test"; // the worker copies env at creation
     const source = new FakeSource();
     const results: TrackDecisionResult[] = [];
-    const pipeline = new GatePipeline({ gate: "EXIT", source, context: ctx, onResult: (r) => results.push(r), statsMs: 100 });
+    const pipeline = new GatePipeline({ gate: "exit", source, context: ctx, onResult: (r) => results.push(r), statsMs: 100 });
     try {
       pipeline.start();
       await until(() => pipeline.stats().worker.state === "running" && /engine not ready/.test(pipeline.stats().contextReason || ""), 20_000, "worker stats");
@@ -231,7 +232,8 @@ class FakeEngine implements PipelineEngine {
   clearIssue(_l: Array<[number, number]>, size: number) { return size >= 60 ? null : "small"; }
 }
 
-function coreSetup(opts: { crops?: boolean; who?: (seq: number) => number[] | null } = {}) {
+function coreSetup(opts: { crops?: boolean; who?: (seq: number) => number[] | null; gate?: Gate; init?: boolean } = {}) {
+  const gate = "gate" in opts ? (opts.gate as Gate) : "exit";
   const msgs: WorkerToHost[] = [];
   const engine = new FakeEngine(opts.who ?? (() => ALICE));
   let cropCalls = 0;
@@ -240,11 +242,12 @@ function coreSetup(opts: { crops?: boolean; who?: (seq: number) => number[] | nu
     post: (m) => msgs.push(structuredClone(m)),
     cropper: async () => { cropCalls += 1; return new Uint8Array([0xff, 0xd8, 0xff, 0xd9]); },
   });
-  core.handle({ type: "init", gate: "EXIT", crops: opts.crops === true, tickMs: 20, statsMs: 10_000 });
+  const init = (g: Gate = gate) => core.handle({ type: "init", gate: g, crops: opts.crops === true, tickMs: 20, statsMs: 10_000 });
+  if (opts.init !== false) init();
   let seq = 0;
   const frame = (): Frame => {
     const f: Frame = {
-      gate: "EXIT", streamId: "exit-test", seq: seq++, capturedAtMs: Date.now(), width: 640, height: 360,
+      gate, streamId: `${gate}-test`, seq: seq++, capturedAtMs: Date.now(), width: 640, height: 360,
       roi: [0, 0, 640, 360], sourceWidth: 640, sourceHeight: 360, rgb: new Uint8Array(640 * 360 * 3),
     };
     engine.seqOf.set(f.rgb, f.seq);
@@ -256,7 +259,7 @@ function coreSetup(opts: { crops?: boolean; who?: (seq: number) => number[] | nu
       await sleep(30);
     }
   };
-  return { core, msgs, engine, send, cropCalls: () => cropCalls };
+  return { core, msgs, engine, send, init, cropCalls: () => cropCalls };
 }
 const resultsOf = (msgs: WorkerToHost[]) => msgs.flatMap((m) => (m.type === "results" ? m.results : []));
 
@@ -338,5 +341,66 @@ describe("pipelineWorkerEnv: PIPELINE_MIN_FACE_PX (pipeline-only face-size floor
     for (const bad of ["10", "4000", "40.5", "abc", ""]) {
       assert.equal(pipelineWorkerEnv({ FACE_MIN_SIZE_PX: "60", PIPELINE_MIN_FACE_PX: bad } as NodeJS.ProcessEnv).FACE_MIN_SIZE_PX, "60", bad);
     }
+  });
+});
+
+describe("PipelineCore: gate ids", () => {
+  it("a third gate decides under its own id and derived track-id prefix", async () => {
+    const { core, msgs, send } = coreSetup({ gate: "side-door" });
+    core.handle({ type: "context", version: 1, context: ctx() });
+    await send(6);
+    core.handle({ type: "stop" });
+    await sleep(30);
+    const results = resultsOf(msgs);
+    const emp = results.find((r) => r.outcome.kind === "employee");
+    assert.ok(emp, JSON.stringify(results.map((r) => r.basis)));
+    for (const r of results) {
+      assert.equal(r.outcome.gate, "side-door");
+      assert.ok(r.outcome.trackId.startsWith(`${trackIdPrefix("side-door")}-`), r.outcome.trackId);
+    }
+  });
+
+  it("legacy gates keep the E-/X- track ids", async () => {
+    for (const [gate, prefix] of [["entry", "E-"], ["exit", "X-"]] as const) {
+      const { core, msgs, send } = coreSetup({ gate });
+      core.handle({ type: "context", version: 1, context: ctx() });
+      await send(6);
+      core.handle({ type: "stop" });
+      await sleep(30);
+      const results = resultsOf(msgs);
+      assert.ok(results.length >= 1, gate);
+      for (const r of results) assert.ok(r.outcome.trackId.startsWith(prefix), `${gate}: ${r.outcome.trackId}`);
+    }
+  });
+
+  it("refuses an init with an invalid gate id: never decides, answers frames unprocessed, says why", async () => {
+    for (const bad of ["ENTRY", "EXIT", "", "Side-Door", undefined]) {
+      const { core, msgs, engine, send } = coreSetup({ gate: bad as Gate });
+      core.handle({ type: "context", version: 1, context: ctx() });
+      await send(3);
+      assert.equal(engine.detectCalls, 0, String(bad));
+      const done = msgs.filter((m) => m.type === "frame-done");
+      assert.equal(done.length, 3);
+      assert.ok(done.every((m) => m.type === "frame-done" && !m.processed));
+      assert.ok(msgs.some((m) => m.type === "error" && /init refused: invalid gate id/.test(m.message)), String(bad));
+      assert.match(core.stats().contextReason || "", /init refused/);
+      assert.equal(core.stats().contextOk, false);
+      core.handle({ type: "stop" });
+      await sleep(20);
+      assert.equal(resultsOf(msgs).length, 0);
+    }
+  });
+
+  it("a context that arrives before init is applied once the gate is known", async () => {
+    const { core, msgs, engine, send, init } = coreSetup({ gate: "side-door", init: false });
+    core.handle({ type: "context", version: 1, context: ctx() });
+    await sleep(20);
+    assert.equal(core.stats().contextOk, false, "no session without a gate");
+    init();
+    await send(6);
+    assert.ok(engine.detectCalls >= 5);
+    assert.equal(resultsOf(msgs).filter((r) => r.outcome.kind === "employee").length, 1);
+    core.handle({ type: "stop" });
+    await sleep(20);
   });
 });

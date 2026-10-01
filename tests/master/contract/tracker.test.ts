@@ -56,7 +56,7 @@ export interface Step {
 }
 
 function frame(seq: number): Frame {
-  return { gate: "EXIT", streamId: "mt-synthetic", seq, capturedAtMs: 1_790_000_000_000 + (seq * 1000) / FPS, width: W, height: H, roi: [0, 0, W, H], sourceWidth: W, sourceHeight: H, rgb: PIXELS };
+  return { gate: "exit", streamId: "mt-synthetic", seq, capturedAtMs: 1_790_000_000_000 + (seq * 1000) / FPS, width: W, height: H, roi: [0, 0, W, H], sourceWidth: W, sourceHeight: H, rgb: PIXELS };
 }
 
 function det(cx: number, cy: number, size: number): FaceDetection {
@@ -119,7 +119,7 @@ async function bindTracker(): Promise<{ make: (() => Bound) | null; why?: string
     return {
       make: () => {
         let now = 0;
-        const tr = new mod.FaceTracker({ gate: "EXIT", modelTag: MODEL_TAG, clock: () => now });
+        const tr = new mod.FaceTracker({ gate: "exit", modelTag: MODEL_TAG, clock: () => now });
         return {
           update: (s: Step) => {
             now = s.frame.capturedAtMs;

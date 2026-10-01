@@ -32,6 +32,7 @@ import { Worker } from "node:worker_threads";
 
 import { resolvePipelineRecognizer } from "../faceEmbedding";
 import type { Frame, FrameSource, Gate, SourceState } from "./contracts";
+import { assertGateId } from "./gateId";
 import type { DecisionContext, TrackDecisionResult } from "./trackDecision";
 import type { PipelineWorkerLike } from "./pipelineCore";
 import {
@@ -82,6 +83,7 @@ export interface PipelineStats {
 }
 
 export interface GatePipelineOptions {
+  /** Gate id (src/server/gates.ts). Invalid, or different from `source.gate`: the constructor throws. */
   gate: Gate;
   source: FrameSource & { getState(): SourceState };
   /** Gallery + thresholds + engine state, rebuilt by the server; null while not usable. */
@@ -198,8 +200,13 @@ export function pipelineWorkerEnv(env: NodeJS.ProcessEnv = process.env): NodeJS.
   return out;
 }
 
+/** Thread name of a gate's worker: `pipeline-<gate id>` (pipeline-entry, pipeline-exit, pipeline-side-door). */
+export function pipelineWorkerName(gate: Gate): string {
+  return `pipeline-${assertGateId(gate, "pipeline worker name")}`;
+}
+
 function createDefaultWorker(gate: Gate): PipelineWorkerLike {
-  return new Worker(resolvePipelineWorkerEntry(), { name: `pipeline-${gate.toLowerCase()}`, env: pipelineWorkerEnv() }) as unknown as PipelineWorkerLike;
+  return new Worker(resolvePipelineWorkerEntry(), { name: pipelineWorkerName(gate), env: pipelineWorkerEnv() }) as unknown as PipelineWorkerLike;
 }
 
 /** The frame and the buffer to transfer: its own backing store, or a copy when that is shared/pooled. */
@@ -259,7 +266,11 @@ export class GatePipeline {
   };
 
   constructor(opts: GatePipelineOptions) {
-    this.gate = opts.gate;
+    this.gate = assertGateId(opts?.gate, "pipeline gate");
+    // A source of another gate would feed frames every tracker rejects (wrong-gate).
+    if (opts.source && opts.source.gate !== this.gate) {
+      throw new TypeError(`pipeline gate ${JSON.stringify(this.gate)}: source belongs to another gate`);
+    }
     this.opts = {
       keepAliveMs: 1000,
       tickMs: 250,
@@ -471,7 +482,14 @@ export class GatePipeline {
           this.pump();
           break;
         case "results":
-          for (const w of msg.results || []) this.emit(fromWireResult(w));
+          for (const w of msg.results || []) {
+            // Only this gate's outcomes leave the pipeline; anything else is a worker bug.
+            if (w?.outcome?.gate !== this.gate) {
+              this.fail(`worker result for another gate dropped (${JSON.stringify(String(w?.outcome?.gate).slice(0, 40))})`);
+              continue;
+            }
+            this.emit(fromWireResult(w));
+          }
           break;
         case "stats":
           this.workerStats = msg.stats;
