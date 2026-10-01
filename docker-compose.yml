@@ -91,6 +91,8 @@ services:
       # Door scans read frames from the gate's always-open pipeline stream (default true).
       - DOOR_SCAN_SHARED_STREAM=${DOOR_SCAN_SHARED_STREAM:-}
       - DOOR_SCAN_SNAPSHOT_FPS=${DOOR_SCAN_SNAPSHOT_FPS:-}
+      - DOOR_SCAN_BEST_OF_EXTRA_FRAMES=${DOOR_SCAN_BEST_OF_EXTRA_FRAMES:-}
+      - DOOR_SCAN_BEST_OF_SPACING_MS=${DOOR_SCAN_BEST_OF_SPACING_MS:-}
       # Pipeline worker tuning (pipeline only; the legacy door engine is unaffected).
       - PIPELINE_FPS=${PIPELINE_FPS:-}
       - PIPELINE_ORT_THREADS=${PIPELINE_ORT_THREADS:-}

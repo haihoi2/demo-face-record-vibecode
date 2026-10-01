@@ -136,6 +136,7 @@ import type { DecisionContext, TrackDecisionResult } from "./src/server/pipeline
 import type { Gate, PipelineMode } from "./src/server/pipeline/contracts";
 import type { ExtractedFace, UnclearReason } from "./src/server/faceEmbedding";
 import { faceCutByFrameEdge } from "./src/server/faceFrameEdge";
+import { pickSharpestObservation } from "./src/server/bestFrame";
 import { chooseEnrolFaces } from "./src/server/enrolFace";
 import {
   buildGallery,
@@ -1996,6 +1997,18 @@ const DOOR_SCAN_SHARED_STREAM = (process.env.DOOR_SCAN_SHARED_STREAM ?? "true").
 const DOOR_SCAN_SNAPSHOT_FPS = envFloat("DOOR_SCAN_SNAPSHOT_FPS", 4, 0.5, 15);
 /** The newest shared-stream JPEG must be at most this old, or the scan dials the camera. */
 const DOOR_SCAN_SNAPSHOT_MAX_AGE_MS = 1500;
+/**
+ * Sharpest of several frames (owner 2026-10-01): when the newest shared-stream
+ * picture of a scan contains a face, this many slightly older pictures from
+ * memory (DOOR_SCAN_BEST_OF_SPACING_MS apart) are looked at too - but only when
+ * that picture recognised nobody, so an employee's door is never delayed (three
+ * pictures took ~3.7 s instead of ~1.2 s on dev). All views join the fused
+ * decision (same thresholds); the stored picture is then the one with the
+ * strongest face (pickSharpestObservation). Empty-doorway scans cost the same
+ * as before. 0 disables.
+ */
+const DOOR_SCAN_BEST_OF_EXTRA_FRAMES = envInt("DOOR_SCAN_BEST_OF_EXTRA_FRAMES", 2, 0, 4);
+const DOOR_SCAN_BEST_OF_SPACING_MS = envInt("DOOR_SCAN_BEST_OF_SPACING_MS", 250, 100, 1000);
 const FACE_SCAN_MAX_FRAME_INTERVAL_MS = 3000;
 
 /**
@@ -2077,6 +2090,8 @@ interface EngineObservation {
   frameIndex: number;
   /** false when the observation-cap dropped it from the fused evidence. */
   fused: boolean;
+  /** From an extra "sharpest of several" picture (DOOR_SCAN_BEST_OF_EXTRA_FRAMES). */
+  extra?: boolean;
 }
 
 /**
@@ -5655,8 +5670,24 @@ async function performGateScan(input: GateScanRequest): Promise<GateScanResult> 
     targets.map(async ({ stream: target, url: streamUrl }): Promise<ScanStreamOutcome> => {
       const transport = target.rtspTransport === "UDP" ? "udp" : "tcp";
       // A body `url` (manual test of a URL) always dials; otherwise prefer the gate's open stream.
-      const shared = singleStreamMode && optionalTrimmedString(url) ? null : sharedStreamFrames(targetGate.id, target.id, streamUrl, framesPerStream, intervalMs);
-      const grabs = shared ?? (await grabRtspFrames(streamUrl, transport, framesPerStream, intervalMs)).map((g) => ({ ...g, source: "camera" as const }));
+      const extraWanted = faceEngine === "onnx" ? DOOR_SCAN_BEST_OF_EXTRA_FRAMES : 0;
+      const shared =
+        singleStreamMode && optionalTrimmedString(url)
+          ? null
+          : sharedStreamFrames(
+              targetGate.id,
+              target.id,
+              streamUrl,
+              framesPerStream + extraWanted,
+              framesPerStream > 1 ? intervalMs : DOOR_SCAN_BEST_OF_SPACING_MS
+            );
+      // Shared frames come oldest first: the newest `framesPerStream` are the
+      // scan's own; the older ones are looked at only when those show a face.
+      const extraSplit = shared ? Math.max(0, shared.length - framesPerStream) : 0;
+      const extraGrabs = shared ? shared.slice(0, extraSplit).reverse() : [];
+      const grabs = shared
+        ? shared.slice(extraSplit)
+        : (await grabRtspFrames(streamUrl, transport, framesPerStream, intervalMs)).map((g) => ({ ...g, source: "camera" as const }));
       const outcome: ScanStreamOutcome = {
         stream: target,
         url: streamUrl,
@@ -5688,6 +5719,23 @@ async function performGateScan(input: GateScanRequest): Promise<GateScanResult> 
           // decision below says which of those frames is worth storing.
           if (observed.length > 0) outcome.frameJpegs.set(i, g.jpeg);
           outcome.observed.push(...observed);
+        }
+        // Somebody is there and nobody was recognised from this picture: look at
+        // the slightly older pictures too (the sharpest face gets stored). A
+        // recognised employee is decided at once, as before - never delayed.
+        if (
+          extraGrabs.length > 0 &&
+          outcome.observed.length > 0 &&
+          !recognizeObservations(capObservations(outcome.observed), currentGallery(), fusionThresholds).recognized
+        ) {
+          for (const g of extraGrabs) {
+            const i = grabs.length;
+            grabs.push(g);
+            const observed = await observeFrame(g.jpeg!, target.id, target.label, i);
+            for (const o of observed) o.extra = true;
+            if (observed.length > 0) outcome.frameJpegs.set(i, g.jpeg!);
+            outcome.observed.push(...observed);
+          }
         }
         return outcome;
       }
@@ -5738,6 +5786,22 @@ async function performGateScan(input: GateScanRequest): Promise<GateScanResult> 
     const pooled = capObservations(allObserved); // marks the dropped ones `fused:false`
     observationsPooled = pooled.length;
     fusion = recognizeObservations(pooled, currentGallery(), fusionThresholds);
+    // Extra "sharpest of several" pictures never add up to a grant: pictures a
+    // quarter second apart are not independent evidence. The grant must be
+    // backed by the scan's own picture(s), or by ONE extra picture on its own -
+    // exactly what a separate one-picture scan would have decided.
+    if (fusion.recognized && allObserved.some((o) => o.extra)) {
+      const gallery = currentGallery();
+      const groups: EngineObservation[][] = [allObserved.filter((o) => !o.extra)];
+      const extraKeys = [...new Set(allObserved.filter((o) => o.extra).map((o) => `${o.streamId}\u0000${o.frameIndex}`))];
+      for (const key of extraKeys) groups.push(allObserved.filter((o) => o.extra && `${o.streamId}\u0000${o.frameIndex}` === key));
+      const backed = groups.some((g) => {
+        if (g.length === 0) return false;
+        const d = recognizeObservations(g.map((o) => o.observation), gallery, fusionThresholds);
+        return d.recognized && d.employeeId === fusion.employeeId;
+      });
+      if (!backed) fusion = { ...fusion, recognized: false, employeeId: undefined, confidence: 0, basis: "rejected-weak" };
+    }
     // Built from the SAME ordered list that was fused, then split per stream.
     allFaces = facesFromDecision(allObserved, fusion, employees);
     for (const o of outcomes) o.faces = allFaces.filter((f) => f.streamId === o.stream.id);
@@ -5908,10 +5972,19 @@ async function performGateScan(input: GateScanRequest): Promise<GateScanResult> 
       if (!f || !f.recognized || !f.employeeId) continue;
       if (pick < 0 || f.confidence > allFaces[pick].confidence) pick = i;
     }
+    if (pick >= 0) {
+      // Equally confident views of the recognised person: store the sharpest.
+      const best = allFaces[pick].confidence;
+      const tied = allObserved.map((o, i) => i).filter((i) => allFaces[i]?.recognized && allFaces[i]?.employeeId && allFaces[i].confidence === best);
+      const sharpest = pickSharpestObservation(tied.map((i) => allObserved[i].observation), faceModelTag() === FEATURE_NORM_MODEL_TAG);
+      if (sharpest >= 0) pick = tied[sharpest];
+    }
     if (pick < 0) {
-      for (let i = 0; i < allObserved.length; i++) {
-        if (pick < 0 || allObserved[i].observation.quality > allObserved[pick].observation.quality) pick = i;
-      }
+      // Nobody recognised: the sharpest face of all looked-at frames.
+      pick = pickSharpestObservation(
+        allObserved.map((o) => o.observation),
+        faceModelTag() === FEATURE_NORM_MODEL_TAG
+      );
     }
     const chosen = allObserved[pick];
     snapshotObservation = chosen.observation;
@@ -6028,6 +6101,17 @@ async function performGateScan(input: GateScanRequest): Promise<GateScanResult> 
     lockUnlocked: outcome.lockUnlocked,
     suppressed: outcome.summary.suppressed,
     snapshotStored: outcome.summary.snapshotStored,
+    // Which looked-at picture was stored, and its face strength (numbers only).
+    ...(snapshotObservation
+      ? {
+          storedFrame: {
+            streamId: snapshotStreamId,
+            frameIndex: snapshotObservation.frameIndex,
+            framesLooked: outcomes.reduce((n, o) => n + o.grabs.filter((g) => g.ok && g.jpeg).length, 0),
+            ...(typeof snapshotObservation.featureNorm === "number" ? { featureNorm: snapshotObservation.featureNorm } : {}),
+          },
+        }
+      : {}),
   } };
 }
 
