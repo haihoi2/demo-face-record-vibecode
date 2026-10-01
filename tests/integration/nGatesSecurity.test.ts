@@ -1049,6 +1049,25 @@ describe("N gates: security (third gate + own door)", () => {
         await deleteGate(id);
       }
     });
+
+    it("O1: a device token may only name the gates it is bound to (DEVICE_INGEST_GATES, default entry,exit)", async () => {
+      const id = `dev-${RUN}`;
+      await createGate(id, "ENTRY", DOOR2);
+      const device = (gateId: string, seed: number) =>
+        rawApi("/api/recognize-face", {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Authorization: `Bearer ${process.env.DEVICE_INGEST_TOKEN || "integration-device-token"}` },
+          body: JSON.stringify({ imageBase64: noFaceJpegDataUrl(64, seed), gateId }),
+        });
+      try {
+        const other = await device(id, 8501);
+        assert.equal(other.status, 403, `device recognition at gate ${id}: HTTP ${other.status}`);
+        assert.equal(other.body?.code, "DEVICE_GATE_FORBIDDEN");
+        assert.notEqual((await device("entry", 8502)).status, 403, "the legacy gates stay open to devices");
+      } finally {
+        await deleteGate(id);
+      }
+    });
   });
 
   // =========================================================================

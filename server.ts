@@ -834,6 +834,16 @@ const requireRecognitionIngest: RequestHandler = (req: Request, res: Response, n
   }
   next();
 };
+/**
+ * Gates a device-token recognition may name with `gateId` (O1). Comma-separated
+ * gate ids; default "entry,exit". Requests without gateId use the legacy gate of
+ * scanType as before. Operator sessions are not restricted by this list.
+ */
+function deviceIngestGates(env: NodeJS.ProcessEnv = process.env): string[] {
+  const raw = String(env.DEVICE_INGEST_GATES ?? "").trim();
+  if (!raw) return [...LEGACY_GATE_IDS];
+  return raw.split(",").map((v) => v.trim()).filter((v) => isGateId(v));
+}
 const recognitionPath = (pathName: string) => [
   "/api/recognize-face", "/recognize-face", "/api/face/recognize",
   "/api/face-recognize", "/api/face-recognition", "/api/recognize",
@@ -1399,8 +1409,24 @@ function deriveStreamId(gateKey: string, rtspUrl: unknown, fallbackSuffix: strin
 
 function optionalTrimmedString(value: unknown): string | undefined {
   if (value === undefined || value === null) return undefined;
-  const str = String(value).trim();
+  // Strings only (NGSEC-5): String({a:1}) stored "[object Object]" and an
+  // object with a bad toString threw a 500. Control characters (newlines) are
+  // flattened so a label cannot forge an audit line (O4).
+  if (typeof value !== "string" && typeof value !== "number") return undefined;
+  const str = String(value).replace(/[\u0000-\u001f\u007f]+/g, " ").trim();
   return str ? str : undefined;
+}
+
+/** Stream fields stored as text: a non-string value is refused, never stringified. */
+const STREAM_STRING_FIELDS = ["id", "label", "rtspUrl", "httpUrl", "uvcDeviceId", "uvcDeviceLabel", "backendDevicePath"];
+
+/** A body field that must be a string when present: undefined/null = absent, anything else = error. */
+function stringFieldError(body: any, fields: string[]): string | null {
+  for (const f of fields) {
+    const v = body?.[f];
+    if (v !== undefined && v !== null && typeof v !== "string") return `${f} phải là chuỗi ký tự`;
+  }
+  return null;
 }
 
 /** Whitelists and coerces the per-stream media fields shared by streams and the legacy gate fields. */
@@ -1692,7 +1718,9 @@ function retiredGateIdsOf(config: CameraConfig): string[] {
 
 /** A configured gate by id (case-insensitive for old callers sending "EXIT"); null when unknown/malformed. */
 function gateFromConfig(config: CameraConfig, raw: unknown): GateRecord | null {
-  const id = typeof raw === "string" ? raw.trim().toLowerCase() : "";
+  // ASCII only BEFORE case-folding (NGSEC-4): "\u212A" (KELVIN SIGN) lower-cases to "k".
+  if (typeof raw !== "string" || !/^[\x21-\x7e]+$/.test(raw.trim())) return null;
+  const id = raw.trim().toLowerCase();
   if (!isGateId(id)) return null;
   return config.gates.find((g) => g.id === id) || null;
 }
@@ -3098,7 +3126,18 @@ async function sendDoorControllerCommand(
  * defaults to the legacy single door "main"; a grant opens the gate's door
  * (doorIdOf). A door without a configured controller only changes state.
  */
-function unlockDoor(source: string, employeeName?: string, employeeId?: string, doorId: string = LEGACY_DOOR_ID) {
+/**
+ * `viaFace` picks the controller trigger flag (triggerOnFaceRecognition vs
+ * triggerOnManualUnlock). Manual routes pass false explicitly so a free-text
+ * source containing "Nhận diện" cannot borrow the face-recognition trigger.
+ */
+function unlockDoor(
+  source: string,
+  employeeName?: string,
+  employeeId?: string,
+  doorId: string = LEGACY_DOOR_ID,
+  viaFace: boolean = source.includes("Nhận diện")
+) {
   clearDoorTimers(doorId);
   const state = lockStateOf(doorId);
 
@@ -3116,8 +3155,7 @@ function unlockDoor(source: string, employeeName?: string, employeeId?: string, 
   // Trigger automated hardware door opening via API if enabled
   const door = doorConfigOf(doorId);
   if (door?.enabled) {
-    const isFace = source.includes("Nhận diện");
-    const shouldTrigger = isFace
+    const shouldTrigger = viaFace
       ? door.triggerOnFaceRecognition
       : door.triggerOnManualUnlock;
 
@@ -3254,11 +3292,37 @@ app.get(["/api/lock/states", "/api/lock/states/"], (_req, res) => {
   res.json({ success: true, doors: doorControllerConfig.doors.map((d) => ({ ...publicLockState(d.id), label: d.label })) });
 });
 
+const LOCK_TEXT_MAX = 120;
+
+/**
+ * Free-text fields of a manual lock/unlock, validated BEFORE any state change
+ * (NGSEC-7): strings only, control characters flattened, capped. The signed-in
+ * actor is appended to the source so lastActionBy names who acted (O3).
+ */
+function manualLockFields(
+  rawBody: unknown,
+  actor: string,
+  defaultSource: string
+): { source: string; employeeName?: string; employeeId?: string } | { error: string } {
+  const body: any = rawBody && typeof rawBody === "object" ? rawBody : {};
+  const typeError = stringFieldError(body, ["source", "employeeName", "employeeId"]);
+  if (typeError) return { error: typeError };
+  const text = (v: unknown) => optionalTrimmedString(v)?.slice(0, LOCK_TEXT_MAX);
+  const base = text(body.source) || defaultSource;
+  return {
+    source: actor ? `${base} · ${actor}` : base,
+    employeeName: text(body.employeeName),
+    employeeId: text(body.employeeId),
+  };
+}
+
 app.post("/api/lock/unlock", (req, res) => {
-  const { source = "API Remote", employeeName, employeeId } = req.body || {};
+  const fields = manualLockFields(req.body, operatorActor(req), "API Remote");
+  if ("error" in fields) return res.status(400).json({ success: false, error: fields.error });
+  const { source, employeeName, employeeId } = fields;
   const door = doorIdFromRequest(req.body?.doorId);
   if ("error" in door) return res.status(400).json({ success: false, error: door.error });
-  unlockDoor(source, employeeName, employeeId, door.doorId);
+  unlockDoor(source, employeeName, employeeId, door.doorId, false);
   const doorName = lockStateOf(door.doorId).doorName;
   console.log(`[Lock] ${operatorActor(req) || "unknown"} mở cửa ${door.doorId} (${doorName}) qua API: ${String(source).slice(0, 80)}`);
 
@@ -3281,7 +3345,9 @@ app.post("/api/lock/unlock", (req, res) => {
 });
 
 app.post("/api/lock/lock", (req, res) => {
-  const { source = "API Remote Lock" } = req.body || {};
+  const fields = manualLockFields(req.body, operatorActor(req), "API Remote Lock");
+  if ("error" in fields) return res.status(400).json({ success: false, error: fields.error });
+  const { source } = fields;
   const door = doorIdFromRequest(req.body?.doorId);
   if ("error" in door) return res.status(400).json({ success: false, error: door.error });
   lockDoor(source, door.doorId);
@@ -3722,6 +3788,8 @@ function requestedDoors(body: any, current: DoorControllerState): { doors: DoorR
   const doors: DoorRecord[] = [];
   for (const item of body.doors) {
     if (!item || typeof item !== "object") return { status: 400, error: "Mỗi cửa phải là một đối tượng" };
+    const typeError = stringFieldError(item, ["label"]);
+    if (typeError) return { status: 400, error: `Cửa ${String(item.id).slice(0, 40)}: ${typeError}` };
     if (!isDoorId(item.id)) return { status: 400, error: `Mã cửa không hợp lệ: "${String(item.id).slice(0, 40)}" (chữ thường, số, gạch ngang; 2-32 ký tự; bắt đầu bằng chữ)` };
     if (doors.some((d) => d.id === item.id)) return { status: 400, error: `Mã cửa bị trùng: "${item.id}"` };
     const existing = current.doors.find((d) => d.id === item.id);
@@ -3811,7 +3879,10 @@ app.post(DOOR_TEST_ROUTES, async (req, res) => {
   }
 
   const action: "OPEN" | "CLOSE" = body.action === "CLOSE" ? "CLOSE" : "OPEN";
-  const source = body.source || "Test Console (Dashboard)";
+  if (!body || typeof body !== "object") body = {};
+  const fields = manualLockFields(body, operatorActor(req), "Test Console (Dashboard)");
+  if ("error" in fields) return res.status(400).json({ success: false, error: fields.error });
+  const { source } = fields;
   const door = doorIdFromRequest(body.doorId);
   if ("error" in door) return res.status(400).json({ success: false, error: door.error });
 
@@ -3833,7 +3904,7 @@ app.post(DOOR_TEST_ROUTES, async (req, res) => {
     // If testing OPEN, also trigger door state update so the user sees UI feedback if desired
     if (body.updateDoorState) {
       if (action === "OPEN") {
-        unlockDoor(`Test API: ${source}`, undefined, undefined, door.doorId);
+        unlockDoor(`Test API: ${source}`, undefined, undefined, door.doorId, false);
       } else {
         lockDoor(`Test API: ${source}`, door.doorId);
       }
@@ -3950,6 +4021,33 @@ async function cameraStreamsSaveCheck(
 }
 
 /**
+ * The global settings a POST /api/camera-streams/config may change (NGSEC-2).
+ * Unknown top-level keys are ignored; a known key with a wrong type is a 400.
+ */
+function cameraRootPatchFrom(body: any): { patch: Record<string, unknown> } | { error: string } {
+  const patch: Record<string, unknown> = {};
+  const num = (key: string, min: number, max: number, integer = false) => {
+    if (body[key] === undefined) return null;
+    const v = body[key];
+    if (typeof v !== "number" || !Number.isFinite(v) || v < min || v > max || (integer && !Number.isInteger(v))) {
+      return `${key} phải là số trong khoảng ${min}-${max}`;
+    }
+    patch[key] = v;
+    return null;
+  };
+  const bool = (key: string) => {
+    if (body[key] === undefined) return null;
+    if (typeof body[key] !== "boolean") return `${key} phải là true/false`;
+    patch[key] = body[key];
+    return null;
+  };
+  const error =
+    num("workerThreadsCount", 1, 16, true) || num("maxFpsPerStream", 1, 60) || num("backendCaptureFps", 0.1, 30) ||
+    bool("multiThreadEnabled") || bool("autoFailoverToClientUvc");
+  return error ? { error } : { patch };
+}
+
+/**
  * The gate patches of a POST /api/camera-streams/config body. `gates` (new
  * clients) wins over the legacy `entryGate`/`exitGate` keys. This operator
  * route edits configured gates only: it never creates or removes a gate (that
@@ -4001,21 +4099,45 @@ app.post(CAMERA_CONFIG_ROUTES, async (req, res) => {
     } catch {}
   }
   if (!body || typeof body !== "object") body = {};
-  const current = loadCameraStreamsConfig();
-  const parsed = gatePatchesFrom(body, current);
-  if ("error" in parsed) return res.status(400).json({ success: false, error: parsed.error });
-  const { entryGate: _entryPatch, exitGate: _exitPatch, gates: _gatesPatch, ...rootPatch } = body;
-  const updated = normalizeCameraStreamsConfig({
-    ...current,
-    ...rootPatch,
-    gates: current.gates.map((g) => (parsed.patches.has(g.id) ? applyGateConfigPatch(g, parsed.patches.get(g.id)) : g)),
-  });
+  // NGSEC-2: only the known global settings are taken from the top level of
+  // the body; everything else (gates list shape, retiredGateIds, legacy views
+  // an old dashboard echoes) is server-owned and ignored.
+  const root = cameraRootPatchFrom(body);
+  if ("error" in root) return res.status(400).json({ success: false, error: root.error });
+  const build = (base: CameraConfig, patches: Map<string, any>) =>
+    normalizeCameraStreamsConfig({
+      ...base,
+      ...root.patch,
+      gates: base.gates.map((g) => (patches.has(g.id) ? applyGateConfigPatch(g, patches.get(g.id)) : g)),
+    });
 
+  const first = loadCameraStreamsConfig();
+  const firstParsed = gatePatchesFrom(body, first);
+  if ("error" in firstParsed) return res.status(400).json({ success: false, error: firstParsed.error });
+  const candidate = build(first, firstParsed.patches);
   const destCheck = await cameraStreamsSaveCheck(
-    current,
-    updated.gates.flatMap((g) => (g.streams || []).map((stream) => ({ gate: g.id, stream })))
+    first,
+    candidate.gates.flatMap((g) => (g.streams || []).map((stream) => ({ gate: g.id, stream })))
   );
   if (destCheck.refused) return res.status(400).json(destCheck.refused);
+
+  // NGSEC-1: the destination check above can wait on DNS. Whatever an admin
+  // changed meanwhile (gate deleted, disabled, door rebound, gate created) must
+  // survive: apply this request's patches to a FRESH read, never to `first`.
+  const current = loadCameraStreamsConfig();
+  const parsed = gatePatchesFrom(body, current);
+  if ("error" in parsed) {
+    return res.status(409).json({ success: false, code: "CONFIG_CHANGED", error: `Cấu hình cổng vừa thay đổi (${parsed.error}); hãy tải lại trang rồi lưu lại` });
+  }
+  const updated = build(current, parsed.patches);
+  // Every camera URL the commit introduces must be one the guard just checked.
+  const checked = new Set(candidate.gates.flatMap((g) => (g.streams || []).flatMap((st) => CAMERA_URL_FIELDS.map((f) => st[f]).filter(Boolean).map(String))));
+  const before = new Set(current.gates.flatMap((g) => (g.streams || []).flatMap((st) => CAMERA_URL_FIELDS.map((f) => st[f]).filter(Boolean).map(String))));
+  const unchecked = updated.gates.flatMap((g) => (g.streams || []).flatMap((st) => CAMERA_URL_FIELDS.map((f) => st[f]).filter(Boolean).map(String)))
+    .filter((u) => !before.has(u) && !checked.has(u));
+  if (unchecked.length) {
+    return res.status(409).json({ success: false, code: "CONFIG_CHANGED", error: "Cấu hình cổng vừa thay đổi; hãy tải lại trang rồi lưu lại" });
+  }
 
   if (typeof body.workerThreadsCount === "number" && body.workerThreadsCount !== current.workerThreadsCount) {
     faceWorkerPool.scaleWorkerPool(body.workerThreadsCount);
@@ -4096,6 +4218,8 @@ app.post(STREAM_ROUTE, async (req, res) => {
   if (!requested) return res.status(400).json({ success: false, error: unknownGateError(req.params.gate) });
   const gateParam = requested.id;
   const body = req.body && typeof req.body === "object" ? req.body : {};
+  const typeError = stringFieldError(body, STREAM_STRING_FIELDS);
+  if (typeError) return res.status(400).json({ success: false, error: typeError });
   const destCheck = await streamUrlSaveCheck(sanitizeStreamMediaFields(body), gateParam);
   if (destCheck.refused) return res.status(400).json(destCheck.refused);
   // Re-read after the await: the gate may have been removed meanwhile.
@@ -4155,6 +4279,8 @@ app.put(STREAM_ITEM_ROUTE, async (req, res) => {
   if (!requested) return res.status(400).json({ success: false, error: unknownGateError(req.params.gate) });
   const gateParam = requested.id;
   const streamId = String(req.params.streamId || "");
+  const typeError = stringFieldError(req.body, STREAM_STRING_FIELDS);
+  if (typeError) return res.status(400).json({ success: false, error: typeError });
   // Destination guard on the URL fields this request CHANGES only: a stored
   // stream the policy now refuses can still be disabled or relabelled.
   const before = requested.streams!.find((s) => s.id === streamId);
@@ -5426,6 +5552,10 @@ async function performGateScan(input: GateScanRequest): Promise<GateScanResult> 
   }
   const gateParam = resolved.gateKey;
   const targetGate = resolved.gate;
+  // A disabled gate scans nothing, manual or watcher (NGSEC-6): its grants would open its door.
+  if (targetGate.enabled === false) {
+    return { status: 409, body: { success: false, code: "GATE_DISABLED", error: `Cổng "${gateParam}" đang tắt` } };
+  }
   const singleStreamMode = Boolean(optionalTrimmedString(url) || optionalTrimmedString(stream));
 
   const targets: Array<{ stream: GateStreamSourceRecord; url: string }> = [];
@@ -6791,6 +6921,8 @@ const RESERVED_GATE_IDS = new Set(["config", "threads", "watch", "snapshot", "sc
 
 app.post(["/api/gates", "/api/gates/"], (req, res) => {
   const body = req.body && typeof req.body === "object" ? req.body : {};
+  const typeError = stringFieldError(body, ["id", "label"]);
+  if (typeError) return res.status(400).json({ success: false, error: typeError });
   const id = typeof body.id === "string" ? body.id.trim() : "";
   if (!isGateId(id) || RESERVED_GATE_IDS.has(id)) {
     return res.status(400).json({ success: false, error: "Mã cổng không hợp lệ: chữ thường, số, gạch ngang; 2-32 ký tự; bắt đầu bằng chữ (không dùng từ dành riêng như config, watch, snapshot)" });
@@ -6843,6 +6975,8 @@ app.put(["/api/gates/:gateId", "/api/gates/:gateId/"], (req, res) => {
   const gate = gateFromConfig(current, req.params.gateId);
   if (!gate) return res.status(400).json({ success: false, error: unknownGateError(req.params.gateId, current) });
   const body = req.body && typeof req.body === "object" ? req.body : {};
+  const typeError = stringFieldError(body, ["label"]);
+  if (typeError) return res.status(400).json({ success: false, error: typeError });
   const next: GateRecord = { ...gate };
   const changes: string[] = [];
 
@@ -6891,7 +7025,8 @@ app.delete(["/api/gates/:gateId", "/api/gates/:gateId/"], (req, res) => {
   commitCameraConfig(normalizeCameraStreamsConfig({
     ...current,
     gates: current.gates.filter((g) => g.id !== gate.id),
-    retiredGateIds: [...new Set([...retiredGateIdsOf(current), gate.id])].slice(-256),
+    // Kept for good (NGSEC-3): a deleted id must never return; 10 000 deletions is far beyond any site.
+    retiredGateIds: [...new Set([...retiredGateIdsOf(current), gate.id])].slice(-10_000),
   }));
   // Stops and drops its watcher and pipeline. Access events keep their gateId.
   syncGateWatchers();
@@ -9999,6 +10134,17 @@ app.post(RECOGNIZE_FACE_ROUTES, async (req, res) => {
       apiGate = gateFromConfig(cameraStreamsConfig, body.gateId);
       if (!apiGate) {
         res.status(400).json({ success: false, recognized: false, error: unknownGateError(body.gateId) });
+        return;
+      }
+      // A disabled gate records nothing and opens nothing (NGSEC-6).
+      if (apiGate.enabled === false) {
+        res.status(409).json({ success: false, recognized: false, code: "GATE_DISABLED", error: `Cổng "${apiGate.id}" đang tắt` });
+        return;
+      }
+      // A device token (no operator session) may only name the gates it is
+      // bound to (O1): DEVICE_INGEST_GATES, default the two legacy gates.
+      if (!(req as any).operatorSession && !deviceIngestGates().includes(apiGate.id)) {
+        res.status(403).json({ success: false, recognized: false, code: "DEVICE_GATE_FORBIDDEN", error: `Thiết bị không được gửi nhận diện cho cổng "${apiGate.id}"` });
         return;
       }
     }

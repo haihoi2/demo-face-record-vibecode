@@ -129,6 +129,7 @@ services:
       - VIEWER_ID=${VIEWER_ID:-}
       - VIEWER_TOKEN=${VIEWER_TOKEN:-}
       - DEVICE_INGEST_TOKEN=${DEVICE_INGEST_TOKEN:-}
+      - DEVICE_INGEST_GATES=${DEVICE_INGEST_GATES:-}
       - INTERNAL_API_TOKEN=${INTERNAL_API_TOKEN:-}
 
       # -----------------------------------------------------------------------
