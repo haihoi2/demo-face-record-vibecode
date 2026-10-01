@@ -35,6 +35,7 @@ import {
 } from "lucide-react";
 import {
   CameraStreamsConfig,
+  GateConfig,
   GateStreamConfig,
   GateStreamSource,
   GateStreamScanResult,
@@ -74,6 +75,20 @@ import {
   sourceStatusLabel,
   sourceStatusTone,
 } from "../utils/pipelineStatus";
+import {
+  directionOf,
+  directionLabel,
+  enabledGates,
+  eventGateId,
+  gateDisplayLabel,
+  gateDoorId,
+  gateLabelMap,
+  gatesOf,
+  labelForGateId,
+  legacyGateLabel,
+  runtimeGateId,
+  type GateDirection,
+} from "../utils/gates";
 
 const DEFAULT_STREAMS_CONFIG: CameraStreamsConfig = {
   entryGate: {
@@ -116,8 +131,8 @@ const DEFAULT_STREAMS_CONFIG: CameraStreamsConfig = {
 };
 
 // ----------------- MULTI-STREAM HELPERS -----------------
-type GateKey = "entry" | "exit";
-const gateKeyOf = (gateType: "ENTRY" | "EXIT"): GateKey => (gateType === "EXIT" ? "exit" : "entry");
+/** A gate id. Every per-gate map below is keyed by it, never by direction. */
+type GateKey = string;
 
 /**
  * Streams of a gate sorted by priority. When the payload has no `streams`
@@ -138,7 +153,7 @@ const deriveGateStreams = (gate: GateStreamConfig | undefined, key: GateKey): Ga
   return [
     {
       id: `${key}-primary`,
-      label: gate.name || (key === "exit" ? "Cổng Ra" : "Cổng Vào"),
+      label: gate.name || legacyGateLabel(key) || key,
       sourceType: gate.sourceType || "RTSP",
       rtspUrl: gate.rtspUrl,
       rtspTransport: gate.rtspTransport || "TCP",
@@ -251,14 +266,17 @@ const DEFAULT_WATCH: GateWatchConfig = { enabled: false, intervalSeconds: 3, fra
  * missing counter or an unknown gate must never crash or half-populate the panel.
  */
 /** The runtime plus the pipeline rollout/health the server may attach (all optional). */
-type WatchRuntime = GateWatchRuntime & { pipeline: PipelineRuntimeView };
+type WatchRuntime = GateWatchRuntime & { gateId: GateKey; pipeline: PipelineRuntimeView };
 
 const normalizeWatchRuntime = (raw: any): WatchRuntime | null => {
   if (!raw || typeof raw !== "object") return null;
-  const upper = String(raw.gate || "").toUpperCase();
-  if (upper !== "ENTRY" && upper !== "EXIT") return null;
-  const gate: "ENTRY" | "EXIT" = upper === "EXIT" ? "EXIT" : "ENTRY";
+  // Gate id from `gateId`; an older server only sends the direction (EXIT -> "exit").
+  const gateId = runtimeGateId(raw);
+  if (!gateId) return null;
+  const gate: GateDirection = directionOf(raw.gate) ?? (gateId === "exit" ? "EXIT" : "ENTRY");
   return {
+    gateId,
+    gateLabel: typeof raw.gateLabel === "string" && raw.gateLabel.trim() ? raw.gateLabel.trim() : undefined,
     gate,
     enabled: raw.enabled === true,
     intervalSeconds: clampInterval(raw.intervalSeconds ?? DEFAULT_WATCH.intervalSeconds),
@@ -390,6 +408,9 @@ const createInitialScanState = (): StreamScanState => ({
   scanFrames: 1,
 });
 
+/** Read-only default for a gate that has no scan state yet. */
+const INITIAL_SCAN_STATE: StreamScanState = createInitialScanState();
+
 const emptyPerStream = (): PerStreamState => ({
   isScanning: false,
   lastResult: null,
@@ -417,40 +438,42 @@ export const CameraDashboard: React.FC<CameraDashboardProps> = ({
   const [nowMs, setNowMs] = useState<number>(() => Date.now());
 
   // ---- Backend watcher (server-side auto-scan) state ----
-  const [watchers, setWatchers] = useState<Record<GateKey, WatchRuntime | null>>({
-    entry: null,
-    exit: null,
-  });
+  const [watchers, setWatchers] = useState<Record<GateKey, WatchRuntime | null>>({});
   /** null = chưa biết (đang tải); false = máy chủ cũ không có endpoint watch. */
   const [watchSupported, setWatchSupported] = useState<boolean | null>(null);
   const [watchLoading, setWatchLoading] = useState<boolean>(true);
   const [watchError, setWatchError] = useState<string | null>(null);
-  const [watchPending, setWatchPending] = useState<Record<GateKey, boolean>>({
-    entry: false,
-    exit: false,
-  });
-  const [watchFieldError, setWatchFieldError] = useState<Record<GateKey, string | null>>({
-    entry: null,
-    exit: null,
-  });
-  /** In-progress edit of the interval box; null = show the server's value. */
-  const [intervalDraft, setIntervalDraft] = useState<Record<GateKey, string | null>>({
-    entry: null,
-    exit: null,
-  });
+  const [watchPending, setWatchPending] = useState<Record<GateKey, boolean>>({});
+  const [watchFieldError, setWatchFieldError] = useState<Record<GateKey, string | null>>({});
+  /** In-progress edit of the interval box; absent/null = show the server's value. */
+  const [intervalDraft, setIntervalDraft] = useState<Record<GateKey, string | null>>({});
   /** Last alert signature per gate, so a person standing in frame does not
    *  re-trigger the chime on every single backend cycle. */
-  const watchAlertRef = useRef<Record<GateKey, string>>({ entry: "", exit: "" });
+  const watchAlertRef = useRef<Record<GateKey, string>>({});
+  /** Outcome of the last "Mở Cổng Này" per gate (server answer, never a local guess). */
+  const [unlockNotice, setUnlockNotice] = useState<Record<GateKey, { ok: boolean; text: string } | null>>({});
 
-  // Per-gate scan and view states
-  const [entryState, setEntryState] = useState<StreamScanState>(createInitialScanState);
-  const [exitState, setExitState] = useState<StreamScanState>(createInitialScanState);
+  // Per-gate scan and view states, keyed by gate id.
+  const [scanStates, setScanStates] = useState<Record<GateKey, StreamScanState>>({});
+  const scanStateOf = (gateId: GateKey): StreamScanState => scanStates[gateId] ?? INITIAL_SCAN_STATE;
+  /** A state setter for one gate's scan state (same shape as a useState setter). */
+  const setterFor = useCallback(
+    (gateId: GateKey): React.Dispatch<React.SetStateAction<StreamScanState>> =>
+      (action) =>
+        setScanStates((prev) => {
+          const current = prev[gateId] ?? createInitialScanState();
+          const next = typeof action === "function" ? (action as (s: StreamScanState) => StreamScanState)(current) : action;
+          return { ...prev, [gateId]: next };
+        }),
+    []
+  );
 
-  // Client UVC video references
-  const entryVideoRef = useRef<HTMLVideoElement | null>(null);
-  const exitVideoRef = useRef<HTMLVideoElement | null>(null);
-  const entryMediaStreamRef = useRef<MediaStream | null>(null);
-  const exitMediaStreamRef = useRef<MediaStream | null>(null);
+  // Client UVC: one <video> and one MediaStream per gate whose PRIMARY stream is
+  // this browser's webcam. Started and stopped explicitly (see the effect below).
+  const videoRefs = useRef<Record<GateKey, HTMLVideoElement | null>>({});
+  const mediaStreamRefs = useRef<Record<GateKey, MediaStream | null>>({});
+  /** Gate id -> webcam device the effect wants open; a late getUserMedia for a gate no longer here is stopped at once. */
+  const uvcWantedRef = useRef<Map<GateKey, string>>(new Map());
 
   // Clock
   useEffect(() => {
@@ -479,7 +502,8 @@ export const CameraDashboard: React.FC<CameraDashboardProps> = ({
       const res = await safeJsonFetch<{ success?: boolean; config?: CameraStreamsConfig }>(
         "/api/camera-streams/config"
       );
-      if (res.ok && res.data?.config?.entryGate && res.data.config.exitGate) {
+      // Either server shape: `gates[]` or the legacy entryGate/exitGate pair.
+      if (res.ok && res.data?.config && gatesOf(res.data.config).length > 0) {
         setConfig(res.data.config);
       }
     } catch (err) {
@@ -499,7 +523,7 @@ export const CameraDashboard: React.FC<CameraDashboardProps> = ({
   const applyWatcher = useCallback((raw: any) => {
     const w = normalizeWatchRuntime(raw);
     if (!w) return;
-    setWatchers((prev) => ({ ...prev, [gateKeyOf(w.gate)]: w }));
+    setWatchers((prev) => ({ ...prev, [w.gateId]: w }));
     setWatchSupported(true);
     setWatchError(null);
   }, []);
@@ -525,10 +549,10 @@ export const CameraDashboard: React.FC<CameraDashboardProps> = ({
       }
       const list = res.data?.watchers;
       if (res.ok && Array.isArray(list)) {
-        const next: Record<GateKey, WatchRuntime | null> = { entry: null, exit: null };
+        const next: Record<GateKey, WatchRuntime | null> = {};
         for (const raw of list) {
           const w = normalizeWatchRuntime(raw);
-          if (w) next[gateKeyOf(w.gate)] = w;
+          if (w) next[w.gateId] = w;
         }
         setWatchers(next);
         setWatchSupported(true);
@@ -565,11 +589,10 @@ export const CameraDashboard: React.FC<CameraDashboardProps> = ({
    */
   const applyWatchResult = useCallback(
     (payload: any) => {
-      const upper = String(payload?.gate || "").toUpperCase();
-      if (upper !== "ENTRY" && upper !== "EXIT") return;
-      const gateType: "ENTRY" | "EXIT" = upper === "EXIT" ? "EXIT" : "ENTRY";
-      const key = gateKeyOf(gateType);
-      const setState = gateType === "ENTRY" ? setEntryState : setExitState;
+      // `gateId` on a newer server; an older one only sends the direction.
+      const key = runtimeGateId(payload);
+      if (!key) return;
+      const setState = setterFor(key);
 
       const streamRows: GateStreamScanResult[] = Array.isArray(payload?.streams)
         ? payload.streams.filter((r: any) => r && typeof r.streamId === "string")
@@ -711,7 +734,7 @@ export const CameraDashboard: React.FC<CameraDashboardProps> = ({
         else if (seenFaces > 0) soundEffects.playStrangerAlert();
       }
     },
-    [employees]
+    [employees, setterFor]
   );
 
   // The SSE connection must not be torn down every time `employees` changes.
@@ -755,13 +778,12 @@ export const CameraDashboard: React.FC<CameraDashboardProps> = ({
    * flip the switch, we render whatever runtime the server hands back.
    */
   const updateWatcher = useCallback(
-    async (gateType: "ENTRY" | "EXIT", patch: Partial<GateWatchConfig>) => {
-      const key = gateKeyOf(gateType);
+    async (key: GateKey, patch: Partial<GateWatchConfig>) => {
       setWatchPending((p) => ({ ...p, [key]: true }));
       setWatchFieldError((p) => ({ ...p, [key]: null }));
       try {
         const res = await safeJsonFetch<{ success?: boolean; watcher?: GateWatchRuntime; error?: string }>(
-          `/api/camera-streams/${key}/watch`,
+          `/api/camera-streams/${encodeURIComponent(key)}/watch`,
           {
             method: "POST",
             headers: { "Content-Type": "application/json" },
@@ -799,62 +821,67 @@ export const CameraDashboard: React.FC<CameraDashboardProps> = ({
   );
 
   /** Commit the interval box (blur / Enter), clamped to the server's 1-300 range. */
-  const commitIntervalDraft = (gateType: "ENTRY" | "EXIT", current: number) => {
-    const key = gateKeyOf(gateType);
-    const draft = intervalDraft[key];
+  const commitIntervalDraft = (key: GateKey, current: number) => {
+    const draft = intervalDraft[key] ?? null;
     setIntervalDraft((p) => ({ ...p, [key]: null }));
     if (draft === null || draft.trim() === "") return;
     const next = clampInterval(draft);
     if (next === current) return;
-    updateWatcher(gateType, { intervalSeconds: next });
+    updateWatcher(key, { intervalSeconds: next });
   };
 
-  // Derived stream lists (sorted, legacy-tolerant)
-  const entryStreams = deriveGateStreams(config.entryGate, "entry");
-  const exitStreams = deriveGateStreams(config.exitGate, "exit");
-  const entryPrimary = getPrimaryStream(entryStreams);
-  const exitPrimary = getPrimaryStream(exitStreams);
-  const entryPrimarySourceType = entryPrimary?.sourceType || config.entryGate?.sourceType;
-  const exitPrimarySourceType = exitPrimary?.sourceType || config.exitGate?.sourceType;
+  // Derived gate list (either server shape) and per-gate stream lists, keyed by gate id.
+  const gates: GateConfig[] = gatesOf(config);
+  const gateLabels = gateLabelMap(gates);
+  const streamsOf = (gate: GateConfig): GateStreamSource[] => deriveGateStreams(gate, gate.id);
 
   // Determine active gates
   const activeGates: {
-    gate: GateStreamConfig;
+    gate: GateConfig;
     streams: GateStreamSource[];
     state: StreamScanState;
     setState: React.Dispatch<React.SetStateAction<StreamScanState>>;
-  }[] = [];
-  if (config.entryGate?.enabled) {
-    activeGates.push({ gate: config.entryGate, streams: entryStreams, state: entryState, setState: setEntryState });
-  }
-  if (config.exitGate?.enabled) {
-    activeGates.push({ gate: config.exitGate, streams: exitStreams, state: exitState, setState: setExitState });
-  }
+  }[] = enabledGates(gates).map((gate) => ({
+    gate,
+    streams: streamsOf(gate),
+    state: scanStateOf(gate.id),
+    setState: setterFor(gate.id),
+  }));
   const totalEnabledStreams = activeGates.reduce(
     (sum, g) => sum + g.streams.filter((s) => s.enabled).length,
     0
   );
-  /** How many gates currently have their backend watcher switched on. */
-  const activeWatcherCount = (["entry", "exit"] as GateKey[]).filter((k) => watchers[k]?.enabled).length;
+  /** How many configured gates currently have their backend watcher switched on. */
+  const activeWatcherCount = gates.filter((g) => watchers[g.id]?.enabled).length;
 
-  const gateHelpers = (gateType: "ENTRY" | "EXIT") => {
-    const isEntry = gateType === "ENTRY";
+  const gateHelpers = (gateId: GateKey) => {
+    const gateConfig = gates.find((g) => g.id === gateId);
+    const streams = gateConfig ? streamsOf(gateConfig) : [];
     return {
-      isEntry,
-      key: gateKeyOf(gateType),
-      gateConfig: isEntry ? config.entryGate : config.exitGate,
-      streams: isEntry ? entryStreams : exitStreams,
-      primary: isEntry ? entryPrimary : exitPrimary,
-      setState: isEntry ? setEntryState : setExitState,
-      videoRef: isEntry ? entryVideoRef : exitVideoRef,
-      streamRef: isEntry ? entryMediaStreamRef : exitMediaStreamRef,
+      key: gateId,
+      gateConfig,
+      streams,
+      primary: getPrimaryStream(streams),
+      setState: setterFor(gateId),
     };
   };
 
+  /** Callback ref for a gate's webcam <video>: attaches the gate's MediaStream when the element mounts. */
+  const attachGateVideo = (gateId: GateKey) => (el: HTMLVideoElement | null) => {
+    videoRefs.current[gateId] = el;
+    const stream = mediaStreamRefs.current[gateId];
+    if (el && stream && el.srcObject !== stream) {
+      el.srcObject = stream;
+      el.play().catch(() => {});
+    }
+  };
+
   // Handle Client UVC Camera Start for a gate (only the PRIMARY stream may be a browser webcam)
-  const startClientUvcCamera = async (gateType: "ENTRY" | "EXIT") => {
-    const { gateConfig, primary, setState, videoRef, streamRef } = gateHelpers(gateType);
+  const startClientUvcCamera = async (gateId: GateKey) => {
+    const { gateConfig, primary, setState } = gateHelpers(gateId);
     const uvcDeviceId = primary?.uvcDeviceId || gateConfig?.uvcDeviceId;
+    /** What the effect asked for when this start began; a later change supersedes it. */
+    const requested = uvcWantedRef.current.get(gateId);
 
     try {
       const constraints: MediaStreamConstraints = {
@@ -865,16 +892,24 @@ export const CameraDashboard: React.FC<CameraDashboardProps> = ({
       };
 
       const stream = await navigator.mediaDevices.getUserMedia(constraints);
-      streamRef.current = stream;
+      // The gate was switched off (or the page closed) while the browser asked:
+      // release the camera at once instead of leaking an open webcam.
+      if (requested === undefined || uvcWantedRef.current.get(gateId) !== requested) {
+        stream.getTracks().forEach((track) => track.stop());
+        return;
+      }
+      mediaStreamRefs.current[gateId]?.getTracks().forEach((track) => track.stop());
+      mediaStreamRefs.current[gateId] = stream;
 
-      if (videoRef.current) {
-        videoRef.current.srcObject = stream;
-        await videoRef.current.play().catch(() => {});
+      const videoEl = videoRefs.current[gateId];
+      if (videoEl) {
+        videoEl.srcObject = stream;
+        await videoEl.play().catch(() => {});
       }
 
       setState((prev) => ({ ...prev, clientUvcActive: true, hasError: false, errorMessage: null }));
     } catch (err: any) {
-      console.error(`[CameraDashboard] Lỗi mở UVC Camera (${gateType}):`, err);
+      console.error(`[CameraDashboard] Lỗi mở UVC Camera (${gateId}):`, err);
       setState((prev) => ({
         ...prev,
         clientUvcActive: false,
@@ -885,17 +920,17 @@ export const CameraDashboard: React.FC<CameraDashboardProps> = ({
   };
 
   // Stop Client UVC
-  const stopClientUvcCamera = (gateType: "ENTRY" | "EXIT") => {
-    const { setState, videoRef, streamRef } = gateHelpers(gateType);
-
-    if (streamRef.current) {
-      streamRef.current.getTracks().forEach((track) => track.stop());
-      streamRef.current = null;
+  const stopClientUvcCamera = (gateId: GateKey) => {
+    const stream = mediaStreamRefs.current[gateId];
+    if (stream) {
+      stream.getTracks().forEach((track) => track.stop());
     }
-    if (videoRef.current) {
-      videoRef.current.srcObject = null;
+    mediaStreamRefs.current[gateId] = null;
+    const videoEl = videoRefs.current[gateId];
+    if (videoEl) {
+      videoEl.srcObject = null;
     }
-    setState((prev) => ({ ...prev, clientUvcActive: false }));
+    setterFor(gateId)((prev) => ({ ...prev, clientUvcActive: false }));
   };
 
   const updatePerStream = (
@@ -921,7 +956,7 @@ export const CameraDashboard: React.FC<CameraDashboardProps> = ({
    * backend is configured at all (static demo build) and is labelled as such.
    */
   const recognizeClientUvcFrame = async (
-    gateType: "ENTRY" | "EXIT",
+    gate: GateConfig,
     videoEl: HTMLVideoElement,
     gateName: string
   ): Promise<{ result: GateScanResponse | null; error: string | null; retryNotice: string | null }> => {
@@ -946,7 +981,9 @@ export const CameraDashboard: React.FC<CameraDashboardProps> = ({
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           imageBase64,
-          scanType: gateType,
+          // Direction for reports; the gate id where the server takes one (older servers ignore it).
+          scanType: gate.direction,
+          gateId: gate.id,
           clientEmployees: employees,
           config: getStoredAiConfig(),
         }),
@@ -999,9 +1036,10 @@ export const CameraDashboard: React.FC<CameraDashboardProps> = ({
    *   server (`POST scan-rtsp { gate }`), which also returns per-stream `streams[]`.
    * A gate whose PRIMARY stream is a browser webcam keeps the CLIENT_UVC path.
    */
-  const performStreamScan = async (gateType: "ENTRY" | "EXIT", streamId?: string) => {
-    const { key, gateConfig, streams, primary, setState, videoRef } = gateHelpers(gateType);
+  const performStreamScan = async (gateId: GateKey, streamId?: string) => {
+    const { key, gateConfig, streams, primary, setState } = gateHelpers(gateId);
     if (!gateConfig) return;
+    const videoEl = videoRefs.current[gateId];
     const enabledStreams = streams.filter((s) => s.enabled);
     const targetStream = streamId ? streams.find((s) => s.id === streamId) || null : null;
 
@@ -1029,8 +1067,8 @@ export const CameraDashboard: React.FC<CameraDashboardProps> = ({
       let retryNotice: string | null = null;
 
       if (useClientUvc) {
-        if (videoRef.current) {
-          const outcome = await recognizeClientUvcFrame(gateType, videoRef.current, gateConfig.name);
+        if (videoEl) {
+          const outcome = await recognizeClientUvcFrame(gateConfig, videoEl, gateDisplayLabel(gateConfig));
           result = outcome.result;
           scanError = outcome.error;
           retryNotice = outcome.retryNotice;
@@ -1048,17 +1086,14 @@ export const CameraDashboard: React.FC<CameraDashboardProps> = ({
       } else {
         // RTSP / HTTP / backend UVC: the server grabs the frame(s) and runs recognition.
         // Frames per stream: an older server simply ignores the extra field.
-        const framesPerStream = Math.min(
-          5,
-          Math.max(1, (gateType === "ENTRY" ? entryState : exitState).scanFrames || 1)
-        );
+        const framesPerStream = Math.min(5, Math.max(1, scanStateOf(gateId).scanFrames || 1));
         const scanRes = await safeJsonFetch<GateScanResponse>("/api/camera-streams/scan-rtsp", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
             gate: key,
             ...(targetStream ? { stream: targetStream.id } : {}),
-            scanType: gateType,
+            scanType: gateConfig.direction,
             frames: framesPerStream,
           }),
         });
@@ -1174,7 +1209,7 @@ export const CameraDashboard: React.FC<CameraDashboardProps> = ({
         }
       }
     } catch (err: any) {
-      console.warn(`[CameraDashboard] Lỗi quét luồng (${gateType}):`, err);
+      console.warn(`[CameraDashboard] Lỗi quét luồng (${gateId}):`, err);
       setState((prev) => ({
         ...prev,
         hasError: true,
@@ -1194,52 +1229,88 @@ export const CameraDashboard: React.FC<CameraDashboardProps> = ({
   // watcher; this component only controls it and renders what it finds.
   // The manual "Quét" / "Quét tất cả luồng" buttons still call scan-rtsp directly.
 
-  // Auto start UVC cameras if a gate's PRIMARY stream uses CLIENT_UVC
-  useEffect(() => {
-    if (config.entryGate?.enabled && entryPrimarySourceType === "CLIENT_UVC" && !entryState.clientUvcActive) {
-      startClientUvcCamera("ENTRY");
-    }
-    return () => {
-      if (entryMediaStreamRef.current) {
-        stopClientUvcCamera("ENTRY");
-      }
-    };
-  }, [config.entryGate?.enabled, entryPrimarySourceType, entryPrimary?.uvcDeviceId]);
+  // Auto start the browser webcam of every enabled gate whose PRIMARY stream is
+  // CLIENT_UVC; stop it when the gate is disabled, its primary changes away from
+  // the webcam, or its device changes. Explicit cleanup on unmount releases all.
+  const uvcTargets = enabledGates(gates)
+    .map((g) => {
+      const primary = getPrimaryStream(streamsOf(g));
+      const sourceType = primary?.sourceType || g.sourceType;
+      return sourceType === "CLIENT_UVC" ? `${g.id}=${primary?.uvcDeviceId || g.uvcDeviceId || "default"}` : null;
+    })
+    .filter((x): x is string => x !== null)
+    .join("|");
 
   useEffect(() => {
-    if (config.exitGate?.enabled && exitPrimarySourceType === "CLIENT_UVC" && !exitState.clientUvcActive) {
-      startClientUvcCamera("EXIT");
+    const wanted = new Map<GateKey, string>();
+    for (const item of uvcTargets ? uvcTargets.split("|") : []) {
+      const i = item.indexOf("=");
+      wanted.set(item.slice(0, i), item.slice(i + 1));
     }
-    return () => {
-      if (exitMediaStreamRef.current) {
-        stopClientUvcCamera("EXIT");
-      }
-    };
-  }, [config.exitGate?.enabled, exitPrimarySourceType, exitPrimary?.uvcDeviceId]);
+    const previous = uvcWantedRef.current;
+    uvcWantedRef.current = wanted;
+    // Stop gates that are no longer wanted or whose device changed.
+    for (const [gateId, device] of previous) {
+      if (wanted.get(gateId) !== device) stopClientUvcCamera(gateId);
+    }
+    // Start gates that are newly wanted (or restarted after a device change).
+    for (const [gateId, device] of wanted) {
+      if (previous.get(gateId) !== device || !mediaStreamRefs.current[gateId]) void startClientUvcCamera(gateId);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [uvcTargets]);
 
-  // Quick unlock for a specific gate
-  const handleGateUnlock = async (gateName: string) => {
+  useEffect(
+    () => () => {
+      uvcWantedRef.current = new Map();
+      for (const gateId of Object.keys(mediaStreamRefs.current)) {
+        mediaStreamRefs.current[gateId]?.getTracks().forEach((track) => track.stop());
+      }
+      mediaStreamRefs.current = {};
+    },
+    []
+  );
+
+  // Quick unlock for a specific gate: the SERVER opens that gate's own door
+  // (doorId; an older server has one door and ignores the field). A refusal is
+  // shown as a refusal; only a transport failure on the static demo build falls
+  // back to the labelled simulation, which cannot reach a physical door.
+  const handleGateUnlock = async (gate: GateConfig) => {
+    const gateName = gateDisplayLabel(gate);
     soundEffects.playLockClick();
-    try {
-      const result = await operatorJsonFetch("/api/lock/unlock", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          source: `Điều khiển mở cửa trực tiếp (${gateName})`,
-          reason: "Bảo vệ bấm nút mở cổng từ Dashboard Quét Cửa AI",
-        }),
-      });
-      if (!result.ok) throw new Error(result.error || `Unlock failed (HTTP ${result.status})`);
+    setUnlockNotice((p) => ({ ...p, [gate.id]: null }));
+    const result = await operatorJsonFetch<{ success?: boolean; error?: string }>("/api/lock/unlock", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        doorId: gateDoorId(gate),
+        source: `Điều khiển mở cửa trực tiếp (${gateName})`,
+        reason: "Bảo vệ bấm nút mở cổng từ Dashboard Quét Cửa AI",
+      }),
+    });
+    if (result.ok && result.data?.success !== false) {
       soundEffects.playSuccess();
-    } catch (err) {
-      if (demoOfflinePersistenceEnabled()) {
-        clientDoorUnlock(`Điều khiển mở cửa (${gateName})`, undefined, undefined, { simulated: true });
-        soundEffects.playSuccess();
-      } else {
-        console.warn("Mở cổng thất bại:", err);
-        soundEffects.playDenied();
-      }
+      setUnlockNotice((p) => ({ ...p, [gate.id]: { ok: true, text: `Máy chủ đã gửi lệnh mở cửa ${gateDoorId(gate)}.` } }));
+      return;
     }
+    if (result.status === 0 && demoOfflinePersistenceEnabled()) {
+      clientDoorUnlock(`Điều khiển mở cửa (${gateName})`, undefined, undefined, { simulated: true });
+      soundEffects.playSuccess();
+      setUnlockNotice((p) => ({ ...p, [gate.id]: { ok: true, text: "Bản demo không có máy chủ: chỉ mô phỏng, không mở cửa thật." } }));
+      return;
+    }
+    console.warn("Mở cổng thất bại:", result.error);
+    soundEffects.playDenied();
+    setUnlockNotice((p) => ({
+      ...p,
+      [gate.id]: {
+        ok: false,
+        text:
+          result.status === 0
+            ? "Không kết nối được máy chủ: cửa CHƯA mở."
+            : `${result.data?.error || result.error || `Máy chủ từ chối (HTTP ${result.status})`}. Cửa CHƯA mở.`,
+      },
+    }));
   };
 
   // Face HUD tag used on tiles
@@ -1326,14 +1397,13 @@ export const CameraDashboard: React.FC<CameraDashboardProps> = ({
    * webcam, and the <video> element IS the capture source for the scan.
    */
   const renderStreamTile = (
-    gateConfig: GateStreamConfig,
+    gateConfig: GateConfig,
     stream: GateStreamSource,
     isPrimary: boolean,
     scanState: StreamScanState,
-    setScanState: React.Dispatch<React.SetStateAction<StreamScanState>>,
-    videoRef: React.RefObject<HTMLVideoElement | null>
+    setScanState: React.Dispatch<React.SetStateAction<StreamScanState>>
   ) => {
-    const isEntry = gateConfig.gateType === "ENTRY";
+    const isEntry = gateConfig.direction === "ENTRY";
     const per = scanState.perStream[stream.id] || emptyPerStream();
     const lastResult = scanState.lastResult;
     const tileFaces = scanState.activeFaces.filter(
@@ -1351,7 +1421,7 @@ export const CameraDashboard: React.FC<CameraDashboardProps> = ({
       >
         {isClientUvc && isPrimary && (
           <div className="relative aspect-video bg-black flex items-center justify-center overflow-hidden">
-            <video ref={videoRef} autoPlay playsInline muted className="w-full h-full object-cover" />
+            <video ref={attachGateVideo(gateConfig.id)} autoPlay playsInline muted className="w-full h-full object-cover" />
             {isScanning && (
               <div className="absolute inset-0 pointer-events-none overflow-hidden">
                 <div className="w-full h-1 bg-gradient-to-r from-transparent via-cyan-400 to-transparent shadow-[0_0_15px_rgba(34,211,238,0.8)] animate-[bounce_2s_infinite]" />
@@ -1433,7 +1503,7 @@ export const CameraDashboard: React.FC<CameraDashboardProps> = ({
 
             <button
               id={`btn-scan-stream-${stream.id}`}
-              onClick={() => performStreamScan(gateConfig.gateType, stream.id)}
+              onClick={() => performStreamScan(gateConfig.id, stream.id)}
               disabled={scanState.isScanning || (isClientUvc && !isPrimary)}
               className="inline-flex items-center gap-1 px-2 py-1 rounded-md bg-indigo-600/90 hover:bg-indigo-500 text-white text-[10px] font-semibold shadow-xs transition-all cursor-pointer disabled:opacity-50 shrink-0"
               title={`Quét nhận diện riêng luồng ${stream.label}`}
@@ -1452,10 +1522,9 @@ export const CameraDashboard: React.FC<CameraDashboardProps> = ({
    * already holds (SSE keeps it current). Crops for new rows, legacy frames for
    * old rows - the thumbnail fits both; a click shows the image enlarged.
    */
-  const renderRecentFaces = (gateType: "ENTRY" | "EXIT") => {
-    const recent = accessLogs
-      .filter((l) => (l.type || (l as { scanType?: string }).scanType) === gateType && !!l.photoSnapshot)
-      .slice(0, 6);
+  const renderRecentFaces = (gateId: GateKey) => {
+    // By gate id; an older event has none and is read as "entry"/"exit" from its direction.
+    const recent = accessLogs.filter((l) => eventGateId(l) === gateId && !!l.photoSnapshot).slice(0, 6);
     return (
       <div className="mx-3.5 mt-3 rounded-xl border border-slate-800 bg-slate-900/60 px-3 py-2.5">
         <div className="flex items-center justify-between gap-2 mb-2">
@@ -1987,9 +2056,9 @@ export const CameraDashboard: React.FC<CameraDashboardProps> = ({
    * POSTs to `/api/camera-streams/:gate/watch` - nothing here schedules
    * anything inside the browser.
    */
-  const renderWatchPanel = (gateConfig: GateStreamConfig, enabledStreamCount: number) => {
-    const key = gateKeyOf(gateConfig.gateType);
-    const runtime = watchers[key];
+  const renderWatchPanel = (gateConfig: GateConfig, enabledStreamCount: number) => {
+    const key = gateConfig.id;
+    const runtime = watchers[key] ?? null;
     const configured: GateWatchConfig = runtime
       ? { enabled: runtime.enabled, intervalSeconds: runtime.intervalSeconds, frames: runtime.frames }
       : gateConfig.watch || DEFAULT_WATCH;
@@ -2040,7 +2109,7 @@ export const CameraDashboard: React.FC<CameraDashboardProps> = ({
     const tooShort = configured.intervalSeconds < scanSec;
     const nextIn = secondsUntil(runtime?.nextRunAt, nowMs);
     const errors = runtime?.consecutiveErrors || 0;
-    const draft = intervalDraft[key];
+    const draft = intervalDraft[key] ?? null;
     const intervalValue = draft !== null ? draft : String(configured.intervalSeconds);
 
     return (
@@ -2099,7 +2168,7 @@ export const CameraDashboard: React.FC<CameraDashboardProps> = ({
           <button
             id={`btn-toggle-watch-${key}`}
             disabled={pending}
-            onClick={() => updateWatcher(gateConfig.gateType, { enabled: !configured.enabled })}
+            onClick={() => updateWatcher(key, { enabled: !configured.enabled })}
             className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-[11px] font-semibold transition-all cursor-pointer disabled:opacity-50 ${
               configured.enabled
                 ? "bg-emerald-600 hover:bg-emerald-500 text-white shadow-xs"
@@ -2124,7 +2193,7 @@ export const CameraDashboard: React.FC<CameraDashboardProps> = ({
               value={intervalValue}
               placeholder="giây nghỉ"
               onChange={(e) => setIntervalDraft((p) => ({ ...p, [key]: e.target.value }))}
-              onBlur={() => commitIntervalDraft(gateConfig.gateType, configured.intervalSeconds)}
+              onBlur={() => commitIntervalDraft(key, configured.intervalSeconds)}
               onKeyDown={(e) => {
                 if (e.key === "Enter") (e.target as HTMLInputElement).blur();
                 if (e.key === "Escape") setIntervalDraft((p) => ({ ...p, [key]: null }));
@@ -2143,7 +2212,7 @@ export const CameraDashboard: React.FC<CameraDashboardProps> = ({
               disabled={pending}
               value={configured.frames}
               onChange={(e) =>
-                updateWatcher(gateConfig.gateType, { frames: clampFrames(e.target.value) })
+                updateWatcher(key, { frames: clampFrames(e.target.value) })
               }
               className="bg-slate-900 text-slate-200 border border-slate-700 rounded-lg px-2 py-1.5 text-[11px] font-mono focus:outline-hidden focus:border-indigo-500 disabled:opacity-50"
               title="Số khung hình chụp trên mỗi luồng cho mỗi lượt quét nền (1-5)"
@@ -2273,14 +2342,15 @@ export const CameraDashboard: React.FC<CameraDashboardProps> = ({
 
   // Render a Single Active Gate Card (with one tile per enabled stream)
   const renderCameraStreamCard = (
-    gateConfig: GateStreamConfig,
+    gateConfig: GateConfig,
     streams: GateStreamSource[],
     scanState: StreamScanState,
-    setScanState: React.Dispatch<React.SetStateAction<StreamScanState>>,
-    videoRef: React.RefObject<HTMLVideoElement | null>
+    setScanState: React.Dispatch<React.SetStateAction<StreamScanState>>
   ) => {
-    const isEntry = gateConfig.gateType === "ENTRY";
-    const gateLabel = isEntry ? "CỔNG VÀO (ENTRY)" : "CỔNG RA (EXIT)";
+    const gateId = gateConfig.id;
+    const isEntry = gateConfig.direction === "ENTRY";
+    const gateLabel = `${gateDisplayLabel(gateConfig).toUpperCase()} (${directionLabel(gateConfig.direction).toUpperCase()})`;
+    const notice = unlockNotice[gateId] ?? null;
     const lastResult = scanState.lastResult;
     const enabledStreams = streams.filter((s) => s.enabled);
     const primary = getPrimaryStream(streams);
@@ -2288,8 +2358,9 @@ export const CameraDashboard: React.FC<CameraDashboardProps> = ({
 
     return (
       <div
-        key={gateConfig.gateType}
-        id={`card-stream-${gateConfig.gateType.toLowerCase()}`}
+        key={gateId}
+        id={`card-stream-${gateId}`}
+        data-gate-id={gateId}
         className="bg-slate-900 rounded-2xl overflow-hidden border border-slate-800 shadow-xl flex flex-col transition-all duration-200 hover:border-slate-700"
       >
         {/* Stream Top Header */}
@@ -2322,7 +2393,7 @@ export const CameraDashboard: React.FC<CameraDashboardProps> = ({
           <div className="flex items-center gap-2 shrink-0">
             {/* Rollout mode of this gate (server-owned; absent on an older server) */}
             {(() => {
-              const mode = watchers[gateKeyOf(gateConfig.gateType)]?.pipeline.mode;
+              const mode = watchers[gateId]?.pipeline.mode;
               if (!mode) return null;
               return (
                 <span
@@ -2356,13 +2427,13 @@ export const CameraDashboard: React.FC<CameraDashboardProps> = ({
         ) : (
           <div className={`grid gap-2 p-2 bg-black/40 ${multi ? "grid-cols-1 md:grid-cols-2" : "grid-cols-1"}`}>
             {enabledStreams.map((s) =>
-              renderStreamTile(gateConfig, s, primary?.id === s.id, scanState, setScanState, videoRef)
+              renderStreamTile(gateConfig, s, primary?.id === s.id, scanState, setScanState)
             )}
           </div>
         )}
 
         {/* Faces captured here (crops only; the scene is in "Đoạn ghi") */}
-        {renderRecentFaces(gateConfig.gateType)}
+        {renderRecentFaces(gateId)}
 
         {/* Backend watcher: control surface + live status for this gate */}
         {renderWatchPanel(gateConfig, enabledStreams.length)}
@@ -2481,7 +2552,7 @@ export const CameraDashboard: React.FC<CameraDashboardProps> = ({
             <label className="inline-flex items-center gap-1.5 text-slate-400">
               <span className="hidden sm:inline">Số khung hình</span>
               <select
-                id={`select-frames-${gateConfig.gateType.toLowerCase()}`}
+                id={`select-frames-${gateId}`}
                 value={scanState.scanFrames}
                 onChange={(e) =>
                   setScanState((prev) => ({
@@ -2504,9 +2575,9 @@ export const CameraDashboard: React.FC<CameraDashboardProps> = ({
           <div className="flex items-center gap-2">
             {/* Scan all streams of this gate */}
             <button
-              id={`btn-scannow-${gateConfig.gateType.toLowerCase()}`}
+              id={`btn-scannow-${gateId}`}
               disabled={scanState.isScanning || enabledStreams.length === 0}
-              onClick={() => performStreamScan(gateConfig.gateType)}
+              onClick={() => performStreamScan(gateId)}
               className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-indigo-600 hover:bg-indigo-500 active:scale-98 text-white font-semibold transition-all shadow-xs cursor-pointer disabled:opacity-50"
               title="Chụp khung hình từ tất cả luồng đang bật của cổng và nhận diện đồng thời"
             >
@@ -2519,14 +2590,20 @@ export const CameraDashboard: React.FC<CameraDashboardProps> = ({
             {/* Quick Gate Unlock Button */}
             {canOperateDoor && (
             <button
-              id={`btn-unlock-${gateConfig.gateType.toLowerCase()}`}
-              onClick={() => handleGateUnlock(gateConfig.name)}
+              id={`btn-unlock-${gateId}`}
+              onClick={() => void handleGateUnlock(gateConfig)}
               className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-emerald-400 font-semibold border border-slate-700 hover:border-emerald-500/50 transition-all cursor-pointer"
-              title={`Mở khóa cổng ${gateConfig.name} ngay`}
+              title={`Mở cửa ${gateDoorId(gateConfig)} của ${gateDisplayLabel(gateConfig)} ngay`}
             >
               <KeyRound className="w-3.5 h-3.5 text-emerald-400" />
               <span>Mở Cổng Này</span>
             </button>
+            )}
+          </div>
+
+          <div role="status" aria-live="polite" className="w-full empty:hidden">
+            {notice && (
+              <p className={`text-[11px] ${notice.ok ? "text-emerald-300" : "text-rose-300"}`}>{notice.text}</p>
             )}
           </div>
 
@@ -2630,7 +2707,7 @@ export const CameraDashboard: React.FC<CameraDashboardProps> = ({
                   : watchSupported === null
                   ? "Đang đọc trạng thái quét nền..."
                   : activeWatcherCount > 0
-                  ? `Watcher máy chủ: ${activeWatcherCount}/${activeGates.length || 2} cổng đang bật`
+                  ? `Watcher máy chủ: ${activeWatcherCount}/${gates.length} cổng đang bật`
                   : "Watcher máy chủ: chưa bật cổng nào"}
               </span>
             </div>
@@ -2675,20 +2752,27 @@ export const CameraDashboard: React.FC<CameraDashboardProps> = ({
           </div>
           <h3 className="text-base font-bold text-slate-800">Chưa có luồng camera nào được kích hoạt</h3>
           <p className="text-xs text-slate-500 max-w-md mx-auto mt-1 mb-4">
-            Cả Cổng Vào và Cổng Ra hiện đang ở trạng thái tắt. Hãy vào trang Cấu Hình Luồng Camera để kích hoạt hoặc kiểm tra kết nối RTSP/UVC.
+            Tất cả {gates.length} cổng hiện đang ở trạng thái tắt. Hãy vào trang Cấu Hình Luồng Camera để kích hoạt hoặc kiểm tra kết nối RTSP/UVC.
+            Nút bên dưới chỉ hiện các cổng trên trang này; muốn máy chủ quét các cổng, hãy bật và lưu trong trang cấu hình.
           </p>
           <div className="flex items-center justify-center gap-3">
             <button
+              id="btn-show-all-gates"
               onClick={() => {
-                setConfig((prev) => ({
-                  ...prev,
-                  entryGate: { ...prev.entryGate, enabled: true },
-                  exitGate: { ...prev.exitGate, enabled: true },
-                }));
+                setConfig((prev) => {
+                  if (Array.isArray(prev.gates) && prev.gates.length > 0) {
+                    return { ...prev, gates: prev.gates.map((g) => ({ ...g, enabled: true })) };
+                  }
+                  return {
+                    ...prev,
+                    entryGate: { ...prev.entryGate, enabled: true },
+                    exitGate: { ...prev.exitGate, enabled: true },
+                  };
+                });
               }}
               className="px-4 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-semibold transition-all shadow-xs cursor-pointer"
             >
-              Bật Cổng Vào &amp; Cổng Ra Ngay
+              Bật tất cả cổng (trên trang này)
             </button>
             <button
               onClick={onNavigateToCamerasConfig}
@@ -2706,15 +2790,7 @@ export const CameraDashboard: React.FC<CameraDashboardProps> = ({
               : "grid-cols-1 lg:grid-cols-2"
           }`}
         >
-          {activeGates.map(({ gate, streams, state, setState }) =>
-            renderCameraStreamCard(
-              gate,
-              streams,
-              state,
-              setState,
-              gate.gateType === "ENTRY" ? entryVideoRef : exitVideoRef
-            )
-          )}
+          {activeGates.map(({ gate, streams, state, setState }) => renderCameraStreamCard(gate, streams, state, setState))}
         </div>
       )}
 
@@ -2779,6 +2855,9 @@ export const CameraDashboard: React.FC<CameraDashboardProps> = ({
                             }`}
                           >
                             {isEntry ? "VÀO" : "RA"}
+                          </span>
+                          <span className="px-1.5 py-0.2 text-[10px] font-semibold rounded bg-slate-100 text-slate-700 truncate max-w-[10rem]">
+                            {labelForGateId(eventGateId(log), gateLabels)}
                           </span>
                         </div>
                         <p className="text-[11px] text-slate-500 truncate mt-0.5">
@@ -2859,7 +2938,7 @@ export const CameraDashboard: React.FC<CameraDashboardProps> = ({
             {/* Lock state + manual unlock (kept from props) */}
             <div className="flex items-center justify-between p-3 rounded-xl bg-slate-50 border border-slate-100 text-xs">
               <span className="text-slate-600">
-                Khóa cổng: <b className={lockState?.isLocked === false ? "text-emerald-600" : "text-slate-900"}>
+                Khóa cửa chính: <b className={lockState?.isLocked === false ? "text-emerald-600" : "text-slate-900"}>
                   {lockState?.isLocked === false ? "Đang mở" : "Đang khóa"}
                 </b>
               </span>
