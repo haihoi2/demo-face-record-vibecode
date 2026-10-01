@@ -19,7 +19,10 @@ describe("NVR playback", () => {
     assert.equal(res.status, 200);
     assert.equal(res.body.success, true);
     assert.equal(typeof res.body.enabled, "boolean");
-    assert.deepEqual(Object.keys(res.body.gates).sort(), ["ENTRY", "EXIT"]);
+    // Per configured gate id (N gates) plus the legacy ENTRY/EXIT keys older clients read.
+    for (const key of ["ENTRY", "EXIT", "entry", "exit"]) assert.equal(typeof res.body.gates[key], "boolean", key);
+    assert.equal(res.body.gates.ENTRY, res.body.gates.entry);
+    assert.equal(res.body.gates.EXIT, res.body.gates.exit);
     assert.doesNotMatch(res.text, /rtsp:|@|Streaming/i);
   });
 
