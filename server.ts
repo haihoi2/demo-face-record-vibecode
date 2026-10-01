@@ -1311,7 +1311,10 @@ let employees: EmployeeRecord[] = db.getEmployees(DEMO_DATA_ENABLED ? DEFAULT_EM
 refreshEmployeeMergeMap();
 let accessLogs: AccessLogRecord[] = db.getAccessLogs(DEMO_DATA_ENABLED ? DEFAULT_ACCESS_LOGS : []);
 let mobileNotifications: MobileNotificationRecord[] = db.getNotifications(DEMO_DATA_ENABLED ? DEFAULT_NOTIFICATIONS : []);
-let smartLockState = db.getSmartLockState(DEFAULT_SMART_LOCK_STATE);
+// Door "main" (the legacy single lock). The door store merges its door_lock_states
+// row with the legacy smart_lock_state row (newest wins), so a state written by
+// the previous release after a rollback is not hidden.
+let smartLockState = db.getDoorLockState(LEGACY_DOOR_ID, db.getSmartLockState(DEFAULT_SMART_LOCK_STATE));
 let webhookConfig = db.getWebhookConfig(DEFAULT_WEBHOOK_CONFIG);
 let webhookLogs: WebhookLogRecord[] = db.getWebhookLogs();
 let doorControllerConfig: DoorControllerState = normalizeDoorControllerConfig(db.getDoorControllerConfig(DEFAULT_DOOR_CONTROLLER_CONFIG), null);
@@ -1592,6 +1595,39 @@ const reportedDroppedGates = new Set<string>();
  * wins when both are present); re-creates a missing "entry"/"exit" from the
  * legacy key or the defaults; keeps the legacy keys as views.
  */
+/** JSON with sorted keys: PostgreSQL jsonb does not keep key order. */
+function stableJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(stableJson).join(",")}]`;
+  if (value && typeof value === "object") {
+    return `{${Object.keys(value as object).sort().map((k) => `${JSON.stringify(k)}:${stableJson((value as any)[k])}`).join(",")}}`;
+  }
+  return JSON.stringify(value) ?? "null";
+}
+
+/**
+ * This release always stores `entryGate`/`exitGate` equal to the gates
+ * "entry"/"exit". A difference means an older release (after a rollback)
+ * edited the legacy key - it does not know `gates` and carries it along
+ * stale - so that edit wins for the gate, keeping the N-gate fields.
+ */
+function adoptLegacyEdits(source: Record<string, any>): Record<string, any> {
+  if (!Array.isArray(source.gates)) return source;
+  let gates: any[] | null = null;
+  for (const [key, id] of [["entryGate", "entry"], ["exitGate", "exit"]] as const) {
+    const legacy = source[key];
+    const at = source.gates.findIndex((g: any) => g && g.id === id);
+    if (!legacy || typeof legacy !== "object" || at < 0 || stableJson(legacy) === stableJson(source.gates[at])) continue;
+    const current = source.gates[at];
+    gates ??= [...source.gates];
+    gates[at] = { ...legacy, id, direction: current.direction, label: current.label, doorId: current.doorId };
+    if (!reportedDroppedGates.has(`legacy-edit:${key}:${stableJson(legacy).length}`)) {
+      reportedDroppedGates.add(`legacy-edit:${key}:${stableJson(legacy).length}`);
+      console.warn(`[Camera Config] ${key} được sửa bởi bản cũ hơn (sau khi quay lui): dùng giá trị đó cho cổng ${id}.`);
+    }
+  }
+  return gates ? { ...source, gates } : source;
+}
+
 function normalizeCameraStreamsConfig(config: unknown): CameraConfig {
   const source = (config && typeof config === "object" ? config : DEFAULT_CAMERA_STREAMS_CONFIG) as Record<string, any>;
   // gatesFromStoredConfig is generic over plain records; GateRecord is an interface type.
@@ -1620,7 +1656,10 @@ function normalizeCameraStreamsConfig(config: unknown): CameraConfig {
 }
 
 function loadCameraStreamsConfig(): CameraConfig {
-  return normalizeCameraStreamsConfig(db.getCameraStreamsConfig(DEFAULT_CAMERA_STREAMS_CONFIG));
+  // Only a STORED config can carry an older release's legacy-key edit; in
+  // memory the legacy keys are just stale views (gates is the truth).
+  const stored = db.getCameraStreamsConfig(DEFAULT_CAMERA_STREAMS_CONFIG) as unknown as Record<string, any>;
+  return normalizeCameraStreamsConfig(stored && typeof stored === "object" ? adoptLegacyEdits(stored) : stored);
 }
 
 /** A configured gate by id (case-insensitive for old callers sending "EXIT"); null when unknown/malformed. */
@@ -1771,7 +1810,8 @@ db.onSync(() => {
   refreshEmployeeMergeMap();
   accessLogs = db.getAccessLogs(DEMO_DATA_ENABLED ? DEFAULT_ACCESS_LOGS : []);
   mobileNotifications = db.getNotifications(DEMO_DATA_ENABLED ? DEFAULT_NOTIFICATIONS : []);
-  smartLockState = db.getSmartLockState(DEFAULT_SMART_LOCK_STATE);
+  smartLockState = db.getDoorLockState(LEGACY_DOOR_ID, db.getSmartLockState(DEFAULT_SMART_LOCK_STATE));
+  refreshDoorLockStates(); // the other doors, from the (re-hydrated) door store
   webhookConfig = db.getWebhookConfig(DEFAULT_WEBHOOK_CONFIG);
   webhookLogs = db.getWebhookLogs();
   doorControllerConfig = loadDoorControllerConfig();
@@ -2764,17 +2804,18 @@ faceWorkerPool.setBroadcastSSE(broadcastSSE);
 faceWorkerPool.initWorkerPool(cameraStreamsConfig.workerThreadsCount || 4);
 
 // ----------------- DOORS: LOCK STATE PER DOOR -----------------
-// Door "main" keeps the legacy smart_lock_state row (`smartLockState`); every
-// other door has its own row in door_lock_states (db.getDoorLockState /
-// saveDoorLockState), cached here. Lock state is display/audit state - the
-// physical command is the controller call - so a store error is logged, never
-// thrown into an unlock.
+// Every door's state lives in the door store (db.getDoorLockState /
+// saveDoorLockState; saving door "main" also writes the legacy smart_lock_state
+// row). Door "main" is `smartLockState`; the others are cached here. Lock state
+// is display/audit state - the physical command is the controller call - so a
+// store error is logged, never thrown into an unlock.
 const doorLockStates = new Map<string, SmartLockStateRecord>();
-let doorLockStoreWarned = false;
+let doorLockStoreWarnedAt = 0;
 function warnDoorLockStore(err: unknown) {
-  if (doorLockStoreWarned) return;
-  doorLockStoreWarned = true;
-  console.error("[Door] Không đọc/ghi được trạng thái khóa của cửa phụ:", (err as any)?.message || err);
+  const now = Date.now();
+  if (now - doorLockStoreWarnedAt < 60_000) return; // at most one line a minute
+  doorLockStoreWarnedAt = now;
+  console.error("[Door] Không lưu được trạng thái khóa:", (err as any)?.message || err);
 }
 
 /** A configured door (null when the id names none). */
@@ -2797,32 +2838,37 @@ function lockStateOf(doorId: string): SmartLockStateRecord {
       lastActionBy: "Hệ thống bảo mật tự động",
       remainingRelockSeconds: 0,
     };
-    try {
-      state = { ...defaults, ...db.getDoorLockState(doorId, defaults), doorName: label };
-    } catch (err) {
-      warnDoorLockStore(err);
-      state = defaults;
-    }
+    state = { ...defaults, ...db.getDoorLockState(doorId, defaults), doorId, doorName: label };
     doorLockStates.set(doorId, state);
   }
   return state;
 }
 
+/**
+ * Re-reads the cached doors from the store (PostgreSQL hydration / sync). A
+ * door with a running relock timer keeps its in-memory state: the timer owns it.
+ */
+function refreshDoorLockStates() {
+  for (const [doorId, cached] of doorLockStates) {
+    if (doorTimers.has(doorId)) continue;
+    const label = doorConfigOf(doorId)?.label || cached.doorName;
+    doorLockStates.set(doorId, { ...cached, ...db.getDoorLockState(doorId, cached), doorId, doorName: label });
+  }
+}
+
+/**
+ * Stores a door's state; door "main" also writes the legacy smart_lock_state row.
+ * Not awaited: the in-memory state is the fact of the moment, the controller
+ * call must not wait on a database write, and the store never rejects (it
+ * resolves false on a failed or refused write, logged here).
+ */
 function saveLockState(doorId: string, state: SmartLockStateRecord) {
-  if (doorId === LEGACY_DOOR_ID) {
-    db.saveSmartLockState(state);
-    return;
-  }
-  // db.saveDoorLockState resolves false on a failed/refused write and never rejects.
-  try {
-    void Promise.resolve(db.saveDoorLockState(doorId, state))
-      .then((ok) => {
-        if (ok === false) warnDoorLockStore(new Error(`door ${doorId}: state not stored`));
-      })
-      .catch(warnDoorLockStore);
-  } catch (err) {
-    warnDoorLockStore(err);
-  }
+  void db
+    .saveDoorLockState(doorId, state)
+    .then((ok) => {
+      if (!ok) warnDoorLockStore(new Error(`door ${doorId}: state not stored`));
+    })
+    .catch(warnDoorLockStore);
 }
 
 /** A lock state as clients see it: the legacy shape plus its door id. */
@@ -3171,6 +3217,11 @@ app.get(
     res.json(publicLockState(door.doorId));
   }
 );
+
+// Every configured door's lock state (door "main" first), for the door page.
+app.get(["/api/lock/states", "/api/lock/states/"], (_req, res) => {
+  res.json({ success: true, doors: doorControllerConfig.doors.map((d) => ({ ...publicLockState(d.id), label: d.label })) });
+});
 
 app.post("/api/lock/unlock", (req, res) => {
   const { source = "API Remote", employeeName, employeeId } = req.body || {};
@@ -3709,11 +3760,7 @@ app.post(DOOR_CONFIG_ROUTES, async (req, res) => {
     if (!updated.doors.some((n) => n.id === d.id)) {
       clearDoorTimers(d.id);
       doorLockStates.delete(d.id);
-      try {
-        void Promise.resolve(db.deleteDoorLockState(d.id)).catch(warnDoorLockStore);
-      } catch (err) {
-        warnDoorLockStore(err);
-      }
+      void db.deleteDoorLockState(d.id).catch(warnDoorLockStore);
     }
   }
   broadcastSSE("door_config_updated", updated);
@@ -4790,8 +4837,7 @@ async function persistStrangerFaces(
     const frameBytes = frameImage.startsWith("data:") ? Buffer.from(frameImage.split(",", 2)[1] || "", "base64") : null;
     if (!frameBytes?.length) return 0;
     const size = encodedImageSize(frameBytes);
-    // = db's StrangerFaceRecordWithGate (N-gate wave): the face row plus its gate id.
-    const rows: Array<StrangerFaceRecord & { gateId?: string }> = [];
+    const rows: StrangerFaceRecord[] = [];
     for (let i = 0; i < faces.length; i++) {
       const o = faces[i];
       if (!o.box || !o.embedding?.length) continue;
@@ -8224,9 +8270,12 @@ app.get("/api/logs/:id/recording", requireOperatorRole("viewer"), async (req, re
     res.status(503).json({ success: false, code: "RECORDING_NOT_CONFIGURED", error: "Chưa cấu hình đầu ghi để xem lại (RECORDING_NVR_URL)." });
     return;
   }
-  // The event's gate (old rows: derived from the direction) picks the channel.
+  // The channel stored on the event (where the gate was recorded at the time)
+  // first; else the event's gate (old rows: derived from the direction) picks
+  // RECORDING_<GATE>_CHANNEL. Digits only either way: it goes into the NVR URL.
   const gate = gateIdForLegacyRow(log);
-  const channel = recordingChannelFor(recordingConfig, gate);
+  const storedChannel = typeof log.recordingChannel === "string" && /^[0-9]{1,5}$/.test(log.recordingChannel) ? log.recordingChannel : null;
+  const channel = storedChannel || recordingChannelFor(recordingConfig, gate);
   if (!channel) {
     res.status(404).json({ success: false, code: "RECORDING_NO_CHANNEL", error: "Cổng này chưa được gán kênh ghi hình trên đầu ghi." });
     return;
@@ -10407,6 +10456,12 @@ async function startServer() {
     console.log(`Server running on http://0.0.0.0:${PORT} (Mode: ${isProduction ? "production" : "development"})`);
     // Backend gate watchers start here, AFTER the camera config is loaded and
     // only for gates whose persisted `watch.enabled` is true.
+    console.log(
+      `[Camera Config] ${cameraStreamsConfig.gates.length} cổng: ` +
+        cameraStreamsConfig.gates
+          .map((g) => `${g.id} (${g.direction}, cửa ${doorIdOf(g)}, ${(g.streams || []).length} luồng${g.enabled === false ? ", tắt" : ""})`)
+          .join(", ")
+    );
     syncGateWatchers();
     void auditStoredDestinations().catch(() => {});
     startStrangerFaceRetention();

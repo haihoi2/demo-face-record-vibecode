@@ -27,6 +27,8 @@ export interface StrangerFaceRecord {
   /** Frame time, ISO UTC. */
   capturedAt: string;
   gate: "ENTRY" | "EXIT";
+  /** Gate id (N gates); absent on faces from before gate ids: readers derive it from `gate`. */
+  gateId?: string;
   streamId?: string;
   engine: StrangerFaceEngine;
   /** Pipeline track id, when the record comes from the real-time pipeline. */
