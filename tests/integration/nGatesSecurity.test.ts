@@ -1181,6 +1181,22 @@ describe("N gates: security (third gate + own door)", () => {
       }
     });
 
+    it("an operator's camera-config save cannot switch a gate on or off (admin only: PUT /api/gates/:id)", async () => {
+      const id = `onoff-${RUN}`;
+      await createGate(id, "ENTRY");
+      try {
+        const off = await call("operator", "POST", "/api/camera-streams/config", { gates: [{ id, enabled: false }] });
+        assert.equal(off.status, 200, off.text.slice(0, 160));
+        assert.equal((await gateSummary(id)).enabled, true, "operator save switched the gate off");
+        assert.equal((await admin("PUT", `/api/gates/${id}`, { enabled: false })).status, 200);
+        const on = await call("operator", "POST", "/api/camera-streams/config", { gates: [{ id, enabled: true }] });
+        assert.equal(on.status, 200, on.text.slice(0, 160));
+        assert.equal((await gateSummary(id)).enabled, false, "operator save switched the gate back on");
+      } finally {
+        await deleteGate(id);
+      }
+    });
+
     it("FINDING NGSEC-2: an operator cannot clear the retired gate ids (deleted ids must never be reused)", async () => {
       const id = `tomb-${RUN}`;
       await createGate(id, "ENTRY");

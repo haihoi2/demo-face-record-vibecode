@@ -1764,9 +1764,11 @@ function applyGateConfigPatch(current: GateRecord, patch: any): GateRecord {
   const base = normalizeGateRecord(current, current.id, current.direction);
   if (!patch || typeof patch !== "object") return base;
 
-  // id and direction are fixed here; the door a gate opens and its pipeline
-  // rollout are admin decisions (PUT /api/gates/:id, /pipeline-mode), never
-  // something this operator route may change - their current values are kept.
+  // id and direction are fixed here; the door a gate opens, its pipeline
+  // rollout and whether it is switched on at all (a switched-off gate refuses
+  // recognitions and scans) are admin decisions (PUT /api/gates/:id,
+  // /pipeline-mode), never something this operator route may change - their
+  // current values are kept. The watcher's own on/off (`watch`) stays here.
   const {
     streams: patchStreams,
     gateType: _ignoredGateType,
@@ -1774,6 +1776,7 @@ function applyGateConfigPatch(current: GateRecord, patch: any): GateRecord {
     direction: _ignoredDirection,
     doorId: _ignoredDoorId,
     pipelineMode: _ignoredPipelineMode,
+    enabled: _ignoredEnabled,
     ...rest
   } = patch;
   const currentPrimary = pickPrimaryStream(base.streams!);
@@ -1793,6 +1796,7 @@ function applyGateConfigPatch(current: GateRecord, patch: any): GateRecord {
       gateType: base.gateType,
       doorId: base.doorId,
       pipelineMode: base.pipelineMode,
+      enabled: base.enabled,
       // A partial `watch` patch ({ enabled: true }) keeps the gate's other watch values.
       watch: "watch" in rest ? normalizeGateWatchConfig(rest.watch, base.watch) : base.watch,
       streams: replaced ? patchStreams : base.streams,
