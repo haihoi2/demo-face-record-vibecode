@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback } from "react";
+import React, { useState, useEffect, useCallback, useReducer } from "react";
 import { Navbar, NavTabType, canSeeTab } from "./components/Navbar";
 import { FaceScanner } from "./components/FaceScanner";
 import { CameraDashboard } from "./components/CameraDashboard";
@@ -27,6 +27,13 @@ import { UsersPage } from "./components/UsersPage";
 import { OrgCatalogPage } from "./components/OrgCatalogPage";
 import { StorageAlert } from "./components/StorageAlert";
 import { useOperatorSession } from "./utils/session";
+import {
+  DOOR_LOCK_POLL_MS,
+  LOCK_STATES_URL,
+  interpretLockStatesResponse,
+  reduceDoorLocks,
+  showDoorList,
+} from "./utils/doorLocks";
 import {
   isNetlifyOrStaticHost,
   getStoredEmployees,
@@ -120,8 +127,14 @@ export default function App() {
     remainingRelockSeconds: 0,
     status: "ONLINE",
   });
+  // Every door's lock (N-gate wave). `lockState` above stays door "main" for the
+  // screens that show one lock; this list only feeds the lock panel's door list.
+  const [doorLocks, dispatchDoorLocks] = useReducer(reduceDoorLocks, []);
+  const [doorLocksNotice, setDoorLocksNotice] = useState<string | null>(null);
 
   const [sseConnected, setSseConnected] = useState<boolean>(false);
+  /** The server's event stream is open right now (sseConnected also turns true for the offline event bus). */
+  const [sseLive, setSseLive] = useState<boolean>(false);
   const [latestToast, setLatestToast] = useState<MobileNotification | null>(null);
   const [showDeploymentGuide, setShowDeploymentGuide] = useState<boolean>(false);
   const [copiedCode, setCopiedCode] = useState<string | null>(null);
@@ -230,8 +243,26 @@ export default function App() {
     }
   };
 
+  // Every door's lock state. An older server without the route (404) keeps the
+  // single-door panel; a refusal or lost connection keeps the last list and says so.
+  const fetchDoorLocks = useCallback(async () => {
+    if (isNetlifyOrStaticHost() && !getApiBaseUrl()) return;
+    const res = await safeJsonFetch<unknown>(LOCK_STATES_URL, undefined, null);
+    const load = interpretLockStatesResponse(res);
+    if (load.kind === "loaded") {
+      dispatchDoorLocks({ type: "snapshot", rows: load.rows });
+      setDoorLocksNotice(null);
+    } else if (load.kind === "unsupported") {
+      dispatchDoorLocks({ type: "snapshot", rows: [] });
+      setDoorLocksNotice(null);
+    } else {
+      setDoorLocksNotice(load.message);
+    }
+  }, []);
+
   // Fetch initial data safely without JSON parse errors
   const fetchData = useCallback(async () => {
+    void fetchDoorLocks();
     try {
       const [empRes, logRes, lockRes, notifRes] = await Promise.all([
         safeJsonFetch<Employee[]>("/api/employees", undefined, []),
@@ -278,11 +309,32 @@ export default function App() {
       setLockState(getStoredLockState());
       setNotifications(getStoredNotifications());
     }
-  }, []);
+  }, [fetchDoorLocks]);
 
   useEffect(() => {
     fetchData();
   }, [fetchData]);
+
+  // After a sign-in (or a role change) the door list can be read again; signed
+  // out, no door list is kept on screen.
+  useEffect(() => {
+    if (operatorSession) {
+      void fetchDoorLocks();
+    } else {
+      dispatchDoorLocks({ type: "snapshot", rows: [] });
+      setDoorLocksNotice(null);
+    }
+  }, [operatorSession, fetchDoorLocks]);
+
+  // Polling is the fallback only: while the server's event stream is down and
+  // there is more than one door. A single door behaves exactly as before.
+  const doorListShown = showDoorList(doorLocks);
+  useEffect(() => {
+    if (sseLive || !doorListShown) return;
+    if (isNetlifyOrStaticHost() && !getApiBaseUrl()) return;
+    const timer = setInterval(() => void fetchDoorLocks(), DOOR_LOCK_POLL_MS);
+    return () => clearInterval(timer);
+  }, [sseLive, doorListShown, fetchDoorLocks]);
 
   // Connect to SSE event stream with controlled backoff & Netlify offline resilience
   useEffect(() => {
@@ -331,13 +383,17 @@ export default function App() {
 
         eventSource.onopen = () => {
           if (isMounted) {
+            // Door states changed while the stream was down are not replayed: reload the list.
+            if (errorCount > 0) void fetchDoorLocks();
             setSseConnected(true);
+            setSseLive(true);
             errorCount = 0;
           }
         };
 
         eventSource.onerror = () => {
           if (isMounted) {
+            setSseLive(false);
             errorCount += 1;
             if (eventSource) {
               eventSource.close();
@@ -363,17 +419,33 @@ export default function App() {
           try {
             const data = JSON.parse(e.data);
             setLockState(data);
+            dispatchDoorLocks({ type: "state", source: "main", payload: data });
           } catch {}
         });
 
         // Countdown updates
         eventSource.addEventListener("lock_countdown", (e: MessageEvent) => {
           try {
-            const { remainingSeconds } = JSON.parse(e.data);
+            const payload = JSON.parse(e.data);
+            const { remainingSeconds } = payload;
             setLockState((prev) => ({
               ...prev,
               remainingRelockSeconds: remainingSeconds,
             }));
+            dispatchDoorLocks({ type: "countdown", source: "main", payload });
+          } catch {}
+        });
+
+        // Every other door (N-gate wave): its own events, so an older dashboard
+        // never shows another door's state as the main lock's.
+        eventSource.addEventListener("door_lock_state", (e: MessageEvent) => {
+          try {
+            dispatchDoorLocks({ type: "state", source: "door", payload: JSON.parse(e.data) });
+          } catch {}
+        });
+        eventSource.addEventListener("door_lock_countdown", (e: MessageEvent) => {
+          try {
+            dispatchDoorLocks({ type: "countdown", source: "door", payload: JSON.parse(e.data) });
           } catch {}
         });
 
@@ -467,7 +539,7 @@ export default function App() {
         eventSource = null;
       }
     };
-  }, []);
+  }, [fetchDoorLocks]);
 
   // Recognition completion handler from FaceScanner
   const handleRecognitionComplete = (result: FaceRecognitionResult) => {
@@ -487,6 +559,11 @@ export default function App() {
       });
     }
   };
+
+  // A door state the server answered to a lock-panel command (its SSE event follows anyway).
+  const handleDoorLockState = useCallback((doorId: string, state: SmartLockState) => {
+    dispatchDoorLocks({ type: "state", source: "door", payload: { ...state, doorId } });
+  }, []);
 
   // Manual unlock trigger
   const handleManualUnlock = async () => {
@@ -662,6 +739,9 @@ export default function App() {
             <SmartLockCard
               lockState={lockState}
               onRefresh={fetchData}
+              doorLocks={doorLocks}
+              doorLocksNotice={doorLocksNotice}
+              onDoorLockState={handleDoorLockState}
             />
           </div>
         )}
@@ -705,6 +785,9 @@ export default function App() {
             <SmartLockCard
               lockState={lockState}
               onRefresh={fetchData}
+              doorLocks={doorLocks}
+              doorLocksNotice={doorLocksNotice}
+              onDoorLockState={handleDoorLockState}
             />
           </div>
         )}

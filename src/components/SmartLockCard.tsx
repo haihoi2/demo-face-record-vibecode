@@ -18,15 +18,213 @@ import { soundEffects } from "../utils/audio";
 import { operatorJsonFetch } from "../utils/api";
 import { clientDoorUnlock, clientDoorLock, demoOfflinePersistenceEnabled } from "../utils/offlineEngine";
 import { hasRole, useOperatorSession } from "../utils/session";
+import { buildLockCommandRequest, interpretLockCommand } from "../utils/doors";
+import {
+  LOCK_PANEL_SOURCE,
+  lockStateText,
+  relockPercent,
+  showDoorList,
+  type DoorLockRow,
+} from "../utils/doorLocks";
 
 interface SmartLockCardProps {
   lockState: SmartLockState;
   onRefresh: () => void;
+  /** Every door's lock (from `/api/lock/states` + SSE). More than one door switches the panel to a door list. */
+  doorLocks?: DoorLockRow[];
+  /** Why the door list could not be refreshed (HTTP refusal or no connection), shown as-is. */
+  doorLocksNotice?: string | null;
+  /** A door state the server returned for a command (the SSE event follows anyway). */
+  onDoorLockState?: (doorId: string, state: SmartLockState) => void;
 }
+
+function formatActionTime(iso: string): string {
+  const t = Date.parse(iso);
+  if (!iso || Number.isNaN(t)) return "—";
+  return new Date(t).toLocaleString("vi-VN", { dateStyle: "short", timeStyle: "medium" });
+}
+
+/**
+ * The lock panel with several doors: every door's label, state, auto-relock
+ * countdown and last action, with unlock/lock per door for the same role as
+ * the single-door buttons. Commands go to the server only - a refusal or a
+ * lost connection is reported, never shown as an opened door, and there is no
+ * client-side fallback here.
+ */
+const DoorLockList: React.FC<{
+  rows: DoorLockRow[];
+  notice: string | null;
+  canOperateDoor: boolean;
+  onRefresh: () => void;
+  onDoorLockState?: (doorId: string, state: SmartLockState) => void;
+}> = ({ rows, notice, canOperateDoor, onRefresh, onDoorLockState }) => {
+  const [busyDoor, setBusyDoor] = useState<string | null>(null);
+  const [result, setResult] = useState<{ ok: boolean; text: string } | null>(null);
+
+  const sendCommand = async (row: DoorLockRow, action: "unlock" | "lock") => {
+    setBusyDoor(row.doorId);
+    setResult(null);
+    try {
+      soundEffects.playLockClick();
+      const { url, init } = buildLockCommandRequest(action, row.doorId, LOCK_PANEL_SOURCE);
+      const res = await operatorJsonFetch<unknown>(url, init);
+      const outcome = interpretLockCommand(action, row.doorId, row.label, res);
+      if (outcome.kind === "applied") {
+        if (outcome.lockState) onDoorLockState?.(row.doorId, outcome.lockState);
+        else onRefresh();
+        if (action === "unlock") soundEffects.playSuccess();
+      } else {
+        soundEffects.playDenied();
+      }
+      setResult({ ok: outcome.kind === "applied", text: outcome.message });
+    } finally {
+      setBusyDoor(null);
+    }
+  };
+
+  const unlockedCount = rows.filter((r) => !r.isLocked).length;
+
+  return (
+    <div className="lg:col-span-6 bg-white rounded-2xl border border-slate-200 p-6 shadow-xs flex flex-col" data-testid="door-lock-list">
+      <div className="flex items-center justify-between mb-4">
+        <div className="flex items-center gap-2.5">
+          <div className="w-9 h-9 rounded-xl bg-slate-900 text-white flex items-center justify-center">
+            <Cpu className="w-5 h-5 text-indigo-400" />
+          </div>
+          <div>
+            <h3 className="font-bold text-slate-900 text-sm">Khóa Cửa Thông Minh ({rows.length} cửa)</h3>
+            <p className="text-xs text-slate-500">
+              {unlockedCount === 0 ? "Tất cả cửa đang khóa" : `${unlockedCount} cửa đang mở`}
+            </p>
+          </div>
+        </div>
+        <button
+          type="button"
+          onClick={onRefresh}
+          className="p-2 text-slate-400 hover:text-slate-600 rounded-lg hover:bg-slate-100 transition"
+          title="Làm mới trạng thái"
+          aria-label="Làm mới trạng thái các cửa"
+        >
+          <RefreshCw className="w-4 h-4" />
+        </button>
+      </div>
+
+      {notice && (
+        <p className="mb-3 px-3 py-2 rounded-lg border border-amber-200 bg-amber-50 text-xs text-amber-900" data-testid="door-lock-notice">
+          {notice}
+        </p>
+      )}
+
+      <ul className="space-y-3" aria-label="Trạng thái khóa từng cửa">
+        {rows.map((row) => {
+          const busy = busyDoor === row.doorId;
+          const open = !row.isLocked;
+          return (
+            <li
+              key={row.doorId}
+              data-door-id={row.doorId}
+              className={`rounded-xl border p-3.5 ${open ? "border-emerald-300 bg-emerald-50/60" : "border-slate-200 bg-slate-50/60"}`}
+            >
+              <div className="flex items-start justify-between gap-3">
+                <div className="flex items-start gap-3 min-w-0">
+                  <div
+                    className={`w-9 h-9 shrink-0 rounded-lg flex items-center justify-center ${
+                      open ? "bg-emerald-600 text-white" : "bg-slate-800 text-rose-300"
+                    }`}
+                    aria-hidden="true"
+                  >
+                    {open ? <Unlock className="w-4 h-4" /> : <Lock className="w-4 h-4" />}
+                  </div>
+                  <div className="min-w-0">
+                    <div className="text-sm font-semibold text-slate-900 truncate" title={row.label}>
+                      {row.label} <span className="text-[11px] font-mono font-normal text-slate-500">({row.doorId})</span>
+                    </div>
+                    <div className="text-[11px] text-slate-600">
+                      Thao tác cuối: {formatActionTime(row.lastActionAt)}
+                      {row.lastActionBy ? ` · ${row.lastActionBy}` : ""}
+                    </div>
+                  </div>
+                </div>
+                <span
+                  className={`shrink-0 text-[11px] px-2 py-0.5 rounded-full font-bold border ${
+                    open ? "bg-emerald-100 text-emerald-800 border-emerald-300" : "bg-white text-slate-700 border-slate-300"
+                  }`}
+                >
+                  {lockStateText(row)}
+                </span>
+              </div>
+
+              {open && row.remainingRelockSeconds > 0 && (
+                <div className="mt-2.5">
+                  <div className="flex justify-between text-[11px] text-emerald-800 font-medium mb-1">
+                    <span>Đang mở cửa</span>
+                    <span>Tự khóa sau: {row.remainingRelockSeconds}s</span>
+                  </div>
+                  <div className="w-full bg-emerald-100 h-1.5 rounded-full overflow-hidden" aria-hidden="true">
+                    <div className="bg-emerald-500 h-full transition-all duration-1000" style={{ width: `${relockPercent(row)}%` }} />
+                  </div>
+                </div>
+              )}
+
+              {canOperateDoor && (
+                <div className="mt-3 flex gap-2">
+                  <button
+                    id={`btn-unlock-door-${row.doorId}`}
+                    type="button"
+                    disabled={busy || !row.isLocked}
+                    onClick={() => void sendCommand(row, "unlock")}
+                    aria-label={`Mở khóa ${row.label}`}
+                    className="flex-1 py-2 bg-emerald-600 hover:bg-emerald-700 disabled:opacity-40 text-white font-semibold rounded-lg text-xs flex items-center justify-center gap-1.5 transition cursor-pointer"
+                  >
+                    {busy ? <RefreshCw className="w-3.5 h-3.5 animate-spin" /> : <Unlock className="w-3.5 h-3.5" />}
+                    <span>Mở khóa</span>
+                  </button>
+                  <button
+                    id={`btn-lock-door-${row.doorId}`}
+                    type="button"
+                    disabled={busy || row.isLocked}
+                    onClick={() => void sendCommand(row, "lock")}
+                    aria-label={`Đóng khóa ${row.label}`}
+                    className="flex-1 py-2 bg-slate-800 hover:bg-slate-900 disabled:opacity-40 text-white font-semibold rounded-lg text-xs flex items-center justify-center gap-1.5 transition cursor-pointer"
+                  >
+                    <Lock className="w-3.5 h-3.5" />
+                    <span>Đóng khóa</span>
+                  </button>
+                </div>
+              )}
+            </li>
+          );
+        })}
+      </ul>
+
+      <div role="status" aria-live="polite" className="empty:hidden mt-3">
+        {result && (
+          <p
+            className={`px-3 py-2 rounded-lg border text-xs ${
+              result.ok ? "border-emerald-200 bg-emerald-50 text-emerald-900" : "border-rose-200 bg-rose-50 text-rose-900"
+            }`}
+          >
+            {result.text}
+          </p>
+        )}
+      </div>
+
+      {!canOperateDoor && (
+        <p className="pt-4 border-t border-slate-100 mt-4 text-xs text-slate-500">
+          Mở/đóng cửa thủ công cần quyền <span className="font-semibold text-slate-700">Quản trị</span>.
+          Cửa vẫn tự mở khi nhận diện đúng nhân viên.
+        </p>
+      )}
+    </div>
+  );
+};
 
 export const SmartLockCard: React.FC<SmartLockCardProps> = ({
   lockState,
   onRefresh,
+  doorLocks = [],
+  doorLocksNotice = null,
+  onDoorLockState,
 }) => {
   // Manual door commands are admin-only; the server refuses them for anyone else.
   const canOperateDoor = hasRole(useOperatorSession(), "admin");
@@ -102,7 +300,17 @@ export const SmartLockCard: React.FC<SmartLockCardProps> = ({
   return (
     <div className="space-y-6">
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
-        {/* Physical Smart Lock Visualization */}
+        {/* Several doors: one row per door. One door: the panel exactly as before. */}
+        {showDoorList(doorLocks) ? (
+          <DoorLockList
+            rows={doorLocks}
+            notice={doorLocksNotice}
+            canOperateDoor={canOperateDoor}
+            onRefresh={onRefresh}
+            onDoorLockState={onDoorLockState}
+          />
+        ) : (
+        /* Physical Smart Lock Visualization */
         <div className="lg:col-span-6 bg-white rounded-2xl border border-slate-200 p-6 shadow-xs flex flex-col justify-between">
           <div>
             <div className="flex items-center justify-between mb-4">
@@ -267,6 +475,7 @@ export const SmartLockCard: React.FC<SmartLockCardProps> = ({
             )}
           </div>
         </div>
+        )}
 
         {/* API Integration & Webhook Endpoints Documentation */}
         <div className="lg:col-span-6 bg-slate-900 text-slate-200 rounded-2xl p-6 border border-slate-800 flex flex-col justify-between">
