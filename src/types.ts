@@ -307,7 +307,8 @@ export interface WebhookConfig {
  */
 export const STRANGER_DEEP_LINK_HASH = "strangers";
 
-export type DoorAuthHeaderType = "BEARER" | "API_KEY" | "CUSTOM_HEADER" | "QUERY_PARAM";
+/** "NONE" may be stored, but the server never dispatches a command without a token scheme (fail closed). */
+export type DoorAuthHeaderType = "BEARER" | "API_KEY" | "CUSTOM_HEADER" | "QUERY_PARAM" | "NONE";
 
 /** One door and its controller (N-gate wave). The legacy single door is id "main". */
 export interface DoorConfig extends DoorControllerConfig {
@@ -320,7 +321,10 @@ export interface DoorControllerConfig {
   doors?: DoorConfig[];
   enabled: boolean;
   apiUrl: string;
+  /** Write-only: the server never returns a token (responses carry hasApiToken). */
   apiToken: string;
+  /** In responses: whether a token is stored for this door. */
+  hasApiToken?: boolean;
   authHeaderType: DoorAuthHeaderType;
   customHeaderName?: string;
   openMethod: "POST" | "GET" | "PUT";

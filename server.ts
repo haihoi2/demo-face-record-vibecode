@@ -908,7 +908,8 @@ function sanitizePublicJson(value: any): any {
   const result: Record<string, unknown> = {};
   for (const [key, item] of Object.entries(value)) {
     if (/^(?:faceEmbedding(?:Dims|ModelTag|Quality)?|imageBase64|snapshot|photoUrl)$/i.test(key)) continue;
-    if (/token|password|secret/i.test(key) && key !== "csrfToken") {
+    // A boolean "has…" flag (hasApiToken) says only whether a secret exists: it passes.
+    if (/token|password|secret/i.test(key) && key !== "csrfToken" && !(typeof item === "boolean" && /^has[A-Z]/.test(key))) {
       result[`${key}Configured`] = Boolean(item);
       continue;
     }
@@ -1221,7 +1222,12 @@ const DEFAULT_WEBHOOK_CONFIG = {
 // server: every response goes through sanitizePublicJson (apiToken ->
 // apiTokenConfigured, URLs redacted).
 const DOOR_LABEL_MAX = 80;
-const DOOR_AUTH_TYPES: ReadonlyArray<DoorControllerConfigRecord["authHeaderType"]> = ["BEARER", "API_KEY", "CUSTOM_HEADER", "QUERY_PARAM"];
+/**
+ * "NONE" can be stored (the door page offers it) but is never dispatched:
+ * every command needs a token sent by a supported scheme (fail closed).
+ */
+const DOOR_AUTH_TYPES = ["BEARER", "API_KEY", "CUSTOM_HEADER", "QUERY_PARAM", "NONE"] as const;
+const DISPATCHABLE_DOOR_AUTH_TYPES: readonly string[] = ["BEARER", "API_KEY", "CUSTOM_HEADER", "QUERY_PARAM"];
 const DOOR_METHODS: ReadonlyArray<DoorControllerConfigRecord["openMethod"]> = ["POST", "GET", "PUT"];
 
 /** One door and its controller. */
@@ -1258,7 +1264,9 @@ function doorFieldsFrom(body: any, current: DoorControllerConfigRecord): DoorCon
     enabled: typeof b.enabled === "boolean" ? b.enabled : current.enabled,
     apiUrl: typeof b.apiUrl === "string" ? b.apiUrl.trim() : current.apiUrl,
     apiToken: typeof b.apiToken === "string" ? b.apiToken.trim() : current.apiToken,
-    authHeaderType: DOOR_AUTH_TYPES.includes(b.authHeaderType) ? b.authHeaderType : current.authHeaderType,
+    authHeaderType: (DOOR_AUTH_TYPES as readonly string[]).includes(b.authHeaderType)
+      ? (b.authHeaderType as DoorControllerConfigRecord["authHeaderType"])
+      : current.authHeaderType,
     customHeaderName: typeof b.customHeaderName === "string" ? b.customHeaderName.trim() : current.customHeaderName,
     openMethod: DOOR_METHODS.includes(b.openMethod) ? b.openMethod : current.openMethod,
     closeMethod: DOOR_METHODS.includes(b.closeMethod) ? b.closeMethod : current.closeMethod,
@@ -1302,6 +1310,20 @@ function normalizeDoorControllerConfig(
 }
 
 /** Re-reads the stored config (only after `doorControllerConfig` below is initialised). */
+/**
+ * The door controller config as any client sees it: no token anywhere (top
+ * level = door "main", and every door), `hasApiToken` instead. URLs are
+ * redacted by sanitizePublicJson on the way out.
+ */
+function publicDoorConfig(cfg: DoorControllerState) {
+  const strip = <T extends DoorControllerConfigRecord>(d: T) => {
+    const { apiToken, ...rest } = d;
+    return { ...rest, hasApiToken: Boolean(apiToken && String(apiToken).trim()) };
+  };
+  const { doors, ...top } = cfg;
+  return { ...strip(top), doors: doors.map((d) => strip(d)) };
+}
+
 function loadDoorControllerConfig(): DoorControllerState {
   return normalizeDoorControllerConfig(db.getDoorControllerConfig(DEFAULT_DOOR_CONTROLLER_CONFIG), doorControllerConfig);
 }
@@ -3005,8 +3027,11 @@ async function sendDoorControllerCommand(
   // Fail closed: every supported auth scheme needs a token. Without one the
   // command would go out unauthenticated, so it is not sent - and the reason
   // is logged where the operator looks, instead of an opaque network error.
-  if (!door.apiToken || !door.apiToken.trim()) {
-    logEntry.error = "Chưa cấu hình mã xác thực bộ điều khiển cửa - lệnh không được gửi";
+  // "NONE" (or any unknown scheme) would send the command without the token.
+  if (!door.apiToken || !door.apiToken.trim() || !DISPATCHABLE_DOOR_AUTH_TYPES.includes(String(door.authHeaderType))) {
+    logEntry.error = !door.apiToken || !door.apiToken.trim()
+      ? "Chưa cấu hình mã xác thực bộ điều khiển cửa - lệnh không được gửi"
+      : "Kiểu xác thực của bộ điều khiển cửa không gửi mã xác thực (NONE) - lệnh không được gửi";
     doorApiLogs.unshift(logEntry);
     if (doorApiLogs.length > 60) doorApiLogs = doorApiLogs.slice(0, 60);
     db.saveDoorApiLog(logEntry);
@@ -3668,9 +3693,8 @@ const DOOR_LOGS_ROUTES = [
 
 app.get(DOOR_CONFIG_ROUTES, (_req, res) => {
   doorControllerConfig = loadDoorControllerConfig();
-  // Tokens are never returned: sanitizePublicJson turns every apiToken (top
-  // level and per door) into apiTokenConfigured and redacts the URLs.
-  res.json(doorControllerConfig);
+  // Tokens are never returned (top level and per door): hasApiToken instead.
+  res.json(publicDoorConfig(doorControllerConfig));
 });
 
 /**
@@ -3763,13 +3787,13 @@ app.post(DOOR_CONFIG_ROUTES, async (req, res) => {
       void db.deleteDoorLockState(d.id).catch(warnDoorLockStore);
     }
   }
-  broadcastSSE("door_config_updated", updated);
+  broadcastSSE("door_config_updated", publicDoorConfig(updated));
   console.log(
     `[Door Config] ${operatorActor(req) || "unknown"} lưu cấu hình ${updated.doors.length} cửa: ` +
       updated.doors.map((d) => `${d.id}${d.enabled ? "" : " (tắt)"}`).join(", ")
   );
 
-  res.json({ success: true, config: updated, ...(warnings.length ? { warnings } : {}) });
+  res.json({ success: true, config: publicDoorConfig(updated), ...(warnings.length ? { warnings } : {}) });
 });
 
 app.post(DOOR_TEST_ROUTES, async (req, res) => {
@@ -3818,7 +3842,7 @@ app.post(DOOR_TEST_ROUTES, async (req, res) => {
     res.json({
       success: result ? result.success : false,
       log: result,
-      config: doorControllerConfig,
+      config: publicDoorConfig(doorControllerConfig),
     });
   } catch (err: any) {
     if (tempConfig && originalConfig) {
@@ -6135,9 +6159,11 @@ async function runGateWatchTick(state: GateWatcherState, generation: number) {
   // JPEGs never leave performGateScan, and employee records are trimmed to
   // `watchEmployeeSummary` because EmployeeRecord.photoUrl is usually a
   // base64 data URL. That keeps an event at a few KB.
+  const resultGate = cameraStreamsConfig.gates.find((g) => g.id === state.gateKey);
   broadcastSSE("gate_watch_result", {
     gate: state.gate,
     gateId: state.gateKey,
+    gateLabel: resultGate ? gateLabelOf(resultGate) : state.gateKey,
     at: state.lastRunAt,
     durationMs,
     status: result.status,
@@ -6665,7 +6691,7 @@ app.post(["/api/camera-streams/:gate/watch", "/api/camera-streams/:gate/watch/"]
 
   if (!gateWatchers.has(gateKey)) gateWatchers.set(gateKey, newGateWatcherState(gateKey, gate.direction));
   const runtime = applyGateWatchConfig(gateKey);
-  res.json({ success: true, gate: runtime.gate, gateId: gateKey, watch: gateFromConfig(updated, gateKey)!.watch, watcher: runtime });
+  res.json({ success: true, gate: runtime.gate, gateId: gateKey, gateLabel: runtime.gateLabel, watch: gateFromConfig(updated, gateKey)!.watch, watcher: runtime });
 });
 
 // Admin switch for a gate's real-time pipeline mode (the separate engine
@@ -6710,6 +6736,7 @@ app.post(["/api/camera-streams/:gate/pipeline-mode", "/api/camera-streams/:gate/
     success: true,
     gate: found.direction,
     gateId: gateKey,
+    gateLabel: runtime.gateLabel,
     pipelineMode: runtime.pipelineMode,
     ...(runtime.pipelineModeRequested ? { pipelineModeRequested: runtime.pipelineModeRequested } : {}),
     pipelineModeSource: runtime.pipelineModeSource,
@@ -6798,7 +6825,7 @@ app.post(["/api/gates", "/api/gates/"], (req, res) => {
   const updated = commitCameraConfig(normalizeCameraStreamsConfig({ ...current, gates: [...current.gates, gate] }));
   syncGateWatchers();
   console.log(`[Gates] ${operatorActor(req) || "unknown"} thêm cổng ${id} (${body.direction}, "${label}", cửa ${doorIdOf(gate)})`);
-  res.status(201).json({ success: true, gate: gateFromConfig(updated, id), summary: publicGateSummary(gateFromConfig(updated, id)!) });
+  res.status(201).json({ success: true, gate: gateFromConfig(updated, id), summary: publicGateSummary(gateFromConfig(updated, id)!), config: updated });
 });
 
 app.put(["/api/gates/:gateId", "/api/gates/:gateId/"], (req, res) => {
@@ -6841,7 +6868,7 @@ app.put(["/api/gates/:gateId", "/api/gates/:gateId/"], (req, res) => {
   syncGateWatchers();
   console.log(`[Gates] ${operatorActor(req) || "unknown"} sửa cổng ${gate.id}: ${changes.join(", ") || "không đổi"}`);
   const saved = gateFromConfig(updated, gate.id)!;
-  res.json({ success: true, gate: saved, summary: publicGateSummary(saved) });
+  res.json({ success: true, gate: saved, summary: publicGateSummary(saved), config: updated });
 });
 
 app.delete(["/api/gates/:gateId", "/api/gates/:gateId/"], (req, res) => {
@@ -6858,7 +6885,7 @@ app.delete(["/api/gates/:gateId", "/api/gates/:gateId/"], (req, res) => {
   recentStrangersByGate.delete(gate.id);
   lastStrangerLogAtByGate.delete(gate.id);
   console.log(`[Gates] ${operatorActor(req) || "unknown"} xóa cổng ${gate.id} ("${gateLabelOf(gate)}"); lịch sử ra vào được giữ nguyên`);
-  res.json({ success: true, removedGateId: gate.id, gates: cameraStreamsConfig.gates.map(publicGateSummary) });
+  res.json({ success: true, removedGateId: gate.id, gates: cameraStreamsConfig.gates.map(publicGateSummary), config: cameraStreamsConfig });
 });
 
 // Simulated RTSP/HTTP live test frame generator (SVG/JPEG)
