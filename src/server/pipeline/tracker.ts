@@ -57,6 +57,7 @@
  */
 
 import type { FaceDetection, Frame, Gate, TrackUpdate } from "./contracts";
+import { assertGateId, trackIdPrefix } from "./gateId";
 import { CLEAR_FACE_LIMITS, EMBEDDING_DIM, facePose, iou } from "../faceEmbedding";
 import { STRANGER_SAME_PERSON_COSINE } from "../strangers";
 
@@ -236,7 +237,7 @@ export interface TrackerOptions {
   modelTag: string;
   config?: Partial<TrackerConfig>;
   clock?: () => number;
-  /** Prefix of track ids; defaults to `<gate>-<clock() base36>` so ids differ across restarts. */
+  /** Prefix of track ids; defaults to `<trackIdPrefix(gate)>-<clock() base36>` so ids differ across restarts. */
   idPrefix?: string;
 }
 
@@ -351,7 +352,7 @@ export class FaceTracker {
   private frameKey: string | null = null;
 
   constructor(opts: TrackerOptions) {
-    if (opts.gate !== "ENTRY" && opts.gate !== "EXIT") throw new TypeError("tracker gate must be ENTRY or EXIT");
+    assertGateId(opts?.gate, "tracker gate");
     if (typeof opts.modelTag !== "string" || opts.modelTag.trim() === "") throw new TypeError("tracker modelTag is required");
     const config = { ...DEFAULT_TRACKER_CONFIG, ...(opts.config || {}) };
     validateConfig(config);
@@ -359,7 +360,7 @@ export class FaceTracker {
     this.modelTag = opts.modelTag;
     this.config = Object.freeze(config);
     this.clock = opts.clock ?? Date.now;
-    this.idPrefix = opts.idPrefix ?? `${opts.gate}-${Math.max(0, Math.floor(this.clock())).toString(36)}`;
+    this.idPrefix = opts.idPrefix ?? `${trackIdPrefix(opts.gate)}-${Math.max(0, Math.floor(this.clock())).toString(36)}`;
   }
 
   /** Live tracks, without any embedding data. */

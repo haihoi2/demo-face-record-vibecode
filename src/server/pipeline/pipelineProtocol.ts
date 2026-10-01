@@ -63,6 +63,7 @@ export interface WorkerStats {
 
 export interface InitMessage {
   type: "init";
+  /** Gate id; the worker refuses an invalid one (never decides, answers frames unprocessed). */
   gate: Gate;
   /** Attach a JPEG crop of the best frame to employee/stranger outcomes (live mode). */
   crops: boolean;

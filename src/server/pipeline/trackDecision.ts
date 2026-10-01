@@ -37,6 +37,7 @@ import type { FaceObservation, FusionDecision, FusionThresholds, ObservationMatc
 import { EMBEDDING_DIM } from "../faceEmbedding";
 import { FaceGallery, fuseDecision, matchObservations } from "../faceFusion";
 import type { BestFrame, Frame, FusionEvidence, Gate, ShadowResult, TrackOutcome } from "./contracts";
+import { assertGateId } from "./gateId";
 import {
   FaceTracker,
   TrackEnd,
@@ -241,6 +242,7 @@ export class TrackDecider {
   private decidedOrder: string[] = [];
 
   constructor(opts: TrackDeciderOptions) {
+    assertGateId(opts?.gate, "decider gate");
     const config = { ...DEFAULT_DECISION_CONFIG, ...(opts.config || {}) };
     if (!Number.isInteger(config.keepBestFrames) || config.keepBestFrames < 1) throw new RangeError("keepBestFrames must be a positive integer");
     if (!Number.isInteger(config.minStrangerFrames) || config.minStrangerFrames < 1) throw new RangeError("minStrangerFrames must be a positive integer");

@@ -9,7 +9,13 @@
  *   faceCrop.ts                                   (PERF, step 3)
  */
 
-export type Gate = "ENTRY" | "EXIT";
+/**
+ * A configured gate's id (src/server/gates.ts: lowercase slug such as "entry",
+ * "exit", "side-door"). N-gate wave: was "ENTRY" | "EXIT". Producers validate
+ * it with isGateId and refuse anything else (src/server/pipeline/gateId.ts);
+ * the gate's direction is not part of the pipeline and travels separately.
+ */
+export type Gate = string;
 
 /** Per-gate rollout switch: legacy watcher, new pipeline observing only, or new pipeline acting. */
 export type PipelineMode = "legacy" | "shadow" | "live";
