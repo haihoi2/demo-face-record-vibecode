@@ -808,9 +808,13 @@ export const StrangerClusterModal: React.FC<StrangerClusterModalProps> = ({
                               <div className="pointer-events-none absolute inset-x-0 bottom-0 bg-gradient-to-t from-black/80 via-black/40 to-transparent p-1.5 text-white">
                                 <p className="text-[10px] font-medium truncate flex items-center gap-1">
                                   <Clock className="w-2.5 h-2.5 shrink-0" />
-                                  {new Date(photo.timestamp).toLocaleTimeString("vi-VN", {
+                                  {/* Date and seconds too, so a photo can be checked against the NVR recording */}
+                                  {new Date(photo.timestamp).toLocaleString("vi-VN", {
                                     hour: "2-digit",
                                     minute: "2-digit",
+                                    second: "2-digit",
+                                    day: "2-digit",
+                                    month: "2-digit",
                                   })}
                                 </p>
                                 <p className="text-[9px] text-slate-300 truncate">
