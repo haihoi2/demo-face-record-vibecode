@@ -408,7 +408,7 @@ describe("component sources: gates keyed by id, never by direction", () => {
     assert.match(src, /disabled=\{!canDeleteGate\(currentGateKey\) \|\| !multiGate \|\| gateBusy\}/);
     assert.match(src, /if \(!target \|\| !canDeleteGate\(target\.id\)\)/);
     assert.match(src, /role="alertdialog"/);
-    assert.equal((src.match(/await operatorJsonFetch<unknown>\(url, init\)/g) || []).length, 3, "create, update and delete");
+    assert.equal((src.match(/await operatorJsonFetch<unknown>\(url, init\)/g) || []).length, 4, "create, update, delete and on/off");
     assert.match(src, /interpretGateMutation\("create"/);
     assert.match(src, /enabledGates\(gates\)\.map\(\(gate\) =>/, "the overview is a grid of every enabled gate");
     assert.match(src, /scanType: currentGateConfig\.direction/);

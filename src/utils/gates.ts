@@ -113,9 +113,17 @@ export function gatesOf(config: Partial<CameraStreamsConfig> | null | undefined)
   return out;
 }
 
-export function enabledGates(gates: readonly GateConfig[]): GateConfig[] {
-  return gates.filter((g) => g.enabled !== false);
+/** A gate is on unless the server says `enabled: false` (same rule as enabledGates). */
+export function isGateEnabled(gate: { enabled?: unknown }): boolean {
+  return gate.enabled !== false;
 }
+
+export function enabledGates(gates: readonly GateConfig[]): GateConfig[] {
+  return gates.filter(isGateEnabled);
+}
+
+/** Badge text for a switched-off gate. */
+export const GATE_OFF_BADGE = "Đang tắt";
 
 /** "Cổng vào" / "Cổng ra" for the two legacy gates, null for any other id. */
 export function legacyGateLabel(id: string): string | null {
@@ -257,6 +265,25 @@ export function buildUpdateGateRequest(gateId: string, patch: GatePatch): JsonRe
   return jsonRequest(`/api/gates/${encodeURIComponent(gateId)}`, "PUT", patch);
 }
 
+/** Switch a gate on or off (admin): `PUT /api/gates/:gateId { enabled }` and nothing else. */
+export function buildSetGateEnabledRequest(gateId: string, enabled: boolean): JsonRequest {
+  return buildUpdateGateRequest(gateId, { enabled });
+}
+
+/**
+ * The gate fields "Lưu Cấu Hình" sends: never `streams` (the per-stream routes
+ * own them). On an N-gate server `enabled` is left out too: switching a gate
+ * on or off is the admin's `PUT /api/gates/:gateId`, and a page loaded before
+ * that switch must not undo it with its stale copy. An older server has no
+ * such route, so it still gets `enabled` from the page's own toggle.
+ */
+export function gateScalarsForSave<G extends GateStreamConfig>(gate: G, multiGate: boolean): Partial<G> {
+  const { streams: _streams, ...rest } = gate;
+  if (!multiGate) return rest as Partial<G>;
+  const { enabled: _enabled, ...withoutEnabled } = rest;
+  return withoutEnabled as Partial<G>;
+}
+
 export function buildDeleteGateRequest(gateId: string): JsonRequest {
   return jsonRequest(`/api/gates/${encodeURIComponent(gateId)}`, "DELETE");
 }
@@ -272,18 +299,37 @@ export function deleteGateConfirmText(label: string, gateId: string): { title: s
   };
 }
 
-export type GateAction = "create" | "update" | "delete";
+/** What the admin is told before a gate is switched off. Switching it back on needs no confirmation. */
+export function disableGateConfirmText(label: string, gateId: string): { title: string; body: string; confirmLabel: string } {
+  return {
+    title: `Tắt ${label} (${gateId})?`,
+    body:
+      "Khi tắt, cổng ngừng quét camera và cửa của cổng sẽ KHÔNG mở bằng nhận diện khuôn mặt cho đến khi bật lại. " +
+      "Quét thủ công tại cổng này cũng bị từ chối. Cấu hình camera và lịch sử vào ra của cổng vẫn được giữ nguyên.",
+    confirmLabel: "Tắt cổng",
+  };
+}
+
+export type GateAction = "create" | "update" | "delete" | "enable" | "disable";
 
 export type GateMutationOutcome =
   | { kind: "applied"; message: string; config: CameraStreamsConfig | null }
   | { kind: "refused"; status: number; message: string }
   | { kind: "unreachable"; message: string };
 
-const ACTION_DONE: Record<GateAction, string> = { create: "đã thêm", update: "đã cập nhật", delete: "đã xóa" };
+const ACTION_DONE: Record<GateAction, string> = {
+  create: "đã thêm",
+  update: "đã cập nhật",
+  delete: "đã xóa",
+  enable: "đã bật",
+  disable: "đã tắt, cổng ngừng quét",
+};
 const ACTION_NOT_DONE: Record<GateAction, string> = {
   create: "CHƯA được thêm",
   update: "CHƯA đổi",
   delete: "CHƯA bị xóa",
+  enable: "CHƯA được bật",
+  disable: "CHƯA được tắt",
 };
 
 /**
