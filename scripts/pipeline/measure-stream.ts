@@ -7,7 +7,7 @@
  * from the command line:
  *   MEASURE_URL_FILE=/path/0600-file   (preferred)   or   MEASURE_URL=rtsp://...
  *
- *   npx tsx scripts/pipeline/measure-stream.ts --gate ENTRY --source 3840x2160 \
+ *   npx tsx scripts/pipeline/measure-stream.ts --gate entry --source 3840x2160 \
  *     [--seconds 30] [--fps 8] [--roi x,y,w,h] [--skip-frame noref] [--threads 2] \
  *     [--no-low-delay] [--latency] [--label name]
  *
@@ -22,6 +22,7 @@ import { readFileSync } from "node:fs";
 import { spawn as nodeSpawn } from "node:child_process";
 
 import type { Frame, SourceState } from "../../src/server/pipeline/contracts";
+import { isGateId } from "../../src/server/gates";
 import { createStreamReader, probeStreamSize, redactCredentials, type SpawnLike } from "../../src/server/pipeline/streamReader";
 
 function arg(name: string): string | undefined {
@@ -68,7 +69,12 @@ async function main() {
     console.error("Set MEASURE_URL_FILE (or MEASURE_URL).");
     process.exit(2);
   }
-  const gate = arg("gate") === "EXIT" ? "EXIT" : "ENTRY";
+  // A configured gate id ("entry", "exit", "side-door"); the pipeline refuses directions.
+  const gate = String(arg("gate") || "entry").toLowerCase();
+  if (!isGateId(gate)) {
+    console.error("--gate must be a gate id (e.g. entry, exit, side-door).");
+    process.exit(2);
+  }
   const seconds = Math.min(90, Math.max(5, Number(arg("seconds") || 30)));
   const fps = Number(arg("fps") || 8);
   const label = arg("label") || "default";
