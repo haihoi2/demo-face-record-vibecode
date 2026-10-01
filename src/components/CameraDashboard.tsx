@@ -2261,7 +2261,7 @@ export const CameraDashboard: React.FC<CameraDashboardProps> = ({
             qua, và thời lượng của chính lần quét luôn được cộng vào khoảng cách giữa hai lượt.
           </div>
           <div>
-            Số đo tham chiếu trên engine ONNX với một cổng {MEASURED_STREAM_COUNT} luồng: 1 khung mất{" "}
+            Số đo tham chiếu với một cổng {MEASURED_STREAM_COUNT} luồng (gồm cả thời gian chờ camera và nhận diện): 1 khung mất{" "}
             {fmtSeconds(MEASURED_SCAN_SECONDS[1])} giây, 2 khung mất {fmtSeconds(MEASURED_SCAN_SECONDS[2])} giây.
             {enabledStreamCount !== MEASURED_STREAM_COUNT
               ? ` Cổng này đang bật ${enabledStreamCount} luồng nên số thực tế có thể lệch.`
@@ -2271,10 +2271,10 @@ export const CameraDashboard: React.FC<CameraDashboardProps> = ({
           </div>
           {tooShort && (
             <div className="text-amber-300">
-              Thời gian nghỉ {configured.intervalSeconds} giây còn ngắn hơn thời lượng một lần quét (
-              {fmtSeconds(scanSec)} giây): cổng gần như bị quét liên tục và camera cùng cụm worker
-              chịu tải cao nhất. Khoảng nghỉ chỉ bắt đầu sau khi lần quét đã xong, nên từ đầu lượt này
-              đến đầu lượt sau vẫn dài hơn {configured.intervalSeconds} giây.
+              Khoảng nghỉ {configured.intervalSeconds} giây ngắn hơn thời lượng một lần quét (
+              {fmtSeconds(scanSec)} giây), nên cổng được quét gần như liên tục. Đây không phải dấu hiệu
+              quá tải CPU: phần lớn thời lượng đó là chờ camera - mỗi lần quét mở lại kết nối tới camera
+              và chờ khung hình chính (keyframe) kế tiếp, phần nhận diện chỉ chiếm một phần nhỏ.
             </div>
           )}
         </div>
