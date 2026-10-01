@@ -323,7 +323,7 @@ test("cropFaceFromRgb: works on a pipeline Frame (box in frame/ROI coordinates)"
   if (!FFMPEG) return t.skip("ffmpeg not on PATH");
   const pic = quadrants(640, 360);
   const frame: Frame = {
-    gate: "EXIT", streamId: "exit-test", seq: 1, capturedAtMs: Date.now(),
+    gate: "exit", streamId: "exit-test", seq: 1, capturedAtMs: Date.now(),
     width: 640, height: 360, roi: [640, 360, 640, 360], sourceWidth: 1920, sourceHeight: 1080, rgb: pic.rgb,
   };
   const jpeg = await cropFaceFromRgb(frame, [300, 160, 400, 260]);

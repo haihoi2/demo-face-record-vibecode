@@ -14,7 +14,8 @@ import { EventEmitter } from "node:events";
 import type { Frame, FrameSource, Gate, SourceState } from "../src/server/pipeline/contracts";
 import { DEFAULT_FUSION_THRESHOLDS, FaceGallery } from "../src/server/faceFusion";
 import type { DecisionContext, TrackDecisionResult } from "../src/server/pipeline/trackDecision";
-import { GatePipeline, PipelineEngine, createInProcessWorker } from "../src/server/pipeline/gatePipeline";
+import { GatePipeline, PipelineEngine, createInProcessWorker, pipelineWorkerName } from "../src/server/pipeline/gatePipeline";
+import { trackIdPrefix } from "../src/server/pipeline/gateId";
 import type { FaceBox, RgbImage } from "../src/server/faceEmbedding";
 
 const TAG = "arcface_test";
@@ -55,7 +56,9 @@ const ctx = (): DecisionContext => ({
 interface Actor { x: number; y: number; size: number; who: (seed: number) => Float32Array }
 
 class FakeSource extends EventEmitter implements FrameSource {
-  readonly gate: Gate = "EXIT";
+  constructor(readonly gate: Gate = "exit") {
+    super();
+  }
   started = 0;
   stopped = 0;
   moving = true;
@@ -69,11 +72,11 @@ class FakeSource extends EventEmitter implements FrameSource {
   latest() { return this.newest; }
   motion() { return this.moving; }
   getState(): SourceState {
-    return { gate: "EXIT", status: "streaming", fps: 8, newestFrameAgeMs: 0, reconnects: 0, since: new Date(0).toISOString() };
+    return { gate: this.gate, status: "streaming", fps: 8, newestFrameAgeMs: 0, reconnects: 0, since: new Date(0).toISOString() };
   }
   push(actors: Actor[]): Frame {
     const f: Frame = {
-      gate: "EXIT", streamId: "exit-test", seq: this.seq++, capturedAtMs: Date.now(), width: 1920, height: 1080,
+      gate: this.gate, streamId: `${this.gate}-test`, seq: this.seq++, capturedAtMs: Date.now(), width: 1920, height: 1080,
       roi: [0, 0, 1920, 1080], sourceWidth: 1920, sourceHeight: 1080, rgb: new Uint8Array(3),
     };
     this.script.set(f.seq, actors);
@@ -122,8 +125,8 @@ class FakeEngine implements PipelineEngine {
   clearIssue(_l: Array<[number, number]>, size: number) { return size >= 60 ? null : "small"; }
 }
 
-function setup(over: Partial<ConstructorParameters<typeof GatePipeline>[0]> = {}) {
-  const source = new FakeSource();
+function setup(over: Partial<ConstructorParameters<typeof GatePipeline>[0]> = {}, gate: Gate = "exit") {
+  const source = new FakeSource(gate);
   const engine = new FakeEngine(source);
   const origDetect = engine.detect.bind(engine);
   engine.detect = async (img) => {
@@ -133,7 +136,7 @@ function setup(over: Partial<ConstructorParameters<typeof GatePipeline>[0]> = {}
   };
   const results: TrackDecisionResult[] = [];
   const pipeline = new GatePipeline({
-    gate: "EXIT", source, context: ctx, onResult: (r) => results.push(r),
+    gate, source, context: ctx, onResult: (r) => results.push(r),
     createWorker: () => createInProcessWorker(engine),
     tickMs: 50, keepAliveMs: 1000, ...over,
   });
@@ -238,5 +241,60 @@ describe("GatePipeline", () => {
     assert.ok(st.loopErrors >= 1);
     assert.match(st.lastError || "", /boom/);
     assert.ok(st.framesProcessed >= 5, "kept processing after the error");
+  });
+});
+
+describe("GatePipeline: N gates (gate ids)", () => {
+  it("a third gate runs end to end: outcomes carry its id and its track-id prefix", async () => {
+    const { source, pipeline, results } = setup({}, "side-door");
+    assert.equal(pipeline.gate, "side-door");
+    pipeline.start();
+    const STRANGER = unitVec(55);
+    await walk(source, 8, (i) => [
+      { x: 500 + i * 4, y: 500, size: 90, who: (s) => near(ALICE, s) },
+      { x: 1400 - i * 4, y: 520, size: 95, who: (s) => near(STRANGER, s) },
+    ]);
+    await pipeline.stop();
+    assert.deepEqual(results.map((r) => r.outcome.kind).sort(), ["employee", "stranger"], JSON.stringify(results.map((r) => r.basis)));
+    const prefix = trackIdPrefix("side-door");
+    for (const r of results) {
+      assert.equal(r.outcome.gate, "side-door");
+      assert.equal(r.shadow.gate, "side-door");
+      assert.ok(r.outcome.trackId.startsWith(`${prefix}-`), r.outcome.trackId);
+    }
+  });
+
+  it("legacy gates keep their E-/X- track ids", async () => {
+    for (const [gate, prefix] of [["entry", "E-"], ["exit", "X-"]] as const) {
+      const { source, pipeline, results } = setup({}, gate);
+      pipeline.start();
+      await walk(source, 6, (i) => [{ x: 900 + i * 5, y: 500, size: 90, who: (s) => near(BOB, s) }]);
+      await pipeline.stop();
+      assert.ok(results.length >= 1, gate);
+      for (const r of results) assert.ok(r.outcome.trackId.startsWith(prefix), `${gate}: ${r.outcome.trackId}`);
+    }
+  });
+
+  it("names the worker thread after the gate id", () => {
+    assert.equal(pipelineWorkerName("entry"), "pipeline-entry");
+    assert.equal(pipelineWorkerName("exit"), "pipeline-exit");
+    assert.equal(pipelineWorkerName("side-door"), "pipeline-side-door");
+    assert.throws(() => pipelineWorkerName("ENTRY"), TypeError);
+  });
+
+  it("refuses an invalid gate id, and a source of another gate", () => {
+    for (const bad of ["ENTRY", "EXIT", "", "Side", "side_door", undefined]) {
+      const source = new FakeSource(bad as Gate);
+      assert.throws(
+        () => new GatePipeline({ gate: bad as Gate, source, context: ctx, onResult: () => {}, createWorker: () => createInProcessWorker(new FakeEngine(source)) }),
+        TypeError,
+        String(bad),
+      );
+    }
+    const other = new FakeSource("exit");
+    assert.throws(
+      () => new GatePipeline({ gate: "side-door", source: other, context: ctx, onResult: () => {}, createWorker: () => createInProcessWorker(new FakeEngine(other)) }),
+      /another gate/,
+    );
   });
 });

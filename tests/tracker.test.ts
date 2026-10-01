@@ -7,6 +7,7 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 
 import type { FaceDetection, Frame, Gate } from "../src/server/pipeline/contracts";
+import { trackIdPrefix } from "../src/server/pipeline/gateId";
 import {
   DEFAULT_TRACKER_CONFIG,
   FaceTracker,
@@ -57,7 +58,7 @@ function emb(person: number[], seed: number): Float32Array {
 
 function frame(seq: number, t = T0 + seq * DT, over: Partial<Frame> = {}): Frame {
   return {
-    gate: "ENTRY", streamId: "entry-main", seq, capturedAtMs: t, width: 1920, height: 1080,
+    gate: "entry", streamId: "entry-main", seq, capturedAtMs: t, width: 1920, height: 1080,
     roi: [0, 0, 1920, 1080], sourceWidth: 1920, sourceHeight: 1080, rgb: new Uint8Array(0), ...over,
   };
 }
@@ -78,7 +79,7 @@ function det(cx: number, cy: number, size: number, o: { score?: number; clear?: 
 function inp(d: FaceDetection, quality = 0.6, embedding?: Float32Array, tag = TAG): TrackerInput {
   return embedding ? { detection: d, quality, embedding, embeddingModelTag: tag } : { detection: d, quality };
 }
-function tracker(config: Partial<TrackerConfig> = {}, gate: Gate = "ENTRY"): FaceTracker {
+function tracker(config: Partial<TrackerConfig> = {}, gate: Gate = "entry"): FaceTracker {
   return new FaceTracker({ gate, modelTag: TAG, config, clock: () => T0, idPrefix: "T" });
 }
 /** plan -> embed exactly what was asked -> update. */
@@ -471,15 +472,36 @@ describe("tracker: no face, overload, corrupted input", () => {
     tr.update(frame(5), [inp(det(900, 500, 80))]);
     const before = JSON.stringify(tr.snapshot());
     assert.equal(tr.update(frame(4), [inp(det(900, 500, 80))]).reason, "stale-frame");
-    assert.equal(tr.update(frame(6, undefined, { gate: "EXIT" }), [inp(det(900, 500, 80))]).reason, "wrong-gate");
+    assert.equal(tr.update(frame(6, undefined, { gate: "exit" }), [inp(det(900, 500, 80))]).reason, "wrong-gate");
     assert.equal(tr.update(frame(6, NaN), [inp(det(900, 500, 80))]).reason, "invalid-frame");
     assert.equal(tr.update(null as unknown as Frame, []).reason, "invalid-frame");
     assert.equal(JSON.stringify(tr.snapshot()), before);
     assert.deepEqual(tr.plan(frame(4), [inp(det(900, 500, 80))]).needsEmbedding, [false]);
   });
 
+  it("works for any gate id: a third gate's tracks carry its id and the derived prefix", () => {
+    const tr = new FaceTracker({ gate: "side-door", modelTag: TAG, clock: () => T0 });
+    const st = tr.update(frame(1, undefined, { gate: "side-door", streamId: "side-door-main" }), [inp(det(900, 500, 80))]);
+    assert.equal(st.accepted, true);
+    assert.equal(st.gate, "side-door");
+    // default prefix: trackIdPrefix(gate) + "-" + clock in base 36
+    assert.equal(st.updates[0].trackId, `${trackIdPrefix("side-door")}-${T0.toString(36)}-1`);
+    assert.equal(tr.update(frame(2, undefined, { gate: "entry" }), [inp(det(900, 500, 80))]).reason, "wrong-gate");
+    for (const [gate, p] of [["entry", "E"], ["exit", "X"]] as const) {
+      const legacy = new FaceTracker({ gate, modelTag: TAG, clock: () => T0 });
+      const s = legacy.update(frame(1, undefined, { gate }), [inp(det(900, 500, 80))]);
+      assert.equal(s.updates[0].trackId, `${p}-${T0.toString(36)}-1`);
+    }
+  });
+
+  it("refuses an invalid gate id instead of coercing it", () => {
+    for (const bad of ["ENTRY", "EXIT", "", "Side", "side door", undefined, null]) {
+      assert.throws(() => new FaceTracker({ gate: bad as Gate, modelTag: TAG }), /tracker gate: invalid gate id/, String(bad));
+    }
+  });
+
   it("refuses an invalid configuration or a missing model tag at construction", () => {
-    assert.throws(() => new FaceTracker({ gate: "ENTRY", modelTag: "" }));
+    assert.throws(() => new FaceTracker({ gate: "entry", modelTag: "" }));
     assert.throws(() => new FaceTracker({ gate: "SIDE" as Gate, modelTag: TAG }));
     assert.throws(() => tracker({ lowScore: 0.9, highScore: 0.5 }));
     assert.throws(() => tracker({ maxEmbeddingsPerTrack: 0 }));

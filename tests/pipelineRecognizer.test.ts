@@ -188,7 +188,7 @@ test("a worker running mbf refuses a context built for the r50 tag (fail closed)
     thresholds: { ...DEFAULT_FUSION_THRESHOLDS },
     engineReady: true,
   };
-  const mbfWorker = new GateTrackSession({ gate: "EXIT", modelTag: "arcface_w600k_mbf", context: legacyContext, clock: () => 0, idPrefix: "X" });
+  const mbfWorker = new GateTrackSession({ gate: "exit", modelTag: "arcface_w600k_mbf", context: legacyContext, clock: () => 0, idPrefix: "X" });
   const st = mbfWorker.contextStatus();
   assert.equal(st.ok, false);
   assert.ok(st.reason, "a reason is given");
@@ -200,12 +200,12 @@ test("a worker running mbf refuses a context built for the r50 tag (fail closed)
     thresholds: { ...DEFAULT_FUSION_THRESHOLDS },
     engineReady: true,
   };
-  const ok = new GateTrackSession({ gate: "EXIT", modelTag: "arcface_w600k_mbf", context: mbfContext, clock: () => 0, idPrefix: "X" });
+  const ok = new GateTrackSession({ gate: "exit", modelTag: "arcface_w600k_mbf", context: mbfContext, clock: () => 0, idPrefix: "X" });
   assert.equal(ok.contextStatus().ok, true);
 
   // A context whose gallery tag and engine tag disagree is refused even by a matching worker.
   const mixed: DecisionContext = { ...mbfContext, galleryModelTag: LEGACY_TAG };
-  assert.equal(new GateTrackSession({ gate: "EXIT", modelTag: "arcface_w600k_mbf", context: mixed, clock: () => 0, idPrefix: "X" }).contextStatus().ok, false);
+  assert.equal(new GateTrackSession({ gate: "exit", modelTag: "arcface_w600k_mbf", context: mixed, clock: () => 0, idPrefix: "X" }).contextStatus().ok, false);
 });
 
 // ---------------------------------------------------------------- thresholds per tag

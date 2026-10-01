@@ -7,7 +7,8 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 
-import type { FaceDetection, Frame } from "../src/server/pipeline/contracts";
+import type { FaceDetection, Frame, Gate } from "../src/server/pipeline/contracts";
+import { trackIdPrefix } from "../src/server/pipeline/gateId";
 import { DEFAULT_FUSION_THRESHOLDS, FaceGallery, recognizeObservations } from "../src/server/faceFusion";
 import {
   DecisionContext,
@@ -98,9 +99,9 @@ function ctx(over: Partial<DecisionContext> = {}): DecisionContext {
   };
 }
 
-function frame(seq: number, t = T0 + seq * DT): Frame {
+function frame(seq: number, t = T0 + seq * DT, gate: Gate = "exit"): Frame {
   return {
-    gate: "EXIT", streamId: "exit-main", seq, capturedAtMs: t, width: 1920, height: 1080,
+    gate, streamId: `${gate}-main`, seq, capturedAtMs: t, width: 1920, height: 1080,
     roi: [0, 0, 1920, 1080], sourceWidth: 1920, sourceHeight: 1080, rgb: new Uint8Array(0),
   };
 }
@@ -126,11 +127,12 @@ class Harness {
   readonly session: GateTrackSession;
   readonly results: TrackDecisionResult[] = [];
   embeddingsRun = 0;
-  constructor(context: DecisionContext = ctx(), modelTag = TAG) {
-    this.session = new GateTrackSession({ gate: "EXIT", modelTag, context, clock: () => this.now, idPrefix: "X" });
+  constructor(context: DecisionContext = ctx(), modelTag = TAG, readonly gate: Gate = "exit", idPrefix: string | null = "X") {
+    // null: let the tracker derive the prefix from the gate id
+    this.session = new GateTrackSession({ gate, modelTag, context, clock: () => this.now, idPrefix: idPrefix ?? undefined });
   }
   frame(seq: number, faces: Face[], t = T0 + seq * DT): TrackDecisionResult[] {
-    const f = frame(seq, t);
+    const f = frame(seq, t, this.gate);
     this.now = t + PROCESS_MS;
     const plain = faces.map((x) => ({ detection: x.d, quality: x.q ?? 0.6 }));
     const plan = this.session.plan(f, plain);
@@ -482,20 +484,20 @@ describe("trackDecision: fail closed", () => {
       return Float32Array.from(E1.map((x, i) => c1 * x + c2 * E2[i] + s * r[i]));
     };
     const vecs = [build(0.47, 0.34, 1), build(0.47, 0.34, 2), build(0.02, 0.36, 3)];
-    const decider = new TrackDecider({ gate: "EXIT", context: ctx({ gallery: new Map([["E1", [E1]], ["E2", [E2]]]) }), clock: () => T0 });
+    const decider = new TrackDecider({ gate: "exit", context: ctx({ gallery: new Map([["E1", [E1]], ["E2", [E2]]]) }), clock: () => T0 });
     const f = frame(0);
     const updates: TrackedFace[] = vecs.map((embedding, i) => ({
       trackId: "M-1", frame: frame(i), detection: det(900, 500, 80), quality: 0.6, embedding,
       detectionIndex: 0, state: "confirmed", usable: true, selectScore: 0.6, newTrack: i === 0, embeddingStatus: "evidence",
     }));
     const stepOf = (u: TrackedFace[]): TrackerStep => ({
-      gate: "EXIT", modelTag: TAG, frameSeq: f.seq, atMs: f.capturedAtMs, accepted: true, updates: u, confirmed: [], ended: [], rejected: [],
+      gate: "exit", modelTag: TAG, frameSeq: f.seq, atMs: f.capturedAtMs, accepted: true, updates: u, confirmed: [], ended: [], rejected: [],
     });
     assert.deepEqual(decider.ingest(stepOf([updates[2]])), []);
     assert.deepEqual(decider.ingest(stepOf([updates[0]])), []);
     assert.deepEqual(decider.ingest(stepOf([updates[1]])), [], "fusion alone would accept E1 here");
     const end = decider.ingestEnds([{
-      trackId: "M-1", gate: "EXIT", reason: "timeout", confirmed: true, firstSeenAtMs: T0, lastSeenAtMs: T0, endedAtMs: T0 + 2000, hits: 3, usableFrames: 3, embeddingsUsed: 3,
+      trackId: "M-1", gate: "exit", reason: "timeout", confirmed: true, firstSeenAtMs: T0, lastSeenAtMs: T0, endedAtMs: T0 + 2000, hits: 3, usableFrames: 3, embeddingsUsed: 3,
     }]);
     assert.equal(end.length, 1);
     assert.notEqual(end[0].outcome.kind, "employee");
@@ -542,5 +544,44 @@ describe("trackDecision: retention and helpers", () => {
       return h.results.map((r) => [r.outcome.kind, r.outcome.trackId, r.basis, r.shadow]);
     };
     assert.deepEqual(run(), run());
+  });
+});
+
+describe("trackDecision: N gates (gate ids)", () => {
+  it("a third gate decides an employee and a stranger under its own id and track-id prefix", () => {
+    // No explicit idPrefix: the tracker derives it from the gate id.
+    const h = new Harness(ctx(), TAG, "side-door", null);
+    const prefix = trackIdPrefix("side-door");
+    assert.match(prefix, /^S[0-9a-z]{4}$/);
+    const emp = passage(E1, 0.52, 51);
+    const stranger = passage(randUnit(52), 0.9, 52);
+    for (let i = 0; i < 6; i++) h.frame(i, [{ d: det(500 + 4 * i, 500, 80), who: emp }, { d: det(1300 - 4 * i, 500, 80), who: stranger }]);
+    h.tick(T0 + 5 * DT + 2000);
+    const kinds = h.results.map((r) => r.outcome.kind).sort();
+    assert.deepEqual(kinds, ["employee", "stranger"], JSON.stringify(h.results.map((r) => r.basis)));
+    for (const r of h.results) {
+      assert.equal(r.outcome.gate, "side-door");
+      assert.equal(r.shadow.gate, "side-door");
+      assert.ok(r.outcome.trackId.startsWith(`${prefix}-`), r.outcome.trackId);
+      if (r.outcome.kind !== "insufficient") assert.equal(r.outcome.best.frame.gate, "side-door");
+    }
+    const employee = h.results.find((r) => r.outcome.kind === "employee")!.outcome;
+    assert.ok(employee.kind === "employee" && employee.employeeId === "E1");
+  });
+
+  it("frames of another gate are rejected, not decided", () => {
+    const h = new Harness(ctx(), TAG, "side-door");
+    const walk = passage(E1, 0.52, 53);
+    const f = frame(0, T0, "exit");
+    const step = h.session.process(f, [{ detection: det(900, 500, 80), quality: 0.6, embedding: walk(0), embeddingModelTag: TAG }]);
+    assert.deepEqual(step.results, []);
+    assert.equal(step.step.reason, "wrong-gate");
+  });
+
+  it("refuses an invalid gate id instead of coercing it", () => {
+    for (const bad of ["ENTRY", "EXIT", "", "x", "Side-Door", "side door", "1gate", undefined, null, 7]) {
+      assert.throws(() => new GateTrackSession({ gate: bad as Gate, modelTag: TAG, context: ctx() }), TypeError, String(bad));
+      assert.throws(() => new TrackDecider({ gate: bad as Gate, context: ctx() }), TypeError, String(bad));
+    }
   });
 });
