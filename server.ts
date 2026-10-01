@@ -1980,6 +1980,18 @@ const FACE_MAX_OBSERVATIONS = envInt("FACE_MAX_OBSERVATIONS", 12, 1, 64);
 /** Multi-frame scan limits (`frames` / `frameIntervalMs` in the scan + capture bodies). */
 const FACE_SCAN_MAX_FRAMES = 5;
 const FACE_SCAN_DEFAULT_FRAME_INTERVAL_MS = 300;
+/**
+ * Door scans read their frames from the gate's always-open pipeline stream
+ * (owner 2026-10-01): the stream reader also writes the WHOLE picture as JPEGs
+ * (DOOR_SCAN_SNAPSHOT_FPS per second, newest few kept in memory), so a scan no
+ * longer opens a camera connection and waits for the next keyframe (~2-3 s of
+ * every scan). Falls back to dialling the camera whenever the gate has no live
+ * pipeline stream for that camera. DOOR_SCAN_SHARED_STREAM=false dials as before.
+ */
+const DOOR_SCAN_SHARED_STREAM = (process.env.DOOR_SCAN_SHARED_STREAM ?? "true").trim().toLowerCase() !== "false";
+const DOOR_SCAN_SNAPSHOT_FPS = envFloat("DOOR_SCAN_SNAPSHOT_FPS", 4, 0.5, 15);
+/** The newest shared-stream JPEG must be at most this old, or the scan dials the camera. */
+const DOOR_SCAN_SNAPSHOT_MAX_AGE_MS = 1500;
 const FACE_SCAN_MAX_FRAME_INTERVAL_MS = 3000;
 
 /**
@@ -4426,6 +4438,8 @@ interface RtspFrameGrab {
   errorLog: string;
   /** Set when the destination guard refused the URL: no FFmpeg process was started. */
   blocked?: { code: string; reason: string; host?: string };
+  /** Where the frame came from: the gate's always-open stream, or a fresh camera connection. */
+  source?: "shared-stream" | "camera";
 }
 
 /**
@@ -4760,6 +4774,25 @@ async function grabRtspFrames(
     if (grab.blocked) break; // refused destination: the next frame would be refused too
   }
   return out;
+}
+
+/**
+ * Up to `frames` whole-picture JPEGs from the gate's always-open pipeline
+ * stream, newest last, at least `intervalMs` apart - or null when that stream
+ * is not live for this camera (then the caller dials). Instant: no wait.
+ */
+function sharedStreamFrames(gate: Gate, streamId: string, url: string, frames: number, intervalMs: number): RtspFrameGrab[] | null {
+  if (!DOOR_SCAN_SHARED_STREAM) return null;
+  const shared = gatePipelines.get(gate)?.source;
+  if (!shared || shared.streamId !== streamId || shared.url !== url) return null;
+  const snaps = shared.reader.snapshots(DOOR_SCAN_SNAPSHOT_MAX_AGE_MS + Math.max(0, frames - 1) * Math.max(intervalMs, 1));
+  const newest = snaps[snaps.length - 1];
+  if (!newest || Date.now() - newest.capturedAtMs > DOOR_SCAN_SNAPSHOT_MAX_AGE_MS) return null;
+  const picked = [newest];
+  for (let i = snaps.length - 2; i >= 0 && picked.length < frames; i--) {
+    if (picked[picked.length - 1].capturedAtMs - snaps[i].capturedAtMs >= intervalMs) picked.push(snaps[i]);
+  }
+  return picked.reverse().map((s) => ({ ok: true, jpeg: s.jpeg, durationMs: 0, exitCode: 0, errorLog: "", source: "shared-stream" as const }));
 }
 
 // =========================================================================
@@ -5617,7 +5650,9 @@ async function performGateScan(input: GateScanRequest): Promise<GateScanResult> 
   const outcomes: ScanStreamOutcome[] = await Promise.all(
     targets.map(async ({ stream: target, url: streamUrl }): Promise<ScanStreamOutcome> => {
       const transport = target.rtspTransport === "UDP" ? "udp" : "tcp";
-      const grabs = await grabRtspFrames(streamUrl, transport, framesPerStream, intervalMs);
+      // A body `url` (manual test of a URL) always dials; otherwise prefer the gate's open stream.
+      const shared = singleStreamMode && optionalTrimmedString(url) ? null : sharedStreamFrames(targetGate.id, target.id, streamUrl, framesPerStream, intervalMs);
+      const grabs = shared ?? (await grabRtspFrames(streamUrl, transport, framesPerStream, intervalMs)).map((g) => ({ ...g, source: "camera" as const }));
       const outcome: ScanStreamOutcome = {
         stream: target,
         url: streamUrl,
@@ -5716,6 +5751,7 @@ async function performGateScan(input: GateScanRequest): Promise<GateScanResult> 
     frameCaptureDurationMs: o.grabs.reduce((max, g) => Math.max(max, g.durationMs), 0),
     framesCaptured: o.grabs.filter((g) => g.ok && g.jpeg).length,
     framesRequested: framesPerStream,
+    captureSource: o.grabs[0]?.source ?? "camera",
     observations: o.observed.length,
     recognized: o.faces.some((f) => f.recognized && f.employeeId),
     totalFacesDetected: o.faces.length,
@@ -6060,6 +6096,8 @@ interface GateWatcherState {
   totalRuns: number;
   lastRunAt?: string;
   lastDurationMs?: number;
+  lastCaptureSource?: "shared-stream" | "camera";
+  lastCaptureMs?: number;
   lastBasis?: string;
   lastRecognized?: boolean;
   lastEmployeeName?: string;
@@ -6147,6 +6185,7 @@ function gateWatchRuntime(state: GateWatcherState): GateWatchRuntime & GateWatch
     running: state.running,
     lastRunAt: state.lastRunAt,
     lastDurationMs: state.lastDurationMs,
+    ...(state.lastCaptureSource ? { lastCaptureSource: state.lastCaptureSource, lastCaptureMs: state.lastCaptureMs } : {}),
     lastBasis: state.lastBasis,
     lastRecognized: state.lastRecognized,
     lastEmployeeName: state.lastEmployeeName,
@@ -6284,6 +6323,9 @@ async function runGateWatchTick(state: GateWatcherState, generation: number) {
   state.totalRuns += 1;
   state.lastRunAt = new Date(startedAt).toISOString();
   state.lastDurationMs = durationMs;
+  const firstStream = Array.isArray(body.streams) ? body.streams[0] : undefined;
+  state.lastCaptureSource = firstStream?.captureSource;
+  state.lastCaptureMs = typeof firstStream?.frameCaptureDurationMs === "number" ? firstStream.frameCaptureDurationMs : undefined;
   state.lastBasis = body.fusion?.basis;
   state.lastRecognized = ok ? Boolean(body.recognized) : false;
   state.lastEmployeeName = ok && body.recognized ? body.bestMatch?.name : undefined;
@@ -6509,6 +6551,8 @@ interface GatePipelineSlot {
   starting: boolean;
   retry: NodeJS.Timeout | null;
   statsLog: NodeJS.Timeout | null;
+  /** The pipeline's stream reader while it runs: door scans read its whole-picture JPEGs. */
+  source: { streamId: string; url: string; reader: ReturnType<typeof createStreamReader> } | null;
   /** The destination guard refused the stream: not started until the config changes. */
   blocked: { code: string; reason: string; since: string } | null;
 }
@@ -6517,7 +6561,7 @@ const gatePipelines = new Map<Gate, GatePipelineSlot>();
 function pipelineSlotOf(gate: Gate): GatePipelineSlot {
   let slot = gatePipelines.get(gate);
   if (!slot) {
-    slot = { key: "", pipeline: null, starting: false, retry: null, statsLog: null, blocked: null };
+    slot = { key: "", pipeline: null, starting: false, retry: null, statsLog: null, blocked: null, source: null };
     gatePipelines.set(gate, slot);
   }
   return slot;
@@ -6570,6 +6614,7 @@ async function startGatePipeline(gate: Gate, want: DesiredPipeline): Promise<voi
       sourceHeight: size.height,
       roi,
       fps: PIPELINE_FPS,
+      ...(DOOR_SCAN_SHARED_STREAM ? { snapshot: { fps: DOOR_SCAN_SNAPSHOT_FPS } } : {}),
       // F12: stale/reconnect/recovery transitions, without URL or host, rate-limited by the reader.
       log: (line) => console.warn(`[Pipeline ${gateLogTag(gate)}] ${line}`),
     });
@@ -6583,6 +6628,7 @@ async function startGatePipeline(gate: Gate, want: DesiredPipeline): Promise<voi
       crops: false,
     });
     slot.pipeline = pipeline;
+    slot.source = { streamId: want.streamId, url: want.url, reader: source };
     pipeline.start();
     if (PIPELINE_STATS_LOG_MS > 0) {
       if (slot.statsLog) clearInterval(slot.statsLog);
@@ -6621,6 +6667,7 @@ function syncPipelines() {
     slot.statsLog = null;
     const old = slot.pipeline;
     slot.pipeline = null;
+    slot.source = null;
     if (old) void old.stop().then(() => console.log(`[Pipeline ${gateLogTag(gate)}] Đã dừng luồng cũ.`));
     if (want) void startGatePipeline(gate, want);
     if (!configured && !slot.pipeline && !slot.starting) gatePipelines.delete(gate);

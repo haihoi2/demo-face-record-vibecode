@@ -11,6 +11,7 @@ import {
   probeStreamSize,
   redactCredentials,
   hostFreeReason,
+  JpegStreamSplitter,
   type SpawnLike,
   type StreamReaderOptions,
 } from "../src/server/pipeline/streamReader";
@@ -672,5 +673,137 @@ describe("probeStreamSize", () => {
     const hung = probeStreamSize(SECRET_URL, { spawn: fake.spawn, timeoutMs: 100 });
     assert.equal(await hung, null);
     assert.deepEqual(fake.last().signals, ["SIGKILL"]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Whole-picture JPEG output for the door scan (owner 2026-10-01)
+// ---------------------------------------------------------------------------
+
+function fakeJpeg(fill: number, size = 40): Buffer {
+  // SOI, some body bytes (byte-stuffed 0xFF00 included), EOI.
+  const body = Buffer.alloc(size, fill);
+  body[5] = 0xff;
+  body[6] = 0x00;
+  return Buffer.concat([Buffer.from([0xff, 0xd8]), body, Buffer.from([0xff, 0xd9])]);
+}
+
+describe("JpegStreamSplitter", () => {
+  it("rebuilds whole JPEGs across any chunk boundaries, including a split marker", () => {
+    const a = fakeJpeg(1);
+    const b = fakeJpeg(2, 100);
+    const stream = Buffer.concat([a, b]);
+    const splitter = new JpegStreamSplitter();
+    const out: Buffer[] = [];
+    // Split inside the EOI of `a` and inside the SOI of `b`.
+    for (const [from, to] of [[0, a.length - 1], [a.length - 1, a.length + 1], [a.length + 1, stream.length]]) {
+      out.push(...splitter.push(stream.subarray(from, to)));
+    }
+    assert.equal(out.length, 2);
+    assert.ok(out[0].equals(a));
+    assert.ok(out[1].equals(b));
+  });
+
+  it("skips garbage before an SOI and resets cleanly", () => {
+    const splitter = new JpegStreamSplitter();
+    assert.deepEqual(splitter.push(Buffer.from([1, 2, 3])), []);
+    const j = fakeJpeg(7);
+    const out = splitter.push(Buffer.concat([Buffer.from([9, 9]), j]));
+    assert.equal(out.length, 1);
+    assert.ok(out[0].equals(j));
+    splitter.push(j.subarray(0, 10));
+    splitter.reset();
+    assert.deepEqual(splitter.push(j.subarray(10)), [], "a reset drops the half image");
+  });
+});
+
+describe("buildStreamReaderArgs with the snapshot output", () => {
+  it("splits one decode into the gate-area frames (pipe:1) and whole-picture JPEGs (pipe:3)", () => {
+    const args = buildStreamReaderArgs("rtsp://cam/x", {
+      roi: [10, 20, 100, 50],
+      fps: 8,
+      skipFrame: null,
+      threads: null,
+      lowDelay: true,
+      socketTimeoutMs: 5000,
+      snapshot: { fps: 4, qscale: 3, keep: 8 },
+    });
+    const fc = args[args.indexOf("-filter_complex") + 1];
+    assert.match(fc, /split=2/);
+    assert.match(fc, /crop=100:50:10:20,fps=8\[roiout\]/);
+    assert.match(fc, /\[full\]fps=4\[fullout\]/);
+    assert.ok(!args.includes("-vf"), "no -vf next to -filter_complex");
+    assert.equal(args.filter((a) => a === "-i").length, 1, "one camera connection");
+    const pipe1 = args.indexOf("pipe:1");
+    const pipe3 = args.indexOf("pipe:3");
+    assert.ok(pipe1 > 0 && pipe3 > pipe1);
+    assert.equal(args[args.indexOf("[fullout]") - 1], "-map");
+    assert.ok(args.slice(pipe1).includes("mjpeg"));
+  });
+
+  it("is unchanged without the snapshot output", () => {
+    const args = buildStreamReaderArgs("rtsp://cam/x", { roi: [0, 0, 4, 2], fps: 8, skipFrame: null, threads: null, lowDelay: true, socketTimeoutMs: 5000 });
+    assert.ok(args.includes("-vf"));
+    assert.ok(!args.includes("-filter_complex"));
+    assert.ok(!args.includes("pipe:3"));
+  });
+});
+
+describe("StreamReader snapshots", () => {
+  class SnapChild extends FakeChild {
+    snap = new EventEmitter();
+    get stdio() {
+      return [null, this.stdout, this.stderr, this.snap];
+    }
+  }
+
+  function snapReader() {
+    const children: SnapChild[] = [];
+    const stdios: unknown[] = [];
+    const spawn: SpawnLike = (_cmd, args, options) => {
+      stdios.push(options.stdio);
+      const child = new SnapChild(2000 + children.length, args);
+      children.push(child);
+      return child;
+    };
+    const source = createStreamReader({
+      gate: "exit",
+      streamId: "exit-main",
+      url: SECRET_URL,
+      sourceWidth: W,
+      sourceHeight: H,
+      spawn,
+      motion: false,
+      snapshot: { fps: 4, keep: 3 },
+    });
+    return { source, children, stdios };
+  }
+
+  it("keeps the newest JPEGs while streaming, and none after a reconnect or stop", () => {
+    const { source, children, stdios } = snapReader();
+    source.start();
+    assert.deepEqual(stdios[0], ["ignore", "pipe", "pipe", "pipe"]);
+    const child = children[0];
+    child.write(frameBytes(1)); // streaming
+    for (let i = 1; i <= 5; i++) {
+      child.snap.emit("data", fakeJpeg(i));
+      advance(250);
+      child.write(frameBytes(i)); // keep the stream fresh
+    }
+    const snaps = source.snapshots(10_000);
+    assert.equal(snaps.length, 3, "keep: 3");
+    assert.ok(snaps[2].jpeg.equals(fakeJpeg(5)), "newest last");
+    assert.ok(snaps[0].capturedAtMs < snaps[2].capturedAtMs);
+    assert.equal(source.snapshots(600).length, 2, "age filter: 250 and 500 ms old");
+    source.stop();
+    assert.deepEqual(source.snapshots(10_000), []);
+  });
+
+  it("returns nothing when the snapshot output is off", () => {
+    const { source, fake } = reader();
+    source.start();
+    fake.last().write(frameBytes(1));
+    assert.deepEqual((source as any).snapshots(10_000), []);
+    source.stop();
   });
 });

@@ -46,12 +46,39 @@ export interface ChildLike {
   readonly pid?: number;
   stdout: NodeJS.EventEmitter | null;
   stderr: NodeJS.EventEmitter | null;
+  /** All pipes; [3] is the full-picture JPEG output when `snapshot` is on. */
+  stdio?: ReadonlyArray<NodeJS.EventEmitter | null | undefined>;
   on(event: "exit", listener: (code: number | null, signal: NodeJS.Signals | null) => void): unknown;
   on(event: "error", listener: (err: Error) => void): unknown;
   kill(signal?: NodeJS.Signals | number): boolean;
 }
 
-export type SpawnLike = (command: string, args: string[], options: { stdio: ["ignore", "pipe", "pipe"] }) => ChildLike;
+export type SpawnLike = (
+  command: string,
+  args: string[],
+  options: { stdio: ["ignore", "pipe", "pipe"] | ["ignore", "pipe", "pipe", "pipe"] },
+) => ChildLike;
+
+/** One full-picture JPEG from the snapshot output. */
+export interface SnapshotFrame {
+  jpeg: Buffer;
+  /** Wall-clock time the JPEG came out of FFmpeg (ms since epoch). */
+  capturedAtMs: number;
+}
+
+/**
+ * Full-picture JPEGs from the SAME camera connection and decode (FFmpeg `split`):
+ * the legacy door scan reads them instead of dialling the camera for every scan
+ * (owner 2026-10-01). Independent of the gate area: always the whole picture.
+ */
+export interface SnapshotOptions {
+  /** JPEGs per second. Default 4. */
+  fps?: number;
+  /** MJPEG qscale, 2 (best) .. 31. Default 3. */
+  qscale?: number;
+  /** Newest JPEGs kept in memory. Default 8. */
+  keep?: number;
+}
 
 export type Roi = [number, number, number, number];
 
@@ -82,6 +109,8 @@ export interface StreamReaderOptions {
   stateIntervalMs?: number;
   /** Frames kept for the motion check. Default 3. */
   ringSize?: number;
+  /** Also emit full-picture JPEGs on a second output (see SnapshotOptions). Default off. */
+  snapshot?: SnapshotOptions | null;
   /** Motion gate settings, or false to disable (`motion()` then always says true). */
   motion?: MotionOptions | false;
   /** Decoder-side savings, measured in the STR handoff. */
@@ -127,6 +156,7 @@ interface ReaderConfig {
   logIntervalMs: number;
   ffmpegPath: string;
   frameBytes: number;
+  snapshot: { fps: number; qscale: number; keep: number } | null;
 }
 
 const MAX_SOURCE_SIDE = 8192;
@@ -197,6 +227,13 @@ function buildConfig(opts: StreamReaderOptions): { config: ReaderConfig | null; 
       logIntervalMs: num(opts.logIntervalMs, 10_000, 0, 3_600_000),
       ffmpegPath: opts.ffmpegPath || "ffmpeg",
       frameBytes: roi[2] * roi[3] * 3,
+      snapshot: opts.snapshot
+        ? {
+            fps: num(opts.snapshot.fps, 4, 0.1, 30),
+            qscale: Math.round(num(opts.snapshot.qscale, 3, 2, 31)),
+            keep: Math.floor(num(opts.snapshot.keep, 8, 1, 64)),
+          }
+        : null,
     },
   };
 }
@@ -204,7 +241,9 @@ function buildConfig(opts: StreamReaderOptions): { config: ReaderConfig | null; 
 /** FFmpeg arguments for the long-running reader. Exported for tests and the measurement tool. */
 export function buildStreamReaderArgs(
   url: string,
-  c: Pick<ReaderConfig, "roi" | "fps" | "skipFrame" | "threads" | "lowDelay" | "socketTimeoutMs">,
+  c: Pick<ReaderConfig, "roi" | "fps" | "skipFrame" | "threads" | "lowDelay" | "socketTimeoutMs"> & {
+    snapshot?: ReaderConfig["snapshot"];
+  },
 ): string[] {
   const [x, y, w, h] = c.roi;
   const args = [
@@ -222,12 +261,24 @@ export function buildStreamReaderArgs(
   if (c.lowDelay) args.push("-flags", "low_delay");
   if (c.skipFrame) args.push("-skip_frame", c.skipFrame);
   if (c.threads != null) args.push("-threads", String(c.threads));
+  args.push("-i", url);
+  if (c.snapshot) {
+    // One decode, two outputs: the gate-area frames below (pipe:1) and the
+    // whole picture as JPEGs (pipe:3) for the door scan.
+    args.push(
+      "-filter_complex",
+      `[0:v:0]split=2[roi][full];[roi]crop=${w}:${h}:${x}:${y},fps=${c.fps}[roiout];[full]fps=${c.snapshot.fps}[fullout]`,
+      "-map", "[roiout]", "-an", "-sn", "-dn",
+    );
+  } else {
+    args.push(
+      "-map", "0:v:0", "-an", "-sn", "-dn",
+      // Explicit crop (also for the full frame) pins the output size: a source
+      // that is smaller than configured fails loudly instead of mis-slicing.
+      "-vf", `crop=${w}:${h}:${x}:${y},fps=${c.fps}`,
+    );
+  }
   args.push(
-    "-i", url,
-    "-map", "0:v:0", "-an", "-sn", "-dn",
-    // Explicit crop (also for the full frame) pins the output size: a source
-    // that is smaller than configured fails loudly instead of mis-slicing.
-    "-vf", `crop=${w}:${h}:${x}:${y},fps=${c.fps}`,
     // rawvideo defaults to CFR output, which duplicates the first frame back to
     // t=0 (a burst of up to one GOP of stale copies after every connect) and
     // fills stalls with copies. Pass frames through as the fps filter made them.
@@ -236,7 +287,56 @@ export function buildStreamReaderArgs(
     "-f", "rawvideo",
     "pipe:1",
   );
+  if (c.snapshot) {
+    args.push(
+      "-map", "[fullout]",
+      "-fps_mode", "passthrough",
+      "-c:v", "mjpeg", "-q:v", String(c.snapshot.qscale), "-pix_fmt", "yuvj420p",
+      "-f", "image2pipe",
+      "pipe:3",
+    );
+  }
   return args;
+}
+
+const JPEG_SOI = Buffer.from([0xff, 0xd8]);
+const JPEG_EOI = Buffer.from([0xff, 0xd9]);
+/** A JPEG larger than this is not a camera frame: the parser resynchronises. */
+const SNAPSHOT_MAX_BYTES = 24 * 1024 * 1024;
+
+/**
+ * Splits an MJPEG byte stream (FFmpeg image2pipe) into whole JPEGs. FFmpeg's
+ * MJPEG output carries no embedded thumbnails and byte-stuffs 0xFF in entropy
+ * data, so the first EOI after an SOI ends the image. Exported for tests.
+ */
+export class JpegStreamSplitter {
+  private buf: Buffer = Buffer.alloc(0);
+
+  push(chunk: Buffer): Buffer[] {
+    this.buf = this.buf.length ? Buffer.concat([this.buf, chunk]) : chunk;
+    const out: Buffer[] = [];
+    for (;;) {
+      const start = this.buf.indexOf(JPEG_SOI);
+      if (start < 0) {
+        // Keep a trailing 0xFF: it may be the first half of the next SOI.
+        this.buf = this.buf.length && this.buf[this.buf.length - 1] === 0xff ? this.buf.subarray(this.buf.length - 1) : Buffer.alloc(0);
+        break;
+      }
+      const end = this.buf.indexOf(JPEG_EOI, start + 2);
+      if (end < 0) {
+        this.buf = start > 0 ? this.buf.subarray(start) : this.buf;
+        if (this.buf.length > SNAPSHOT_MAX_BYTES) this.buf = Buffer.alloc(0);
+        break;
+      }
+      out.push(Buffer.from(this.buf.subarray(start, end + 2)));
+      this.buf = this.buf.subarray(end + 2);
+    }
+    return out;
+  }
+
+  reset(): void {
+    this.buf = Buffer.alloc(0);
+  }
 }
 
 type Listener = (...args: any[]) => void;
@@ -274,6 +374,8 @@ class StreamReader extends EventEmitter implements FrameSource {
   private readonly spawnFn: SpawnLike;
   private readonly now: () => number;
   private readonly ring: RingBuffer<Frame>;
+  private snapshotRing: SnapshotFrame[] = [];
+  private readonly jpegSplitter = new JpegStreamSplitter();
   private readonly motionDetector: MotionDetector | null;
   private motionResults = new WeakMap<Frame, MotionResult>();
 
@@ -375,6 +477,16 @@ class StreamReader extends EventEmitter implements FrameSource {
     if (wasRunning || this.status !== "stopped") this.setStatus("stopped", true);
   }
 
+  /**
+   * Full-picture JPEGs, oldest first, newer than `maxAgeMs` - only while the
+   * stream is healthy. Empty when the snapshot output is off.
+   */
+  snapshots(maxAgeMs = 2000): SnapshotFrame[] {
+    if (!this.cfg?.snapshot || this.status !== "streaming") return [];
+    const now = this.now();
+    return this.snapshotRing.filter((s) => now - s.capturedAtMs <= maxAgeMs);
+  }
+
   latest(): Frame | null {
     const frame = this.ring.newest();
     if (!frame || !this.cfg || this.status !== "streaming") return null;
@@ -436,6 +548,8 @@ class StreamReader extends EventEmitter implements FrameSource {
     this.lastBytesAtMs = null;
     this.deliveries = [];
     this.ring.clear();
+    this.snapshotRing = [];
+    this.jpegSplitter.reset();
     this.motionResults = new WeakMap();
     this.motionDetector?.reset();
   }
@@ -462,7 +576,9 @@ class StreamReader extends EventEmitter implements FrameSource {
     this.setStatus("starting");
     let proc: ChildLike;
     try {
-      proc = this.spawnFn(cfg.ffmpegPath, buildStreamReaderArgs(cfg.url, cfg), { stdio: ["ignore", "pipe", "pipe"] });
+      proc = this.spawnFn(cfg.ffmpegPath, buildStreamReaderArgs(cfg.url, cfg), {
+        stdio: cfg.snapshot ? ["ignore", "pipe", "pipe", "pipe"] : ["ignore", "pipe", "pipe"],
+      });
     } catch (err: any) {
       this.fail(gen, `ffmpeg could not start: ${err?.message || err}`);
       return;
@@ -477,6 +593,11 @@ class StreamReader extends EventEmitter implements FrameSource {
     proc.stderr?.on("error", ignore);
     proc.stdout?.on("data", (chunk: Buffer) => {
       if (gen === this.generation) this.onData(chunk);
+    });
+    const snapshotPipe = cfg.snapshot ? proc.stdio?.[3] : null;
+    snapshotPipe?.on("error", ignore);
+    snapshotPipe?.on("data", (chunk: Buffer) => {
+      if (gen === this.generation) this.onSnapshotData(chunk);
     });
     proc.stderr?.on("data", (chunk: Buffer) => {
       if (gen !== this.generation) return;
@@ -629,6 +750,15 @@ class StreamReader extends EventEmitter implements FrameSource {
     if (newest) this.deliver(newest);
   }
 
+  private onSnapshotData(chunk: Buffer): void {
+    const keep = this.cfg?.snapshot?.keep ?? 0;
+    if (!keep) return;
+    for (const jpeg of this.jpegSplitter.push(chunk)) {
+      this.snapshotRing.push({ jpeg, capturedAtMs: this.now() });
+      if (this.snapshotRing.length > keep) this.snapshotRing.splice(0, this.snapshotRing.length - keep);
+    }
+  }
+
   private deliver(rgb: Buffer): void {
     const cfg = this.cfg!;
     const now = this.now();
@@ -662,7 +792,9 @@ class StreamReader extends EventEmitter implements FrameSource {
 }
 
 /** Creates the reader; call `start()` to open the stream. Never throws. */
-export function createStreamReader(opts: StreamReaderOptions): FrameSource & { getState(): SourceState; readonly pid?: number } {
+export function createStreamReader(
+  opts: StreamReaderOptions,
+): FrameSource & { getState(): SourceState; snapshots(maxAgeMs?: number): SnapshotFrame[]; readonly pid?: number } {
   return new StreamReader(opts);
 }
 

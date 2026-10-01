@@ -456,6 +456,10 @@ export interface GateWatchRuntime {
   running: boolean;
   lastRunAt?: string;
   lastDurationMs?: number;
+  /** How the last scan got its frame(s): the gate's always-open stream, or a fresh camera connection. */
+  lastCaptureSource?: "shared-stream" | "camera";
+  /** Time spent getting the frame(s) in the last scan (0 for the shared stream). */
+  lastCaptureMs?: number;
   /** FusionDecision.basis of the last completed scan. */
   lastBasis?: string;
   lastRecognized?: boolean;
