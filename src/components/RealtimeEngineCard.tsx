@@ -39,10 +39,10 @@ import {
   type Tone,
 } from "../utils/pipelineStatus";
 import {
-  GATE_KEYS,
   PIPELINE_MODES,
   PIPELINE_MODE_UNAVAILABLE_TITLE,
   buildPipelineModeRequest,
+  gateKeysForCard,
   gateLabel,
   interpretPipelineModeResponse,
   isPipelineModeSelectable,
@@ -53,6 +53,8 @@ import {
   type GateKey,
   type GatePipelineRow,
 } from "../utils/pipelineMode";
+import { directionLabel, gateLabelMap, gatesOf } from "../utils/gates";
+import type { CameraStreamsConfig, GateConfig } from "../types";
 
 /** Light-theme chips (the dashboard's dark map does not read on this page). */
 const TONE_CHIP: Record<Tone, string> = {
@@ -69,7 +71,8 @@ const POLL_MS = 5000;
 const SHADOW_SUMMARY_HOURS = 24;
 const SHADOW_SUMMARY_URL = `/api/pipeline/shadow-summary?hours=${SHADOW_SUMMARY_HOURS}`;
 
-type Rows = Partial<Record<GateKey, GatePipelineRow>>;
+/** Rows keyed by gate id (several gates can share a direction). */
+type Rows = Record<GateKey, GatePipelineRow>;
 type Notice = { tone: Tone; text: string } | null;
 type PendingSwitch = { key: GateKey; target: PipelineMode | null } | null;
 
@@ -192,6 +195,9 @@ export const RealtimeEngineCard: React.FC = () => {
   const isAdmin = hasRole(session, "admin");
 
   const [rows, setRows] = useState<Rows>({});
+  // The configured gate list gives the rows their order and labels; the watcher
+  // list adds any gate the config did not name. Read on open and on "Đọc lại".
+  const [gates, setGates] = useState<GateConfig[]>([]);
   const [loading, setLoading] = useState<boolean>(true);
   const [supported, setSupported] = useState<boolean | null>(null);
   const [fetchError, setFetchError] = useState<string | null>(null);
@@ -233,6 +239,13 @@ export const RealtimeEngineCard: React.FC = () => {
     );
   }, []);
 
+  const fetchGates = useCallback(async () => {
+    const res = await safeJsonFetch<{ config?: CameraStreamsConfig }>("/api/camera-streams/config");
+    if (!mounted.current || !res.ok) return; // keep the last list; rows still come from the watchers
+    const list = gatesOf(res.data?.config);
+    if (list.length > 0) setGates(list);
+  }, []);
+
   const fetchRows = useCallback(async (silent = false) => {
     if (!silent) setLoading(true);
     const [res] = await Promise.all([safeJsonFetch<unknown>("/api/camera-streams/watch"), fetchShadowSummary()]);
@@ -258,6 +271,7 @@ export const RealtimeEngineCard: React.FC = () => {
   // Poll every 5 s while the page is visible; catch up on return; stop on unmount.
   useEffect(() => {
     mounted.current = true;
+    void fetchGates();
     void fetchRows();
     const tick = () => {
       if (typeof document !== "undefined" && document.visibilityState === "hidden") return;
@@ -273,7 +287,11 @@ export const RealtimeEngineCard: React.FC = () => {
       clearInterval(timer);
       document.removeEventListener("visibilitychange", onVisibility);
     };
-  }, [fetchRows]);
+  }, [fetchRows, fetchGates]);
+
+  const labels = gateLabelMap(gates);
+  /** The server's label for the runtime, else the configured one, else "Cổng vào"/"Cổng ra". */
+  const labelOf = (key: GateKey): string => gateLabel(key, rows[key]?.label ?? labels[key] ?? null);
 
   const applySwitch = useCallback(
     async (key: GateKey, target: PipelineMode | null) => {
@@ -283,10 +301,11 @@ export const RealtimeEngineCard: React.FC = () => {
         const { url, init } = buildPipelineModeRequest(key, target);
         const res = await operatorJsonFetch<unknown>(url, init);
         if (!mounted.current) return;
-        const outcome = interpretPipelineModeResponse(key, res);
+        const outcome = interpretPipelineModeResponse(key, res, labelOf(key));
         if (outcome.kind === "applied") {
           const row = readGatePipelineRow(outcome.watcher);
-          if (row) setRows((prev) => ({ ...prev, [row.key]: row }));
+          // Key by the gate asked for when an older server's watcher only names a direction.
+          if (row) setRows((prev) => ({ ...prev, [outcome.gateId]: { ...row, key: outcome.gateId } }));
           setNotice({ tone: "emerald", text: outcome.message });
           void fetchRows(true);
         } else {
@@ -299,7 +318,7 @@ export const RealtimeEngineCard: React.FC = () => {
         }
       }
     },
-    [fetchRows],
+    [fetchRows, gates, rows],
   );
 
   const renderControls = (row: GatePipelineRow | undefined, key: GateKey) => {
@@ -314,7 +333,7 @@ export const RealtimeEngineCard: React.FC = () => {
     const configured = row?.configured ?? null;
     return (
       <div className="flex flex-wrap items-center gap-2">
-        <div role="group" aria-label={`Chế độ động cơ thời gian thực cho ${gateLabel(key)}`} className="inline-flex rounded-lg border border-slate-200 overflow-hidden">
+        <div role="group" aria-label={`Chế độ động cơ thời gian thực cho ${labelOf(key)}`} className="inline-flex rounded-lg border border-slate-200 overflow-hidden">
           {PIPELINE_MODES.map((mode) => {
             const selectable = isPipelineModeSelectable(mode);
             const selected = configured === mode;
@@ -422,7 +441,7 @@ export const RealtimeEngineCard: React.FC = () => {
               "Không có mặt dùng được" là các lượt người đi qua mà không khung hình nào tới được bước nhận diện - chỉ số
               về thông lượng, không phải về mô hình.
             </p>
-            <ul className="flex flex-wrap gap-1.5" aria-label={`Đối chiếu hai động cơ tại ${gateLabel(key)}`}>
+            <ul className="flex flex-wrap gap-1.5" aria-label={`Đối chiếu hai động cơ tại ${labelOf(key)}`}>
               {agreementRows(view).map((rowItem) => (
                 <li
                   key={rowItem.key}
@@ -463,7 +482,15 @@ export const RealtimeEngineCard: React.FC = () => {
       <div key={key} className="rounded-xl border border-slate-200 bg-slate-50/60 p-3 space-y-2" data-testid={`rt-gate-${key}`}>
         <div className="flex flex-wrap items-center justify-between gap-2">
           <div className="flex flex-wrap items-center gap-2 text-xs">
-            <span className="font-bold text-slate-900">{gateLabel(key)}</span>
+            <span className="font-bold text-slate-900">{labelOf(key)}</span>
+            {(() => {
+              const direction = row?.gate ?? gates.find((g) => g.id === key)?.direction ?? null;
+              return direction ? (
+                <span className="text-[10px] text-slate-500" title={`Mã cổng: ${key}`}>
+                  {directionLabel(direction)} · {key}
+                </span>
+              ) : null;
+            })()}
             {!row ? (
               <span className="text-slate-500">{loading ? "đang đọc..." : "máy chủ chưa báo cổng này"}</span>
             ) : (
@@ -597,7 +624,7 @@ export const RealtimeEngineCard: React.FC = () => {
     );
   };
 
-  const confirmText = confirm ? pipelineModeConfirmText(confirm.key, confirm.target) : null;
+  const confirmText = confirm ? pipelineModeConfirmText(confirm.key, confirm.target, labelOf(confirm.key)) : null;
 
   return (
     <section
@@ -617,7 +644,10 @@ export const RealtimeEngineCard: React.FC = () => {
           </span>
           <button
             type="button"
-            onClick={() => void fetchRows()}
+            onClick={() => {
+              void fetchGates();
+              void fetchRows();
+            }}
             disabled={loading}
             className="inline-flex items-center gap-1 px-2 py-1 text-[11px] font-semibold rounded-lg border border-slate-200 text-slate-700 hover:bg-slate-50 disabled:opacity-40"
             aria-label="Đọc lại trạng thái động cơ thời gian thực"
@@ -660,7 +690,7 @@ export const RealtimeEngineCard: React.FC = () => {
             </span>
           </div>
         )}
-        {supported !== false && GATE_KEYS.map(renderRow)}
+        {supported !== false && gateKeysForCard(gates, rows).map(renderRow)}
       </div>
 
       <div role="status" aria-live="polite" className="mt-3 min-h-[1.25rem]" data-testid="rt-engine-notice">

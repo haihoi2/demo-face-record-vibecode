@@ -28,6 +28,7 @@ import {
   GateStreamSource,
 } from "../types";
 import { safeJsonFetch, compressImage } from "../utils/api";
+import { directionLabel, gateDisplayLabel, gatesOf } from "../utils/gates";
 import { ProtectedImage } from "./ProtectedImage";
 import { orgChoice, orgOptions, orgPlaceholder, useOrgCatalog } from "../utils/orgCatalog";
 import {
@@ -89,9 +90,10 @@ interface TemplatesResponse {
 /** How many coverage reads run at once when the employee list loads. */
 const COVERAGE_FETCH_CONCURRENCY = 4;
 
-/** A camera stream flattened with the gate it belongs to. */
+/** A camera stream flattened with the gate (id + label) it belongs to. */
 interface FlatStream {
-  gateKey: "entry" | "exit";
+  /** Gate id ("entry", "exit" or any configured gate). */
+  gateKey: string;
   gateName: string;
   id: string;
   label: string;
@@ -113,10 +115,10 @@ const OBSERVED_GOOD_QUALITY = 0.35;
 /** Streams of one gate, tolerant of a legacy config that has no `streams[]`. */
 const flattenGateStreams = (
   gate: GateStreamConfig | undefined,
-  gateKey: "entry" | "exit"
+  gateKey: string,
+  gateName: string
 ): FlatStream[] => {
   if (!gate) return [];
-  const gateName = gate.name || (gateKey === "exit" ? "Cổng Ra" : "Cổng Vào");
   const list: GateStreamSource[] = Array.isArray(gate.streams) ? gate.streams.filter(Boolean) : [];
   if (list.length > 0) {
     return list.map((st, index) => ({
@@ -206,7 +208,8 @@ export const EmployeeRegistration: React.FC<EmployeeRegistrationProps> = ({
   const [streamsError, setStreamsError] = useState<string | null>(null);
 
   const [enrollEmployeeId, setEnrollEmployeeId] = useState<string>("");
-  const [enrollGate, setEnrollGate] = useState<"entry" | "exit">("exit");
+  /** Gate id of the enrolment camera picker. */
+  const [enrollGate, setEnrollGate] = useState<string>("exit");
   const [enrollStreamId, setEnrollStreamId] = useState<string>("");
   const [enrollFrames, setEnrollFrames] = useState<number>(3);
 
@@ -228,12 +231,12 @@ export const EmployeeRegistration: React.FC<EmployeeRegistrationProps> = ({
   const coverageRequested = useRef<Set<string>>(new Set());
   const [coverageReload, setCoverageReload] = useState<number>(0);
 
-  const entryStreams = flattenGateStreams(streamsConfig?.entryGate, "entry");
-  const exitStreams = flattenGateStreams(streamsConfig?.exitGate, "exit");
-  const allStreams: FlatStream[] = [...entryStreams, ...exitStreams];
+  /** Every configured gate (either server shape), in display order. */
+  const configGates = gatesOf(streamsConfig);
+  const allStreams: FlatStream[] = configGates.flatMap((g) => flattenGateStreams(g, g.id, gateDisplayLabel(g)));
   /** Cameras the coverage indicator and filter speak of: configured and enabled. */
   const activeStreams: FlatStream[] = allStreams.filter((st) => st.enabled);
-  const gateStreams = (enrollGate === "entry" ? entryStreams : exitStreams).filter((st) => st.enabled);
+  const gateStreams = allStreams.filter((st) => st.gateKey === enrollGate && st.enabled);
   const selectedEmployee = employees.find((emp) => emp.id === enrollEmployeeId) || null;
   /** The server's accept floor when it reports one; otherwise its documented default. */
   const qualityFloor = enrollMinQuality ?? DEFAULT_ENROLL_MIN_QUALITY;
@@ -293,9 +296,7 @@ export const EmployeeRegistration: React.FC<EmployeeRegistrationProps> = ({
 
   // Keep a valid stream selected for the chosen gate
   useEffect(() => {
-    const ids = (enrollGate === "entry" ? entryStreams : exitStreams)
-      .filter((st) => st.enabled)
-      .map((st) => st.id);
+    const ids = allStreams.filter((st) => st.gateKey === enrollGate && st.enabled).map((st) => st.id);
     if (enrollStreamId && ids.includes(enrollStreamId)) return;
     setEnrollStreamId(ids[0] || "");
   }, [enrollGate, streamsConfig]);
@@ -630,7 +631,7 @@ export const EmployeeRegistration: React.FC<EmployeeRegistrationProps> = ({
       rows.push({
         id: key,
         label: key === "__unknown__" ? "Không gắn với camera nào" : key,
-        gateKey: "entry" as "entry" | "exit",
+        gateKey: "",
         gateName: "Ngoài cấu hình camera hiện tại",
         known: false,
         enabled: true,
@@ -638,6 +639,18 @@ export const EmployeeRegistration: React.FC<EmployeeRegistrationProps> = ({
       });
     });
     return rows;
+  })();
+
+  /** The camera cards grouped under their gate's label, gates in configured order; unknown cameras last. */
+  const templateSections = (() => {
+    const sections: Array<{ key: string; gateName: string; rows: typeof templateGroups }> = [];
+    for (const g of configGates) {
+      const rows = templateGroups.filter((row) => row.known && row.gateKey === g.id);
+      if (rows.length > 0) sections.push({ key: g.id, gateName: gateDisplayLabel(g), rows });
+    }
+    const other = templateGroups.filter((row) => !row.known || !configGates.some((g) => g.id === row.gateKey));
+    if (other.length > 0) sections.push({ key: "__other__", gateName: "Ngoài cấu hình camera hiện tại", rows: other });
+    return sections;
   })();
 
   /** Employees shown in the list once the coverage filter is applied. */
@@ -1039,11 +1052,16 @@ export const EmployeeRegistration: React.FC<EmployeeRegistrationProps> = ({
                 <select
                   id="select-enroll-gate"
                   value={enrollGate}
-                  onChange={(e) => setEnrollGate(e.target.value === "entry" ? "entry" : "exit")}
+                  onChange={(e) => setEnrollGate(e.target.value)}
                   className="w-full px-3 py-2 bg-slate-50 border border-slate-200 rounded-xl text-xs focus:outline-hidden focus:ring-2 focus:ring-emerald-500/30 focus:border-emerald-500 transition"
                 >
-                  <option value="entry">Cổng Vào</option>
-                  <option value="exit">Cổng Ra</option>
+                  {configGates.length === 0 && <option value={enrollGate}>{streamsLoading ? "Đang tải cổng..." : enrollGate}</option>}
+                  {configGates.map((g) => (
+                    <option key={g.id} value={g.id}>
+                      {gateDisplayLabel(g)} ({directionLabel(g.direction)})
+                      {g.enabled === false ? " – đang tắt" : ""}
+                    </option>
+                  ))}
                 </select>
               </div>
 
@@ -1271,112 +1289,119 @@ export const EmployeeRegistration: React.FC<EmployeeRegistrationProps> = ({
               )}
 
               {!templatesLoading && !templatesError && templates && templateGroups.length > 0 && (
-                <div className="grid grid-cols-1 lg:grid-cols-2 gap-3">
-                  {templateGroups.map((group) => (
-                    <div
-                      key={`${group.gateKey}-${group.id}`}
-                      className={`rounded-xl border overflow-hidden ${
-                        group.items.length > 0 ? "border-slate-200" : "border-dashed border-amber-300 bg-amber-50/40"
-                      }`}
-                    >
-                      <div className="px-3 py-2 bg-slate-50 border-b border-slate-200 flex items-center justify-between gap-2">
-                        <div className="min-w-0">
-                          <div className="text-xs font-bold text-slate-800 truncate" title={group.label}>
-                            {group.label}
-                          </div>
-                          <div className="text-[10px] text-slate-500 font-mono truncate">
-                            {group.gateName} • {group.id}
-                          </div>
-                        </div>
-                        <span
-                          className={`text-[10px] font-bold px-2 py-0.5 rounded-full border shrink-0 ${
-                            group.items.length > 0
-                              ? "bg-emerald-100 text-emerald-800 border-emerald-200"
-                              : "bg-amber-100 text-amber-800 border-amber-200"
+                <div className="space-y-4">
+                  {templateSections.map((section) => (
+                    <section key={section.key} aria-label={`Mẫu theo camera của ${section.gateName}`}>
+                      <h4 className="text-[11px] font-bold uppercase tracking-wide text-slate-500 mb-1.5">{section.gateName}</h4>
+                      <div className="grid grid-cols-1 lg:grid-cols-2 gap-3">
+                        {section.rows.map((group) => (
+                        <div
+                          key={`${group.gateKey}-${group.id}`}
+                          className={`rounded-xl border overflow-hidden ${
+                            group.items.length > 0 ? "border-slate-200" : "border-dashed border-amber-300 bg-amber-50/40"
                           }`}
                         >
-                          {group.items.length > 0 ? `${group.items.length} mẫu` : "Chưa đăng ký"}
-                          {group.items.some(isAdaptationTemplate)
-                            ? ` · ${group.items.filter(isAdaptationTemplate).length} ${ADAPTATION_TAG}`
-                            : ""}
-                        </span>
-                      </div>
-
-                      {group.items.length === 0 ? (
-                        <div className="px-3 py-2.5 flex items-center justify-between gap-2">
-                          <span className="text-[11px] text-amber-900">
-                            Người này sẽ không được nhận diện tại camera này.
-                          </span>
-                          {group.known && (
-                            <button
-                              type="button"
-                              onClick={() => {
-                                setEnrollGate(group.gateKey);
-                                setEnrollStreamId(group.id);
-                              }}
-                              className="text-[11px] font-semibold text-emerald-700 hover:text-emerald-900 shrink-0 cursor-pointer"
+                          <div className="px-3 py-2 bg-slate-50 border-b border-slate-200 flex items-center justify-between gap-2">
+                            <div className="min-w-0">
+                              <div className="text-xs font-bold text-slate-800 truncate" title={group.label}>
+                                {group.label}
+                              </div>
+                              <div className="text-[10px] text-slate-500 font-mono truncate">
+                                {group.gateName} • {group.id}
+                              </div>
+                            </div>
+                            <span
+                              className={`text-[10px] font-bold px-2 py-0.5 rounded-full border shrink-0 ${
+                                group.items.length > 0
+                                  ? "bg-emerald-100 text-emerald-800 border-emerald-200"
+                                  : "bg-amber-100 text-amber-800 border-amber-200"
+                              }`}
                             >
-                              Chọn camera này
-                            </button>
-                          )}
-                        </div>
-                      ) : (
-                        <div className="divide-y divide-slate-100">
-                          {group.items.map((tpl, idx) => {
-                            const tone = qualityTone(tpl.quality, qualityFloor);
-                            return (
-                              <div key={tpl.id || idx} className="px-3 py-2 flex items-center gap-2.5">
-                                <div className="min-w-0 flex-1">
-                                  <div className="flex items-center gap-2">
-                                    <div className="h-1.5 rounded-full bg-slate-200 overflow-hidden flex-1 min-w-[50px]">
-                                      <div
-                                        className={`h-full ${tone.bar}`}
-                                        style={{
-                                          width: `${Math.round(Math.min(1, Math.max(0, tpl.quality ?? 0)) * 100)}%`,
-                                        }}
-                                      />
-                                    </div>
-                                    <span className={`font-mono text-[10px] font-bold ${tone.text} shrink-0`}>
-                                      {typeof tpl.quality === "number" ? tpl.quality.toFixed(2) : "—"}
-                                    </span>
-                                  </div>
-                                  <div className="text-[10px] text-slate-500 font-mono truncate mt-0.5 flex items-center gap-1.5">
-                                    <span className="truncate">
-                                      {formatCapturedAt(tpl.capturedAt)}
-                                      {tpl.source ? ` • ${tpl.source}` : ""}
-                                      {typeof tpl.dims === "number" ? ` • ${tpl.dims}-D` : ""}
-                                      {tpl.modelTag ? ` • ${tpl.modelTag}` : ""}
-                                    </span>
-                                    {isAdaptationTemplate(tpl) && (
-                                      <span
-                                        className="shrink-0 px-1.5 py-px rounded-full border border-sky-200 bg-sky-50 text-sky-800 font-sans font-semibold"
-                                        title="Mẫu do máy chủ tự tạo từ một lượt nhận diện chắc chắn trên camera này (camera adaptation); có thể xóa như mẫu khác."
-                                        data-testid={`template-adaptation-tag-${tpl.id}`}
-                                      >
-                                        {ADAPTATION_TAG}
-                                      </span>
-                                    )}
-                                  </div>
-                                </div>
+                              {group.items.length > 0 ? `${group.items.length} mẫu` : "Chưa đăng ký"}
+                              {group.items.some(isAdaptationTemplate)
+                                ? ` · ${group.items.filter(isAdaptationTemplate).length} ${ADAPTATION_TAG}`
+                                : ""}
+                            </span>
+                          </div>
+
+                          {group.items.length === 0 ? (
+                            <div className="px-3 py-2.5 flex items-center justify-between gap-2">
+                              <span className="text-[11px] text-amber-900">
+                                Người này sẽ không được nhận diện tại camera này.
+                              </span>
+                              {group.known && (
                                 <button
                                   type="button"
-                                  onClick={() => handleDeleteTemplate(tpl.id)}
-                                  disabled={deletingTemplateId === tpl.id || !tpl.id}
-                                  className="text-slate-400 hover:text-rose-600 p-1 rounded-md transition disabled:opacity-40 shrink-0 cursor-pointer"
-                                  title="Xóa mẫu này"
+                                  onClick={() => {
+                                    setEnrollGate(group.gateKey);
+                                    setEnrollStreamId(group.id);
+                                  }}
+                                  className="text-[11px] font-semibold text-emerald-700 hover:text-emerald-900 shrink-0 cursor-pointer"
                                 >
-                                  {deletingTemplateId === tpl.id ? (
-                                    <RefreshCw className="w-3.5 h-3.5 animate-spin" />
-                                  ) : (
-                                    <Trash2 className="w-3.5 h-3.5" />
-                                  )}
+                                  Chọn camera này
                                 </button>
-                              </div>
-                            );
-                          })}
+                              )}
+                            </div>
+                          ) : (
+                            <div className="divide-y divide-slate-100">
+                              {group.items.map((tpl, idx) => {
+                                const tone = qualityTone(tpl.quality, qualityFloor);
+                                return (
+                                  <div key={tpl.id || idx} className="px-3 py-2 flex items-center gap-2.5">
+                                    <div className="min-w-0 flex-1">
+                                      <div className="flex items-center gap-2">
+                                        <div className="h-1.5 rounded-full bg-slate-200 overflow-hidden flex-1 min-w-[50px]">
+                                          <div
+                                            className={`h-full ${tone.bar}`}
+                                            style={{
+                                              width: `${Math.round(Math.min(1, Math.max(0, tpl.quality ?? 0)) * 100)}%`,
+                                            }}
+                                          />
+                                        </div>
+                                        <span className={`font-mono text-[10px] font-bold ${tone.text} shrink-0`}>
+                                          {typeof tpl.quality === "number" ? tpl.quality.toFixed(2) : "—"}
+                                        </span>
+                                      </div>
+                                      <div className="text-[10px] text-slate-500 font-mono truncate mt-0.5 flex items-center gap-1.5">
+                                        <span className="truncate">
+                                          {formatCapturedAt(tpl.capturedAt)}
+                                          {tpl.source ? ` • ${tpl.source}` : ""}
+                                          {typeof tpl.dims === "number" ? ` • ${tpl.dims}-D` : ""}
+                                          {tpl.modelTag ? ` • ${tpl.modelTag}` : ""}
+                                        </span>
+                                        {isAdaptationTemplate(tpl) && (
+                                          <span
+                                            className="shrink-0 px-1.5 py-px rounded-full border border-sky-200 bg-sky-50 text-sky-800 font-sans font-semibold"
+                                            title="Mẫu do máy chủ tự tạo từ một lượt nhận diện chắc chắn trên camera này (camera adaptation); có thể xóa như mẫu khác."
+                                            data-testid={`template-adaptation-tag-${tpl.id}`}
+                                          >
+                                            {ADAPTATION_TAG}
+                                          </span>
+                                        )}
+                                      </div>
+                                    </div>
+                                    <button
+                                      type="button"
+                                      onClick={() => handleDeleteTemplate(tpl.id)}
+                                      disabled={deletingTemplateId === tpl.id || !tpl.id}
+                                      className="text-slate-400 hover:text-rose-600 p-1 rounded-md transition disabled:opacity-40 shrink-0 cursor-pointer"
+                                      title="Xóa mẫu này"
+                                    >
+                                      {deletingTemplateId === tpl.id ? (
+                                        <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+                                      ) : (
+                                        <Trash2 className="w-3.5 h-3.5" />
+                                      )}
+                                    </button>
+                                  </div>
+                                );
+                              })}
+                            </div>
+                          )}
                         </div>
-                      )}
-                    </div>
+                        ))}
+                      </div>
+                    </section>
                   ))}
                 </div>
               )}

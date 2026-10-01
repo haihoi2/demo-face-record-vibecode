@@ -22,9 +22,32 @@ import {
   Radio,
   ExternalLink,
   Code2,
+  Plus,
+  DoorOpen,
 } from "lucide-react";
-import { DoorControllerConfig, DoorApiLog, DoorAuthHeaderType, SmartLockState } from "../types";
-import { operatorJsonFetch } from "../utils/api";
+import { CameraStreamsConfig, DoorControllerConfig, DoorApiLog, DoorAuthHeaderType, SmartLockState } from "../types";
+import { operatorJsonFetch, safeJsonFetch } from "../utils/api";
+import { ModalDialog } from "./ModalDialog";
+import { hasRole, useOperatorSession } from "../utils/session";
+import { gateDisplayLabel, gateDoorId, gatesOf } from "../utils/gates";
+import {
+  LEGACY_DOOR_ID,
+  LEGACY_LOCK_STATUS_URL,
+  TOKEN_PLACEHOLDER,
+  buildDoorSavePayload,
+  buildDoorTestConfig,
+  buildLockCommandRequest,
+  buildLockStateUrl,
+  doorDisplayLabel,
+  doorsOf,
+  interpretLockCommand,
+  newDoorView,
+  readLockState,
+  validateDoorDraft,
+  withoutTokens,
+  type DoorDraft,
+  type DoorView,
+} from "../utils/doors";
 import { soundEffects } from "../utils/audio";
 import {
   getStoredDoorLogs,
@@ -43,7 +66,50 @@ export const DoorConfigPage: React.FC<DoorConfigPageProps> = ({
   lockState,
   onRefreshLockState,
 }) => {
-  const [config, setConfig] = useState<DoorControllerConfig>(DEFAULT_OFFLINE_DOOR_CONFIG);
+  // Manual door commands are admin-only; the server refuses them for anyone else.
+  const canOperateDoor = hasRole(useOperatorSession(), "admin");
+  // Doors (N-gate wave): `doors[]` from the server, or its single config read as door "main".
+  // The page never holds a controller token: what the server sends is dropped on read,
+  // and a token is sent only when the admin types a new one (tokenDrafts).
+  const [doors, setDoors] = useState<DoorView[]>(() => doorsOf(DEFAULT_OFFLINE_DOOR_CONFIG).doors);
+  const [multiDoor, setMultiDoor] = useState<boolean>(false);
+  const [selectedDoorId, setSelectedDoorId] = useState<string>(LEGACY_DOOR_ID);
+  const [tokenDrafts, setTokenDrafts] = useState<Record<string, string | undefined>>({});
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const [saveError, setSaveError] = useState<string | null>(null);
+  const [addDoorOpen, setAddDoorOpen] = useState<boolean>(false);
+  const [doorDraft, setDoorDraft] = useState<DoorDraft>({ id: "", label: "" });
+  const [doorDraftError, setDoorDraftError] = useState<string | null>(null);
+  /** Gates and the door each one opens (read-only here; bound on the camera page). */
+  const [gateBindings, setGateBindings] = useState<Array<{ id: string; label: string; doorId: string }>>([]);
+  // Lock state per door, read from the server; null = could not be read.
+  const [lockStates, setLockStates] = useState<Record<string, SmartLockState | null>>({});
+  const [lockBusy, setLockBusy] = useState<string | null>(null);
+  const [lockNotice, setLockNotice] = useState<{ ok: boolean; text: string } | null>(null);
+
+  const config: DoorView = doors.find((d) => d.id === selectedDoorId) ?? doors[0] ?? doorsOf(DEFAULT_OFFLINE_DOOR_CONFIG).doors[0];
+  /** Edit the selected door's controller fields (the form below is unchanged). */
+  const setConfig = (action: React.SetStateAction<DoorControllerConfig>) => {
+    const id = config.id;
+    setDoors((prev) =>
+      prev.map((d) => {
+        if (d.id !== id) return d;
+        const next = typeof action === "function" ? (action as (p: DoorControllerConfig) => DoorControllerConfig)(d) : action;
+        // Identity and token stay out of the form's reach.
+        return { ...d, ...next, id: d.id, label: d.label, apiToken: "", hasToken: d.hasToken } as DoorView;
+      })
+    );
+  };
+  const tokenDraft = tokenDrafts[config.id];
+
+  const applyServerDoors = useCallback((raw: unknown) => {
+    const { doors: list, multiDoor: multi } = doorsOf(raw);
+    if (list.length === 0) return;
+    setDoors(list);
+    setMultiDoor(multi);
+    setTokenDrafts({});
+    setSelectedDoorId((prev) => (list.some((d) => d.id === prev) ? prev : list[0].id));
+  }, []);
   const [logs, setLogs] = useState<DoorApiLog[]>([]);
   const [loading, setLoading] = useState<boolean>(false);
   const [saving, setSaving] = useState<boolean>(false);
@@ -67,10 +133,26 @@ export const DoorConfigPage: React.FC<DoorConfigPageProps> = ({
     setLoading(true);
     try {
       const configRes = await operatorJsonFetch<DoorControllerConfig>("/api/door-controller/config");
-      if (configRes.ok && configRes.data && configRes.data.apiUrl) {
-        setConfig(configRes.data);
+      if (configRes.ok && configRes.data && (configRes.data.apiUrl || Array.isArray(configRes.data.doors))) {
+        applyServerDoors(configRes.data);
+        setLoadError(null);
       } else {
-        setConfig(DEFAULT_OFFLINE_DOOR_CONFIG);
+        applyServerDoors(DEFAULT_OFFLINE_DOOR_CONFIG);
+        // A refusal or an unreachable server is said as such; the form then shows defaults, not the stored config.
+        setLoadError(
+          configRes.ok
+            ? null
+            : configRes.status === 0
+              ? "Không kết nối được máy chủ: đang hiển thị cấu hình mặc định, không phải cấu hình đã lưu."
+              : `Máy chủ từ chối đọc cấu hình cửa (HTTP ${configRes.status}): đang hiển thị cấu hình mặc định.`
+        );
+      }
+
+      const camRes = await safeJsonFetch<{ config?: CameraStreamsConfig }>("/api/camera-streams/config");
+      if (camRes.ok) {
+        setGateBindings(
+          gatesOf(camRes.data?.config).map((g) => ({ id: g.id, label: gateDisplayLabel(g), doorId: gateDoorId(g) }))
+        );
       }
 
       const logsRes = await operatorJsonFetch<DoorApiLog[]>("/api/door-controller/logs");
@@ -81,12 +163,12 @@ export const DoorConfigPage: React.FC<DoorConfigPageProps> = ({
         setLogs(getStoredDoorLogs());
       }
     } catch {
-      setConfig(DEFAULT_OFFLINE_DOOR_CONFIG);
+      applyServerDoors(DEFAULT_OFFLINE_DOOR_CONFIG);
       setLogs(getStoredDoorLogs());
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [applyServerDoors]);
 
   useEffect(() => {
     fetchConfigAndLogs();
@@ -97,7 +179,7 @@ export const DoorConfigPage: React.FC<DoorConfigPageProps> = ({
     });
 
     const unsubConfig = clientEventBus.on("door_config_updated", (newConfig: DoorControllerConfig) => {
-      setConfig(newConfig);
+      applyServerDoors(newConfig);
     });
 
     const unsubClear = clientEventBus.on("door_api_logs_cleared", () => {
@@ -109,27 +191,95 @@ export const DoorConfigPage: React.FC<DoorConfigPageProps> = ({
       unsubConfig();
       unsubClear();
     };
-  }, [fetchConfigAndLogs]);
+  }, [fetchConfigAndLogs, applyServerDoors]);
+
+  // ---- Lock state and commands per door (server-owned; nothing is simulated here) ----
+  const fetchLockState = useCallback(async (doorId: string) => {
+    let res = await operatorJsonFetch<unknown>(buildLockStateUrl(doorId));
+    // An older server has one lock at /api/lock/status; only door "main" may use it.
+    if (res.status === 404 && doorId === LEGACY_DOOR_ID) res = await operatorJsonFetch<unknown>(LEGACY_LOCK_STATUS_URL);
+    setLockStates((prev) => ({ ...prev, [doorId]: res.ok ? readLockState(res.data, doorId) : null }));
+  }, []);
+
+  const doorIdsKey = doors.map((d) => d.id).join("|");
+  useEffect(() => {
+    for (const id of doorIdsKey.split("|")) if (id) void fetchLockState(id);
+  }, [doorIdsKey, fetchLockState]);
+
+  const handleLockCommand = async (door: DoorView, action: "unlock" | "lock") => {
+    const label = doorDisplayLabel(door);
+    setLockBusy(door.id);
+    setLockNotice(null);
+    try {
+      const { url, init } = buildLockCommandRequest(action, door.id, `Trang Cấu Hình Cửa (${label})`);
+      const res = await operatorJsonFetch<unknown>(url, init);
+      const outcome = interpretLockCommand(action, door.id, label, res);
+      if (outcome.kind === "applied") {
+        if (outcome.lockState) setLockStates((prev) => ({ ...prev, [door.id]: outcome.lockState }));
+        else void fetchLockState(door.id);
+        if (door.id === LEGACY_DOOR_ID) onRefreshLockState?.();
+        soundEffects.playGranted();
+      } else {
+        soundEffects.playDenied();
+      }
+      setLockNotice({ ok: outcome.kind === "applied", text: outcome.message });
+    } finally {
+      setLockBusy(null);
+    }
+  };
+
+  // ---- Adding a door: local until "Lưu Cấu Hình" sends it with the others ----
+  const handleAddDoor = () => {
+    const error = validateDoorDraft(doorDraft, doors.map((d) => d.id));
+    if (error) {
+      setDoorDraftError(error);
+      return;
+    }
+    const door = newDoorView(doorDraft, DEFAULT_OFFLINE_DOOR_CONFIG);
+    setDoors((prev) => [...prev, door]);
+    setSelectedDoorId(door.id);
+    setAddDoorOpen(false);
+    setDoorDraft({ id: "", label: "" });
+    setDoorDraftError(null);
+  };
 
   const handleSave = async (e?: React.FormEvent) => {
     if (e) e.preventDefault();
     setSaving(true);
     setSaveSuccess(false);
+    setSaveError(null);
 
     try {
-      const result = await operatorJsonFetch("/api/door-controller/config", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(config),
-      });
-      if (!result.ok) throw new Error(result.error || `Lưu cấu hình thất bại (HTTP ${result.status})`);
+      const result = await operatorJsonFetch<{ success?: boolean; config?: unknown; error?: string }>(
+        "/api/door-controller/config",
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(buildDoorSavePayload(doors, tokenDrafts, multiDoor)),
+        }
+      );
+      if (!result.ok || result.data?.success === false) {
+        throw new Error(
+          result.status === 0
+            ? "Không kết nối được máy chủ: cấu hình cửa CHƯA được lưu."
+            : `${result.data?.error || result.error || `Lưu cấu hình thất bại (HTTP ${result.status})`}. Cấu hình cửa CHƯA được lưu.`
+        );
+      }
 
-      clientEventBus.emit("door_config_updated", config);
+      // Render what the server stored (tokens dropped on read), not what was sent.
+      if (result.data?.config) {
+        applyServerDoors(result.data.config);
+        clientEventBus.emit("door_config_updated", withoutTokens(result.data.config));
+      } else {
+        setTokenDrafts({});
+        await fetchConfigAndLogs();
+      }
       setSaveSuccess(true);
       soundEffects.playGranted();
       setTimeout(() => setSaveSuccess(false), 3500);
-    } catch (err) {
-      console.warn("Lỗi lưu cấu hình API cửa:", err);
+    } catch (err: any) {
+      console.warn("Lỗi lưu cấu hình API cửa:", err?.message);
+      setSaveError(err?.message || "Lưu cấu hình cửa thất bại.");
       setSaveSuccess(false);
     } finally {
       setSaving(false);
@@ -152,7 +302,8 @@ export const DoorConfigPage: React.FC<DoorConfigPageProps> = ({
             action: testAction,
             source: testSource,
             updateDoorState: updateUIAfterTest,
-            testConfig: config,
+            doorId: config.id,
+            testConfig: buildDoorTestConfig(config, tokenDraft),
           }),
         }
       );
@@ -304,20 +455,22 @@ export const DoorConfigPage: React.FC<DoorConfigPageProps> = ({
   };
 
   const generateCurlCommand = () => {
+    // Never the token itself (stored or typed): the preview is copied and pasted around.
+    const hasAnyToken = config.hasToken || !!tokenDraft;
     let authHeader = "";
-    if (config.apiToken) {
+    if (hasAnyToken) {
       if (config.authHeaderType === "BEARER") {
-        authHeader = ` \\\n  -H "Authorization: Bearer ${config.apiToken}"`;
+        authHeader = ` \\\n  -H "Authorization: Bearer ${TOKEN_PLACEHOLDER}"`;
       } else if (config.authHeaderType === "API_KEY") {
-        authHeader = ` \\\n  -H "X-Api-Key: ${config.apiToken}"`;
+        authHeader = ` \\\n  -H "X-Api-Key: ${TOKEN_PLACEHOLDER}"`;
       } else if (config.authHeaderType === "CUSTOM_HEADER") {
-        authHeader = ` \\\n  -H "${config.customHeaderName || "X-Door-Token"}: ${config.apiToken}"`;
+        authHeader = ` \\\n  -H "${config.customHeaderName || "X-Door-Token"}: ${TOKEN_PLACEHOLDER}"`;
       }
     }
 
     let url = config.apiUrl || "https://smartlock.eton.vn/api/door/control";
-    if (config.authHeaderType === "QUERY_PARAM" && config.apiToken) {
-      url += (url.includes("?") ? "&" : "?") + `token=${config.apiToken}`;
+    if (config.authHeaderType === "QUERY_PARAM" && hasAnyToken) {
+      url += (url.includes("?") ? "&" : "?") + `token=${TOKEN_PLACEHOLDER}`;
     }
 
     let data = "";
@@ -328,7 +481,7 @@ export const DoorConfigPage: React.FC<DoorConfigPageProps> = ({
             .replace(/\{\{TRIGGERED_BY\}\}/g, "Admin Test")
             .replace(/\{\{TIMESTAMP\}\}/g, new Date().toISOString())
             .replace(/\{\{PULSE\}\}/g, String(config.pulseDurationSeconds || 6))
-            .replace(/\{\{DOOR\}\}/g, lockState.doorName)
+            .replace(/\{\{DOOR\}\}/g, config.id === LEGACY_DOOR_ID ? lockState.doorName : doorDisplayLabel(config))
         : JSON.stringify({ action: "OPEN", pulse: config.pulseDurationSeconds || 6 });
       data = ` \\\n  -H "Content-Type: application/json" \\\n  -d '${payload.replace(/'/g, "\\'")}'`;
     }
@@ -414,10 +567,181 @@ export const DoorConfigPage: React.FC<DoorConfigPageProps> = ({
         </div>
       </div>
 
+      {(loadError || saveError) && (
+        <div role="alert" className="p-3 rounded-xl border border-rose-200 bg-rose-50 text-xs text-rose-800 space-y-1">
+          {loadError && <p>{loadError}</p>}
+          {saveError && <p>{saveError}</p>}
+        </div>
+      )}
+
+      {/* Door list (N-gate wave): each gate opens exactly its own door */}
+      <section
+        aria-labelledby="door-list-title"
+        className="bg-white rounded-2xl border border-slate-200 p-5 sm:p-6 shadow-xs space-y-4"
+        data-testid="door-list"
+      >
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <div className="flex items-center gap-2.5">
+            <div className="w-8 h-8 rounded-lg bg-teal-100 text-teal-700 flex items-center justify-center">
+              <DoorOpen className="w-4 h-4" />
+            </div>
+            <div>
+              <h2 id="door-list-title" className="text-sm font-bold text-slate-900">
+                Danh Sách Cửa ({doors.length})
+              </h2>
+              <p className="text-xs text-slate-500">
+                Chọn một cửa để sửa bộ điều khiển của cửa đó bên dưới. Mỗi cổng mở đúng cửa đã gán ở trang Cấu Hình Luồng Camera.
+              </p>
+            </div>
+          </div>
+          <button
+            id="door-btn-add"
+            type="button"
+            onClick={() => {
+              setDoorDraft({ id: "", label: "" });
+              setDoorDraftError(null);
+              setAddDoorOpen(true);
+            }}
+            disabled={!multiDoor}
+            title={multiDoor ? "Thêm một cửa và bộ điều khiển của cửa đó" : "Máy chủ này chưa hỗ trợ nhiều cửa: chỉ có cửa chính"}
+            className="inline-flex items-center gap-1.5 px-3 py-2 rounded-xl text-xs font-semibold text-white bg-teal-600 hover:bg-teal-700 disabled:opacity-50 disabled:cursor-not-allowed"
+          >
+            <Plus className="w-3.5 h-3.5" />
+            Thêm cửa
+          </button>
+        </div>
+
+        <ul className="divide-y divide-slate-100 rounded-xl border border-slate-200" aria-label="Các cửa">
+          {doors.map((door) => {
+            const selected = door.id === config.id;
+            const lock = lockStates[door.id];
+            const usedBy = gateBindings.filter((g) => g.doorId === door.id);
+            const busy = lockBusy === door.id;
+            return (
+              <li
+                key={door.id}
+                data-door-id={door.id}
+                className={`px-3 py-2.5 flex flex-wrap items-center gap-3 text-xs ${selected ? "bg-teal-50/60" : ""}`}
+              >
+                <button
+                  type="button"
+                  onClick={() => setSelectedDoorId(door.id)}
+                  aria-pressed={selected}
+                  className="flex-1 min-w-[12rem] text-left"
+                  title="Sửa bộ điều khiển của cửa này"
+                >
+                  <span className="font-bold text-slate-900">{doorDisplayLabel(door)}</span>
+                  <span className="ml-1.5 font-mono text-[11px] text-slate-500">{door.id}</span>
+                  <span className={`ml-2 text-[10px] font-semibold ${door.enabled ? "text-emerald-700" : "text-slate-500"}`}>
+                    {door.enabled ? "đang bật" : "đang tắt"}
+                  </span>
+                  <span className="block text-[11px] text-slate-500 mt-0.5">
+                    {usedBy.length > 0 ? `Cổng dùng cửa này: ${usedBy.map((g) => g.label).join(", ")}` : "Chưa có cổng nào gán vào cửa này"}
+                  </span>
+                </button>
+                <span
+                  className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-full border text-[10px] font-bold ${
+                    lock === undefined
+                      ? "bg-slate-50 text-slate-500 border-slate-200"
+                      : lock === null
+                        ? "bg-amber-50 text-amber-800 border-amber-200"
+                        : lock.isLocked
+                          ? "bg-slate-100 text-slate-800 border-slate-300"
+                          : "bg-emerald-50 text-emerald-800 border-emerald-300"
+                  }`}
+                >
+                  {lock === undefined ? (
+                    "đang đọc..."
+                  ) : lock === null ? (
+                    "không đọc được trạng thái"
+                  ) : lock.isLocked ? (
+                    <>
+                      <Lock className="w-3 h-3" /> Đang khóa
+                    </>
+                  ) : (
+                    <>
+                      <Unlock className="w-3 h-3" /> Đang mở
+                    </>
+                  )}
+                </span>
+                {canOperateDoor && (
+                  <span className="inline-flex gap-1.5">
+                    <button
+                      type="button"
+                      id={`door-btn-unlock-${door.id}`}
+                      disabled={busy}
+                      onClick={() => void handleLockCommand(door, "unlock")}
+                      className="inline-flex items-center gap-1 px-2 py-1 rounded-lg border border-emerald-300 text-emerald-800 bg-white hover:bg-emerald-50 font-semibold disabled:opacity-40"
+                    >
+                      <Unlock className="w-3 h-3" /> Mở
+                    </button>
+                    <button
+                      type="button"
+                      id={`door-btn-lock-${door.id}`}
+                      disabled={busy}
+                      onClick={() => void handleLockCommand(door, "lock")}
+                      className="inline-flex items-center gap-1 px-2 py-1 rounded-lg border border-slate-300 text-slate-800 bg-white hover:bg-slate-50 font-semibold disabled:opacity-40"
+                    >
+                      <Lock className="w-3 h-3" /> Khóa
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => void fetchLockState(door.id)}
+                      className="p-1 rounded-lg text-slate-500 hover:bg-slate-100"
+                      aria-label={`Đọc lại trạng thái khóa của ${doorDisplayLabel(door)}`}
+                    >
+                      <RefreshCw className={`w-3.5 h-3.5 ${busy ? "animate-spin" : ""}`} />
+                    </button>
+                  </span>
+                )}
+              </li>
+            );
+          })}
+        </ul>
+
+        <div role="status" aria-live="polite" className="empty:hidden">
+          {lockNotice && (
+            <p
+              className={`px-3 py-2 rounded-lg border text-xs ${
+                lockNotice.ok ? "bg-emerald-50 border-emerald-200 text-emerald-900" : "bg-rose-50 border-rose-200 text-rose-900"
+              }`}
+            >
+              {lockNotice.text}
+            </p>
+          )}
+        </div>
+
+        {multiDoor && (
+          <div className="flex flex-wrap items-end gap-3 pt-1">
+            <div>
+              <label htmlFor="door-label-input" className="block text-xs font-semibold text-slate-700 mb-1">
+                Tên hiển thị của cửa đang chọn ({config.id})
+              </label>
+              <input
+                id="door-label-input"
+                type="text"
+                maxLength={80}
+                value={config.label}
+                onChange={(e) => {
+                  const label = e.target.value;
+                  setDoors((prev) => prev.map((d) => (d.id === config.id ? { ...d, label } : d)));
+                }}
+                className="w-64 px-3 py-1.5 bg-slate-50 border border-slate-300 rounded-lg text-xs"
+              />
+            </div>
+            <p className="text-[11px] text-slate-500">Thay đổi tên và bộ điều khiển được lưu khi bấm "Lưu Cấu Hình".</p>
+          </div>
+        )}
+      </section>
+
       {/* Main Grid: Form Settings (Left) + Interactive Test & Logs (Right) */}
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
         {/* Left Column: Configuration Form (7 cols) */}
         <div className="lg:col-span-7 space-y-6">
+          <p className="text-xs font-semibold text-slate-700">
+            Đang sửa bộ điều khiển của: <span className="text-teal-700">{doorDisplayLabel(config)}</span>{" "}
+            <span className="font-mono text-slate-500">({config.id})</span>
+          </p>
           <form onSubmit={handleSave} className="space-y-6">
             {/* Section 1: Enable & Quick Presets */}
             <div className="bg-white rounded-2xl border border-slate-200 p-5 sm:p-6 shadow-xs space-y-5">
@@ -589,7 +913,8 @@ export const DoorConfigPage: React.FC<DoorConfigPageProps> = ({
               </div>
 
               {/* Secret Token Input */}
-              {config.authHeaderType !== "NONE" && (
+              {/* "NONE" is sent by the presets/select but missing from DoorAuthHeaderType (proposed type fix in the handoff). */}
+              {(config.authHeaderType as string) !== "NONE" && (
                 <div>
                   <label
                     htmlFor="door-api-token"
@@ -601,11 +926,18 @@ export const DoorConfigPage: React.FC<DoorConfigPageProps> = ({
                     <input
                       id="door-api-token"
                       type={showToken ? "text" : "password"}
-                      value={config.apiToken}
-                      onChange={(e) =>
-                        setConfig((prev) => ({ ...prev, apiToken: e.target.value }))
+                      value={tokenDraft ?? ""}
+                      autoComplete="off"
+                      onChange={(e) => {
+                        const value = e.target.value;
+                        // Empty again = keep the stored token (nothing is sent).
+                        setTokenDrafts((prev) => ({ ...prev, [config.id]: value === "" ? undefined : value }));
+                      }}
+                      placeholder={
+                        config.hasToken
+                          ? "Đã có token lưu trên máy chủ - để trống để giữ nguyên"
+                          : "Nhập secret token mở khóa"
                       }
-                      placeholder="Nhập secret token mở khóa"
                       className="w-full px-3.5 py-2.5 bg-slate-50 border border-slate-300 rounded-xl text-xs sm:text-sm font-mono text-slate-900 focus:bg-white focus:outline-hidden focus:ring-2 focus:ring-emerald-500/20 focus:border-emerald-600 transition-all pr-10"
                     />
                     <button
@@ -618,7 +950,9 @@ export const DoorConfigPage: React.FC<DoorConfigPageProps> = ({
                     </button>
                   </div>
                   <p className="text-[11px] text-slate-500 mt-1">
-                    Token được lưu trữ an toàn trong Database và tự động ẩn khi hiển thị ra nhật ký.
+                    Token chỉ được gửi lên khi bạn nhập token mới; máy chủ không trả token về trình duyệt và trang không
+                    hiển thị lại token đã lưu.
+                    {config.hasToken ? " Cửa này đã có token." : " Cửa này chưa có token."}
                   </p>
                 </div>
               )}
@@ -1159,6 +1493,76 @@ export const DoorConfigPage: React.FC<DoorConfigPageProps> = ({
           </div>
         </div>
       </div>
+      {addDoorOpen && (
+        <ModalDialog
+          id="add-door-dialog"
+          title={
+            <>
+              <Plus className="w-4 h-4 text-teal-600" /> Thêm cửa
+            </>
+          }
+          description="Cửa mới bắt đầu ở trạng thái tắt, chưa có URL và token. Điền bộ điều khiển bên dưới rồi bấm Lưu Cấu Hình; sau đó gán cửa cho cổng ở trang Cấu Hình Luồng Camera."
+          onClose={() => setAddDoorOpen(false)}
+          footer={
+            <>
+              <button
+                type="button"
+                onClick={() => setAddDoorOpen(false)}
+                className="px-3 py-1.5 text-xs font-semibold rounded-lg border border-slate-200 text-slate-700 hover:bg-slate-50"
+              >
+                Hủy
+              </button>
+              <button
+                type="button"
+                onClick={handleAddDoor}
+                className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold rounded-lg bg-teal-600 text-white hover:bg-teal-700"
+              >
+                <Plus className="w-3.5 h-3.5" />
+                Thêm vào danh sách
+              </button>
+            </>
+          }
+        >
+          <div>
+            <label htmlFor="new-door-label" className="block text-xs font-semibold text-slate-700">
+              Tên hiển thị
+            </label>
+            <input
+              id="new-door-label"
+              data-autofocus
+              type="text"
+              maxLength={80}
+              value={doorDraft.label}
+              onChange={(e) => setDoorDraft((d) => ({ ...d, label: e.target.value }))}
+              placeholder="VD: Cửa kho B"
+              className="mt-1 w-full px-3 py-2 rounded-lg border border-slate-300 text-sm"
+            />
+          </div>
+          <div>
+            <label htmlFor="new-door-id" className="block text-xs font-semibold text-slate-700">
+              Mã cửa
+            </label>
+            <input
+              id="new-door-id"
+              type="text"
+              maxLength={32}
+              value={doorDraft.id}
+              onChange={(e) => setDoorDraft((d) => ({ ...d, id: e.target.value.trim().toLowerCase() }))}
+              placeholder="vd: kho-b"
+              aria-describedby="new-door-id-hint"
+              className="mt-1 w-full px-3 py-2 rounded-lg border border-slate-300 text-sm font-mono"
+            />
+            <p id="new-door-id-hint" className="mt-1 text-[11px] text-slate-500">
+              2-32 ký tự: chữ thường không dấu, số, dấu gạch ngang; bắt đầu bằng chữ cái.
+            </p>
+          </div>
+          <div role="alert" className="empty:hidden">
+            {doorDraftError && (
+              <p className="px-3 py-2 rounded-lg border border-rose-200 bg-rose-50 text-xs text-rose-800">{doorDraftError}</p>
+            )}
+          </div>
+        </ModalDialog>
+      )}
     </div>
   );
 };

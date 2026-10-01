@@ -5,18 +5,21 @@
  */
 import { apiFetch, operatorJsonFetch } from "./api";
 import type { AccessLog } from "../types";
+import { isGateId } from "./gates";
 
 export interface AccessLogFilters {
   q: string;
   status: "ALL" | "GRANTED" | "DENIED";
   type: "ALL" | "ENTRY" | "EXIT";
+  /** Gate id ("" = every gate). The direction filter above stays independent of it. */
+  gateId: string;
   /** yyyy-mm-dd in the viewer's local calendar, inclusive; "" = open. */
   fromDate: string;
   /** yyyy-mm-dd, inclusive (the whole day); "" = open. */
   toDate: string;
 }
 
-export const EMPTY_LOG_FILTERS: AccessLogFilters = { q: "", status: "ALL", type: "ALL", fromDate: "", toDate: "" };
+export const EMPTY_LOG_FILTERS: AccessLogFilters = { q: "", status: "ALL", type: "ALL", gateId: "", fromDate: "", toDate: "" };
 
 export interface AccessLogHourBucket {
   hour: number;
@@ -52,6 +55,8 @@ export function logFilterParams(f: AccessLogFilters, extraFrom?: string): URLSea
   if (f.q.trim()) p.set("q", f.q.trim());
   if (f.status !== "ALL") p.set("status", f.status);
   if (f.type !== "ALL") p.set("type", f.type);
+  // Old events have no gateId; the server matches them to "entry"/"exit" by type.
+  if (f.gateId && isGateId(f.gateId)) p.set("gateId", f.gateId);
   let from = f.fromDate ? startOfLocalDay(f.fromDate) : "";
   if (extraFrom && (!from || extraFrom > from)) from = extraFrom;
   if (from) p.set("from", from);

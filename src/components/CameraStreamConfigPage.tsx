@@ -38,9 +38,11 @@ import {
   X,
   Save,
   Crop,
+  DoorOpen,
 } from "lucide-react";
 import {
   CameraStreamsConfig,
+  GateConfig,
   GateStreamConfig,
   GateStreamSource,
   CameraSourceType,
@@ -49,8 +51,33 @@ import {
 import { apiFetch, operatorJsonFetch } from "../utils/api";
 import { ProtectedImage } from "./ProtectedImage";
 import { GateAreaEditor } from "./GateAreaEditor";
+import { ModalDialog } from "./ModalDialog";
 import { formatGateArea, streamGateArea } from "../utils/gateArea";
 import { hasRole, useOperatorSession } from "../utils/session";
+import {
+  LEGACY_DOOR_ID,
+  buildCreateGateRequest,
+  buildDeleteGateRequest,
+  buildUpdateGateRequest,
+  canDeleteGate,
+  deleteGateConfirmText,
+  directionLabel,
+  enabledGates,
+  gateDisplayLabel,
+  gateDoorId,
+  gatesOf,
+  interpretGateMutation,
+  isLegacyGateId,
+  legacyGateLabel,
+  serverHasGates,
+  suggestGateId,
+  updateGateInConfig,
+  validateGateDraft,
+  type GateDirection,
+  type GateDraft,
+  type GateMutationOutcome,
+} from "../utils/gates";
+import { doorDisplayLabel, doorsOf } from "../utils/doors";
 
 const DEFAULT_STREAMS_CONFIG: CameraStreamsConfig = {
   entryGate: {
@@ -98,12 +125,14 @@ interface AvailableMediaDevice {
 }
 
 // ----------------- MULTI-STREAM HELPERS -----------------
-type GateKey = "entry" | "exit";
-type GateField = "entryGate" | "exitGate";
+/** A gate id ("entry", "exit", or any configured slug). Gates are keyed by id, never by direction. */
+type GateKey = string;
 type StreamResolution = NonNullable<GateStreamSource["resolution"]>;
 
-const gateKeyOf = (gateType: "ENTRY" | "EXIT"): GateKey => (gateType === "EXIT" ? "exit" : "entry");
-const gateFieldOf = (key: GateKey): GateField => (key === "exit" ? "exitGate" : "entryGate");
+/** Tab value of the all-gates overview (not a valid gate id, so it can never collide). */
+const OVERVIEW_TAB = "__overview__";
+
+const EMPTY_GATE_DRAFT: GateDraft = { id: "", label: "", direction: "", doorId: LEGACY_DOOR_ID };
 
 /**
  * Returns the gate's streams sorted by priority. When the payload carries no
@@ -125,7 +154,7 @@ const deriveGateStreams = (gate: GateStreamConfig | undefined, key: GateKey): Ga
   return [
     {
       id: `${key}-primary`,
-      label: gate.name || (key === "exit" ? "Cổng Ra" : "Cổng Vào"),
+      label: gate.name || legacyGateLabel(key) || key,
       sourceType: gate.sourceType || "RTSP",
       rtspUrl: gate.rtspUrl,
       rtspTransport: gate.rtspTransport || "TCP",
@@ -277,10 +306,23 @@ interface PreviewSource {
 export const CameraStreamConfigPage: React.FC = () => {
   // Drawing a gate area is a camera-stream mutation: operator and up (the server enforces it).
   const canEditGateArea = hasRole(useOperatorSession(), "operator");
+  // Adding, editing and removing gates is admin-only (the server enforces it).
+  const isAdmin = hasRole(useOperatorSession(), "admin");
   const [gateAreaStreamId, setGateAreaStreamId] = useState<string | null>(null);
   const [config, setConfig] = useState<CameraStreamsConfig>(DEFAULT_STREAMS_CONFIG);
   const [telemetry, setTelemetry] = useState<ThreadPoolTelemetry | null>(null);
-  const [activeGateTab, setActiveGateTab] = useState<"ENTRY" | "EXIT" | "DUAL_MONITOR">("ENTRY");
+  /** The selected gate id, or the all-gates overview. */
+  const [activeGateTab, setActiveGateTab] = useState<string>("entry");
+  // Gate management (admin): add / edit / remove, all answered by the server.
+  const [doorOptions, setDoorOptions] = useState<Array<{ id: string; label: string }>>([]);
+  const [addGateOpen, setAddGateOpen] = useState<boolean>(false);
+  const [gateDraft, setGateDraft] = useState<GateDraft>(EMPTY_GATE_DRAFT);
+  const [gateDraftIdTouched, setGateDraftIdTouched] = useState<boolean>(false);
+  const [gateDraftError, setGateDraftError] = useState<string | null>(null);
+  const [gateInfoDraft, setGateInfoDraft] = useState<{ label: string; direction: GateDirection; doorId: string } | null>(null);
+  const [gateBusy, setGateBusy] = useState<boolean>(false);
+  const [gateNotice, setGateNotice] = useState<{ tone: "ok" | "error" | "warn"; text: string } | null>(null);
+  const [deleteGateId, setDeleteGateId] = useState<string | null>(null);
   const [availableCameras, setAvailableCameras] = useState<AvailableMediaDevice[]>([]);
   const [loading, setLoading] = useState<boolean>(true);
   const [saving, setSaving] = useState<boolean>(false);
@@ -397,6 +439,21 @@ export const CameraStreamConfigPage: React.FC = () => {
     };
   }, []);
 
+  // Doors a gate can be bound to (admin read). Without it the selector offers the
+  // gate's current door and the legacy door "main" only.
+  useEffect(() => {
+    if (!isAdmin) return;
+    let active = true;
+    (async () => {
+      const res = await operatorJsonFetch<unknown>("/api/door-controller/config");
+      if (!active || !res.ok) return;
+      setDoorOptions(doorsOf(res.data).doors.map((d) => ({ id: d.id, label: doorDisplayLabel(d) })));
+    })();
+    return () => {
+      active = false;
+    };
+  }, [isAdmin]);
+
   // Save Configuration (global settings + gate name/enabled only).
   //
   // This deliberately does NOT send a `streams` array. Streams are added,
@@ -413,15 +470,16 @@ export const CameraStreamConfigPage: React.FC = () => {
       setSaveError(null);
       setSaveSuccess(false);
 
-      const gateScalars = (gate: GateStreamConfig) => {
+      const gateScalars = <G extends GateStreamConfig>(gate: G) => {
         const { streams: _streams, ...rest } = gate;
         return rest;
       };
-      const payload = {
-        ...config,
-        entryGate: gateScalars(config.entryGate),
-        exitGate: gateScalars(config.exitGate),
-      };
+      // A server that sends `gates` gets `gates` (it wins over the legacy views);
+      // an older one gets entryGate/exitGate exactly as before.
+      const { gates: _gates, entryGate: _entry, exitGate: _exit, ...globals } = config;
+      const payload = serverHasGates(config)
+        ? { ...globals, gates: gatesOf(config).map(gateScalars) }
+        : { ...globals, entryGate: gateScalars(config.entryGate), exitGate: gateScalars(config.exitGate) };
 
       const res = await operatorJsonFetch<any>("/api/camera-streams/config", {
         method: "POST",
@@ -440,9 +498,7 @@ export const CameraStreamConfigPage: React.FC = () => {
       if (data.telemetry) {
         setTelemetry(data.telemetry);
       }
-
-      // Also save to localStorage for client-side persistence
-      localStorage.setItem("smartface_camera_streams_config", JSON.stringify(data.config || payload));
+      // Nothing is copied to localStorage: the config holds camera URLs, which may carry credentials.
 
       setSaveSuccess(true);
       setTimeout(() => setSaveSuccess(false), 4000);
@@ -495,31 +551,36 @@ export const CameraStreamConfigPage: React.FC = () => {
   };
 
   // ----------------- STREAM LIST: DERIVED VALUES -----------------
-  const currentGateKey: GateKey = activeGateTab === "EXIT" ? "exit" : "entry";
-  const currentGateField: GateField = gateFieldOf(currentGateKey);
-  const currentGateConfig: GateStreamConfig = config[currentGateField];
+  const gates: GateConfig[] = gatesOf(config);
+  /** The server speaks the N-gate model: gates can be added, edited and removed. */
+  const multiGate = serverHasGates(config);
+  const isOverview = activeGateTab === OVERVIEW_TAB;
+  const currentGate: GateConfig | undefined = gates.find((g) => g.id === activeGateTab) || gates[0];
+  const currentGateKey: GateKey = currentGate?.id || "entry";
+  const currentGateConfig: GateConfig = currentGate || { ...config.entryGate, id: "entry", direction: "ENTRY" };
+  const currentGateLabel = gateDisplayLabel(currentGateConfig);
   const currentStreams = deriveGateStreams(currentGateConfig, currentGateKey);
   const currentPrimary = getPrimaryStream(currentStreams);
   const previewStream: GateStreamSource | null =
     currentStreams.find((s) => s.id === previewStreamId) || currentPrimary;
 
-  const updateCurrentGate = (updater: (prev: GateStreamConfig) => GateStreamConfig) => {
-    setConfig((prev) => ({ ...prev, [currentGateField]: updater(prev[currentGateField]) }));
+  const updateCurrentGate = (updater: (prev: GateConfig) => GateConfig) => {
+    const key = currentGateKey;
+    setConfig((prev) => updateGateInConfig(prev, key, updater));
   };
 
   /** Apply a stream list to a gate locally (keeps locally edited name/enabled/autoStart). */
   const applyStreamsLocally = (key: GateKey, streams: GateStreamSource[]) => {
-    const field = gateFieldOf(key);
-    setConfig((prev) => ({ ...prev, [field]: withStreams(prev[field], streams) }));
+    setConfig((prev) => updateGateInConfig(prev, key, (g) => ({ ...withStreams(g, streams), id: g.id, direction: g.direction })));
   };
 
   /** Extract the stream list from any shape the thin endpoints / config endpoint may return. */
   const parseStreamsFromResponse = (data: any, key: GateKey): GateStreamSource[] | null => {
-    const field = gateFieldOf(key);
+    const legacyField = key === "entry" ? "entryGate" : key === "exit" ? "exitGate" : null;
     const gate =
-      data?.config?.[field] ||
+      (data?.config ? gatesOf(data.config).find((g) => g.id === key) : undefined) ||
       data?.gate ||
-      data?.[field] ||
+      (legacyField ? data?.[legacyField] : undefined) ||
       (data && data.gateType && Array.isArray(data.streams) ? data : null);
     if (gate && Array.isArray(gate.streams) && gate.streams.length > 0) {
       return deriveGateStreams(gate as GateStreamConfig, key);
@@ -527,10 +588,17 @@ export const CameraStreamConfigPage: React.FC = () => {
     return null;
   };
 
-  /** Fallback for servers without the thin stream endpoints: POST the whole gate with its stream list. */
+  /**
+   * Fallback for servers without the thin stream endpoints: POST the whole gate
+   * with its stream list. Only the two legacy gates exist on such a server.
+   */
   const replaceGateStreamsViaConfig = async (key: GateKey, streams: GateStreamSource[]): Promise<GateStreamSource[]> => {
-    const field = gateFieldOf(key);
-    const gatePayload = withStreams(config[field], streams);
+    const field = key === "entry" ? "entryGate" : key === "exit" ? "exitGate" : null;
+    const legacyGate = field ? config[field] : undefined;
+    if (!field || !legacyGate) {
+      throw new Error(`Máy chủ chưa có API luồng cho cổng "${key}" (HTTP 404). Chưa lưu gì.`);
+    }
+    const gatePayload = withStreams(legacyGate, streams);
     const res = await apiFetch("/api/camera-streams/config", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -775,7 +843,7 @@ export const CameraStreamConfigPage: React.FC = () => {
         body: JSON.stringify({
           gate: currentGateKey,
           stream: previewStream.id,
-          scanType: activeGateTab === "EXIT" ? "EXIT" : "ENTRY",
+          scanType: currentGateConfig.direction,
         }),
       });
       const data = await res.json().catch(() => ({}));
@@ -936,8 +1004,10 @@ export const CameraStreamConfigPage: React.FC = () => {
     }
   }, [isPreviewActive, activeGateTab, previewSourceType]);
 
-  const switchGateTab = (tab: "ENTRY" | "EXIT" | "DUAL_MONITOR") => {
+  const switchGateTab = (tab: string) => {
     setActiveGateTab(tab);
+    setGateInfoDraft(null);
+    setGateNotice(null);
     stopPreview();
     setPreviewStreamId(null);
     setEditingStreamId(null);
@@ -946,6 +1016,127 @@ export const CameraStreamConfigPage: React.FC = () => {
     setGateAreaStreamId(null);
     setRtspScanResult(null);
     resetStreamMessages();
+  };
+
+  // ----------------- GATES: ADD / EDIT / REMOVE (admin) -----------------
+  // Every change is a server request; the page shows what the server answers and
+  // never keeps a gate the server refused.
+  const doorChoices = (current?: string) => {
+    const list = doorOptions.length > 0 ? [...doorOptions] : [{ id: LEGACY_DOOR_ID, label: "Cửa chính" }];
+    if (current && !list.some((d) => d.id === current)) list.push({ id: current, label: current });
+    return list;
+  };
+
+  const applyGateOutcome = async (outcome: GateMutationOutcome) => {
+    if (outcome.kind === "applied") {
+      if (outcome.config && gatesOf(outcome.config).length > 0) setConfig(outcome.config);
+      else await fetchConfig();
+      setGateNotice({ tone: "ok", text: outcome.message });
+    } else {
+      setGateNotice({ tone: outcome.kind === "unreachable" ? "warn" : "error", text: outcome.message });
+    }
+  };
+
+  const openAddGate = () => {
+    setGateDraft(EMPTY_GATE_DRAFT);
+    setGateDraftIdTouched(false);
+    setGateDraftError(null);
+    setAddGateOpen(true);
+  };
+
+  const handleCreateGate = async () => {
+    const error = validateGateDraft(gateDraft, gates.map((g) => g.id));
+    if (error) {
+      setGateDraftError(error);
+      return;
+    }
+    setGateBusy(true);
+    setGateDraftError(null);
+    try {
+      const { url, init } = buildCreateGateRequest(gateDraft);
+      const res = await operatorJsonFetch<unknown>(url, init);
+      const outcome = interpretGateMutation("create", `Cổng "${gateDraft.label.trim()}"`, res);
+      if (outcome.kind !== "applied") {
+        // Keep the form open with the server's own answer; nothing is added locally.
+        setGateDraftError(outcome.message);
+        return;
+      }
+      setAddGateOpen(false);
+      switchGateTab(gateDraft.id.trim());
+      await applyGateOutcome(outcome);
+    } finally {
+      setGateBusy(false);
+    }
+  };
+
+  const gateInfo = gateInfoDraft ?? {
+    label: currentGateConfig.label || gateDisplayLabel(currentGateConfig),
+    direction: currentGateConfig.direction,
+    doorId: gateDoorId(currentGateConfig),
+  };
+  const gateInfoChanged =
+    !!gateInfoDraft &&
+    (gateInfoDraft.label.trim() !== (currentGateConfig.label || gateDisplayLabel(currentGateConfig)) ||
+      gateInfoDraft.direction !== currentGateConfig.direction ||
+      gateInfoDraft.doorId !== gateDoorId(currentGateConfig));
+
+  const handleSaveGateInfo = async () => {
+    if (!gateInfoDraft || !currentGate) return;
+    const label = gateInfoDraft.label.trim();
+    if (!label) {
+      setGateNotice({ tone: "error", text: "Nhập tên hiển thị của cổng." });
+      return;
+    }
+    setGateBusy(true);
+    setGateNotice(null);
+    try {
+      const { url, init } = buildUpdateGateRequest(currentGate.id, {
+        label,
+        direction: gateInfoDraft.direction,
+        doorId: gateInfoDraft.doorId,
+      });
+      const res = await operatorJsonFetch<unknown>(url, init);
+      const outcome = interpretGateMutation("update", gateDisplayLabel(currentGate), res);
+      await applyGateOutcome(outcome);
+      if (outcome.kind === "applied") setGateInfoDraft(null);
+    } finally {
+      setGateBusy(false);
+    }
+  };
+
+  const handleDeleteGate = async () => {
+    const target = gates.find((g) => g.id === deleteGateId);
+    if (!target || !canDeleteGate(target.id)) {
+      setDeleteGateId(null);
+      return;
+    }
+    setGateBusy(true);
+    try {
+      const { url, init } = buildDeleteGateRequest(target.id);
+      const res = await operatorJsonFetch<unknown>(url, init);
+      const outcome = interpretGateMutation("delete", gateDisplayLabel(target), res);
+      setDeleteGateId(null);
+      if (outcome.kind === "applied") switchGateTab("entry");
+      await applyGateOutcome(outcome);
+    } finally {
+      setGateBusy(false);
+    }
+  };
+
+  /** Tabs in order: every gate, then the overview. Arrow keys / Home / End move between them. */
+  const gateTabIds = [...gates.map((g) => g.id), OVERVIEW_TAB];
+  const selectedTab = isOverview ? OVERVIEW_TAB : currentGateKey;
+  const onGateTabKeyDown = (e: React.KeyboardEvent<HTMLButtonElement>, tab: string) => {
+    const i = gateTabIds.indexOf(tab);
+    let next = -1;
+    if (e.key === "ArrowRight") next = (i + 1) % gateTabIds.length;
+    else if (e.key === "ArrowLeft") next = (i - 1 + gateTabIds.length) % gateTabIds.length;
+    else if (e.key === "Home") next = 0;
+    else if (e.key === "End") next = gateTabIds.length - 1;
+    if (next < 0) return;
+    e.preventDefault();
+    switchGateTab(gateTabIds[next]);
+    document.getElementById(`gate-tab-${gateTabIds[next]}`)?.focus();
   };
 
   const selectPreviewStream = (id: string) => {
@@ -1916,65 +2107,217 @@ export const CameraStreamConfigPage: React.FC = () => {
         )}
       </div>
 
-      {/* ---------------- SECTION 2: DUAL GATE CAMERA STREAMS CONFIGURATION ---------------- */}
+      {/* ---------------- SECTION 2: GATE LIST & CAMERA STREAMS CONFIGURATION ---------------- */}
       <div className="bg-white rounded-2xl border border-slate-200 shadow-xs overflow-hidden">
-        {/* Gate Tabs */}
-        <div className="flex border-b border-slate-200 bg-slate-50/70 p-2 gap-2">
-          <button
-            onClick={() => switchGateTab("ENTRY")}
-            className={`flex-1 flex items-center justify-center gap-2 py-2.5 px-4 rounded-xl text-sm font-semibold transition-all ${
-              activeGateTab === "ENTRY"
-                ? "bg-white text-indigo-700 shadow-xs border border-slate-200 font-bold"
-                : "text-slate-600 hover:text-slate-900 hover:bg-slate-100"
-            }`}
-          >
-            <Radio className="w-4 h-4 text-emerald-600" />
-            Cổng Vào (Main Entry Gate)
-            <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-slate-100 text-slate-600 border border-slate-200 font-mono">
-              {deriveGateStreams(config.entryGate, "entry").filter((s) => s.enabled).length} luồng
-            </span>
-            <span
-              className={`w-2 h-2 rounded-full ${
-                config.entryGate?.enabled ? "bg-emerald-500" : "bg-slate-300"
-              }`}
-            />
-          </button>
+        {/* Gate Tabs: one per configured gate (keyed by gate id), then the overview */}
+        <div className="flex flex-wrap items-stretch border-b border-slate-200 bg-slate-50/70 p-2 gap-2">
+          <div role="tablist" aria-label="Danh sách cổng" className="flex flex-1 flex-wrap gap-2">
+            {gates.map((g) => {
+              const selected = selectedTab === g.id;
+              const isIn = g.direction === "ENTRY";
+              return (
+                <button
+                  key={g.id}
+                  id={`gate-tab-${g.id}`}
+                  type="button"
+                  role="tab"
+                  aria-selected={selected}
+                  aria-controls="gate-tabpanel"
+                  tabIndex={selected ? 0 : -1}
+                  onClick={() => switchGateTab(g.id)}
+                  onKeyDown={(e) => onGateTabKeyDown(e, g.id)}
+                  data-gate-id={g.id}
+                  className={`flex-1 min-w-[10rem] flex items-center justify-center gap-2 py-2.5 px-4 rounded-xl text-sm font-semibold transition-all ${
+                    selected
+                      ? "bg-white text-indigo-700 shadow-xs border border-slate-200 font-bold"
+                      : "text-slate-600 hover:text-slate-900 hover:bg-slate-100"
+                  }`}
+                >
+                  <Radio className={`w-4 h-4 ${isIn ? "text-emerald-600" : "text-blue-600"}`} />
+                  <span className="truncate max-w-[12rem]">{gateDisplayLabel(g)}</span>
+                  <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-slate-100 text-slate-600 border border-slate-200 font-semibold">
+                    {directionLabel(g.direction)}
+                  </span>
+                  <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-slate-100 text-slate-600 border border-slate-200 font-mono">
+                    {deriveGateStreams(g, g.id).filter((s) => s.enabled).length} luồng
+                  </span>
+                  <span
+                    className={`w-2 h-2 rounded-full ${g.enabled ? "bg-emerald-500" : "bg-slate-300"}`}
+                    aria-label={g.enabled ? "đang bật" : "đang tắt"}
+                  />
+                </button>
+              );
+            })}
 
-          <button
-            onClick={() => switchGateTab("EXIT")}
-            className={`flex-1 flex items-center justify-center gap-2 py-2.5 px-4 rounded-xl text-sm font-semibold transition-all ${
-              activeGateTab === "EXIT"
-                ? "bg-white text-indigo-700 shadow-xs border border-slate-200 font-bold"
-                : "text-slate-600 hover:text-slate-900 hover:bg-slate-100"
-            }`}
-          >
-            <Radio className="w-4 h-4 text-blue-600" />
-            Cổng Ra (Exit Gate B2)
-            <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-slate-100 text-slate-600 border border-slate-200 font-mono">
-              {deriveGateStreams(config.exitGate, "exit").filter((s) => s.enabled).length} luồng
-            </span>
-            <span
-              className={`w-2 h-2 rounded-full ${
-                config.exitGate?.enabled ? "bg-emerald-500" : "bg-slate-300"
+            <button
+              id={`gate-tab-${OVERVIEW_TAB}`}
+              type="button"
+              role="tab"
+              aria-selected={selectedTab === OVERVIEW_TAB}
+              aria-controls="gate-tabpanel"
+              tabIndex={selectedTab === OVERVIEW_TAB ? 0 : -1}
+              onClick={() => switchGateTab(OVERVIEW_TAB)}
+              onKeyDown={(e) => onGateTabKeyDown(e, OVERVIEW_TAB)}
+              className={`flex-1 min-w-[10rem] flex items-center justify-center gap-2 py-2.5 px-4 rounded-xl text-sm font-semibold transition-all ${
+                selectedTab === OVERVIEW_TAB
+                  ? "bg-white text-indigo-700 shadow-xs border border-slate-200 font-bold"
+                  : "text-slate-600 hover:text-slate-900 hover:bg-slate-100"
               }`}
-            />
-          </button>
+            >
+              <Eye className="w-4 h-4 text-purple-600" />
+              Tổng Quan Tất Cả Cổng
+            </button>
+          </div>
 
-          <button
-            onClick={() => switchGateTab("DUAL_MONITOR")}
-            className={`flex-1 flex items-center justify-center gap-2 py-2.5 px-4 rounded-xl text-sm font-semibold transition-all ${
-              activeGateTab === "DUAL_MONITOR"
-                ? "bg-white text-indigo-700 shadow-xs border border-slate-200 font-bold"
-                : "text-slate-600 hover:text-slate-900 hover:bg-slate-100"
-            }`}
-          >
-            <Eye className="w-4 h-4 text-purple-600" />
-            Tổng Quan 2 Cổng
-          </button>
+          {isAdmin && (
+            <button
+              id="btn-add-gate"
+              type="button"
+              onClick={openAddGate}
+              disabled={!multiGate}
+              title={
+                multiGate
+                  ? "Thêm một cổng mới (mã cổng, tên, hướng Vào/Ra, cửa)"
+                  : "Máy chủ này chưa hỗ trợ nhiều cổng: chỉ có Cổng vào và Cổng ra"
+              }
+              className="inline-flex items-center gap-1.5 px-3.5 py-2.5 rounded-xl text-sm font-semibold bg-indigo-600 text-white hover:bg-indigo-700 disabled:opacity-50 disabled:cursor-not-allowed"
+            >
+              <Plus className="w-4 h-4" />
+              Thêm cổng
+            </button>
+          )}
         </div>
 
-        {activeGateTab !== "DUAL_MONITOR" ? (
-          <div className="p-6 sm:p-8 space-y-8">
+        <div role="status" aria-live="polite" className="empty:hidden px-6 pt-4">
+          {gateNotice && (
+            <div
+              className={`px-3 py-2 rounded-lg border text-xs flex items-start gap-2 ${
+                gateNotice.tone === "ok"
+                  ? "bg-emerald-50 border-emerald-200 text-emerald-900"
+                  : gateNotice.tone === "warn"
+                    ? "bg-amber-50 border-amber-200 text-amber-900"
+                    : "bg-rose-50 border-rose-200 text-rose-900"
+              }`}
+            >
+              {gateNotice.tone === "ok" ? <CheckCircle2 className="w-4 h-4 shrink-0" /> : <AlertTriangle className="w-4 h-4 shrink-0" />}
+              <span>{gateNotice.text}</span>
+            </div>
+          )}
+        </div>
+
+        {!isOverview ? (
+          <div
+            id="gate-tabpanel"
+            role="tabpanel"
+            aria-labelledby={`gate-tab-${currentGateKey}`}
+            className="p-6 sm:p-8 space-y-8"
+          >
+            {/* Gate identity (admin): label, direction, door; remove for added gates only */}
+            {isAdmin && (
+              <div className="rounded-xl border border-slate-200 bg-slate-50/60 p-4 space-y-3" data-testid="gate-info-panel">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <div className="text-sm font-semibold text-slate-800 flex items-center gap-2">
+                    <DoorOpen className="w-4 h-4 text-indigo-600" />
+                    Thông tin cổng
+                    <span className="text-[11px] font-mono font-normal text-slate-500">mã: {currentGateKey}</span>
+                  </div>
+                  <button
+                    id={`btn-delete-gate-${currentGateKey}`}
+                    type="button"
+                    disabled={!canDeleteGate(currentGateKey) || !multiGate || gateBusy}
+                    onClick={() => setDeleteGateId(currentGateKey)}
+                    title={
+                      isLegacyGateId(currentGateKey)
+                        ? "Cổng vào và Cổng ra luôn tồn tại: chỉ tắt được, không xóa được"
+                        : "Xóa cổng này (lịch sử vào ra vẫn được giữ)"
+                    }
+                    className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg border border-rose-200 text-rose-700 bg-white hover:bg-rose-50 text-xs font-semibold disabled:opacity-40 disabled:cursor-not-allowed"
+                  >
+                    <Trash2 className="w-3.5 h-3.5" />
+                    Xóa cổng
+                  </button>
+                </div>
+                {!multiGate ? (
+                  <p className="text-xs text-slate-600">
+                    Máy chủ này chưa hỗ trợ nhiều cổng: chỉ có Cổng vào và Cổng ra, dùng chung một cửa. Tên camera của cổng
+                    sửa ở ô bên dưới và lưu bằng nút "Lưu Cấu Hình".
+                  </p>
+                ) : (
+                  <div className="grid grid-cols-1 md:grid-cols-4 gap-3 items-end">
+                    <div className="md:col-span-2">
+                      <label htmlFor="input-gate-label" className="block text-xs font-semibold text-slate-700">
+                        Tên hiển thị
+                      </label>
+                      <input
+                        id="input-gate-label"
+                        type="text"
+                        value={gateInfo.label}
+                        maxLength={80}
+                        onChange={(e) => setGateInfoDraft({ ...gateInfo, label: e.target.value })}
+                        className="mt-1 w-full px-3 py-2 rounded-lg border border-slate-300 text-sm"
+                      />
+                    </div>
+                    <fieldset>
+                      <legend className="block text-xs font-semibold text-slate-700">Hướng</legend>
+                      <div className="mt-1 inline-flex rounded-lg border border-slate-300 overflow-hidden">
+                        {(["ENTRY", "EXIT"] as GateDirection[]).map((d) => (
+                          <label
+                            key={d}
+                            className={`px-3 py-2 text-xs font-semibold cursor-pointer ${
+                              gateInfo.direction === d ? "bg-indigo-600 text-white" : "bg-white text-slate-700"
+                            }`}
+                          >
+                            <input
+                              type="radio"
+                              name="gate-direction"
+                              value={d}
+                              checked={gateInfo.direction === d}
+                              onChange={() => setGateInfoDraft({ ...gateInfo, direction: d })}
+                              className="sr-only"
+                            />
+                            {directionLabel(d)}
+                          </label>
+                        ))}
+                      </div>
+                    </fieldset>
+                    <div>
+                      <label htmlFor="select-gate-door" className="block text-xs font-semibold text-slate-700">
+                        Cửa mở khi nhận diện
+                      </label>
+                      <select
+                        id="select-gate-door"
+                        value={gateInfo.doorId}
+                        onChange={(e) => setGateInfoDraft({ ...gateInfo, doorId: e.target.value })}
+                        className="mt-1 w-full px-3 py-2 rounded-lg border border-slate-300 text-sm bg-white"
+                      >
+                        {doorChoices(gateInfo.doorId).map((d) => (
+                          <option key={d.id} value={d.id}>
+                            {d.label} ({d.id})
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+                    <div className="md:col-span-4 flex flex-wrap items-center justify-between gap-2">
+                      <p className="text-[11px] text-slate-500">
+                        Hướng Vào/Ra dùng cho báo cáo và bộ lọc; mỗi cổng chỉ mở đúng cửa đã chọn. Bật/tắt cổng bằng công tắc
+                        bên dưới rồi bấm "Lưu Cấu Hình".
+                      </p>
+                      <button
+                        id="btn-save-gate-info"
+                        type="button"
+                        onClick={() => void handleSaveGateInfo()}
+                        disabled={!gateInfoChanged || gateBusy}
+                        className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-indigo-600 text-white text-xs font-semibold hover:bg-indigo-700 disabled:opacity-40"
+                      >
+                        {gateBusy ? <RefreshCw className="w-3.5 h-3.5 animate-spin" /> : <Save className="w-3.5 h-3.5" />}
+                        Lưu thông tin cổng
+                      </button>
+                    </div>
+                  </div>
+                )}
+              </div>
+            )}
+
             {/* Gate Enable & Name */}
             <div className="grid grid-cols-1 md:grid-cols-2 gap-6 items-center border-b border-slate-100 pb-6">
               <div>
@@ -2273,7 +2616,7 @@ export const CameraStreamConfigPage: React.FC = () => {
                     <div className="flex items-center gap-2">
                       <ScanFace className="w-4 h-4" />
                       <span>
-                        KẾT QUẢ QUÉT NHẬN DIỆN ({activeGateTab}
+                        KẾT QUẢ QUÉT NHẬN DIỆN ({currentGateLabel}
                         {rtspScanResult.streamLabel ? ` • ${rtspScanResult.streamLabel}` : ""})
                       </span>
                     </div>
@@ -2313,68 +2656,76 @@ export const CameraStreamConfigPage: React.FC = () => {
             </div>
           </div>
         ) : (
-          /* TWO-GATE OVERVIEW: stream status only - no camera pictures */
-          <div className="p-6 space-y-6">
+          /* ALL-GATES OVERVIEW: stream status of every enabled gate - no camera pictures */
+          <div id="gate-tabpanel" role="tabpanel" aria-labelledby={`gate-tab-${OVERVIEW_TAB}`} className="p-6 space-y-6">
             <div className="text-center max-w-xl mx-auto space-y-1">
-              <h3 className="text-base font-bold text-slate-900">Tổng Quan Luồng Của Cả 2 Cổng</h3>
+              <h3 className="text-base font-bold text-slate-900">Tổng Quan Luồng Của Tất Cả Cổng Đang Bật</h3>
               <p className="text-xs text-slate-700">
                 Ứng dụng chỉ hiển thị ảnh khuôn mặt đã chụp, không hiển thị hình camera. Toàn cảnh một lượt quét
                 xem bằng nút “Đoạn ghi” trong Nhật ký; kiểm tra một luồng bằng 1 khung hình ở tab của từng cổng.
               </p>
             </div>
 
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-              {(["entry", "exit"] as GateKey[]).map((key) => {
-                const gate = config[gateFieldOf(key)];
-                const all = deriveGateStreams(gate, key);
-                const enabledCount = all.filter((s) => s.enabled).length;
-                const primary = getPrimaryStream(all);
-                const isEntry = key === "entry";
-                return (
-                  <div key={key} className="space-y-2">
-                    <div className="flex items-center justify-between">
-                      <span className="text-sm font-semibold text-slate-800 flex items-center gap-2">
-                        <span className={`w-2.5 h-2.5 rounded-full ${isEntry ? "bg-emerald-500" : "bg-blue-500"}`} />
-                        {gate?.name}
-                      </span>
-                      <span
-                        className={`text-xs px-2 py-0.5 rounded-md font-bold border ${
-                          isEntry ? "bg-emerald-50 text-emerald-700 border-emerald-200" : "bg-blue-50 text-blue-700 border-blue-200"
-                        }`}
-                      >
-                        {enabledCount} luồng bật
-                      </span>
-                    </div>
-                    {all.length === 0 ? (
-                      <div className="p-4 rounded-xl border border-dashed border-slate-300 text-xs text-slate-500 text-center">
-                        Chưa có luồng nào
+            {enabledGates(gates).length === 0 ? (
+              <div className="p-4 rounded-xl border border-dashed border-slate-300 text-xs text-slate-500 text-center">
+                Chưa có cổng nào đang bật.
+              </div>
+            ) : (
+              <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-6">
+                {enabledGates(gates).map((gate) => {
+                  const all = deriveGateStreams(gate, gate.id);
+                  const enabledCount = all.filter((s) => s.enabled).length;
+                  const primary = getPrimaryStream(all);
+                  const isIn = gate.direction === "ENTRY";
+                  return (
+                    <div key={gate.id} className="space-y-2" data-gate-id={gate.id}>
+                      <div className="flex items-center justify-between gap-2">
+                        <span className="text-sm font-semibold text-slate-800 flex items-center gap-2 min-w-0">
+                          <span className={`w-2.5 h-2.5 rounded-full shrink-0 ${isIn ? "bg-emerald-500" : "bg-blue-500"}`} />
+                          <span className="truncate">{gateDisplayLabel(gate)}</span>
+                          <span className="text-[10px] font-normal text-slate-500 shrink-0">
+                            {directionLabel(gate.direction)} · cửa {gateDoorId(gate)}
+                          </span>
+                        </span>
+                        <span
+                          className={`text-xs px-2 py-0.5 rounded-md font-bold border shrink-0 ${
+                            isIn ? "bg-emerald-50 text-emerald-700 border-emerald-200" : "bg-blue-50 text-blue-700 border-blue-200"
+                          }`}
+                        >
+                          {enabledCount} luồng bật
+                        </span>
                       </div>
-                    ) : (
-                      <ul className="rounded-xl border border-slate-200 divide-y divide-slate-100 bg-white">
-                        {all.map((s) => {
-                          const area = streamGateArea(s);
-                          return (
-                            <li key={s.id} className="px-3 py-2 flex flex-wrap items-center gap-2 text-xs">
-                              <span className={`font-semibold ${s.enabled ? "text-slate-900" : "text-slate-400"}`}>{s.label}</span>
-                              {primary?.id === s.id && (
-                                <span className="text-[10px] px-1.5 py-0.5 rounded bg-indigo-600 text-white font-bold">Chính</span>
-                              )}
-                              <span className="text-[10px] px-1.5 py-0.5 rounded font-mono bg-slate-100 text-slate-700 border border-slate-200">
-                                {SOURCE_TYPE_LABEL[s.sourceType] || s.sourceType}
-                              </span>
-                              {!s.enabled && <span className="text-[10px] text-slate-500">đã tắt</span>}
-                              <span className="ml-auto text-[10px] text-slate-500" title={formatGateArea(area)}>
-                                Vùng cổng: {area ? "đã đặt" : "toàn khung"}
-                              </span>
-                            </li>
-                          );
-                        })}
-                      </ul>
-                    )}
-                  </div>
-                );
-              })}
-            </div>
+                      {all.length === 0 ? (
+                        <div className="p-4 rounded-xl border border-dashed border-slate-300 text-xs text-slate-500 text-center">
+                          Chưa có luồng nào
+                        </div>
+                      ) : (
+                        <ul className="rounded-xl border border-slate-200 divide-y divide-slate-100 bg-white">
+                          {all.map((s) => {
+                            const area = streamGateArea(s);
+                            return (
+                              <li key={s.id} className="px-3 py-2 flex flex-wrap items-center gap-2 text-xs">
+                                <span className={`font-semibold ${s.enabled ? "text-slate-900" : "text-slate-400"}`}>{s.label}</span>
+                                {primary?.id === s.id && (
+                                  <span className="text-[10px] px-1.5 py-0.5 rounded bg-indigo-600 text-white font-bold">Chính</span>
+                                )}
+                                <span className="text-[10px] px-1.5 py-0.5 rounded font-mono bg-slate-100 text-slate-700 border border-slate-200">
+                                  {SOURCE_TYPE_LABEL[s.sourceType] || s.sourceType}
+                                </span>
+                                {!s.enabled && <span className="text-[10px] text-slate-500">đã tắt</span>}
+                                <span className="ml-auto text-[10px] text-slate-500" title={formatGateArea(area)}>
+                                  Vùng cổng: {area ? "đã đặt" : "toàn khung"}
+                                </span>
+                              </li>
+                            );
+                          })}
+                        </ul>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            )}
           </div>
         )}
       </div>
@@ -2409,7 +2760,7 @@ export const CameraStreamConfigPage: React.FC = () => {
 
             <div className="flex items-center justify-between text-xs text-slate-700 p-1">
               <span>Chu kỳ tự động thử kết nối lại luồng:</span>
-              <span className="font-semibold text-slate-900">{config.entryGate?.reconnectIntervalSeconds || 5} giây</span>
+              <span className="font-semibold text-slate-900">{gates[0]?.reconnectIntervalSeconds || 5} giây</span>
             </div>
           </div>
         </div>
@@ -2441,19 +2792,177 @@ export const CameraStreamConfigPage: React.FC = () => {
       </div>
 
       {gateAreaStreamId &&
-        activeGateTab !== "DUAL_MONITOR" &&
+        !isOverview &&
         (() => {
           const target = currentStreams.find((x) => x.id === gateAreaStreamId);
           if (!target) return null;
           return (
             <GateAreaEditor
               gateKey={currentGateKey}
-              gateName={currentGateConfig.name}
+              gateName={currentGateLabel}
               stream={target}
               onSaved={(streams) => {
                 if (streams && streams.length > 0) applyStreamsLocally(currentGateKey, deriveGateStreams({ ...currentGateConfig, streams }, currentGateKey));
               }}
               onClose={() => setGateAreaStreamId(null)}
+            />
+          );
+        })()}
+
+      {addGateOpen && (
+        <ModalDialog
+          id="add-gate-dialog"
+          title={
+            <>
+              <Plus className="w-4 h-4 text-indigo-600" /> Thêm cổng
+            </>
+          }
+          description="Cổng mới bắt đầu chưa có luồng camera; thêm luồng ở tab của cổng sau khi tạo. Mã cổng không đổi được về sau và không dùng lại cho cổng khác."
+          busy={gateBusy}
+          onClose={() => setAddGateOpen(false)}
+          footer={
+            <>
+              <button
+                type="button"
+                onClick={() => setAddGateOpen(false)}
+                disabled={gateBusy}
+                className="px-3 py-1.5 text-xs font-semibold rounded-lg border border-slate-200 text-slate-700 hover:bg-slate-50 disabled:opacity-40"
+              >
+                Hủy
+              </button>
+              <button
+                type="button"
+                onClick={() => void handleCreateGate()}
+                disabled={gateBusy}
+                className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold rounded-lg bg-indigo-600 text-white hover:bg-indigo-700 disabled:opacity-40"
+              >
+                {gateBusy ? <RefreshCw className="w-3.5 h-3.5 animate-spin" /> : <Plus className="w-3.5 h-3.5" />}
+                Thêm cổng
+              </button>
+            </>
+          }
+        >
+          <div>
+            <label htmlFor="new-gate-label" className="block text-xs font-semibold text-slate-700">
+              Tên hiển thị
+            </label>
+            <input
+              id="new-gate-label"
+              data-autofocus
+              type="text"
+              maxLength={80}
+              value={gateDraft.label}
+              onChange={(e) => {
+                const label = e.target.value;
+                setGateDraft((d) => ({ ...d, label, id: gateDraftIdTouched ? d.id : suggestGateId(label) }));
+              }}
+              placeholder="VD: Cổng phụ kho B"
+              className="mt-1 w-full px-3 py-2 rounded-lg border border-slate-300 text-sm"
+            />
+          </div>
+          <div>
+            <label htmlFor="new-gate-id" className="block text-xs font-semibold text-slate-700">
+              Mã cổng
+            </label>
+            <input
+              id="new-gate-id"
+              type="text"
+              value={gateDraft.id}
+              maxLength={32}
+              onChange={(e) => {
+                setGateDraftIdTouched(true);
+                setGateDraft((d) => ({ ...d, id: e.target.value.trim().toLowerCase() }));
+              }}
+              aria-describedby="new-gate-id-hint"
+              placeholder="vd: cong-phu-b"
+              className="mt-1 w-full px-3 py-2 rounded-lg border border-slate-300 text-sm font-mono"
+            />
+            <p id="new-gate-id-hint" className="mt-1 text-[11px] text-slate-500">
+              2-32 ký tự: chữ thường không dấu, số, dấu gạch ngang; bắt đầu bằng chữ cái.
+            </p>
+          </div>
+          <fieldset>
+            <legend className="block text-xs font-semibold text-slate-700">Hướng</legend>
+            <div className="mt-1 flex gap-3">
+              {(["ENTRY", "EXIT"] as GateDirection[]).map((d) => (
+                <label key={d} className="inline-flex items-center gap-1.5 text-sm text-slate-800 cursor-pointer">
+                  <input
+                    type="radio"
+                    name="new-gate-direction"
+                    value={d}
+                    checked={gateDraft.direction === d}
+                    onChange={() => setGateDraft((g) => ({ ...g, direction: d }))}
+                  />
+                  {directionLabel(d)}
+                </label>
+              ))}
+            </div>
+          </fieldset>
+          <div>
+            <label htmlFor="new-gate-door" className="block text-xs font-semibold text-slate-700">
+              Cửa
+            </label>
+            <select
+              id="new-gate-door"
+              value={gateDraft.doorId}
+              onChange={(e) => setGateDraft((g) => ({ ...g, doorId: e.target.value }))}
+              className="mt-1 w-full px-3 py-2 rounded-lg border border-slate-300 text-sm bg-white"
+            >
+              {doorChoices(gateDraft.doorId).map((d) => (
+                <option key={d.id} value={d.id}>
+                  {d.label} ({d.id})
+                </option>
+              ))}
+            </select>
+            <p className="mt-1 text-[11px] text-slate-500">Thêm cửa mới ở trang Cấu Hình API Cửa.</p>
+          </div>
+          <div role="alert" aria-live="assertive" className="empty:hidden">
+            {gateDraftError && (
+              <p className="px-3 py-2 rounded-lg border border-rose-200 bg-rose-50 text-xs text-rose-800">{gateDraftError}</p>
+            )}
+          </div>
+        </ModalDialog>
+      )}
+
+      {deleteGateId &&
+        (() => {
+          const target = gates.find((g) => g.id === deleteGateId);
+          if (!target) return null;
+          const text = deleteGateConfirmText(gateDisplayLabel(target), target.id);
+          return (
+            <ModalDialog
+              id="delete-gate-dialog"
+              role="alertdialog"
+              title={
+                <>
+                  <AlertTriangle className="w-4 h-4 text-rose-600" /> {text.title}
+                </>
+              }
+              description={text.body}
+              busy={gateBusy}
+              onClose={() => setDeleteGateId(null)}
+              footer={
+                <>
+                  <button
+                    type="button"
+                    data-autofocus
+                    onClick={() => setDeleteGateId(null)}
+                    disabled={gateBusy}
+                    className="px-3 py-1.5 text-xs font-semibold rounded-lg border border-slate-200 text-slate-700 hover:bg-slate-50 disabled:opacity-40"
+                  >
+                    Hủy
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => void handleDeleteGate()}
+                    disabled={gateBusy || !canDeleteGate(target.id)}
+                    className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold rounded-lg bg-rose-600 text-white hover:bg-rose-700 disabled:opacity-40"
+                  >
+                    {gateBusy ? <RefreshCw className="w-3.5 h-3.5 animate-spin" /> : <Trash2 className="w-3.5 h-3.5" />}
+                    {text.confirmLabel}
+                  </button>
+                </>
+              }
             />
           );
         })()}

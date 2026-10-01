@@ -9,7 +9,7 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 
 import {
-  GATE_KEYS,
+  LEGACY_GATE_KEYS,
   PIPELINE_MODES,
   PIPELINE_MODE_UNAVAILABLE_TITLE,
   buildPipelineModeRequest,
@@ -37,13 +37,16 @@ describe("mode source and gate labels", () => {
     assert.equal(pipelineModeSourceLabel(null), "máy chủ chưa báo nguồn");
   });
 
-  it("maps gates both ways", () => {
-    assert.deepEqual([...GATE_KEYS], ["entry", "exit"]);
+  it("maps gates both ways (N-gate wave: any configured slug is a gate id)", () => {
+    assert.deepEqual([...LEGACY_GATE_KEYS], ["entry", "exit"]);
     assert.equal(gateKeyOf("ENTRY"), "entry");
     assert.equal(gateKeyOf("exit"), "exit");
-    assert.equal(gateKeyOf("side"), null);
+    assert.equal(gateKeyOf("side"), "side");
+    assert.equal(gateKeyOf("SIDE"), null, "neither a slug nor a direction");
     assert.equal(gateLabel("entry"), "Cổng vào");
     assert.equal(gateLabel("exit"), "Cổng ra");
+    assert.equal(gateLabel("side", "Cổng phụ"), "Cổng phụ");
+    assert.equal(gateLabel("side"), "Cổng side");
   });
 
   it("offers legacy and shadow; live is greyed out with the agreed title", () => {
