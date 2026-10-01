@@ -33,8 +33,11 @@ CREATE TABLE IF NOT EXISTS access_logs (
   "faceEmbeddingQuality" REAL,
   "capturedAt" VARCHAR(64),        -- ISO-8601 UTC capture time of the decided frame
   "trackId" VARCHAR(64),           -- tracker id of the passage (one person, one event)
-  "recordingChannel" VARCHAR(16)   -- NVR channel the gate was recorded on
+  "recordingChannel" VARCHAR(16),  -- NVR channel the gate was recorded on
+  "gateId" VARCHAR(32)             -- gate id (N gates); NULL on rows from before gate ids: readers derive entry/exit from type
 );
+-- Gate filter of the history (the id, and the NULL legacy rows of entry/exit) in history order.
+CREATE INDEX IF NOT EXISTS idx_access_logs_gate_ts ON access_logs ("gateId", "timestamp" DESC, id DESC);
 
 CREATE TABLE IF NOT EXISTS smart_lock_state (
   "lockId" VARCHAR(64) PRIMARY KEY,
@@ -48,6 +51,15 @@ CREATE TABLE IF NOT EXISTS smart_lock_state (
   "lastActionBy" VARCHAR(255),
   "autoRelockSeconds" INTEGER,
   status VARCHAR(32)
+);
+
+-- Lock state per door (N gates; each gate opens its own door). The legacy
+-- single-row smart_lock_state above IS door "main" and is written together
+-- with its row here. Same DDL as PG_DOOR_LOCK_STATES_DDL in src/server/db.ts.
+CREATE TABLE IF NOT EXISTS door_lock_states (
+  "doorId" VARCHAR(32) PRIMARY KEY CONSTRAINT door_lock_states_door_id_check CHECK ("doorId" ~ '^[a-z][a-z0-9-]{1,31}$'),
+  state JSONB NOT NULL,            -- SmartLockState of the door (known fields only, no credentials)
+  "updatedAt" VARCHAR(64) NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS webhook_config (
@@ -163,7 +175,8 @@ CREATE TABLE IF NOT EXISTS stranger_faces (
   -- feed camera adaptation. NULL on every stranger face.
   "employeeId" VARCHAR(64),
   "matchCosine" REAL,
-  "matchMargin" REAL
+  "matchMargin" REAL,
+  "gateId" VARCHAR(32)             -- gate id (N gates); NULL on older faces: readers derive it from gate
 );
 CREATE INDEX IF NOT EXISTS idx_stranger_faces_captured ON stranger_faces ("capturedAt" DESC, id DESC)
   WHERE "purgedAt" IS NULL;
@@ -179,7 +192,7 @@ CREATE INDEX IF NOT EXISTS idx_stranger_faces_recognised ON stranger_faces ("emp
 -- Same DDL as PG_SHADOW_RESULTS_DDL in src/server/db.ts.
 CREATE TABLE IF NOT EXISTS pipeline_shadow_results (
   id VARCHAR(64) COLLATE "C" PRIMARY KEY,
-  gate VARCHAR(64) NOT NULL,
+  gate VARCHAR(64) NOT NULL,             -- gate id; rows from before gate ids say ENTRY/EXIT (read as entry/exit)
   "trackId" VARCHAR(64) NOT NULL,
   outcome VARCHAR(16) NOT NULL,          -- employee | stranger | insufficient
   "employeeId" VARCHAR(64),

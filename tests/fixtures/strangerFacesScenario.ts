@@ -367,6 +367,7 @@ export function assertStrangerFaceScenario(out: Record<string, any>, assert: typ
     streamId: "entry-main", engine: "legacy", trackId: "entry-000017", box: [100, 50, 220, 190],
     sourceWidth: 3840, sourceHeight: 2160, detectorScore: 0.91, quality: 0.62, edgeEnergy: 0.3, sizePx: 120,
     embedding: [0.6, 0.8, 0, 0], dims: 4, modelTag: "arcface_test", createdAt: "2026-09-29T02:00:00.000Z",
+    gateId: "entry", // N-gate wave: derived from gate for a face written without a gate id
     hasCrop: false,
   });
   assert.deepEqual(out.byIds, ["SF-A1", "SF-B0"], "unknown and non-string ids are skipped, duplicates collapse");
