@@ -148,6 +148,7 @@ import type { DecisionContext, TrackDecisionResult } from "./src/server/pipeline
 import type { Gate, PipelineMode } from "./src/server/pipeline/contracts";
 import type { ExtractedFace, UnclearReason } from "./src/server/faceEmbedding";
 import { faceCutByFrameEdge } from "./src/server/faceFrameEdge";
+import { newBlurReportId, type BlurReportRecord } from "./src/server/blurReports";
 import { pickSharpestObservation } from "./src/server/bestFrame";
 import { chooseEnrolFaces } from "./src/server/enrolFace";
 import {
@@ -5214,6 +5215,7 @@ async function persistStrangerFaces(
         detectorScore: Math.round(Number(o.detectorScore) * 1000) / 1000,
         quality: Math.round(o.quality * 1000) / 1000,
         edgeEnergy: typeof o.edgeEnergy === "number" ? Math.round(o.edgeEnergy * 10000) / 10000 : undefined,
+        featureNorm: typeof o.featureNorm === "number" ? Math.round(o.featureNorm * 100) / 100 : undefined,
         sizePx: Math.round(Math.min(o.box[2] - o.box[0], o.box[3] - o.box[1])),
         embedding: Array.from(o.embedding),
         dims: o.embedding.length,
@@ -9086,7 +9088,14 @@ app.get(["/api/strangers/clusters", "/api/strangers", "/api/strangers/"], requir
     }
     const { logs, clusters: all } = await strangerWindow();
     // The cursor names the last group already shown; continue right after it.
-    const { clusters, hasMore, restarted } = pageStrangerClusters(all, cursor?.id || null, limit);
+    const { clusters: page, hasMore, restarted } = pageStrangerClusters(all, cursor?.id || null, limit);
+    // Blur reports (labels, 2026-10-02): flag reported per-face photos. Copies, never the cached groups.
+    const reported = await db
+      .blurReportedFaceIds(page.flatMap((c: any) => (c.photos || []).map((p: any) => p.faceId).filter(Boolean)))
+      .catch(() => new Set<string>());
+    const clusters = reported.size
+      ? page.map((c: any) => ({ ...c, photos: (c.photos || []).map((p: any) => (p.faceId && reported.has(p.faceId) ? { ...p, blurReported: true } : p)) }))
+      : page;
     const last = clusters[clusters.length - 1];
     const nextCursor = last && hasMore
       ? Buffer.from(JSON.stringify({ timestamp: last.lastSeen, id: last.clusterId }), "utf8").toString("base64url")
@@ -9109,6 +9118,66 @@ app.get(["/api/strangers/clusters", "/api/strangers", "/api/strangers/"], requir
   } catch (err: any) {
     console.error("[Strangers] Lỗi gom cụm ảnh khuôn mặt người lạ:", err);
     res.status(500).json({ success: false, error: err?.message || "Lỗi xử lý phân cụm ảnh người lạ" });
+  }
+});
+
+// ---- Blur reports: operator labels for re-tuning the blur filter (src/server/blurReports.ts) ----
+const BLUR_REPORT_FACE_ID_RE = /^SF-[A-Za-z0-9-]{1,60}$/;
+
+async function recordBlurReport(req: Request, res: Response, kind: "blur" | "blur-withdrawn") {
+  const faceId = String(req.params.faceId || "");
+  if (!BLUR_REPORT_FACE_ID_RE.test(faceId)) {
+    res.status(400).json({ success: false, error: "Chỉ báo mờ được ảnh khuôn mặt riêng (mã SF-...); ảnh cả khung hình cũ không hỗ trợ." });
+    return;
+  }
+  const typeError = stringFieldError(req.body, ["note"]);
+  if (typeError) {
+    res.status(400).json({ success: false, error: typeError });
+    return;
+  }
+  const [face] = await db.getStrangerFacesByIds([faceId]);
+  if (!face) {
+    res.status(404).json({ success: false, error: `Không tìm thấy ảnh khuôn mặt ${faceId}` });
+    return;
+  }
+  const f = face as any;
+  const report: BlurReportRecord = {
+    id: newBlurReportId(),
+    faceId,
+    logId: face.logId,
+    kind,
+    actor: operatorActor(req) || "unknown",
+    at: new Date().toISOString(),
+    featureNorm: typeof f.featureNorm === "number" ? f.featureNorm : null,
+    edgeEnergy: typeof face.edgeEnergy === "number" ? face.edgeEnergy : null,
+    quality: typeof face.quality === "number" ? face.quality : null,
+    detectorScore: typeof face.detectorScore === "number" ? face.detectorScore : null,
+    sizePx: typeof face.sizePx === "number" ? face.sizePx : null,
+    gateId: typeof f.gateId === "string" ? f.gateId : null,
+    ...(optionalTrimmedString(req.body?.note) ? { note: optionalTrimmedString(req.body?.note)!.slice(0, 200) } : {}),
+  };
+  if (!(await db.saveBlurReport(report))) {
+    res.status(503).json({ success: false, error: "Chưa lưu được báo cáo ảnh mờ (kho dữ liệu chưa sẵn sàng); thử lại sau." });
+    return;
+  }
+  console.log(`[Strangers] ${report.actor} ${kind === "blur" ? "báo ảnh mờ" : "bỏ báo ảnh mờ"} ${faceId}`);
+  res.json({ success: true, faceId, blurReported: kind === "blur", report });
+}
+
+app.post("/api/strangers/faces/:faceId/blur-report", requireOperatorRole("operator"), requireCsrf, (req, res) => void recordBlurReport(req, res, "blur"));
+app.delete("/api/strangers/faces/:faceId/blur-report", requireOperatorRole("operator"), requireCsrf, (req, res) => void recordBlurReport(req, res, "blur-withdrawn"));
+
+app.get("/api/strangers/blur-reports", requireOperatorRole("admin"), async (req, res) => {
+  try {
+    const limit = boundedInt(req.query.limit, 500, 1, 1000);
+    const since = typeof req.query.since === "string" && req.query.since ? req.query.since : undefined;
+    const reports = await db.getBlurReports({ sinceIso: since, limit });
+    const latest = new Map<string, { faceId: string; blurReported: boolean; at: string }>();
+    for (const r of reports) if (!latest.has(r.faceId)) latest.set(r.faceId, { faceId: r.faceId, blurReported: r.kind === "blur", at: r.at });
+    console.log(`[Strangers] ${operatorActor(req) || "unknown"} xem báo cáo ảnh mờ: ${reports.length} dòng`);
+    res.json({ success: true, reports, current: [...latest.values()] });
+  } catch (err: any) {
+    res.status(err instanceof RangeError ? 400 : 500).json({ success: false, error: err instanceof RangeError ? "since phải là thời gian ISO" : err?.message || "Lỗi đọc báo cáo ảnh mờ" });
   }
 });
 

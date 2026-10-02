@@ -40,6 +40,8 @@ export interface StrangerFaceRecord {
   detectorScore: number;
   quality: number;
   edgeEnergy?: number;
+  /** Recogniser feature strength (ArcFace norm before normalisation; blur measure). Stored since 2026-10-02. */
+  featureNorm?: number;
   /** Shorter side of the box, px. */
   sizePx: number;
   /** L2-normalised embedding; absent once purged. */

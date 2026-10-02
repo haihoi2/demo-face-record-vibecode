@@ -49,7 +49,7 @@ const SHADOW_COLUMNS = [
 const FACE_COLUMNS = [
   "id", "logId", "faceIndex", "capturedAt", "gate", "streamId", "engine", "trackId", "box",
   "sourceWidth", "sourceHeight", "detectorScore", "quality", "edgeEnergy", "sizePx", "embedding", "dims", "modelTag",
-  "crop", "createdAt", "purgedAt", "employeeId", "matchCosine", "matchMargin", "gateId",
+  "crop", "createdAt", "purgedAt", "employeeId", "matchCosine", "matchMargin", "gateId", "featureNorm",
 ];
 
 describe("medianMs", () => {

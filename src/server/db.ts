@@ -15,6 +15,7 @@ import {
 import type { StrangerFacePage, StrangerFaceRecord, StrangerFaceStore } from "./strangerFaces";
 import type { ShadowAccuracySummary, ShadowAgreement, ShadowResultRecord, ShadowResultStore } from "./shadowResults";
 import { LOGIN_EVENT_KINDS, type LoginEventQuery, type LoginEventRecord, type LoginEventStore } from "./loginEvents";
+import type { BlurReportRecord, BlurReportStore } from "./blurReports";
 import type { FaceTemplate } from "../types";
 import { gateIdForLegacyRow, isDoorId, isGateId, LEGACY_DOOR_ID } from "./gates";
 
@@ -846,6 +847,7 @@ interface StrangerFaceRow {
   detectorScore: number;
   quality: number;
   edgeEnergy: number | null;
+  featureNorm: number | null;
   sizePx: number;
   embedding: Buffer | null;
   dims: number | null;
@@ -957,6 +959,7 @@ export function normalizeStrangerFace(face: StrangerFaceRecordWithGate): { row?:
       detectorScore: face.detectorScore,
       quality: face.quality,
       edgeEnergy: realValue(face.edgeEnergy) ? face.edgeEnergy : null,
+      featureNorm: realValue(face.featureNorm) ? face.featureNorm : null,
       sizePx: Math.round(face.sizePx),
       embedding,
       dims,
@@ -999,6 +1002,7 @@ function rowToStrangerFace(r: any): StrangerFaceRecordWithGate {
     detectorScore: Number(r.detectorScore),
     quality: Number(r.quality),
     edgeEnergy: optionalNumber(r.edgeEnergy),
+    featureNorm: optionalNumber(r.featureNorm),
     sizePx: Number(r.sizePx),
     embedding: embedding.length ? embedding : undefined,
     dims: optionalNumber(r.dims),
@@ -1039,24 +1043,25 @@ function jsonToStrangerFace(face: StrangerFaceJson): StrangerFaceRecordWithGate 
 
 const STRANGER_FACE_COLUMNS_PG = `id, "logId", "faceIndex", "capturedAt", gate, "streamId", engine, "trackId", box,
   "sourceWidth", "sourceHeight", "detectorScore", quality, "edgeEnergy", "sizePx", embedding, dims, "modelTag",
-  "createdAt", "purgedAt", "employeeId", "matchCosine", "matchMargin", "gateId"`;
+  "createdAt", "purgedAt", "employeeId", "matchCosine", "matchMargin", "gateId", "featureNorm"`;
 const STRANGER_FACE_COLUMNS_SQLITE = `id, logId, faceIndex, capturedAt, gate, streamId, engine, trackId, box,
   sourceWidth, sourceHeight, detectorScore, quality, edgeEnergy, sizePx, embedding, dims, modelTag,
-  createdAt, purgedAt, employeeId, matchCosine, matchMargin, gateId`;
+  createdAt, purgedAt, employeeId, matchCosine, matchMargin, gateId, featureNorm`;
 
-/** Insert column lists (no purgedAt: a new face is never born purged). 24 parameters. */
+/** Insert column lists (no purgedAt: a new face is never born purged). 25 parameters. */
 const STRANGER_FACE_INSERT_COLUMNS_PG = `id, "logId", "faceIndex", "capturedAt", gate, "streamId", engine, "trackId", box,
   "sourceWidth", "sourceHeight", "detectorScore", quality, "edgeEnergy", "sizePx", embedding, dims, "modelTag",
-  crop, "createdAt", "employeeId", "matchCosine", "matchMargin", "gateId"`;
+  crop, "createdAt", "employeeId", "matchCosine", "matchMargin", "gateId", "featureNorm"`;
 const STRANGER_FACE_INSERT_COLUMNS_SQLITE = `id, logId, faceIndex, capturedAt, gate, streamId, engine, trackId, box,
   sourceWidth, sourceHeight, detectorScore, quality, edgeEnergy, sizePx, embedding, dims, modelTag,
-  crop, createdAt, employeeId, matchCosine, matchMargin, gateId`;
-const STRANGER_FACE_INSERT_PARAM_COUNT = 24;
+  crop, createdAt, employeeId, matchCosine, matchMargin, gateId, featureNorm`;
+const STRANGER_FACE_INSERT_PARAM_COUNT = 25;
 
 const strangerFaceInsertParams = (f: StrangerFaceRow, box: unknown): unknown[] => [
   f.id, f.logId, f.faceIndex, f.capturedAt, f.gate, f.streamId, f.engine, f.trackId, box,
   f.sourceWidth, f.sourceHeight, f.detectorScore, f.quality, f.edgeEnergy, f.sizePx,
   f.embedding, f.dims, f.modelTag, f.crop, f.createdAt, f.employeeId, f.matchCosine, f.matchMargin, f.gateId,
+  f.featureNorm,
 ];
 
 /**
@@ -1113,6 +1118,10 @@ const PG_STRANGER_FACES_DDL = `
   -- default (catalog-only), no backfill: old rows read NULL and readers derive
   -- the id from gate (ENTRY -> entry, EXIT -> exit). Rollback: DROP COLUMN.
   ALTER TABLE stranger_faces ADD COLUMN IF NOT EXISTS "gateId" VARCHAR(32);
+  -- Blur reports (2026-10-02): the recogniser feature strength of new faces, so
+  -- operator blur reports can be compared with unreported faces. Additive,
+  -- nullable, no backfill. Rollback: DROP COLUMN.
+  ALTER TABLE stranger_faces ADD COLUMN IF NOT EXISTS "featureNorm" REAL;
 `;
 
 /**
@@ -1190,6 +1199,82 @@ const SQLITE_LOGIN_EVENTS_DDL = `
   CREATE INDEX IF NOT EXISTS idx_login_events_at ON login_events (at DESC, id DESC);
   CREATE INDEX IF NOT EXISTS idx_login_events_user ON login_events (userId, at DESC);
 `;
+
+/**
+ * stranger_face_reports (src/server/blurReports.ts): append-only operator labels
+ * ("too blurred") on stranger faces, with the face's scores at report time. No
+ * images, no embeddings; outlives the face's crop retention as numbers.
+ * Rollback: DROP TABLE stranger_face_reports.
+ */
+const PG_BLUR_REPORTS_DDL = `
+  CREATE TABLE IF NOT EXISTS stranger_face_reports (
+    id VARCHAR(64) COLLATE "C" PRIMARY KEY,
+    "faceId" VARCHAR(64) NOT NULL,
+    "logId" VARCHAR(64),
+    kind VARCHAR(32) NOT NULL,
+    actor VARCHAR(64) NOT NULL,
+    at VARCHAR(64) COLLATE "C" NOT NULL,
+    "featureNorm" REAL,
+    "edgeEnergy" REAL,
+    quality REAL,
+    "detectorScore" REAL,
+    "sizePx" REAL,
+    "gateId" VARCHAR(32),
+    note VARCHAR(200)
+  );
+  CREATE INDEX IF NOT EXISTS idx_stranger_face_reports_at ON stranger_face_reports (at DESC, id DESC);
+  CREATE INDEX IF NOT EXISTS idx_stranger_face_reports_face ON stranger_face_reports ("faceId", at DESC);
+`;
+
+const SQLITE_BLUR_REPORTS_DDL = `
+  CREATE TABLE IF NOT EXISTS stranger_face_reports (
+    id TEXT PRIMARY KEY,
+    faceId TEXT NOT NULL,
+    logId TEXT,
+    kind TEXT NOT NULL,
+    actor TEXT NOT NULL,
+    at TEXT NOT NULL,
+    featureNorm REAL,
+    edgeEnergy REAL,
+    quality REAL,
+    detectorScore REAL,
+    sizePx REAL,
+    gateId TEXT,
+    note TEXT
+  );
+  CREATE INDEX IF NOT EXISTS idx_stranger_face_reports_at ON stranger_face_reports (at DESC, id DESC);
+  CREATE INDEX IF NOT EXISTS idx_stranger_face_reports_face ON stranger_face_reports (faceId, at DESC);
+`;
+
+const BLUR_REPORT_COLUMNS_PG = `id, "faceId", "logId", kind, actor, at, "featureNorm", "edgeEnergy", quality, "detectorScore", "sizePx", "gateId", note`;
+const BLUR_REPORT_COLUMNS_SQLITE = "id, faceId, logId, kind, actor, at, featureNorm, edgeEnergy, quality, detectorScore, sizePx, gateId, note";
+
+function normalizeBlurReport(r: BlurReportRecord): BlurReportRecord | null {
+  const at = typeof r?.at === "string" && Number.isFinite(Date.parse(r.at)) ? new Date(r.at).toISOString() : null;
+  if (!r || typeof r.id !== "string" || !r.id || r.id.length > 64 || !at) return null;
+  if (typeof r.faceId !== "string" || !r.faceId || r.faceId.length > 64) return null;
+  if (r.kind !== "blur" && r.kind !== "blur-withdrawn") return null;
+  const num = (v: unknown) => (typeof v === "number" && Number.isFinite(v) ? v : null);
+  const text = (v: unknown, n: number) => (typeof v === "string" && v ? v.slice(0, n) : null);
+  return {
+    id: r.id, faceId: r.faceId, logId: text(r.logId, 64) ?? undefined, kind: r.kind,
+    actor: text(r.actor, 64) || "unknown", at,
+    featureNorm: num(r.featureNorm), edgeEnergy: num(r.edgeEnergy), quality: num(r.quality),
+    detectorScore: num(r.detectorScore), sizePx: num(r.sizePx), gateId: text(r.gateId, 32),
+    note: text(r.note, 200) ?? undefined,
+  };
+}
+
+function rowToBlurReport(r: any): BlurReportRecord {
+  const out: BlurReportRecord = { id: String(r.id), faceId: String(r.faceId), kind: r.kind, actor: String(r.actor), at: String(r.at) };
+  if (r.logId) out.logId = String(r.logId);
+  for (const k of ["featureNorm", "edgeEnergy", "quality", "detectorScore", "sizePx"] as const) {
+    out[k] = r[k] === null || r[k] === undefined ? null : Number(r[k]);
+  }
+  out.gateId = r.gateId ? String(r.gateId) : null;
+  if (r.note) out.note = String(r.note);
+  return out;
+}
 
 const LOGIN_EVENT_PAGE_MAX = 200;
 const LOGIN_EVENT_COLUMNS_PG = `id, at, kind, method, "userId", username, reason, ip, "userAgent"`;
@@ -1525,6 +1610,7 @@ const SQLITE_STRANGER_FACES_MIGRATIONS = [
   "ALTER TABLE stranger_faces ADD COLUMN matchCosine REAL",
   "ALTER TABLE stranger_faces ADD COLUMN matchMargin REAL",
   "ALTER TABLE stranger_faces ADD COLUMN gateId TEXT",
+  "ALTER TABLE stranger_faces ADD COLUMN featureNorm REAL",
 ];
 /** After the columns exist (fresh or migrated). */
 const SQLITE_STRANGER_FACES_RECOGNISED_INDEX = `
@@ -1775,7 +1861,7 @@ export function mergeAiRecognitionConfig(
 }
 
 // Database wrapper supporting PostgreSQL (via DATABASE_URL), native Node 22 SQLite, and fallback JSON
-class SQLiteStorage implements StrangerFaceStore, ShadowResultStore, LoginEventStore {
+class SQLiteStorage implements StrangerFaceStore, ShadowResultStore, LoginEventStore, BlurReportStore {
   private db: any = null;
   private isNativeSqlite = false;
   private pgPool: Pool | null = null;
@@ -1805,6 +1891,8 @@ class SQLiteStorage implements StrangerFaceStore, ShadowResultStore, LoginEventS
   private pgShadowResultsReady = false;
   /** login_events exists on PostgreSQL (same pattern). */
   private pgLoginEventsReady = false;
+  /** stranger_face_reports exists on PostgreSQL (same pattern). */
+  private pgBlurReportsReady = false;
   /**
    * Resolves once the PostgreSQL schema migration has run (or failed, which is
    * logged). PostgreSQL becomes the active store just before the migration, so
@@ -2456,6 +2544,12 @@ class SQLiteStorage implements StrangerFaceStore, ShadowResultStore, LoginEventS
         console.error("[PostgreSQL] Lỗi khởi tạo bảng login_events:", err);
       }
       try {
+        await this.pgPool.query(PG_BLUR_REPORTS_DDL);
+        this.pgBlurReportsReady = true;
+      } catch (err) {
+        console.error("[PostgreSQL] Lỗi khởi tạo bảng stranger_face_reports:", err);
+      }
+      try {
         await this.pgPool.query(PG_DOOR_LOCK_STATES_DDL);
         this.pgDoorLockStatesReady = true;
       } catch (err) {
@@ -2730,6 +2824,11 @@ class SQLiteStorage implements StrangerFaceStore, ShadowResultStore, LoginEventS
       console.error("[SQLite] Lỗi khởi tạo bảng login_events:", err);
     }
     try {
+      this.db.exec(SQLITE_BLUR_REPORTS_DDL);
+    } catch (err) {
+      console.error("[SQLite] Lỗi khởi tạo bảng stranger_face_reports:", err);
+    }
+    try {
       this.db.exec(SQLITE_DOOR_LOCK_STATES_DDL);
     } catch (err) {
       console.error("[SQLite] Lỗi khởi tạo bảng door_lock_states:", err);
@@ -2758,6 +2857,7 @@ class SQLiteStorage implements StrangerFaceStore, ShadowResultStore, LoginEventS
     stranger_faces?: StrangerFaceJson[];
     pipeline_shadow_results?: ShadowResultRecord[];
     login_events?: LoginEventRecord[];
+    stranger_face_reports?: BlurReportRecord[];
     /** Lock state per door (N-gate wave); door "main" is also smart_lock_state. */
     door_lock_states?: Record<string, { state: SmartLockStateRecord; updatedAt: string }>;
   } = {
@@ -3754,6 +3854,99 @@ class SQLiteStorage implements StrangerFaceStore, ShadowResultStore, LoginEventS
     this.writeFallback({ ...this.fallbackData, stranger_faces: staged });
     this.fallbackData.stranger_faces = staged;
     return purged;
+  }
+
+  // ================= BLUR REPORTS (stranger_face_reports) =================
+
+  private blurReportMode(): "postgresql" | "sqlite" | "json" | null {
+    return this.singleStoreMode(this.pgBlurReportsReady);
+  }
+
+  /** BlurReportStore.saveBlurReport: append; replay by id is a no-op. Never rejects. */
+  async saveBlurReport(report: BlurReportRecord): Promise<boolean> {
+    const r = normalizeBlurReport(report);
+    if (!r) return false;
+    const mode = this.blurReportMode();
+    if (!mode) return false;
+    const params = [r.id, r.faceId, r.logId ?? null, r.kind, r.actor, r.at, r.featureNorm ?? null, r.edgeEnergy ?? null, r.quality ?? null, r.detectorScore ?? null, r.sizePx ?? null, r.gateId ?? null, r.note ?? null];
+    try {
+      if (mode === "postgresql") {
+        await this.pgPool!.query(
+          `INSERT INTO stranger_face_reports (${BLUR_REPORT_COLUMNS_PG}) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) ON CONFLICT (id) DO NOTHING`,
+          params,
+        );
+        return true;
+      }
+      if (mode === "sqlite") {
+        this.db.prepare(`INSERT INTO stranger_face_reports (${BLUR_REPORT_COLUMNS_SQLITE}) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT (id) DO NOTHING`).run(...params);
+        return true;
+      }
+      const existing = this.fallbackData.stranger_face_reports || [];
+      if (existing.some((x) => x.id === r.id)) return true;
+      const staged = [r, ...existing];
+      this.writeFallback({ ...this.fallbackData, stranger_face_reports: staged });
+      this.fallbackData.stranger_face_reports = staged;
+      return true;
+    } catch (err: any) {
+      console.error(`[BlurReports] Lỗi lưu báo cáo ảnh mờ (${mode}): ${err?.message}`);
+      return false;
+    }
+  }
+
+  /** BlurReportStore.getBlurReports: newest first by (at DESC, id DESC). */
+  async getBlurReports(opts: { sinceIso?: string; limit: number }): Promise<BlurReportRecord[]> {
+    const n = Math.min(1000, Math.max(1, Number.isFinite(opts?.limit) ? Math.trunc(opts.limit) : 200));
+    const since = opts?.sinceIso ? normIso(opts.sinceIso) : undefined;
+    if (opts?.sinceIso && !since) throw new RangeError("getBlurReports: invalid sinceIso");
+    const mode = this.blurReportMode();
+    if (mode === "postgresql") {
+      const res = await this.pgPool!.query(
+        `SELECT ${BLUR_REPORT_COLUMNS_PG} FROM stranger_face_reports ${since ? "WHERE at >= $1" : ""} ORDER BY at DESC, id DESC LIMIT ${since ? "$2" : "$1"}`,
+        since ? [since, n] : [n],
+      );
+      return res.rows.map(rowToBlurReport);
+    }
+    if (mode === "sqlite") {
+      return (this.db.prepare(
+        `SELECT ${BLUR_REPORT_COLUMNS_SQLITE} FROM stranger_face_reports ${since ? "WHERE at >= ?" : ""} ORDER BY at DESC, id DESC LIMIT ?`,
+      ).all(...(since ? [since, n] : [n])) as any[]).map(rowToBlurReport);
+    }
+    if (mode === "json") {
+      return (this.fallbackData.stranger_face_reports || [])
+        .filter((r) => !since || r.at >= since)
+        .sort((a, b) => (a.at === b.at ? (a.id < b.id ? 1 : -1) : a.at < b.at ? 1 : -1))
+        .slice(0, n)
+        .map((r) => rowToBlurReport(r));
+    }
+    return [];
+  }
+
+  /** BlurReportStore.blurReportedFaceIds: faces whose newest row is "blur". */
+  async blurReportedFaceIds(faceIds: string[]): Promise<Set<string>> {
+    const ids = [...new Set(faceIds.filter((id) => typeof id === "string" && id && id.length <= 64))].slice(0, 2000);
+    const out = new Set<string>();
+    if (!ids.length) return out;
+    const mode = this.blurReportMode();
+    let rows: Array<{ faceId: string; kind: string; at: string; id: string }> = [];
+    if (mode === "postgresql") {
+      rows = (await this.pgPool!.query(
+        `SELECT DISTINCT ON ("faceId") "faceId", kind, at, id FROM stranger_face_reports WHERE "faceId" = ANY($1::varchar[]) ORDER BY "faceId", at DESC, id DESC`,
+        [ids],
+      )).rows;
+    } else if (mode === "sqlite") {
+      rows = this.db.prepare(
+        `SELECT faceId, kind, at, id FROM stranger_face_reports WHERE faceId IN (${ids.map(() => "?").join(",")}) ORDER BY faceId, at DESC, id DESC`,
+      ).all(...ids) as any[];
+    } else if (mode === "json") {
+      rows = (this.fallbackData.stranger_face_reports || []).filter((r) => ids.includes(r.faceId)).sort((a, b) => (a.at === b.at ? (a.id < b.id ? 1 : -1) : a.at < b.at ? 1 : -1));
+    }
+    const seen = new Set<string>();
+    for (const r of rows) {
+      if (seen.has(r.faceId)) continue; // newest row per face only
+      seen.add(r.faceId);
+      if (r.kind === "blur") out.add(r.faceId);
+    }
+    return out;
   }
 
   // ================= SIGN-IN AUDIT (login_events) =================

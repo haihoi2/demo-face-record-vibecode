@@ -143,7 +143,7 @@ describe("PostgreSQL: N-gate persistence", () => {
 
     const cols = (await client!.query(
       `SELECT table_name, data_type, character_maximum_length AS len, is_nullable, column_default FROM information_schema.columns
-        WHERE column_name = 'gateId' ORDER BY table_name`,
+        WHERE column_name = 'gateId' AND table_name IN ('access_logs', 'stranger_faces') ORDER BY table_name`,
     )).rows;
     assert.deepEqual(cols, [
       { table_name: "access_logs", data_type: "character varying", len: 32, is_nullable: "YES", column_default: null },
@@ -288,7 +288,7 @@ describe("PostgreSQL: N-gate persistence", () => {
     assert.equal(g.code, 0, g.stderr.slice(-3000));
     assert.deepEqual(g.out.side.ids, [], "dropping the column turns every row into a legacy row (derived from type)");
     assert.equal(g.out.all.ids.length, 10, "no event is lost");
-    const n = (await client!.query(`SELECT count(*)::int AS n FROM information_schema.columns WHERE column_name = 'gateId'`)).rows[0].n;
+    const n = (await client!.query(`SELECT count(*)::int AS n FROM information_schema.columns WHERE column_name = 'gateId' AND table_name IN ('access_logs', 'stranger_faces')`)).rows[0].n;
     assert.equal(n, 2);
     assert.equal((await client!.query(`SELECT to_regclass('door_lock_states') IS NOT NULL AS ok`)).rows[0].ok, true);
     assert.equal((await client!.query(`SELECT to_regclass('idx_access_logs_gate_ts') IS NOT NULL AS ok`)).rows[0].ok, true);

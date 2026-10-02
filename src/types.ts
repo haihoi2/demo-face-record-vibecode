@@ -48,6 +48,8 @@ export interface AccessLog {
 export interface StrangerPhoto {
   /** The access event of the frame. Several face tiles can share one logId. */
   logId: string;
+  /** True while an operator's blur report on this per-face photo stands (src/server/blurReports.ts). */
+  blurReported?: boolean;
   /**
    * Identity of this tile in resolve requests: `face:<faceId>` for a per-face
    * record, `log:<logId>` for an older whole-frame capture. Absent from servers

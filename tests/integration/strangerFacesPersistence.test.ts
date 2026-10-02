@@ -180,6 +180,7 @@ describe("PostgreSQL: per-face stranger records", () => {
       matchCosine: ["real", null, "YES", null],
       matchMargin: ["real", null, "YES", null],
       gateId: ["character varying", 32, "YES", null],
+      featureNorm: ["real", null, "YES", null],
     });
     const idx = (await client!.query(
       `SELECT indexname, indexdef FROM pg_indexes WHERE tablename = 'stranger_faces' ORDER BY indexname`,

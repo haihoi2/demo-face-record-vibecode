@@ -94,6 +94,9 @@ const RULES: readonly Rule[] = [
     pattern: /^\/api\/strangers\/(?:quick-register|register|merge|assign|dismiss|reject|restore)$/,
     role: "operator",
   },
+  // Blur reports: labels on stranger faces (never delete anything). The report list is admin.
+  { methods: ["POST", "DELETE"], pattern: /^\/api\/strangers\/faces\/[^/]+\/blur-report$/, role: "operator" },
+  { methods: READ, pattern: /^\/api\/strangers\/blur-reports$/, role: "admin" },
   // Bulk "not a face" retirement of stored captures (restorable): admin only.
   { methods: ["POST"], pattern: /^\/api\/strangers\/retire-non-faces$/, role: "admin" },
 
