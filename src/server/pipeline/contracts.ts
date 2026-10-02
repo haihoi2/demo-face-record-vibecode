@@ -52,6 +52,8 @@ export interface SourceState {
   newestFrameAgeMs: number | null;
   reconnects: number;
   lastError?: string;
+  /** When lastError happened (ISO). The error stays reported after the stream recovers. */
+  lastErrorAt?: string;
   since: string;
 }
 

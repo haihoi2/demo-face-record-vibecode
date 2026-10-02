@@ -424,6 +424,7 @@ export interface GateWatchRuntime {
     newestFrameAgeMs: number | null;
     reconnects: number;
     lastError?: string;
+    lastErrorAt?: string;
     since: string;
   };
   /** Real-time pipeline decisions (shadow/live only). */

@@ -74,6 +74,8 @@ import {
   readPipelineRuntime,
   sourceStatusLabel,
   sourceStatusTone,
+  sourceErrorView,
+  streamErrorTime,
 } from "../utils/pipelineStatus";
 import {
   directionOf,
@@ -2038,11 +2040,22 @@ export const CameraDashboard: React.FC<CameraDashboardProps> = ({
             )}
           </div>
         )}
-        {state?.lastError && (
-          <div className="px-2 py-1 rounded-md bg-rose-950/60 border border-rose-700/70 text-[10px] text-rose-200 flex items-start gap-1.5">
+        {sourceErrorView(state) && (
+          <div
+            className={`px-2 py-1 rounded-md border text-[10px] flex items-start gap-1.5 ${
+              sourceErrorView(state)!.current
+                ? "bg-rose-950/60 border-rose-700/70 text-rose-200"
+                : "bg-slate-900/60 border-slate-700 text-slate-300"
+            }`}
+          >
             <AlertTriangle className="w-3 h-3 shrink-0 mt-px" />
             <span className="break-words">
-              <b>Lỗi luồng hình:</b> {state.lastError}
+              <b>
+                {sourceErrorView(state)!.current
+                  ? "Lỗi luồng hình:"
+                  : `Đã tự kết nối lại sau sự cố${streamErrorTime(sourceErrorView(state)!.at)}:`}
+              </b>{" "}
+              {state!.lastError}
             </span>
           </div>
         )}
