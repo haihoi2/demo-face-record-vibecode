@@ -1,6 +1,6 @@
 # Plan: person-presence alerts ("human exists, no face")
 
-Status: DRAFT 2026-10-02 (model candidates updated the same day), for owner review. Nothing is built yet. Owner request: "to make sure not to miss a stranger or a thief, we also need a feature that quickly detects 'human exists' if faces cannot be detected; this should be a quicker thread and notify the other security group." Decisions needed are in section 9.
+Status: P1 STARTED 2026-10-02. Decided: 1 channels (shared for now), 2 no image in messages, 3 all time / 3 s, 6 free licence. Open: 4 zones, 5 retention, 7 exit camera. Nothing is built yet. Owner request: "to make sure not to miss a stranger or a thief, we also need a feature that quickly detects 'human exists' if faces cannot be detected; this should be a quicker thread and notify the other security group." Decisions needed are in section 9.
 
 ## 1. Why: what the cameras show today
 
@@ -121,12 +121,12 @@ Owners: face-engine agent (P1 model evaluation, detector wrapper), INT (worker, 
 ## 9. Owner decisions needed before P2
 
 1. ~~**Destination for the security group**~~ **Decided 2026-10-02:** admins can declare more notification channels; for now all alerts use the existing shared Eton channel (section 5).
-2. **Send the person's picture in the message,** or only a link that requires login?
-3. **When to alert:**
+2. ~~**Send the person's picture in the message**~~ **Decided 2026-10-02: NO** - messages carry text and a login-protected link only; no image leaves the system.
+3. **Decided 2026-10-02: alert at all times, for a person in view for at least 3 s** (one rule, no working-hours split). Original options:
    a. after hours, every person;
    b. working hours, only people without a face staying ≥ N s (default 5 s);
    c. which hours count as "after hours".
 4. **Zones:** whole picture, or a drawn zone per gate (recommended: zone)?
 5. **Retention of body pictures:** 14 days like stranger faces?
-6. **Model licence:** Apache-licensed models only (recommended; candidate list in section 3), or buy a commercial YOLO licence?
+6. ~~**Model licence**~~ **Decided 2026-10-02: free licence only** (Apache-2.0 models; candidate list in section 3). P1 started the same day.
 7. **Exit camera:** re-aim or add a camera so the exit actually sees people's faces and bodies (presence detection helps, but only within what the camera sees).
