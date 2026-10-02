@@ -69,7 +69,15 @@ camera (one RTSP connection per gate, already open)
 
 ## 5. Notifications to the security group
 
-- **Separate destination:** a second, separately configured destination ("Nhóm bảo vệ"), not the existing employee/stranger chat room. It's admin-configured, destination-guarded like the other webhooks, and its URL is never shown back.
+- **Notification channels (owner decision 2026-10-02):** admins can declare **additional notification channels** (name, type, URL; today's type is the Eton chat-room webhook), and each alert type is routed to a channel:
+  - stranger face (today's alert),
+  - presence without a face,
+  - presence detection offline.
+
+  **For now every alert type uses the existing shared channel** (the current Eton chat room). Moving security alerts to their own group later is a settings change, not a code change.
+  - New channels are admin-only, destination-guarded like the existing webhook (allowlist, no loopback/metadata/unintended private targets), audited, and their URLs/tokens are never shown back (masked like the door-controller token).
+  - The existing webhook settings become channel "Eton (chung)" automatically, so nothing changes for current alerts.
+  - A "send test" button per channel.
 - **Message:** gate, time, duration, "không thấy mặt" / "người lạ" / count, and a link to the event in the dashboard (login required).
   - If the chat accepts an attached image, the crop can be attached. That's an owner decision, because it sends a person's picture outside the system.
 - **Flood control:**
@@ -93,7 +101,7 @@ camera (one RTSP connection per gate, already open)
 | P0 | Owner decisions (section 9) | decisions recorded here | — |
 | P1 | Model choice offline (no change to the running system): export/convert YOLOX-Nano/Tiny, RTMDet-tiny, EfficientDet-Lite0/Lite2, RT-DETR-R18, RF-DETR-Nano to ONNX; build an evaluation set from NVR footage of both gates, day and night (8-day retention window), pre-labelled with Grounding DINO and checked by hand; compare (1) recall of people - missing nobody comes first, (2) false alarms per hour, (3) ms per frame on this host's CPU under ONNX Runtime for Node.js | short report + chosen model file | 2-3 days |
 | P2 | Presence worker + third stream output + tracker + linking + `presence_events` store; **shadow** (record only, no alerts) on both gates | events visible in the panel, no messages sent | 3-4 days |
-| P3 | Security-group destination, alert rules, schedules, panel with labels, settings, health | alerts to a test group on dev, then the real group | 2-3 days |
+| P3 | Notification channels (declare more channels, route each alert type; existing webhook migrated as "Eton (chung)"), alert rules, schedules, panel with labels, settings, health | alerts to a test channel on dev, then the shared channel | 3-4 days |
 | P4 | Shadow on live for ~1 week, tune zones and durations from labels, then switch alerts on | go-live with measured false-alarm rate | 1 week elapsed |
 
 Each phase goes through the usual gates (typecheck, lint, unit, integration on SQLite and PostgreSQL), a dev test, and your "deploy …" before staging.
@@ -112,7 +120,7 @@ Owners: face-engine agent (P1 model evaluation, detector wrapper), INT (worker, 
 
 ## 9. Owner decisions needed before P2
 
-1. **Destination for the security group:** another Eton chat room (URL from you), or Telegram / Zalo / SMS?
+1. ~~**Destination for the security group**~~ **Decided 2026-10-02:** admins can declare more notification channels; for now all alerts use the existing shared Eton channel (section 5).
 2. **Send the person's picture in the message,** or only a link that requires login?
 3. **When to alert:**
    a. after hours, every person;
