@@ -19,7 +19,26 @@ export interface PipelineSourceState {
   newestFrameAgeMs: number | null;
   reconnects: number | null;
   lastError?: string;
+  /** When lastError happened (ISO), if the server says. */
+  lastErrorAt?: string;
   since?: string;
+}
+
+/**
+ * A stream error is current only while the stream is not delivering frames.
+ * Once it streams again the error is history: "reconnected after an
+ * interruption", not a red fault (owner 2026-10-02: a recovered reconnect kept
+ * showing as "Lỗi luồng hình").
+ */
+/** " lúc 07:58:14 02/10" for an ISO time, "" when unknown. */
+export function streamErrorTime(iso: string | undefined): string {
+  if (!iso || !Number.isFinite(Date.parse(iso))) return "";
+  return ` lúc ${new Date(iso).toLocaleString("vi-VN", { hour: "2-digit", minute: "2-digit", second: "2-digit", day: "2-digit", month: "2-digit" })}`;
+}
+
+export function sourceErrorView(state: PipelineSourceState | null | undefined): { current: boolean; text: string; at?: string } | null {
+  if (!state?.lastError) return null;
+  return { current: state.status !== "streaming", text: state.lastError, ...(state.lastErrorAt ? { at: state.lastErrorAt } : {}) };
 }
 
 /** The gate worker as the pipeline host reports it (`pipelineStats.worker`). */
@@ -97,6 +116,7 @@ export function normalizePipelineState(raw: unknown): PipelineSourceState | null
     newestFrameAgeMs: age !== null && age >= 0 ? age : null,
     reconnects: reconnects !== null && reconnects >= 0 ? Math.floor(reconnects) : null,
     ...(typeof r.lastError === "string" && r.lastError.trim() ? { lastError: redactCredentialUrls(r.lastError.trim()) } : {}),
+    ...(typeof r.lastErrorAt === "string" && Number.isFinite(Date.parse(r.lastErrorAt)) ? { lastErrorAt: r.lastErrorAt } : {}),
     ...(typeof r.since === "string" ? { since: r.since } : {}),
   };
 }

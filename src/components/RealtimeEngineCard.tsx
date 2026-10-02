@@ -34,6 +34,8 @@ import {
   pipelineModeTone,
   sourceStatusLabel,
   sourceStatusTone,
+  sourceErrorView,
+  streamErrorTime,
   workerStateLabel,
   type PipelineMode,
   type Tone,
@@ -600,13 +602,18 @@ export const RealtimeEngineCard: React.FC = () => {
           </div>
         )}
 
-        {(state?.lastError || stats?.lastError) && (
-          <div className={`px-2 py-1.5 rounded-md border text-[11px] flex items-start gap-1.5 ${TONE_CHIP.rose}`}>
+        {(sourceErrorView(state) || stats?.lastError) && (
+          <div
+            className={`px-2 py-1.5 rounded-md border text-[11px] flex items-start gap-1.5 ${
+              sourceErrorView(state)?.current || stats?.lastError ? TONE_CHIP.rose : TONE_CHIP.slate
+            }`}
+          >
             <AlertTriangle className="w-3.5 h-3.5 shrink-0 mt-px" />
             <span className="break-words">
-              {state?.lastError && (
+              {sourceErrorView(state) && (
                 <>
-                  <b>Lỗi luồng hình:</b> {state.lastError}
+                  <b>{sourceErrorView(state)!.current ? "Lỗi luồng hình:" : `Đã tự kết nối lại sau sự cố${streamErrorTime(sourceErrorView(state)!.at)}:`}</b>{" "}
+                  {state!.lastError}
                 </>
               )}
               {state?.lastError && stats?.lastError && <br />}

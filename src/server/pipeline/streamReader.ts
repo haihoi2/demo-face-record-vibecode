@@ -385,6 +385,7 @@ class StreamReader extends EventEmitter implements FrameSource {
   private status: SourceStatus = "stopped";
   private sinceMs: number;
   private lastError?: string;
+  private lastErrorAtMs: number | null = null;
   private reconnects = 0;
   private attempt = 0;
   private stderrTail = "";
@@ -449,6 +450,7 @@ class StreamReader extends EventEmitter implements FrameSource {
     if (this.running) return;
     if (!this.cfg) {
       this.lastError = this.configError;
+      this.lastErrorAtMs = this.now();
       this.setStatus("stopped", true);
       return;
     }
@@ -511,6 +513,7 @@ class StreamReader extends EventEmitter implements FrameSource {
       since: new Date(this.sinceMs).toISOString(),
     };
     if (this.lastError) state.lastError = this.lastError;
+    if (this.lastError && this.lastErrorAtMs !== null) state.lastErrorAt = new Date(this.lastErrorAtMs).toISOString();
     return state;
   }
 
@@ -621,6 +624,7 @@ class StreamReader extends EventEmitter implements FrameSource {
     this.generation += 1; // later events of this process are ignored
     this.killProcess();
     this.lastError = redactCredentials(reason);
+    this.lastErrorAtMs = this.now();
     const from = this.status;
     if (stale) this.setStatus("stale");
     this.resetStream();
