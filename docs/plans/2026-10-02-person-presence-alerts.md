@@ -1,6 +1,6 @@
 # Plan: person-presence alerts ("human exists, no face")
 
-Status: P1 STARTED 2026-10-02. Decided: 1 channels (shared for now), 2 no image in messages, 3 all time / 3 s, 6 free licence. Open: 4 zones, 5 retention, 7 exit camera. Nothing is built yet. Owner request: "to make sure not to miss a stranger or a thief, we also need a feature that quickly detects 'human exists' if faces cannot be detected; this should be a quicker thread and notify the other security group." Decisions needed are in section 9.
+Status: P1 STARTED 2026-10-02. All decisions taken 2026-10-02: 1 declarable channels (shared Eton channel for now), 2 no image in messages, 3 all hours / >= 3 s in view, 4 whole picture, 5 body pictures kept 7 days, 6 free licence only, 7 entry gate first. Nothing is built yet. Owner request: "to make sure not to miss a stranger or a thief, we also need a feature that quickly detects 'human exists' if faces cannot be detected; this should be a quicker thread and notify the other security group." Decisions needed are in section 9.
 
 ## 1. Why: what the cameras show today
 
@@ -64,7 +64,7 @@ camera (one RTSP connection per gate, already open)
 - Body crops are personal data. They get the same governance as stranger faces:
   - operator+ access with the existing image guard;
   - audit of reads;
-  - retention `PRESENCE_EVENT_RETENTION_DAYS` (proposal: 14 days for crops, the event row kept as numbers);
+  - retention `PRESENCE_EVENT_RETENTION_DAYS` = 7 days for crops (owner decision), the event row kept as numbers;
   - no embeddings or re-identification across days in this phase.
 
 ## 5. Notifications to the security group
@@ -126,7 +126,7 @@ Owners: face-engine agent (P1 model evaluation, detector wrapper), INT (worker, 
    a. after hours, every person;
    b. working hours, only people without a face staying ≥ N s (default 5 s);
    c. which hours count as "after hours".
-4. **Zones:** whole picture, or a drawn zone per gate (recommended: zone)?
-5. **Retention of body pictures:** 14 days like stranger faces?
+4. ~~**Zones**~~ **Decided 2026-10-02: whole picture** (no drawn zone; the 3 s rule filters passers-by).
+5. ~~**Retention of body pictures**~~ **Decided 2026-10-02: 7 days** (`PRESENCE_EVENT_RETENTION_DAYS=7`; the event row stays as numbers).
 6. ~~**Model licence**~~ **Decided 2026-10-02: free licence only** (Apache-2.0 models; candidate list in section 3). P1 started the same day.
-7. **Exit camera:** re-aim or add a camera so the exit actually sees people's faces and bodies (presence detection helps, but only within what the camera sees).
+7. **Decided 2026-10-02: entry gate first.** Presence detection is built and switched on for the entry gate; the exit camera stays as it is for now (it can be added as a second gate later with the same settings).
