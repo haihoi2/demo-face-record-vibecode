@@ -26,8 +26,9 @@ import {
   ZoomIn,
   ExternalLink,
   Lightbulb,
+  Focus,
 } from "lucide-react";
-import { StrangerCluster, StrangerClusterSuggestion, Employee, AccessLog } from "../types";
+import { StrangerCluster, StrangerClusterSuggestion, StrangerPhoto, Employee, AccessLog } from "../types";
 import { readSuggestion, suggestionAsEmployee, suggestionMergeLabel, suggestionText } from "../utils/accuracyUi";
 import { normalizeApiAssetUrl, operatorJsonFetch } from "../utils/api";
 import { ProtectedImage } from "./ProtectedImage";
@@ -44,6 +45,18 @@ import {
   preselectTarget,
   resolvePayloadIds,
 } from "../utils/strangerPhotos";
+import {
+  BLUR_EXPLAINER,
+  BLUR_REPORT_HINT,
+  BLUR_WITHDRAW_HINT,
+  applyBlurState,
+  blurReportRequest,
+  blurReportSuccessText,
+  canBlurReport,
+  isBlurReported,
+  readBlurReportResult,
+} from "../utils/blurReports";
+import { hasRole, useOperatorSession } from "../utils/session";
 
 interface StrangerClusterModalProps {
   isOpen: boolean;
@@ -168,6 +181,12 @@ export const StrangerClusterModal: React.FC<StrangerClusterModalProps> = ({
   const [mergeTarget, setMergeTarget] = useState<Employee | null>(null);
   const [adoptPhoto, setAdoptPhoto] = useState<boolean>(false);
 
+  // --- Blur reports (a label for tuning the blur filter; the photo is never deleted or hidden) ---
+  // The toggle is a courtesy for operator/admin; the server checks the role on every request.
+  const canReportBlur = hasRole(useOperatorSession(), "operator");
+  const [blurPending, setBlurPending] = useState<Record<string, boolean>>({});
+  const [blurNotice, setBlurNotice] = useState<{ kind: "success" | "error"; text: string } | null>(null);
+
   // Quick department options
   // Same managed catalog as the registration form; the server refuses anything else.
   const orgCatalog = useOrgCatalog();
@@ -231,6 +250,7 @@ export const StrangerClusterModal: React.FC<StrangerClusterModalProps> = ({
     setLoading(true);
     setError(null);
     setPreselectMissNotice(null);
+    setBlurNotice(null);
     try {
       const query = cursor ? `?limit=20&cursor=${encodeURIComponent(cursor)}` : "?limit=20";
       const res = await operatorJsonFetch<{
@@ -446,6 +466,47 @@ export const StrangerClusterModal: React.FC<StrangerClusterModalProps> = ({
     }
   };
 
+  /**
+   * "Báo ảnh mờ" / "Bỏ báo mờ" on one per-face photo. The badge changes only
+   * after the server confirms (2xx); a refusal or transport failure leaves it as
+   * it was and shows the server's error text as-is. Nothing is deleted or hidden.
+   */
+  const handleToggleBlurReport = async (photo: StrangerPhoto) => {
+    if (!canBlurReport(photo) || blurPending[photo.faceId]) return;
+    const faceId = photo.faceId;
+    const report = !isBlurReported(photo);
+    setBlurPending((prev) => ({ ...prev, [faceId]: true }));
+    setBlurNotice(null);
+    try {
+      const { url, init } = blurReportRequest(faceId, report);
+      const res = await operatorJsonFetch(url, init);
+      const outcome = readBlurReportResult(faceId, res);
+      // A refusal or transport failure: the badge stays as it was.
+      if ("error" in outcome) {
+        setBlurNotice({ kind: "error", text: outcome.error });
+        return;
+      }
+      setClusters((prev) => applyBlurState(prev, faceId, outcome.blurReported));
+      setSelectedCluster((prev) => (prev ? applyBlurState([prev], faceId, outcome.blurReported)[0] : prev));
+      setBlurNotice({ kind: "success", text: blurReportSuccessText(outcome.blurReported) });
+    } catch (err: any) {
+      setBlurNotice({ kind: "error", text: err?.message || "Lỗi không xác định" });
+    } finally {
+      setBlurPending((prev) => {
+        const next = { ...prev };
+        delete next[faceId];
+        return next;
+      });
+    }
+  };
+
+  // A confirmation fades after a few seconds; an error stays until dismissed.
+  useEffect(() => {
+    if (blurNotice?.kind !== "success") return;
+    const timer = setTimeout(() => setBlurNotice(null), 4000);
+    return () => clearTimeout(timer);
+  }, [blurNotice]);
+
   const handleSubmitQuickRegister = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!name.trim()) {
@@ -590,6 +651,43 @@ export const StrangerClusterModal: React.FC<StrangerClusterModalProps> = ({
           </div>
         )}
 
+        {/* Blur report result: always mounted so screen readers hear the change */}
+        <div
+          id="blur-report-notice"
+          aria-live={blurNotice?.kind === "error" ? "assertive" : "polite"}
+          aria-atomic="true"
+        >
+          {blurNotice && (
+            <div
+              className={`mx-6 mt-4 p-3 rounded-2xl border flex items-start gap-2.5 text-xs animate-in slide-in-from-top duration-300 ${
+                blurNotice.kind === "error"
+                  ? "bg-rose-50 border-rose-200 text-rose-900"
+                  : "bg-emerald-50 border-emerald-200 text-emerald-900"
+              }`}
+            >
+              {blurNotice.kind === "error" ? (
+                <AlertTriangle className="w-4 h-4 text-rose-600 shrink-0 mt-0.5" aria-hidden="true" />
+              ) : (
+                <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0 mt-0.5" aria-hidden="true" />
+              )}
+              <span className="flex-1 leading-relaxed">
+                {blurNotice.kind === "error" && <span className="font-semibold">Không lưu được báo ảnh mờ: </span>}
+                {blurNotice.text}
+              </span>
+              <button
+                id="btn-dismiss-blur-notice"
+                type="button"
+                onClick={() => setBlurNotice(null)}
+                aria-label="Đóng thông báo"
+                title="Đóng thông báo"
+                className="p-1 rounded-lg opacity-70 hover:opacity-100 hover:bg-white/60 transition-colors shrink-0 focus:outline-hidden focus-visible:ring-2 focus-visible:ring-indigo-500"
+              >
+                <X className="w-3.5 h-3.5" />
+              </button>
+            </div>
+          )}
+        </div>
+
         {/* Modal Body */}
         <div className="p-6 overflow-y-auto flex-1 space-y-6">
           {/* Information Callout */}
@@ -732,6 +830,10 @@ export const StrangerClusterModal: React.FC<StrangerClusterModalProps> = ({
                           const tileId = observationIdOf(photo);
                           const isPrimary = isSelected && activeObservationId === tileId;
                           const framePath = frameLinkPath(photo);
+                          // Blur report: per-face photos only; the badge for everyone, the toggle for operator/admin.
+                          const blurReported = isBlurReported(photo);
+                          const showBlurToggle = canReportBlur && canBlurReport(photo);
+                          const blurBusy = canBlurReport(photo) && !!blurPending[photo.faceId];
 
                           return (
                             <div
@@ -797,15 +899,49 @@ export const StrangerClusterModal: React.FC<StrangerClusterModalProps> = ({
                                 </a>
                               )}
 
-                              {/* Primary tag badge */}
+                              {/* Blur report toggle: a label for tuning the blur filter, the photo stays */}
+                              {showBlurToggle && (
+                                <button
+                                  id={`btn-blur-report-${cluster.clusterId}-${pIdx}`}
+                                  type="button"
+                                  onClick={() => handleToggleBlurReport(photo)}
+                                  disabled={blurBusy}
+                                  aria-pressed={blurReported}
+                                  aria-busy={blurBusy || undefined}
+                                  aria-label={`Báo ảnh mờ: ảnh khuôn mặt ${pIdx + 1}`}
+                                  title={blurReported ? BLUR_WITHDRAW_HINT : BLUR_REPORT_HINT}
+                                  className={`absolute top-1.5 right-1.5 z-10 p-1 rounded-md text-white opacity-80 hover:opacity-100 focus:opacity-100 focus:outline-hidden focus-visible:ring-2 focus-visible:ring-white disabled:opacity-50 disabled:cursor-wait ${
+                                    blurReported ? "bg-amber-500" : "bg-black/55"
+                                  }`}
+                                >
+                                  {blurBusy ? (
+                                    <RefreshCw className="w-3 h-3 animate-spin" aria-hidden="true" />
+                                  ) : (
+                                    <Focus className="w-3 h-3" aria-hidden="true" />
+                                  )}
+                                </button>
+                              )}
+
+                              {/* Primary tag badge (below the blur toggle when there is one) */}
                               {isPrimary && (
-                                <div className="pointer-events-none absolute top-1.5 right-1.5 px-1.5 py-0.5 rounded-md bg-indigo-600 text-white text-[10px] font-bold shadow-xs">
+                                <div className={`pointer-events-none absolute ${showBlurToggle ? "top-8" : "top-1.5"} right-1.5 px-1.5 py-0.5 rounded-md bg-indigo-600 text-white text-[10px] font-bold shadow-xs`}>
                                   Avatar chính
                                 </div>
                               )}
 
                               {/* Time & Door metadata overlay */}
                               <div className="pointer-events-none absolute inset-x-0 bottom-0 bg-gradient-to-t from-black/80 via-black/40 to-transparent p-1.5 text-white">
+                                {blurReported && (
+                                  <p className="mb-0.5">
+                                    <span
+                                      data-testid={`blur-badge-${cluster.clusterId}-${pIdx}`}
+                                      className="inline-flex items-center gap-0.5 px-1 py-px rounded bg-amber-400 text-amber-950 text-[9px] font-bold"
+                                    >
+                                      <Focus className="w-2.5 h-2.5" aria-hidden="true" />
+                                      Đã báo mờ
+                                    </span>
+                                  </p>
+                                )}
                                 <p className="text-[10px] font-medium truncate flex items-center gap-1">
                                   <Clock className="w-2.5 h-2.5 shrink-0" />
                                   {/* Date and seconds too, so a photo can be checked against the NVR recording */}
@@ -854,6 +990,52 @@ export const StrangerClusterModal: React.FC<StrangerClusterModalProps> = ({
                                   ? "Ảnh cắt khuôn mặt của người này; khung hình đầy đủ có thể có người khác."
                                   : "Ảnh toàn khung hình (bản ghi cũ)."}
                               </p>
+                              {/* Blur report on the chosen face: a label, the photo is kept */}
+                              {canBlurReport(activePhoto) && (canReportBlur || isBlurReported(activePhoto)) && (
+                                <div className="space-y-1">
+                                  <div className="flex flex-wrap items-center gap-2">
+                                    {isBlurReported(activePhoto) && (
+                                      <span
+                                        id={`blur-badge-active-${cluster.clusterId}`}
+                                        className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[11px] font-semibold bg-amber-100 text-amber-900 border border-amber-300"
+                                      >
+                                        <Focus className="w-3 h-3" aria-hidden="true" />
+                                        Đã báo mờ
+                                      </span>
+                                    )}
+                                    {canReportBlur && (
+                                      <button
+                                        id={`btn-blur-report-active-${cluster.clusterId}`}
+                                        type="button"
+                                        onClick={() => handleToggleBlurReport(activePhoto)}
+                                        disabled={!!blurPending[activePhoto.faceId]}
+                                        aria-pressed={isBlurReported(activePhoto)}
+                                        aria-busy={!!blurPending[activePhoto.faceId] || undefined}
+                                        title={isBlurReported(activePhoto) ? BLUR_WITHDRAW_HINT : BLUR_REPORT_HINT}
+                                        className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold border transition-colors focus:outline-hidden focus-visible:ring-2 focus-visible:ring-amber-500 disabled:opacity-50 disabled:cursor-wait ${
+                                          isBlurReported(activePhoto)
+                                            ? "border-slate-300 bg-white text-slate-700 hover:bg-slate-50"
+                                            : "border-amber-300 bg-white text-amber-800 hover:bg-amber-50"
+                                        }`}
+                                      >
+                                        {blurPending[activePhoto.faceId] ? (
+                                          <RefreshCw className="w-3.5 h-3.5 animate-spin" aria-hidden="true" />
+                                        ) : (
+                                          <Focus className="w-3.5 h-3.5" aria-hidden="true" />
+                                        )}
+                                        <span>
+                                          {blurPending[activePhoto.faceId]
+                                            ? "Đang lưu..."
+                                            : isBlurReported(activePhoto)
+                                              ? "Bỏ báo mờ"
+                                              : "Báo ảnh mờ"}
+                                        </span>
+                                      </button>
+                                    )}
+                                  </div>
+                                  <p className="text-[10px] text-slate-500">{BLUR_EXPLAINER}</p>
+                                </div>
+                              )}
                               {activeFramePath && (
                                 <a
                                   id={`link-active-frame-${cluster.clusterId}`}
