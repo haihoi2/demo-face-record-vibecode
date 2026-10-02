@@ -7,6 +7,7 @@
 Plans:
   accuracy-<gate>  every model x input on the full picture (and the gate area for ENTRY, dynamic-
                    shape models only), --threads intra-op threads (default 2), all frames of that gate -> runs/<model>__<view>__<input>__t4__<gate>
+  night            every model x input on INT's night IR stills (set "night", both gates)
   timing           every model x input, intra-op threads 1 and 2, first 200 frames of the NVR clips
                    (after 10 warm-up frames), no detections written -> runs/...__timing
 Prerequisites: docker images presence-p1-tester (docker build --target tester -t presence-p1-tester .),
@@ -36,6 +37,12 @@ def jobs(plan, models, threads=2):
                     out.append(dict(model=m["id"], input=inp["key"], view=v, threads=threads, gates=gate,
                                     tag=gate.lower(),
                                     extra=["--sets", "nvr"] if v == "gate" or inp.get("nvrOnly") else []))
+    elif plan == "night":
+        # INT's lights-off IR stills (person-free): every model x input, whole picture, both gates
+        for m in models:
+            for inp in m["inputs"]:
+                out.append(dict(model=m["id"], input=inp["key"], view="full", threads=threads, gates="ENTRY,EXIT",
+                                tag="night", extra=["--sets", "night"]))
     elif plan == "timing":
         for m in models:
             for inp in m["inputs"]:
@@ -64,6 +71,9 @@ def main():
     ap.add_argument("--threads", type=int, default=2, help="intra-op threads for accuracy plans")
     ap.add_argument("--only", default="", help="comma list of model ids")
     ap.add_argument("--skip-done", action="store_true")
+    ap.add_argument("--clips", default="", help="only these clip ids (e.g. new exports; see merge_runs.py)")
+    ap.add_argument("--tag", default="", help="override the run tag (e.g. entry-add)")
+    ap.add_argument("--views", default="", help="only these views (full,gate)")
     ap.add_argument("--dry-run", action="store_true")
     a = ap.parse_args()
     if float(a.cpus) > 2.5:
@@ -73,6 +83,12 @@ def main():
         models = [m for m in models if m["id"] in a.only.split(",")]
     uid = f"{os.getuid()}:{os.getgid()}"
     for j in jobs(a.plan, models, a.threads):
+        if a.views and j["view"] not in a.views.split(","):
+            continue
+        if a.tag:
+            j["tag"] = a.tag
+        if a.clips:
+            j["extra"] = j["extra"] + ["--clips", a.clips]
         name = "__".join([j["model"], j["view"], j["input"], f"t{j['threads']}", j["tag"]])
         if a.skip_done and os.path.exists(os.path.join(a.work, "runs", name, "summary.json")):
             print(f"skip {name}", flush=True)

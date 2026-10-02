@@ -117,7 +117,10 @@ def sheets(work, gate, clips, all_tracks, labels, out_dir, per_sheet=40, cols=8,
     os.makedirs(out_dir, mode=0o700, exist_ok=True)
     for f in glob.glob(os.path.join(out_dir, "*.jpg")):
         os.remove(f)
-    items = [(c, t) for c in clips for t in all_tracks[c["id"]] if t["n"] >= 4]
+    # every track of >= 1 s, plus every short track labelled person (e.g. Grounding DINO-only boxes at
+    # sparse keyframes), so nothing enters the ground truth unseen
+    items = [(c, t) for c in clips for t in all_tracks[c["id"]]
+             if t["n"] >= 4 or labels[f"{c['id']}#{t['id']}"] == "person"]
     index = []
     for s in range(0, len(items), per_sheet):
         chunk = items[s:s + per_sheet]

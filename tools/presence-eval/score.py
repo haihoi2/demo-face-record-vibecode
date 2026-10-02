@@ -34,6 +34,22 @@ import os
 THRESHOLDS = [round(0.10 + 0.05 * k, 2) for k in range(15)]  # 0.10 .. 0.80
 ZONE_MIN_FRAC = 0.2
 MOVING_FRAC = 0.05
+# Camera overlays (x, y, w, h fractions) - the OSD date/time and the logo. Detections lying mostly
+# inside them are dropped with --mask-overlays (a fixed mask is trivial to apply in production).
+OVERLAYS = {
+    "ENTRY": [[0.0, 0.93, 0.35, 0.07], [0.0, 0.0, 0.14, 0.06]],
+    "EXIT": [[0.63, 0.0, 0.27, 0.04], [0.0, 0.84, 0.14, 0.05]],
+}
+
+
+def drop_overlays(dets, gate):
+    out = []
+    for d in dets:
+        a = area(d)
+        inside = sum(inter(d, [x, y, x + w, y + h]) for x, y, w, h in OVERLAYS.get(gate, []))
+        if a <= 0 or inside < 0.5 * a:
+            out.append(d)
+    return out
 
 
 def area(b):
@@ -117,7 +133,7 @@ def load_jsonl(p):
     return rows
 
 
-def score_run(run_dir, man, gt, gap, thr_iou, zone_mode):
+def score_run(run_dir, man, gt, gap, thr_iou, zone_mode, mask_overlays=False):
     """zone_mode: None (full picture) or 'zone' (clip GT + dets to the gate area)."""
     meta = json.load(open(os.path.join(run_dir, "summary.json")))
     dets = load_jsonl(os.path.join(run_dir, "dets.jsonl"))
@@ -141,6 +157,8 @@ def score_run(run_dir, man, gt, gap, thr_iou, zone_mode):
             trk_ctr = {}  # track id -> box centres (to tell people walking through from people standing)
             for i in range(n):
                 d = [x for x in dets.get((c["id"], i), []) if x[4] >= t]
+                if mask_overlays:
+                    d = drop_overlays(d, c["gate"])
                 if c["set"] == "nvr":
                     g = g_clip["frames"][i] if i < len(g_clip["frames"]) else []
                     if zone_mode:
@@ -231,12 +249,15 @@ def main():
     ap.add_argument("--out", default="metrics.json")
     ap.add_argument("--gap", type=int, default=2)
     ap.add_argument("--iou", type=float, default=0.3)
+    ap.add_argument("--mask-overlays", action="store_true", help="drop detections on the OSD clock/logo")
     a = ap.parse_args()
     man = json.load(open(os.path.join(a.work, "manifest.json")))
     gt = json.load(open(os.path.join(a.work, a.gt)))
     out = []
     for rd in sorted(glob.glob(os.path.join(a.work, a.runs))):
         if not os.path.exists(os.path.join(rd, "summary.json")):  # missing or still running
+            continue
+        if not os.path.exists(os.path.join(rd, "dets.jsonl")):  # timing-only run
             continue
         meta = json.load(open(os.path.join(rd, "summary.json")))
         modes = [None]
@@ -249,7 +270,7 @@ def main():
                 if zm and subset == "scripted":  # zones are only meaningful on the real footage
                     continue
                 man_s = dict(man, clips=[c for c in man["clips"] if c["set"] == subset])
-                meta, res = score_run(rd, man_s, gt, a.gap, a.iou, zm)
+                meta, res = score_run(rd, man_s, gt, a.gap, a.iou, zm, a.mask_overlays)
                 if not any(v["sec"] for v in res.values()):
                     continue
                 view = meta["view"] if zm is None or meta["view"] == "gate" else "full+zone"
@@ -257,7 +278,8 @@ def main():
                             "shapes": meta["shapes"], "set": subset, "byThreshold": res})
                 print(f"scored {os.path.basename(rd)} {view} {subset}", flush=True)
     p = os.path.join(a.work, a.out)
-    json.dump({"gapFrames": a.gap, "iou": a.iou, "thresholds": THRESHOLDS, "results": out}, open(p, "w"), indent=1)
+    json.dump({"gapFrames": a.gap, "iou": a.iou, "maskOverlays": a.mask_overlays, "thresholds": THRESHOLDS,
+               "results": out}, open(p, "w"), indent=1)
     os.chmod(p, 0o600)
     print(f"wrote {p}")
 

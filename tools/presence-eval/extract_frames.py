@@ -15,6 +15,7 @@ NVR frames are stored 1920 px wide (entry 4K is downscaled; exit is native 1920x
 frames are stored 1280 px wide (synthetic tiles on a flat background, see the report).
 """
 import argparse
+import datetime
 import glob
 import json
 import os
@@ -94,6 +95,59 @@ def scripted_clips():
     return out
 
 
+def extra_clips(work):
+    """Extra NVR exports from INT: <work>/night/clips/<gate>-<channel>-<startUtc>.mp4. Scored with the
+    real NVR set (set "nvr"); ground truth comes from the same pooled review."""
+    out = []
+    for f in sorted(glob.glob(os.path.join(work, "night", "clips", "*.mp4"))):
+        base = os.path.basename(f)[:-4]
+        gate = base.split("-")[0].upper()
+        dur, w, h = probe(f)
+        hour = int(base.split("T")[1][:2])
+        out.append({
+            "id": "x-" + base, "set": "nvr", "file": f, "gate": gate,
+            "light": "evening" if 10 <= hour < 15 else "day" if hour < 10 else "night",
+            "outcome": "int-export", "durationS": dur, "width": w, "height": h, "storeWidth": 1920,
+            "passages": [{"id": "x-" + base, "startS": 0.0, "endS": dur, "weakPeople": 0, "labelQuality": "image-checked"}],
+        })
+    return out
+
+
+def night_clips(work):
+    """INT's night stills: <work>/night/<gate>/<UTC stamp>.jpg, one frame every few seconds, lights off
+    (IR). Treated as person-free clips (checked by eye) for the night false-alarm count."""
+    out = []
+    for gate in ("entry", "exit"):
+        files = sorted(glob.glob(os.path.join(work, "night", gate, "*.jpg")))
+        if not files:
+            continue
+        stamps = [datetime.datetime.strptime(os.path.basename(f)[:16], "%Y%m%dT%H%M%SZ") for f in files]
+        gaps = sorted((b - a).total_seconds() for a, b in zip(stamps, stamps[1:])) or [5.0]
+        step = gaps[len(gaps) // 2]
+        _, w, h = probe(files[0])
+        cid = f"night-{gate}"
+        out.append({
+            "id": cid, "set": "night", "file": os.path.join(work, "night", gate), "gate": gate.upper(),
+            "light": "night-ir", "durationS": step * len(files), "width": w, "height": h, "storeWidth": 1920,
+            "stillStepS": step, "times": [os.path.basename(f)[:16] for f in files],
+            "passages": [{"id": cid, "startS": 0.0, "endS": step * len(files), "weakPeople": 0,
+                          "labelQuality": "assumed-empty, checked by eye"}],
+        })
+    return out
+
+
+def extract_stills(clip, work):
+    d = os.path.join(work, "frames", clip["id"])
+    os.makedirs(d, mode=0o700, exist_ok=True)
+    for f in glob.glob(os.path.join(d, "*.jpg")):
+        os.remove(f)
+    cmd = ["nice", "-n", "19", "ffmpeg", "-v", "error", "-threads", "2", "-pattern_type", "glob",
+           "-i", os.path.join(clip["file"], "*.jpg"), "-vf", f"scale={clip['storeWidth']}:-2:flags=area",
+           "-q:v", "2", "-start_number", "0", "-y", os.path.join(d, "%05d.jpg")]
+    subprocess.run(cmd, check=True)
+    return sorted(glob.glob(os.path.join(d, "*.jpg")))
+
+
 def extract(clip, work, fps):
     d = os.path.join(work, "frames", clip["id"])
     os.makedirs(d, mode=0o700, exist_ok=True)
@@ -101,7 +155,7 @@ def extract(clip, work, fps):
     have = len(glob.glob(os.path.join(d, "*.jpg")))
     if have >= n_expected:
         return sorted(glob.glob(os.path.join(d, "*.jpg")))
-    cmd = ["nice", "-n", "19", "ffmpeg", "-v", "error", "-threads", "4", "-i", clip["file"],
+    cmd = ["nice", "-n", "19", "ffmpeg", "-v", "error", "-threads", "2", "-i", clip["file"],
            "-vf", f"fps={fps},scale={clip['storeWidth']}:-2:flags=area", "-q:v", "2",
            "-start_number", "0", "-y", os.path.join(d, "%05d.jpg")]
     subprocess.run(cmd, check=True)
@@ -112,7 +166,7 @@ def main():
     os.nice(19)  # shared host with the live gateway: lowest CPU priority
     ap = argparse.ArgumentParser()
     ap.add_argument("--work", default=os.path.join(CLIPS, "presence-p1"))
-    ap.add_argument("--sets", default="nvr,scripted")
+    ap.add_argument("--sets", default="nvr,scripted", help="nvr, scripted, night (INT's IR stills), extra (INT's extra NVR exports)")
     ap.add_argument("--fps", type=float, default=4.0)
     a = ap.parse_args()
     os.makedirs(a.work, mode=0o700, exist_ok=True)
@@ -122,9 +176,13 @@ def main():
         clips += nvr_clips()
     if "scripted" in sets:
         clips += scripted_clips()
+    if "night" in sets:
+        clips += night_clips(a.work)
+    if "extra" in sets:
+        clips += extra_clips(a.work)
     for c in clips:
-        frames = extract(c, a.work, a.fps)
-        c["fps"] = a.fps
+        frames = extract_stills(c, a.work) if c["set"] == "night" else extract(c, a.work, a.fps)
+        c["fps"] = 1 / c["stillStepS"] if c["set"] == "night" else a.fps
         c["frames"] = len(frames)
         c["storeHeight"] = round(c["height"] * c["storeWidth"] / c["width"] / 2) * 2
         c["gateArea"] = gate_area_frac(c["gate"])
