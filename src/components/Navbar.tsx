@@ -59,6 +59,23 @@ export const TAB_MIN_ROLE: Record<NavTabType, OperatorRole> = {
 export const canSeeTab = (session: OperatorSessionInfo | null, tab: NavTabType): boolean =>
   TAB_MIN_ROLE[tab] === "viewer" || hasRole(session, TAB_MIN_ROLE[tab]);
 
+const INDIGO = "bg-indigo-50 text-indigo-700 border-indigo-100";
+
+/** The tabs in menu order. Ids stay `nav-tab-<id>`; who sees a tab is TAB_MIN_ROLE. */
+const NAV_ITEMS: Array<{ id: NavTabType; label: string; title?: string; Icon: React.ComponentType<{ className?: string }>; iconClass?: string; active: string }> = [
+  { id: "scanner", label: "Quét Cửa AI", title: "Giám sát trực tiếp các luồng camera và nhận diện tự động", Icon: ScanFace, active: INDIGO },
+  { id: "manual", label: "Nhận diện thủ công", title: "Nhận diện thủ công qua webcam hoặc tải ảnh", Icon: Camera, iconClass: "text-indigo-600", active: INDIGO },
+  { id: "register", label: "Đăng Ký Khuôn Mặt", Icon: UserPlus, active: INDIGO },
+  { id: "catalog", label: "Phòng ban & Chức vụ", title: "Danh mục phòng ban và chức vụ dùng khi đăng ký nhân viên", Icon: Building2, iconClass: "text-indigo-600", active: INDIGO },
+  { id: "logs", label: "Nhật Ký Vào Ra", Icon: ClipboardList, active: INDIGO },
+  { id: "mobile", label: "App Di Động", Icon: Smartphone, active: INDIGO },
+  { id: "webhook", label: "Webhook Eton", Icon: Send, iconClass: "text-indigo-600", active: INDIGO },
+  { id: "door", label: "API Mở Cửa", Icon: KeyRound, iconClass: "text-emerald-600", active: "bg-emerald-50 text-emerald-700 border-emerald-200" },
+  { id: "cameras", label: "Luồng Camera", Icon: Video, iconClass: "text-blue-600", active: "bg-blue-50 text-blue-700 border-blue-200" },
+  { id: "config", label: "Cấu Hình AI", Icon: Sliders, iconClass: "text-indigo-600", active: INDIGO },
+  { id: "users", label: "Tài khoản", title: "Tạo và quản lý tài khoản đăng nhập, phân quyền", Icon: Users, iconClass: "text-indigo-600", active: INDIGO },
+];
+
 interface NavbarProps {
   activeTab: NavTabType;
   setActiveTab: (tab: NavTabType) => void;
@@ -98,249 +115,64 @@ export const Navbar: React.FC<NavbarProps> = ({
     return () => clearInterval(timer);
   }, []);
 
+  const tabClass = (tab: NavTabType, active: string) =>
+    `relative flex items-center gap-1.5 px-2 py-1.5 rounded-lg text-[13px] font-medium whitespace-nowrap shrink-0 transition-all ${
+      activeTab === tab ? `${active} shadow-xs border font-semibold` : "text-slate-600 border border-transparent hover:text-slate-900 hover:bg-slate-100"
+    }`;
+
   return (
     <header className="border-b border-slate-200 bg-white/95 backdrop-blur-md sticky top-0 z-30 shadow-xs">
-      <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
-        <div className="flex items-center justify-between h-16">
-          {/* Logo & Brand */}
-          <div className="flex items-center gap-3">
-            <div className="w-10 h-10 rounded-xl bg-gradient-to-br from-blue-600 to-indigo-700 flex items-center justify-center text-white shadow-sm shadow-indigo-200">
-              <ScanFace className="w-6 h-6" />
+      <div className="max-w-7xl 2xl:max-w-screen-2xl mx-auto px-4 sm:px-6 lg:px-8">
+        {/* Row 1: brand, then live status and the signed-in user */}
+        <div className="flex items-center justify-between gap-3 h-14">
+          <div className="flex items-center gap-3 min-w-0">
+            <div className="w-9 h-9 rounded-xl bg-gradient-to-br from-blue-600 to-indigo-700 flex items-center justify-center text-white shadow-sm shadow-indigo-200 shrink-0">
+              <ScanFace className="w-5 h-5" />
             </div>
-            <div>
-              <div className="flex items-center gap-2">
-                <span className="font-bold text-lg tracking-tight text-slate-900">
-                  SmartFace Access
-                </span>
-                <span className="hidden sm:inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-medium bg-emerald-50 text-emerald-700 border border-emerald-200">
+            <div className="min-w-0">
+              <div className="flex items-center gap-2 min-w-0">
+                <span className="font-bold text-base sm:text-lg tracking-tight text-slate-900 whitespace-nowrap truncate">SmartFace Access</span>
+                <span className="hidden md:inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-medium bg-emerald-50 text-emerald-700 border border-emerald-200 whitespace-nowrap">
                   <ShieldCheck className="w-3 h-3" /> AI Vision
                 </span>
               </div>
-              <p className="text-xs text-slate-700 hidden md:block">
+              <p className="text-xs text-slate-600 hidden lg:block truncate">
                 Hệ thống nhận diện khuôn mặt &amp; mở khóa cửa tự động qua API
               </p>
             </div>
           </div>
 
-          {/* Navigation Tabs */}
-          <nav className="flex items-center gap-1 sm:gap-2">
-            {canSeeTab(session, "scanner") && (
-            <button
-              id="nav-tab-scanner"
-              onClick={() => setActiveTab("scanner")}
-              className={`flex items-center gap-2 px-3 py-2 rounded-lg text-sm font-medium transition-all ${
-                activeTab === "scanner"
-                  ? "bg-indigo-50 text-indigo-700 shadow-xs border border-indigo-100 font-semibold"
-                  : "text-slate-600 hover:text-slate-900 hover:bg-slate-100"
-              }`}
-              title="Dashboard giám sát trực tiếp các luồng camera active và nhận diện tự động"
-            >
-              <ScanFace className="w-4 h-4" />
-              <span className="hidden sm:inline">Quét Cửa AI</span>
-            </button>
-            )}
-
-            {canSeeTab(session, "manual") && (
-            <button
-              id="nav-tab-manual"
-              onClick={() => setActiveTab("manual")}
-              className={`flex items-center gap-2 px-3 py-2 rounded-lg text-sm font-medium transition-all ${
-                activeTab === "manual"
-                  ? "bg-indigo-50 text-indigo-700 shadow-xs border border-indigo-100 font-semibold"
-                  : "text-slate-600 hover:text-slate-900 hover:bg-slate-100"
-              }`}
-              title="Nhận diện thủ công qua webcam mặc định hoặc tải ảnh"
-            >
-              <Camera className="w-4 h-4 text-indigo-600" />
-              <span className="hidden sm:inline">Nhận diện thủ công- Manual track</span>
-            </button>
-            )}
-
-            {canSeeTab(session, "register") && (
-            <button
-              id="nav-tab-register"
-              onClick={() => setActiveTab("register")}
-              className={`flex items-center gap-2 px-3 py-2 rounded-lg text-sm font-medium transition-all ${
-                activeTab === "register"
-                  ? "bg-indigo-50 text-indigo-700 shadow-xs border border-indigo-100"
-                  : "text-slate-600 hover:text-slate-900 hover:bg-slate-100"
-              }`}
-            >
-              <UserPlus className="w-4 h-4" />
-              <span className="hidden sm:inline">Đăng Ký Khuôn Mặt</span>
-            </button>
-            )}
-
-            {canSeeTab(session, "catalog") && (
-            <button
-              id="nav-tab-catalog"
-              onClick={() => setActiveTab("catalog")}
-              className={`flex items-center gap-2 px-3 py-2 rounded-lg text-sm font-medium transition-all ${
-                activeTab === "catalog"
-                  ? "bg-indigo-50 text-indigo-700 shadow-xs border border-indigo-100 font-semibold"
-                  : "text-slate-600 hover:text-slate-900 hover:bg-slate-100"
-              }`}
-              title="Quản lý danh mục phòng ban và chức vụ dùng khi đăng ký nhân viên"
-            >
-              <Building2 className="w-4 h-4 text-indigo-600" />
-              <span className="hidden sm:inline">Phòng ban &amp; Chức vụ</span>
-            </button>
-            )}
-
-            {canSeeTab(session, "logs") && (
-            <button
-              id="nav-tab-logs"
-              onClick={() => setActiveTab("logs")}
-              className={`flex items-center gap-2 px-3 py-2 rounded-lg text-sm font-medium transition-all ${
-                activeTab === "logs"
-                  ? "bg-indigo-50 text-indigo-700 shadow-xs border border-indigo-100"
-                  : "text-slate-600 hover:text-slate-900 hover:bg-slate-100"
-              }`}
-            >
-              <ClipboardList className="w-4 h-4" />
-              <span className="hidden sm:inline">Nhật Ký Vào Ra</span>
-            </button>
-            )}
-
-            {canSeeTab(session, "mobile") && (
-            <button
-              id="nav-tab-mobile"
-              onClick={() => setActiveTab("mobile")}
-              className={`relative flex items-center gap-2 px-3 py-2 rounded-lg text-sm font-medium transition-all ${
-                activeTab === "mobile"
-                  ? "bg-indigo-50 text-indigo-700 shadow-xs border border-indigo-100"
-                  : "text-slate-600 hover:text-slate-900 hover:bg-slate-100"
-              }`}
-            >
-              <Smartphone className="w-4 h-4" />
-              <span className="hidden sm:inline">App Di Động</span>
-              {unreadCount > 0 && (
-                <span className="inline-flex items-center justify-center px-1.5 py-0.5 text-xs font-bold leading-none text-white bg-rose-500 rounded-full animate-pulse">
-                  {unreadCount}
-                </span>
-              )}
-            </button>
-            )}
-
-            {canSeeTab(session, "webhook") && (
-            <button
-              id="nav-tab-webhook"
-              onClick={() => setActiveTab("webhook")}
-              className={`flex items-center gap-2 px-3 py-2 rounded-lg text-sm font-medium transition-all ${
-                activeTab === "webhook"
-                  ? "bg-indigo-50 text-indigo-700 shadow-xs border border-indigo-100"
-                  : "text-slate-600 hover:text-slate-900 hover:bg-slate-100"
-              }`}
-            >
-              <Send className="w-4 h-4 text-indigo-600" />
-              <span className="hidden sm:inline">Webhook Eton</span>
-            </button>
-            )}
-
-            {canSeeTab(session, "door") && (
-            <button
-              id="nav-tab-door"
-              onClick={() => setActiveTab("door")}
-              className={`flex items-center gap-2 px-3 py-2 rounded-lg text-sm font-medium transition-all ${
-                activeTab === "door"
-                  ? "bg-emerald-50 text-emerald-700 shadow-xs border border-emerald-200 font-semibold"
-                  : "text-slate-600 hover:text-slate-900 hover:bg-slate-100"
-              }`}
-            >
-              <KeyRound className="w-4 h-4 text-emerald-600" />
-              <span className="hidden sm:inline">API Mở Cửa</span>
-            </button>
-            )}
-
-            {canSeeTab(session, "cameras") && (
-            <button
-              id="nav-tab-cameras"
-              onClick={() => setActiveTab("cameras")}
-              className={`flex items-center gap-2 px-3 py-2 rounded-lg text-sm font-medium transition-all ${
-                activeTab === "cameras"
-                  ? "bg-blue-50 text-blue-700 shadow-xs border border-blue-200 font-semibold"
-                  : "text-slate-600 hover:text-slate-900 hover:bg-slate-100"
-              }`}
-            >
-              <Video className="w-4 h-4 text-blue-600" />
-              <span className="hidden sm:inline">Luồng Camera</span>
-            </button>
-            )}
-
-            {canSeeTab(session, "config") && (
-            <button
-              id="nav-tab-config"
-              onClick={() => setActiveTab("config")}
-              className={`flex items-center gap-2 px-3 py-2 rounded-lg text-sm font-medium transition-all ${
-                activeTab === "config"
-                  ? "bg-indigo-50 text-indigo-700 shadow-xs border border-indigo-100"
-                  : "text-slate-600 hover:text-slate-900 hover:bg-slate-100"
-              }`}
-            >
-              <Sliders className="w-4 h-4 text-indigo-600" />
-              <span className="hidden sm:inline">Cấu Hình AI</span>
-            </button>
-            )}
-
-            {canSeeTab(session, "users") && (
-            <button
-              id="nav-tab-users"
-              onClick={() => setActiveTab("users")}
-              className={`flex items-center gap-2 px-3 py-2 rounded-lg text-sm font-medium transition-all ${
-                activeTab === "users"
-                  ? "bg-indigo-50 text-indigo-700 shadow-xs border border-indigo-100"
-                  : "text-slate-600 hover:text-slate-900 hover:bg-slate-100"
-              }`}
-              title="Tạo và quản lý tài khoản đăng nhập, phân quyền"
-            >
-              <Users className="w-4 h-4 text-indigo-600" />
-              <span className="hidden sm:inline">Tài khoản</span>
-            </button>
-            )}
-          </nav>
-
-          {/* Real-time status & Door lock widget badge */}
-          <div className="flex items-center gap-2 sm:gap-3">
-            {/* Quick Stranger Clusters Button */}
+          <div className="flex items-center gap-2 shrink-0">
             {onOpenStrangers && (
               <button
                 id="nav-btn-strangers"
                 onClick={onOpenStrangers}
-                className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-semibold bg-amber-50 text-amber-900 border border-amber-300 hover:bg-amber-100 transition-colors shadow-2xs cursor-pointer"
+                className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-semibold whitespace-nowrap bg-amber-50 text-amber-900 border border-amber-300 hover:bg-amber-100 transition-colors shadow-2xs cursor-pointer"
                 title="Quản lý cụm ảnh người lạ và khai báo nhanh nhân viên"
               >
                 <UserX className="w-3.5 h-3.5 text-amber-600 shrink-0" />
                 <span className="hidden sm:inline">Cụm Người Lạ</span>
-                <span className="px-1.5 py-0.2 rounded-full bg-amber-600 text-white font-mono text-[10px] font-bold">
-                  {strangerCount !== undefined ? strangerCount : 2}
+                <span className="px-1.5 rounded-full bg-amber-600 text-white font-mono text-[10px] font-bold">
+                  {strangerCount !== undefined ? strangerCount : 0}
                 </span>
               </button>
             )}
 
-            {/* Live Clock */}
-            <div className="hidden lg:flex items-center gap-1.5 text-xs font-mono text-slate-500 bg-slate-50 px-2.5 py-1.5 rounded-lg border border-slate-200">
+            <div className="hidden lg:flex items-center gap-1.5 text-xs font-mono text-slate-500 bg-slate-50 px-2.5 py-1.5 rounded-lg border border-slate-200 whitespace-nowrap">
               <Clock className="w-3.5 h-3.5 text-slate-400" />
               <span>{currentTime}</span>
             </div>
 
-            {/* SSE Live Status */}
             <div
-              className="flex items-center gap-1.5 text-xs px-2.5 py-1.5 rounded-lg border border-slate-200 bg-slate-50 text-slate-600"
+              className="flex items-center gap-1.5 text-xs px-2.5 py-1.5 rounded-lg border border-slate-200 bg-slate-50 text-slate-600 whitespace-nowrap"
               title={sseConnected ? "SSE Real-time đang kết nối" : "Đang kết nối lại..."}
             >
-              <Radio
-                className={`w-3.5 h-3.5 ${
-                  sseConnected ? "text-emerald-500 animate-pulse" : "text-amber-500"
-                }`}
-              />
-              <span className="hidden xl:inline">
-                {sseConnected ? "Real-time SSE" : "Đang kết nối..."}
-              </span>
+              <Radio className={`w-3.5 h-3.5 ${sseConnected ? "text-emerald-500 animate-pulse" : "text-amber-500"}`} />
+              <span className="hidden xl:inline">{sseConnected ? "Real-time" : "Đang kết nối..."}</span>
             </div>
 
-            {/* Lock State Pill */}
             <div
-              className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold border transition-all ${
+              className={`flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-semibold border whitespace-nowrap transition-all ${
                 lockState.isLocked
                   ? "bg-slate-100 text-slate-700 border-slate-300"
                   : "bg-emerald-100 text-emerald-800 border-emerald-300 shadow-xs shadow-emerald-200"
@@ -349,7 +181,7 @@ export const Navbar: React.FC<NavbarProps> = ({
               {lockState.isLocked ? (
                 <>
                   <Lock className="w-3.5 h-3.5 text-slate-600" />
-                  <span>ĐÃ KHÓA</span>
+                  <span className="hidden sm:inline">ĐÃ KHÓA</span>
                 </>
               ) : (
                 <>
@@ -363,6 +195,29 @@ export const Navbar: React.FC<NavbarProps> = ({
             <UserMenu />
           </div>
         </div>
+
+        {/* Row 2: one line of tabs; scrolls sideways on narrow screens instead of wrapping */}
+        <nav aria-label="Trang chính" className="flex items-center gap-0.5 -mx-1 px-1 pb-2 overflow-x-auto [scrollbar-width:thin]">
+          {NAV_ITEMS.filter((item) => canSeeTab(session, item.id)).map(({ id, label, title, Icon, iconClass, active }) => (
+            <button
+              key={id}
+              id={`nav-tab-${id}`}
+              onClick={() => setActiveTab(id)}
+              className={tabClass(id, active)}
+              title={title}
+              aria-current={activeTab === id ? "page" : undefined}
+            >
+              {/* Icons only where the row has room for them (all 11 tabs fit as text from ~1200 px) */}
+              <Icon className={`hidden 2xl:block w-4 h-4 shrink-0 ${iconClass || ""}`} />
+              <span>{label}</span>
+              {id === "mobile" && unreadCount > 0 && (
+                <span className="inline-flex items-center justify-center px-1.5 py-0.5 text-xs font-bold leading-none text-white bg-rose-500 rounded-full">
+                  {unreadCount}
+                </span>
+              )}
+            </button>
+          ))}
+        </nav>
       </div>
     </header>
   );
