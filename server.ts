@@ -384,7 +384,7 @@ const OPERATOR_SESSION_TTL_MS = 8 * 60 * 60 * 1000;
 const TRUSTED_PROXY_IPS = parseTrustedProxies(process.env.TRUSTED_PROXY_IPS);
 const clientIp = (req: Request) => clientIpOf(req.socket?.remoteAddress, req.headers, TRUSTED_PROXY_IPS);
 /** Sign-in attempts per client address per minute, and for the whole server (second layer behind eton8's limit). */
-const LOGIN_RATE_PER_IP = envNumber("LOGIN_RATE_LIMIT_PER_MINUTE", 10, { min: 1, max: 1000, integer: true });
+const LOGIN_RATE_PER_IP = envNumber("LOGIN_RATE_LIMIT_PER_MINUTE", 10, { min: 1, max: 100_000, integer: true });
 const LOGIN_RATE_GLOBAL = envNumber("LOGIN_RATE_LIMIT_GLOBAL_PER_MINUTE", 120, { min: 1, max: 100_000, integer: true });
 const loginLimiterPerIp = new SlidingWindowLimiter(LOGIN_RATE_PER_IP, 60_000);
 const loginLimiterGlobal = new SlidingWindowLimiter(LOGIN_RATE_GLOBAL, 60_000, 1);
