@@ -1,0 +1,130 @@
+#!/usr/bin/env python3
+"""Print the P1 report tables (markdown) from metrics.json and the timing runs. Stdlib only.
+
+    python3 tools/presence-eval/report_tables.py --work /data/test-clips/presence-p1 [--gate ENTRY]
+
+Operating threshold per model/input = the highest score threshold that still reaches the model's
+best passage recall at 3 s on the real footage (nobody may be missed first; then fewest false alarms).
+"""
+import argparse
+import glob
+import json
+import os
+
+LICENCE = {
+    "yolox-nano": "Apache-2.0 / Apache-2.0",
+    "yolox-tiny": "Apache-2.0 / Apache-2.0",
+    "rtmdet-tiny": "Apache-2.0 / unconfirmed",
+    "efficientdet-lite0": "Apache-2.0 / unconfirmed",
+    "efficientdet-lite2": "Apache-2.0 / unconfirmed",
+    "rtdetr-r18": "Apache-2.0 / unconfirmed",
+    "rfdetr-nano": "Apache-2.0 / Apache-2.0",
+}
+
+
+def pct(h, n):
+    return f"{h}/{n} ({100 * h / n:.0f}%)" if n else "-"
+
+
+def timing(work):
+    t = {}
+    for p in glob.glob(os.path.join(work, "runs", "*__timing", "summary.json")):
+        s = json.load(open(p))
+        t[(s["model"], s["input"], s["threads"])] = s
+    return t
+
+
+def op_threshold(byt):
+    best = max(v["hit3"] for v in byt.values())
+    ok = [float(t) for t, v in byt.items() if v["hit3"] == best]
+    return str(max(ok))
+
+
+def main():
+    os.nice(19)  # shared host with the live gateway: lowest CPU priority
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--work", default="/data/test-clips/presence-p1")
+    ap.add_argument("--metrics", default="metrics.json")
+    ap.add_argument("--gate", default="ENTRY")
+    ap.add_argument("--fixed", default="0.3", help="also report every model at this common threshold")
+    a = ap.parse_args()
+    m = json.load(open(os.path.join(a.work, a.metrics)))
+    tim = timing(a.work)
+    tag = a.gate.lower()
+    res = [r for r in m["results"] if r["run"].endswith("__" + tag)]
+
+    def row(r, t):
+        v = r["byThreshold"][t]
+        hours = v["sec"] / 3600
+        fa = f"{v['fa'] / hours:.1f} ({v['fa']})" if hours else "-"
+        br = f"{100 * v['gt_hit'] / v['gt_boxes']:.0f}%" if v["gt_boxes"] else "-"
+        return v, fa, br
+
+    print(f"\n### {a.gate}: real footage, full picture (primary)\n")
+    print("| Model | Input | Licence code / weights | Thr | Recall >=3 s | Recall >=1 s | False alarms/h (episodes) | Box recall | ms/frame 1 thr mean / p95 | ms/frame 2 thr mean / p95 | Size MB |")
+    print("|---|---|---|---|---|---|---|---|---|---|---|")
+    full = sorted([r for r in res if r["set"] == "nvr" and r["view"] == "full"], key=lambda r: (r["model"], r["input"]))
+    for r in full:
+        t = op_threshold(r["byThreshold"])
+        v, fa, br = row(r, t)
+        t1 = tim.get((r["model"], r["input"], 1))
+        t2 = tim.get((r["model"], r["input"], 2))
+        f1 = f"{t1['runMs']['mean']:.0f} / {t1['runMs']['p95']:.0f}" if t1 else "-"
+        f2 = f"{t2['runMs']['mean']:.0f} / {t2['runMs']['p95']:.0f}" if t2 else "-"
+        size = (t1 or t2 or {}).get("fileBytes")
+        print(f"| {r['model']} | {r['shapes'].split(' ')[0]} | {LICENCE.get(r['model'], '?')} | {t} | {pct(v['hit3'], v['pos3'])} | "
+              f"{pct(v['hit1'], v['pos1'])} | {fa} | {br} | {f1} | {f2} | {size / 1e6:.1f} |" if size else
+              f"| {r['model']} | {r['shapes'].split(' ')[0]} | {LICENCE.get(r['model'], '?')} | {t} | {pct(v['hit3'], v['pos3'])} | "
+              f"{pct(v['hit1'], v['pos1'])} | {fa} | {br} | {f1} | {f2} | - |")
+    hours = full[0]["byThreshold"]["0.3"]["sec"] / 3600 if full else 0
+    print(f"\nFootage: {hours * 60:.1f} min real {a.gate} video.")
+
+    print(f"\n### {a.gate}: every model at threshold {a.fixed}\n")
+    print("| Model | Input | Recall >=3 s | Recall >=1 s | False alarms/h (episodes) | Box recall |")
+    print("|---|---|---|---|---|---|")
+    for r in full:
+        v, fa, br = row(r, a.fixed)
+        print(f"| {r['model']} | {r['shapes'].split(' ')[0]} | {pct(v['hit3'], v['pos3'])} | {pct(v['hit1'], v['pos1'])} | {fa} | {br} |")
+
+    print(f"\n### {a.gate}: threshold sweep (real footage, full picture)\n")
+    ths = ["0.15", "0.2", "0.25", "0.3", "0.35", "0.4", "0.5", "0.6"]
+    print("| Model | Input | " + " | ".join(f"t={t} R3 / FA" for t in ths) + " |")
+    print("|---|---|" + "---|" * len(ths))
+    for r in full:
+        cells = []
+        for t in ths:
+            v = r["byThreshold"][t]
+            h = v["sec"] / 3600
+            cells.append(f"{v['hit3']}/{v['pos3']} / {v['fa'] / h:.0f}" if h else "-")
+        print(f"| {r['model']} | {r['shapes'].split(' ')[0]} | " + " | ".join(cells) + " |")
+
+    zone = sorted([r for r in res if r["set"] == "nvr" and r["view"] in ("gate", "full+zone")],
+                  key=lambda r: (r["model"], r["input"], r["view"]))
+    if zone:
+        print(f"\n### {a.gate}: gate area (secondary)\n")
+        print("| Model | Input | How | Thr | Recall >=3 s | Recall >=1 s | False alarms/h (episodes) |")
+        print("|---|---|---|---|---|---|---|")
+        for r in zone:
+            t = op_threshold(r["byThreshold"])
+            v, fa, br = row(r, t)
+            how = "crop then detect" if r["view"] == "gate" else "detect full, keep boxes in area"
+            print(f"| {r['model']} | {r['shapes'].split(' ')[0]} | {how} | {t} | {pct(v['hit3'], v['pos3'])} | {pct(v['hit1'], v['pos1'])} | {fa} |")
+
+    scr = sorted([r for r in res if r["set"] == "scripted"], key=lambda r: (r["model"], r["input"]))
+    if scr:
+        print(f"\n### {a.gate}: scripted synthetic set (sanity check only)\n")
+        print("| Model | Input | t=0.3 recall >=3 s | t=0.3 recall >=1 s | t=0.3 FA episodes in empty passages/clip |")
+        print("|---|---|---|---|---|")
+        for r in scr:
+            v = r["byThreshold"]["0.3"]
+            print(f"| {r['model']} | {r['shapes'].split(' ')[0]} | {pct(v['hit3'], v['pos3'])} | {pct(v['hit1'], v['pos1'])} | {v['fa']} |")
+
+    print("\n### Misses and false alarms at the operating threshold\n")
+    for r in full:
+        t = op_threshold(r["byThreshold"])
+        v = r["byThreshold"][t]
+        print(f"- {r['model']} {r['input']} t={t}: missed {v['missed'] or 'none'}; FA {v['fa_where'] or 'none'}")
+
+
+if __name__ == "__main__":
+    main()
