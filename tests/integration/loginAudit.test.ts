@@ -26,6 +26,16 @@ const events = async (query = "") => {
   return res.body;
 };
 
+/** Audit rows are written in the background: wait (up to 3 s) until `ok(page)` holds. */
+const eventsWhen = async (query: string, ok: (page: any) => boolean) => {
+  let page = await events(query);
+  for (let i = 0; i < 30 && !ok(page); i++) {
+    await new Promise((r) => setTimeout(r, 100));
+    page = await events(query);
+  }
+  return page;
+};
+
 describe("sign-in audit", () => {
   before(async () => {
     admin = await authenticateAs(OPERATOR_TOKEN);
@@ -47,7 +57,7 @@ describe("sign-in audit", () => {
     assert.equal(ok.status, 200, ok.text.slice(0, 200));
     assert.equal((await apiAs(ok.cookie, "/api/operator/session", { method: "DELETE" })).status, 200);
 
-    const page = await events(`?userId=${encodeURIComponent(userId)}`);
+    const page = await eventsWhen(`?userId=${encodeURIComponent(userId)}`, (p) => p.events[0]?.kind === "sign-out");
     const kinds = page.events.map((e: any) => `${e.kind}${e.reason ? `:${e.reason}` : ""}`);
     assert.deepEqual(kinds.slice(0, 3), ["sign-out", "sign-in", "sign-in-failed:bad-password"]);
     for (const e of page.events.slice(0, 3)) {
@@ -63,7 +73,7 @@ describe("sign-in audit", () => {
     await loginWithPassword(`nobody-${RUN}`, "x".repeat(12));
     await loginWithPassword("my secret Pa55word!", "x".repeat(12));
     await rawApi("/api/operator/session", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ token: "not-the-token" }) });
-    const page = await events("?kind=sign-in-failed&limit=20");
+    const page = await eventsWhen("?kind=sign-in-failed&limit=20", (p) => p.events.some((e: any) => e.reason === "bad-token"));
     const reasons = page.events.map((e: any) => `${e.reason}|${e.username ?? ""}|${e.method}`);
     assert.ok(reasons.includes(`unknown-user|nobody-${RUN}|account`), reasons.join(", "));
     assert.ok(reasons.includes("unknown-user|(không hợp lệ)|account"));
@@ -75,7 +85,7 @@ describe("sign-in audit", () => {
     for (let i = 0; i < 5; i++) await loginWithPassword(username, `wrong password ${i}`);
     const refused = await loginWithPassword(username, PASSWORD);
     assert.equal(refused.status, 429);
-    const page = await events(`?userId=${encodeURIComponent(userId)}&kind=locked`);
+    const page = await eventsWhen(`?userId=${encodeURIComponent(userId)}&kind=locked`, (p) => p.events.length >= 2);
     assert.ok(page.events.length >= 2, "the lock and the refused attempt");
     assert.ok(page.events.every((e: any) => e.reason === "account-locked"));
     // Unlock for the remaining tests.
