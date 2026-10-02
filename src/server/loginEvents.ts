@@ -12,8 +12,9 @@
  * typed into the wrong field) is replaced by "(không hợp lệ)".
  *
  * API: GET /api/users/login-events (admin)
- *   query: userId, username, kind, before (cursor = id of the last row seen), limit (1..200, default 50)
- *   200 { success, events: LoginEventRecord[] (newest first), hasMore, nextCursor? }
+ *   query: userId, username, kind, before (= nextCursor of the previous page, opaque), limit (1..200, default 50)
+ *   200 { success, events: LoginEventRecord[] (newest first), hasMore, nextCursor? (when hasMore) }
+ *   400 for an unknown kind.
  */
 import { randomUUID } from "node:crypto";
 import { envNumber } from "./env";

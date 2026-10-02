@@ -31,6 +31,18 @@ import {
   SmartLockStateRecord,
 } from "./src/server/db";
 import { envNumber } from "./src/server/env";
+import { clientIpOf, parseTrustedProxies } from "./src/server/clientIp";
+import { SlidingWindowLimiter } from "./src/server/loginRateLimit";
+import {
+  auditText,
+  auditUsername,
+  LOGIN_EVENT_KINDS,
+  loginEventRetentionDays,
+  newLoginEventId,
+  type LoginEventKind,
+  type LoginEventRecord,
+} from "./src/server/loginEvents";
+import { loginEventCursor } from "./src/server/db";
 import {
   faceObservationId,
   newStrangerFaceId,
@@ -318,6 +330,26 @@ app.options("*", (_req, res) => {
 });
 
 // Increase payload limit for base64 camera frames, raw text, and binary images
+// Large bodies are read only for an authenticated caller (owner 2026-10-02,
+// site public): anything over ANON_BODY_MAX_BYTES needs a valid operator
+// session or a device/internal bearer token BEFORE the parsers below buffer it.
+// Sign-in and other small requests pass as before; the auth boundary further
+// down still decides what the caller may do.
+const ANON_BODY_MAX_BYTES = 64 * 1024;
+app.use((req: Request, res: Response, next: NextFunction) => {
+  if (req.method === "GET" || req.method === "HEAD" || req.method === "OPTIONS") return next();
+  const lengthHeader = req.headers["content-length"];
+  const length = Number(lengthHeader);
+  const unknownLength = lengthHeader === undefined && /chunked/i.test(String(req.headers["transfer-encoding"] || ""));
+  if (!unknownLength && !(length > ANON_BODY_MAX_BYTES)) return next();
+  if (readOperatorSession(req)) return next();
+  const bearer = bearerFromRequest(req);
+  const device = configuredBearer("DEVICE_INGEST_TOKEN");
+  const internal = configuredBearer("INTERNAL_API_TOKEN");
+  if (bearer && ((device && constantTimeEqual(bearer, device)) || (internal && constantTimeEqual(bearer, internal)))) return next();
+  res.setHeader("Connection", "close");
+  res.status(401).json({ success: false, code: "AUTH_REQUIRED", error: "Large request bodies require authentication" });
+});
 app.use(express.json({ limit: "50mb" }));
 app.use(express.urlencoded({ extended: true, limit: "50mb" }));
 app.use(express.text({ limit: "50mb", type: ["text/*", "application/octet-stream"] }));
@@ -342,6 +374,34 @@ interface OperatorSession {
 }
 const OPERATOR_COOKIE = "smartface_operator_session";
 const OPERATOR_SESSION_TTL_MS = 8 * 60 * 60 * 1000;
+
+// ---- Sign-in hardening and audit (owner 2026-10-02) ----
+/**
+ * Edge proxies whose X-Real-IP is believed (clientIp.ts). Live: eton8
+ * 192.168.6.19 and T2 10.0.19.37 (checked 2026-10-02). Empty = every client is
+ * keyed by its TCP peer.
+ */
+const TRUSTED_PROXY_IPS = parseTrustedProxies(process.env.TRUSTED_PROXY_IPS);
+const clientIp = (req: Request) => clientIpOf(req.socket?.remoteAddress, req.headers, TRUSTED_PROXY_IPS);
+/** Sign-in attempts per client address per minute, and for the whole server (second layer behind eton8's limit). */
+const LOGIN_RATE_PER_IP = envNumber("LOGIN_RATE_LIMIT_PER_MINUTE", 10, { min: 1, max: 1000, integer: true });
+const LOGIN_RATE_GLOBAL = envNumber("LOGIN_RATE_LIMIT_GLOBAL_PER_MINUTE", 120, { min: 1, max: 100_000, integer: true });
+const loginLimiterPerIp = new SlidingWindowLimiter(LOGIN_RATE_PER_IP, 60_000);
+const loginLimiterGlobal = new SlidingWindowLimiter(LOGIN_RATE_GLOBAL, 60_000, 1);
+/** One "rate-limited" audit row per address per minute, not one per refused attempt. */
+const loginRateAudited = new SlidingWindowLimiter(1, 60_000);
+
+/** Appends one sign-in audit row; never blocks or fails the request. */
+function auditLogin(req: Request, e: { kind: LoginEventKind; method: "account" | "token"; userId?: string; username?: string; reason?: LoginEventRecord["reason"] }): void {
+  const record: LoginEventRecord = {
+    id: newLoginEventId(),
+    at: new Date().toISOString(),
+    ...e,
+    ip: auditText(clientIp(req), 64),
+    userAgent: auditText(req.headers["user-agent"], 200),
+  };
+  void db.saveLoginEvent(record).catch(() => {});
+}
 
 const authPrincipals = () => [
   { actor: String(process.env.OPERATOR_ID || "").trim(), token: String(process.env.OPERATOR_TOKEN || ""), role: "admin" as const },
@@ -503,6 +563,27 @@ app.post("/api/operator/session", async (req, res) => {
   }
 
   const body = (req.body || {}) as Record<string, unknown>;
+  const method: "account" | "token" = body.username !== undefined || body.password !== undefined ? "account" : "token";
+  const ip = clientIp(req);
+  const nowMs = Date.now();
+  const perIp = loginLimiterPerIp.hit(ip, nowMs);
+  const global = perIp.allowed ? loginLimiterGlobal.hit("all", nowMs) : { allowed: true, retryAfterMs: 0 };
+  if (!perIp.allowed || !global.allowed) {
+    const retryAfter = Math.ceil(Math.max(perIp.retryAfterMs, global.retryAfterMs) / 1000);
+    if (loginRateAudited.hit(ip, nowMs).allowed) {
+      auditLogin(req, { kind: "rate-limited", method, username: method === "account" ? auditUsername(body.username) : undefined });
+      console.warn(`[Accounts] Quá nhiều lần đăng nhập${perIp.allowed ? " trên toàn hệ thống" : ` từ ${ip}`}; tạm từ chối ${retryAfter}s.`);
+    }
+    res.setHeader("Retry-After", String(retryAfter));
+    res.status(429).json({
+      success: false,
+      code: "RATE_LIMITED",
+      retryAfterSeconds: retryAfter,
+      error: `Quá nhiều lần đăng nhập. Thử lại sau ${retryAfter} giây.`,
+    });
+    return;
+  }
+
   const base = { expiresAt: Date.now() + OPERATOR_SESSION_TTL_MS, csrfToken: randomUUID() };
   let session: OperatorSession;
 
@@ -514,11 +595,13 @@ app.post("/api/operator/session", async (req, res) => {
     if (!user) {
       // Spend the same time as a real check so latency does not reveal which usernames exist.
       await verifyPassword(password, await timingDummyHash());
+      auditLogin(req, { kind: "sign-in-failed", method, username: auditUsername(body.username), reason: "unknown-user" });
       res.status(401).json({ success: false, code: "INVALID_CREDENTIALS", error: INVALID_LOGIN });
       return;
     }
     const lockedMs = lockRemainingMs(user.lockedUntil);
     if (lockedMs > 0) {
+      auditLogin(req, { kind: "locked", method, userId: user.id, username: user.username, reason: "account-locked" });
       const minutes = Math.ceil(lockedMs / 60000);
       res.status(429).json({
         success: false,
@@ -540,6 +623,10 @@ app.post("/api/operator/session", async (req, res) => {
           updatedAt: new Date().toISOString(),
         });
         if (locking) console.warn(`[Accounts] Tạm khóa tài khoản ${user.username} sau ${failures} lần đăng nhập sai.`);
+        auditLogin(req, { kind: "sign-in-failed", method, userId: user.id, username: user.username, reason: "bad-password" });
+        if (locking) auditLogin(req, { kind: "locked", method, userId: user.id, username: user.username, reason: "account-locked" });
+      } else {
+        auditLogin(req, { kind: "sign-in-failed", method, userId: user.id, username: user.username, reason: "disabled" });
       }
       // A disabled account gets the same answer as a wrong password.
       res.status(401).json({ success: false, code: "INVALID_CREDENTIALS", error: INVALID_LOGIN });
@@ -547,6 +634,7 @@ app.post("/api/operator/session", async (req, res) => {
     }
     const now = new Date().toISOString();
     db.saveUser({ ...user, failedLogins: 0, lockedUntil: null, lastLoginAt: now, updatedAt: now });
+    auditLogin(req, { kind: "sign-in", method, userId: user.id, username: user.username });
     session = {
       ...base,
       actor: user.username,
@@ -560,9 +648,11 @@ app.post("/api/operator/session", async (req, res) => {
     const supplied = String(body.token || "");
     const principal = authPrincipals().find((candidate) => constantTimeEqual(supplied, candidate.token));
     if (!principal) {
+      auditLogin(req, { kind: "sign-in-failed", method, reason: "bad-token" });
       res.status(401).json({ success: false, code: "INVALID_CREDENTIALS", error: "Mã khởi tạo không đúng" });
       return;
     }
+    auditLogin(req, { kind: "sign-in", method, username: auditText(principal.actor, 64) });
     session = { ...base, actor: principal.actor, role: principal.role };
   }
 
@@ -570,7 +660,9 @@ app.post("/api/operator/session", async (req, res) => {
   res.json(sessionPayload(session));
 });
 
-app.delete("/api/operator/session", requireOperatorRole("viewer"), requireCsrf, (_req: Request, res: Response) => {
+app.delete("/api/operator/session", requireOperatorRole("viewer"), requireCsrf, (req: Request, res: Response) => {
+  const ended = (req as any).operatorSession as OperatorSession | undefined;
+  if (ended) auditLogin(req, { kind: "sign-out", method: ended.uid ? "account" : "token", userId: ended.uid, username: auditText(ended.actor, 64) });
   const attributes = operatorCookieAttributes() || "Path=/; HttpOnly; SameSite=Lax; Max-Age=0";
   res.setHeader("Set-Cookie", `${OPERATOR_COOKIE}=; ${attributes.replace(/Max-Age=\d+/, "Max-Age=0")}`);
   res.json({ success: true });
@@ -602,6 +694,7 @@ app.post("/api/operator/password", requireOperatorRole("viewer"), requireCsrf, a
   const current = typeof req.body?.currentPassword === "string" ? req.body.currentPassword : "";
   const next = req.body?.newPassword;
   if (!(await verifyPassword(current, user.passwordHash))) {
+    auditLogin(req, { kind: "sign-in-failed", method: "account", userId: user.id, username: user.username, reason: "bad-password" });
     res.status(401).json({ success: false, code: "INVALID_CREDENTIALS", error: "Mật khẩu hiện tại không đúng" });
     return;
   }
@@ -631,6 +724,7 @@ app.post("/api/operator/password", requireOperatorRole("viewer"), requireCsrf, a
   const cookieAttributes = operatorCookieAttributes();
   if (cookieAttributes) res.setHeader("Set-Cookie", `${OPERATOR_COOKIE}=${signOperatorSession(fresh)}; ${cookieAttributes}`);
   console.log(`[Accounts] ${user.username} đã đổi mật khẩu.`);
+  auditLogin(req, { kind: "password-changed", method: "account", userId: user.id, username: user.username });
   res.json(sessionPayload(fresh));
 });
 
@@ -785,6 +879,48 @@ app.delete("/api/users/:id", requireOperatorRole("admin"), requireCsrf, (req: Re
   console.log(`[Accounts] ${operatorActor(req)} đã xóa tài khoản ${target.username}.`);
   res.json({ success: true });
 });
+
+// Sign-in audit (admin; /api/users/* reads are admin in the role table).
+app.get("/api/users/login-events", requireOperatorRole("admin"), async (req: Request, res: Response) => {
+  const q = req.query as Record<string, unknown>;
+  const str = (v: unknown, max: number) => (typeof v === "string" && v.length <= max ? v : undefined);
+  const kind = str(q.kind, 32);
+  if (kind && !(LOGIN_EVENT_KINDS as readonly string[]).includes(kind)) {
+    res.status(400).json({ success: false, error: `kind phải là một trong: ${LOGIN_EVENT_KINDS.join(", ")}` });
+    return;
+  }
+  const limitNum = Number(q.limit ?? 50);
+  try {
+    const page = await db.getLoginEventsPage({
+      userId: str(q.userId, 64),
+      username: str(q.username, 64),
+      kind: kind as LoginEventKind | undefined,
+      before: str(q.before, 140),
+      limit: Number.isFinite(limitNum) ? limitNum : 50,
+    });
+    const last = page.events[page.events.length - 1];
+    // Sensitive read (addresses, browsers): attributed in the server log.
+    console.log(
+      `[Accounts] ${operatorActor(req) || "unknown"} xem nhật ký đăng nhập (${[q.userId && "theo tài khoản", kind && `loại ${kind}`, q.before && "trang sau"].filter(Boolean).join(", ") || "tất cả"}): ${page.events.length} dòng`
+    );
+    res.json({ success: true, events: page.events, hasMore: page.hasMore, ...(page.hasMore && last ? { nextCursor: loginEventCursor(last) } : {}) });
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: `Không đọc được nhật ký đăng nhập: ${err?.message || err}` });
+  }
+});
+
+// Retention of the sign-in audit (LOGIN_EVENT_RETENTION_DAYS, default 180; 0 keeps forever).
+const LOGIN_EVENT_RETENTION_DAYS = loginEventRetentionDays();
+if (LOGIN_EVENT_RETENTION_DAYS > 0) {
+  const purgeLogins = () => {
+    const cutoff = new Date(Date.now() - LOGIN_EVENT_RETENTION_DAYS * 86_400_000).toISOString();
+    db.purgeLoginEvents(cutoff)
+      .then((n) => { if (n > 0) console.log(`[Accounts] Đã xóa ${n} dòng nhật ký đăng nhập cũ hơn ${LOGIN_EVENT_RETENTION_DAYS} ngày.`); })
+      .catch((err) => console.warn("[Accounts] Lỗi dọn nhật ký đăng nhập:", err?.message || err));
+  };
+  setTimeout(purgeLogins, 60_000).unref?.();
+  setInterval(purgeLogins, 6 * 60 * 60 * 1000).unref?.();
+}
 
 const configuredBearer = (name: "DEVICE_INGEST_TOKEN" | "INTERNAL_API_TOKEN") =>
   String(process.env[name] || "").trim();
@@ -10783,7 +10919,7 @@ async function startServer() {
   }
 
   app.use(jsonErrorHandler);
-  app.listen(PORT, "0.0.0.0", () => {
+  const httpServer = app.listen(PORT, "0.0.0.0", () => {
     console.log(`Server running on http://0.0.0.0:${PORT} (Mode: ${isProduction ? "production" : "development"})`);
     // Backend gate watchers start here, AFTER the camera config is loaded and
     // only for gates whose persisted `watch.enabled` is true.
@@ -10798,6 +10934,13 @@ async function startServer() {
     startStrangerFaceRetention();
     startAccuracyJobs();
   });
+  // The edge proxies (eton8, T2) keep idle upstream connections for up to 60 s;
+  // with Node's 5 s default the app closed connections nginx was just reusing,
+  // and a POST on such a connection failed with 502 (nginx never retries a POST;
+  // 63 resets 24 Sep - 2 Oct, e.g. a stranger merge at 2026-10-02 08:37 +07).
+  // Idle connections now outlive the proxy's, so the proxy always closes first.
+  httpServer.keepAliveTimeout = 65_000;
+  httpServer.headersTimeout = 66_000;
 }
 
 startServer();

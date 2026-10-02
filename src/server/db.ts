@@ -14,6 +14,7 @@ import {
 } from "./dbStatus";
 import type { StrangerFacePage, StrangerFaceRecord, StrangerFaceStore } from "./strangerFaces";
 import type { ShadowAccuracySummary, ShadowAgreement, ShadowResultRecord, ShadowResultStore } from "./shadowResults";
+import { LOGIN_EVENT_KINDS, type LoginEventQuery, type LoginEventRecord, type LoginEventStore } from "./loginEvents";
 import type { FaceTemplate } from "../types";
 import { gateIdForLegacyRow, isDoorId, isGateId, LEGACY_DOOR_ID } from "./gates";
 
@@ -1152,6 +1153,86 @@ const PG_SHADOW_RESULTS_DDL = `
   CREATE INDEX IF NOT EXISTS idx_shadow_results_gate ON pipeline_shadow_results (gate, "decidedAt" DESC);
 `;
 
+/**
+ * login_events (src/server/loginEvents.ts): append-only sign-in audit. Personal
+ * data (IP, browser string), no secrets; retention by a plain DELETE on "at"
+ * (LOGIN_EVENT_RETENTION_DAYS). id and at sort bytewise like the other keyset
+ * pages. Rollback: DROP TABLE login_events (nothing else references it).
+ */
+const PG_LOGIN_EVENTS_DDL = `
+  CREATE TABLE IF NOT EXISTS login_events (
+    id VARCHAR(64) COLLATE "C" PRIMARY KEY,
+    at VARCHAR(64) COLLATE "C" NOT NULL,
+    kind VARCHAR(32) NOT NULL,
+    method VARCHAR(16) NOT NULL,
+    "userId" VARCHAR(64),
+    username VARCHAR(64),
+    reason VARCHAR(32),
+    ip VARCHAR(64),
+    "userAgent" VARCHAR(200)
+  );
+  CREATE INDEX IF NOT EXISTS idx_login_events_at ON login_events (at DESC, id DESC);
+  CREATE INDEX IF NOT EXISTS idx_login_events_user ON login_events ("userId", at DESC);
+`;
+
+const SQLITE_LOGIN_EVENTS_DDL = `
+  CREATE TABLE IF NOT EXISTS login_events (
+    id TEXT PRIMARY KEY,
+    at TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    method TEXT NOT NULL,
+    userId TEXT,
+    username TEXT,
+    reason TEXT,
+    ip TEXT,
+    userAgent TEXT
+  );
+  CREATE INDEX IF NOT EXISTS idx_login_events_at ON login_events (at DESC, id DESC);
+  CREATE INDEX IF NOT EXISTS idx_login_events_user ON login_events (userId, at DESC);
+`;
+
+const LOGIN_EVENT_PAGE_MAX = 200;
+const LOGIN_EVENT_COLUMNS_PG = `id, at, kind, method, "userId", username, reason, ip, "userAgent"`;
+const LOGIN_EVENT_COLUMNS_SQLITE = "id, at, kind, method, userId, username, reason, ip, userAgent";
+
+/** Clamps a record to the column limits; null when it cannot be stored. */
+function normalizeLoginEvent(e: LoginEventRecord): LoginEventRecord | null {
+  const cut = (v: unknown, n: number) => (typeof v === "string" && v ? v.slice(0, n) : undefined);
+  const at = typeof e?.at === "string" && Number.isFinite(Date.parse(e.at)) ? new Date(e.at).toISOString() : null;
+  if (!e || typeof e.id !== "string" || !e.id || e.id.length > 64 || !at) return null;
+  if (!(LOGIN_EVENT_KINDS as readonly string[]).includes(e.kind) || (e.method !== "account" && e.method !== "token")) return null;
+  return {
+    id: e.id,
+    at,
+    kind: e.kind,
+    method: e.method,
+    userId: cut(e.userId, 64),
+    username: cut(e.username, 64),
+    reason: cut(e.reason, 32) as LoginEventRecord["reason"],
+    ip: cut(e.ip, 64),
+    userAgent: cut(e.userAgent, 200),
+  };
+}
+
+function rowToLoginEvent(r: any): LoginEventRecord {
+  const out: LoginEventRecord = { id: String(r.id), at: String(r.at), kind: r.kind, method: r.method };
+  for (const k of ["userId", "username", "reason", "ip", "userAgent"] as const) {
+    if (r[k] !== null && r[k] !== undefined && r[k] !== "") (out as any)[k] = String(r[k]);
+  }
+  return out;
+}
+
+/** Opaque keyset cursor: "<at>|<id>". */
+export function loginEventCursor(e: { at: string; id: string }): string {
+  return `${e.at}|${e.id}`;
+}
+function parseLoginEventCursor(raw: unknown): { at: string; id: string } | null {
+  const s = typeof raw === "string" ? raw : "";
+  const i = s.indexOf("|");
+  if (i <= 0 || s.length > 140) return null;
+  return { at: s.slice(0, i), id: s.slice(i + 1) };
+}
+
 const SQLITE_SHADOW_RESULTS_DDL = `
   CREATE TABLE IF NOT EXISTS pipeline_shadow_results (
     id TEXT PRIMARY KEY,
@@ -1694,7 +1775,7 @@ export function mergeAiRecognitionConfig(
 }
 
 // Database wrapper supporting PostgreSQL (via DATABASE_URL), native Node 22 SQLite, and fallback JSON
-class SQLiteStorage implements StrangerFaceStore, ShadowResultStore {
+class SQLiteStorage implements StrangerFaceStore, ShadowResultStore, LoginEventStore {
   private db: any = null;
   private isNativeSqlite = false;
   private pgPool: Pool | null = null;
@@ -1722,6 +1803,8 @@ class SQLiteStorage implements StrangerFaceStore, ShadowResultStore {
   private pgStrangerFacesReady = false;
   /** pipeline_shadow_results exists on PostgreSQL (same pattern: refuse writes until then). */
   private pgShadowResultsReady = false;
+  /** login_events exists on PostgreSQL (same pattern). */
+  private pgLoginEventsReady = false;
   /**
    * Resolves once the PostgreSQL schema migration has run (or failed, which is
    * logged). PostgreSQL becomes the active store just before the migration, so
@@ -2367,6 +2450,12 @@ class SQLiteStorage implements StrangerFaceStore, ShadowResultStore {
         console.error("[PostgreSQL] Lỗi khởi tạo bảng pipeline_shadow_results:", err);
       }
       try {
+        await this.pgPool.query(PG_LOGIN_EVENTS_DDL);
+        this.pgLoginEventsReady = true;
+      } catch (err) {
+        console.error("[PostgreSQL] Lỗi khởi tạo bảng login_events:", err);
+      }
+      try {
         await this.pgPool.query(PG_DOOR_LOCK_STATES_DDL);
         this.pgDoorLockStatesReady = true;
       } catch (err) {
@@ -2636,6 +2725,11 @@ class SQLiteStorage implements StrangerFaceStore, ShadowResultStore {
       console.error("[SQLite] Lỗi khởi tạo bảng pipeline_shadow_results:", err);
     }
     try {
+      this.db.exec(SQLITE_LOGIN_EVENTS_DDL);
+    } catch (err) {
+      console.error("[SQLite] Lỗi khởi tạo bảng login_events:", err);
+    }
+    try {
       this.db.exec(SQLITE_DOOR_LOCK_STATES_DDL);
     } catch (err) {
       console.error("[SQLite] Lỗi khởi tạo bảng door_lock_states:", err);
@@ -2663,6 +2757,7 @@ class SQLiteStorage implements StrangerFaceStore, ShadowResultStore {
     org_catalog?: OrgCatalogRecord;
     stranger_faces?: StrangerFaceJson[];
     pipeline_shadow_results?: ShadowResultRecord[];
+    login_events?: LoginEventRecord[];
     /** Lock state per door (N-gate wave); door "main" is also smart_lock_state. */
     door_lock_states?: Record<string, { state: SmartLockStateRecord; updatedAt: string }>;
   } = {
@@ -3659,6 +3754,111 @@ class SQLiteStorage implements StrangerFaceStore, ShadowResultStore {
     this.writeFallback({ ...this.fallbackData, stranger_faces: staged });
     this.fallbackData.stranger_faces = staged;
     return purged;
+  }
+
+  // ================= SIGN-IN AUDIT (login_events) =================
+  // Single authority like shadow results: PostgreSQL once its table exists,
+  // else SQLite, else JSON; refused while PostgreSQL is configured but not ready.
+
+  private loginEventMode(): "postgresql" | "sqlite" | "json" | null {
+    return this.singleStoreMode(this.pgLoginEventsReady);
+  }
+
+  /** LoginEventStore.saveLoginEvent: append; replay by id is a no-op. Never rejects. */
+  async saveLoginEvent(event: LoginEventRecord): Promise<boolean> {
+    const e = normalizeLoginEvent(event);
+    if (!e) return false;
+    const mode = this.loginEventMode();
+    if (!mode) return false;
+    const params = [e.id, e.at, e.kind, e.method, e.userId ?? null, e.username ?? null, e.reason ?? null, e.ip ?? null, e.userAgent ?? null];
+    try {
+      if (mode === "postgresql") {
+        await this.pgPool!.query(
+          `INSERT INTO login_events (${LOGIN_EVENT_COLUMNS_PG}) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) ON CONFLICT (id) DO NOTHING`,
+          params,
+        );
+        return true;
+      }
+      if (mode === "sqlite") {
+        this.db.prepare(`INSERT INTO login_events (${LOGIN_EVENT_COLUMNS_SQLITE}) VALUES (?,?,?,?,?,?,?,?,?) ON CONFLICT (id) DO NOTHING`).run(...params);
+        return true;
+      }
+      const existing = this.fallbackData.login_events || [];
+      if (existing.some((x) => x.id === e.id)) return true;
+      const staged = [e, ...existing];
+      this.writeFallback({ ...this.fallbackData, login_events: staged });
+      this.fallbackData.login_events = staged;
+      return true;
+    } catch (err: any) {
+      console.error(`[LoginEvents] Lỗi lưu nhật ký đăng nhập (${mode}): ${err?.message}`);
+      return false;
+    }
+  }
+
+  /** LoginEventStore.getLoginEventsPage: newest first by (at DESC, id DESC); cursor = loginEventCursor of the last row. */
+  async getLoginEventsPage(query: LoginEventQuery): Promise<{ events: LoginEventRecord[]; hasMore: boolean }> {
+    const n = Math.min(LOGIN_EVENT_PAGE_MAX, Math.max(1, Number.isFinite(query?.limit) ? Math.trunc(query.limit) : 50));
+    const after = query?.before ? parseLoginEventCursor(query.before) : null;
+    if (query?.before && !after) return { events: [], hasMore: false };
+    const userId = typeof query?.userId === "string" && query.userId ? query.userId : null;
+    const username = typeof query?.username === "string" && query.username ? query.username.toLowerCase() : null;
+    const kind = typeof query?.kind === "string" && query.kind ? query.kind : null;
+    if (kind && !(LOGIN_EVENT_KINDS as readonly string[]).includes(kind)) return { events: [], hasMore: false };
+    const mode = this.loginEventMode();
+    let rows: LoginEventRecord[] = [];
+    if (mode === "postgresql") {
+      const params: unknown[] = [];
+      const where: string[] = [];
+      if (userId) { params.push(userId); where.push(`"userId" = $${params.length}`); }
+      if (username) { params.push(username); where.push(`username = $${params.length}`); }
+      if (kind) { params.push(kind); where.push(`kind = $${params.length}`); }
+      if (after) { params.push(after.at, after.id); where.push(`(at, id) < ($${params.length - 1}, $${params.length})`); }
+      params.push(n + 1);
+      const result = await this.pgPool!.query(
+        `SELECT ${LOGIN_EVENT_COLUMNS_PG} FROM login_events ${where.length ? `WHERE ${where.join(" AND ")}` : ""}
+          ORDER BY at DESC, id DESC LIMIT $${params.length}`,
+        params,
+      );
+      rows = result.rows.map(rowToLoginEvent);
+    } else if (mode === "sqlite") {
+      const params: unknown[] = [];
+      const where: string[] = [];
+      if (userId) { params.push(userId); where.push("userId = ?"); }
+      if (username) { params.push(username); where.push("username = ?"); }
+      if (kind) { params.push(kind); where.push("kind = ?"); }
+      if (after) { params.push(after.at, after.at, after.id); where.push("(at < ? OR (at = ? AND id < ?))"); }
+      rows = (this.db.prepare(
+        `SELECT ${LOGIN_EVENT_COLUMNS_SQLITE} FROM login_events ${where.length ? `WHERE ${where.join(" AND ")}` : ""}
+          ORDER BY at DESC, id DESC LIMIT ?`,
+      ).all(...params, n + 1) as any[]).map(rowToLoginEvent);
+    } else if (mode === "json") {
+      rows = (this.fallbackData.login_events || [])
+        .filter((e) => (!userId || e.userId === userId) && (!username || e.username === username) && (!kind || e.kind === kind))
+        .filter((e) => !after || e.at < after.at || (e.at === after.at && e.id < after.id))
+        .sort((a, b) => (a.at === b.at ? (a.id < b.id ? 1 : a.id > b.id ? -1 : 0) : a.at < b.at ? 1 : -1))
+        .slice(0, n + 1)
+        .map((e) => rowToLoginEvent(e));
+    }
+    return { events: rows.slice(0, n), hasMore: rows.length > n };
+  }
+
+  /** LoginEventStore.purgeLoginEvents: delete rows with at < cutoffIso. */
+  async purgeLoginEvents(cutoffIso: string): Promise<number> {
+    const cutoff = normIso(cutoffIso);
+    if (!cutoff) throw new RangeError("purgeLoginEvents: invalid cutoff");
+    const mode = this.loginEventMode();
+    if (mode === "postgresql") return (await this.pgPool!.query("DELETE FROM login_events WHERE at < $1", [cutoff])).rowCount || 0;
+    if (mode === "sqlite") return Number(this.db.prepare("DELETE FROM login_events WHERE at < ?").run(cutoff)?.changes || 0);
+    if (mode === "json") {
+      const current = this.fallbackData.login_events || [];
+      const staged = current.filter((e) => !(e.at < cutoff));
+      const removed = current.length - staged.length;
+      if (!removed) return 0;
+      this.writeFallback({ ...this.fallbackData, login_events: staged });
+      this.fallbackData.login_events = staged;
+      return removed;
+    }
+    return 0;
   }
 
   // ================= SHADOW RESULTS (accuracy wave) =================
