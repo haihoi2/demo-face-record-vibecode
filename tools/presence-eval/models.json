@@ -1,56 +1,246 @@
 {
- "_comment": "P1 candidate person detectors. Every ONNX file takes one float32 image tensor and returns dets [1,N,5] = x1,y1,x2,y2 (input pixels), person score. Files live in /data/models/candidates/presence (not in git); see the P1 report for source URLs, commits and licences. inputs[].width = dynamic-shape model scaled to that width (height padded to stride); inputs[].w/h = static model input, letterboxed top-left.",
+ "_comment": "P1 candidate person detectors. Every ONNX file takes one float32 image tensor and returns dets [1,N,5] = x1,y1,x2,y2 (input pixels), person score. Files live in /data/models/candidates/presence (not in git); see the P1 report for source URLs, commits and licences. inputs[].width = dynamic-shape model scaled to that width (height padded to stride); inputs[].w/h = static model input, letterboxed top-left. inputs[].nvrOnly = run on the real footage only (larger inputs added after the entry camera showed people ~80 px tall at 1920 wide).",
  "models": [
   {
-   "id": "yolox-nano", "family": "YOLOX (Megvii)", "layout": "nchw", "order": "bgr",
-   "mean": [0, 0, 0], "std": [1, 1, 1], "pad": 114, "nms": 0.5,
+   "id": "yolox-nano",
+   "family": "YOLOX (Megvii)",
+   "layout": "nchw",
+   "order": "bgr",
+   "mean": [
+    0,
+    0,
+    0
+   ],
+   "std": [
+    1,
+    1,
+    1
+   ],
+   "pad": 114,
+   "nms": 0.5,
    "inputs": [
-    {"key": "native", "width": 416, "stride": 32, "file": "yolox_nano_person.onnx"},
-    {"key": "640", "width": 640, "stride": 32, "file": "yolox_nano_person.onnx"}
+    {
+     "key": "native",
+     "width": 416,
+     "stride": 32,
+     "file": "yolox_nano_person.onnx"
+    },
+    {
+     "key": "640",
+     "width": 640,
+     "stride": 32,
+     "file": "yolox_nano_person.onnx"
+    },
+    {
+     "key": "960",
+     "width": 960,
+     "stride": 32,
+     "file": "yolox_nano_person.onnx",
+     "nvrOnly": true
+    },
+    {
+     "key": "1280",
+     "width": 1280,
+     "stride": 32,
+     "file": "yolox_nano_person.onnx",
+     "nvrOnly": true
+    }
    ]
   },
   {
-   "id": "yolox-tiny", "family": "YOLOX (Megvii)", "layout": "nchw", "order": "bgr",
-   "mean": [0, 0, 0], "std": [1, 1, 1], "pad": 114, "nms": 0.5,
+   "id": "yolox-tiny",
+   "family": "YOLOX (Megvii)",
+   "layout": "nchw",
+   "order": "bgr",
+   "mean": [
+    0,
+    0,
+    0
+   ],
+   "std": [
+    1,
+    1,
+    1
+   ],
+   "pad": 114,
+   "nms": 0.5,
    "inputs": [
-    {"key": "native", "width": 416, "stride": 32, "file": "yolox_tiny_person.onnx"},
-    {"key": "640", "width": 640, "stride": 32, "file": "yolox_tiny_person.onnx"}
+    {
+     "key": "native",
+     "width": 416,
+     "stride": 32,
+     "file": "yolox_tiny_person.onnx"
+    },
+    {
+     "key": "640",
+     "width": 640,
+     "stride": 32,
+     "file": "yolox_tiny_person.onnx"
+    },
+    {
+     "key": "960",
+     "width": 960,
+     "stride": 32,
+     "file": "yolox_tiny_person.onnx",
+     "nvrOnly": true
+    },
+    {
+     "key": "1280",
+     "width": 1280,
+     "stride": 32,
+     "file": "yolox_tiny_person.onnx",
+     "nvrOnly": true
+    }
    ]
   },
   {
-   "id": "rtmdet-tiny", "family": "RTMDet (OpenMMLab)", "layout": "nchw", "order": "bgr",
-   "mean": [103.53, 116.28, 123.675], "std": [57.375, 57.12, 58.395], "pad": 114, "nms": 0.5,
+   "id": "rtmdet-tiny",
+   "family": "RTMDet (OpenMMLab)",
+   "layout": "nchw",
+   "order": "bgr",
+   "mean": [
+    103.53,
+    116.28,
+    123.675
+   ],
+   "std": [
+    57.375,
+    57.12,
+    58.395
+   ],
+   "pad": 114,
+   "nms": 0.5,
    "inputs": [
-    {"key": "640", "width": 640, "stride": 32, "file": "rtmdet_tiny_person.onnx"},
-    {"key": "416", "width": 416, "stride": 32, "file": "rtmdet_tiny_person.onnx"}
+    {
+     "key": "640",
+     "width": 640,
+     "stride": 32,
+     "file": "rtmdet_tiny_person.onnx"
+    },
+    {
+     "key": "416",
+     "width": 416,
+     "stride": 32,
+     "file": "rtmdet_tiny_person.onnx"
+    },
+    {
+     "key": "960",
+     "width": 960,
+     "stride": 32,
+     "file": "rtmdet_tiny_person.onnx",
+     "nvrOnly": true
+    },
+    {
+     "key": "1280",
+     "width": 1280,
+     "stride": 32,
+     "file": "rtmdet_tiny_person.onnx",
+     "nvrOnly": true
+    }
    ]
   },
   {
-   "id": "efficientdet-lite0", "family": "EfficientDet-Lite (MediaPipe)", "layout": "nhwc", "order": "rgb",
-   "mean": [127.5, 127.5, 127.5], "std": [127.5, 127.5, 127.5], "pad": 0, "nms": 0.5,
+   "id": "efficientdet-lite0",
+   "family": "EfficientDet-Lite (MediaPipe)",
+   "layout": "nhwc",
+   "order": "rgb",
+   "mean": [
+    127.5,
+    127.5,
+    127.5
+   ],
+   "std": [
+    127.5,
+    127.5,
+    127.5
+   ],
+   "pad": 0,
+   "nms": 0.5,
    "inputs": [
-    {"key": "native", "w": 320, "h": 320, "file": "efficientdet_lite0_person.onnx"}
+    {
+     "key": "native",
+     "w": 320,
+     "h": 320,
+     "file": "efficientdet_lite0_person.onnx"
+    }
    ]
   },
   {
-   "id": "efficientdet-lite2", "family": "EfficientDet-Lite (MediaPipe)", "layout": "nhwc", "order": "rgb",
-   "mean": [127.5, 127.5, 127.5], "std": [127.5, 127.5, 127.5], "pad": 0, "nms": 0.5,
+   "id": "efficientdet-lite2",
+   "family": "EfficientDet-Lite (MediaPipe)",
+   "layout": "nhwc",
+   "order": "rgb",
+   "mean": [
+    127.5,
+    127.5,
+    127.5
+   ],
+   "std": [
+    127.5,
+    127.5,
+    127.5
+   ],
+   "pad": 0,
+   "nms": 0.5,
    "inputs": [
-    {"key": "native", "w": 448, "h": 448, "file": "efficientdet_lite2_person.onnx"}
+    {
+     "key": "native",
+     "w": 448,
+     "h": 448,
+     "file": "efficientdet_lite2_person.onnx"
+    }
    ]
   },
   {
-   "id": "rtdetr-r18", "family": "RT-DETR (Baidu, lyuwenyu/RT-DETR)", "layout": "nchw", "order": "rgb",
-   "mean": [0, 0, 0], "std": [255, 255, 255], "pad": 114, "nms": null,
+   "id": "rtdetr-r18",
+   "family": "RT-DETR (Baidu, lyuwenyu/RT-DETR)",
+   "layout": "nchw",
+   "order": "rgb",
+   "mean": [
+    0,
+    0,
+    0
+   ],
+   "std": [
+    255,
+    255,
+    255
+   ],
+   "pad": 114,
+   "nms": null,
    "inputs": [
-    {"key": "640", "w": 640, "h": 640, "file": "rtdetr_r18_person.onnx"}
+    {
+     "key": "640",
+     "w": 640,
+     "h": 640,
+     "file": "rtdetr_r18_person.onnx"
+    }
    ]
   },
   {
-   "id": "rfdetr-nano", "family": "RF-DETR (Roboflow)", "layout": "nchw", "order": "rgb",
-   "mean": [123.675, 116.28, 103.53], "std": [58.395, 57.12, 57.375], "pad": 114, "nms": null,
+   "id": "rfdetr-nano",
+   "family": "RF-DETR (Roboflow)",
+   "layout": "nchw",
+   "order": "rgb",
+   "mean": [
+    123.675,
+    116.28,
+    103.53
+   ],
+   "std": [
+    58.395,
+    57.12,
+    57.375
+   ],
+   "pad": 114,
+   "nms": null,
    "inputs": [
-    {"key": "native", "w": 384, "h": 384, "file": "rfdetr_nano_person.onnx"}
+    {
+     "key": "native",
+     "w": 384,
+     "h": 384,
+     "file": "rfdetr_nano_person.onnx"
+    }
    ]
   }
  ]

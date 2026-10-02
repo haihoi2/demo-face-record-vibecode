@@ -6,8 +6,9 @@ human check, and (with --decisions) write labels/gt.json. OFFLINE ONLY.
 Runs in presence-p1-torch (needs Pillow):
   # 1) pool + sheets (review/<gate>/sheet-NN.jpg: one tile per track, default label printed)
   python pool_labels.py --work /work --gate ENTRY
-  # 2) after looking at the sheets, write overrides {"<clip>#<track>": "person"|"no"} to
-  #    labels/decisions-<gate>.json and build the ground truth
+  # 2) after looking at the sheets, write overrides to labels/decisions-<gate>.json as
+  #    [{"clip", "frame", "box", "label": "person"|"no"}] (frame/box from review/<gate>/index.json, so a
+  #    decision survives re-pooling) and build the ground truth
   python pool_labels.py --work /work --gate ENTRY --decisions labels/decisions-entry.json --write-gt
 
 Default label: person if Grounding DINO scored the track >= --gdino-person at any 1 fps keyframe,
@@ -156,6 +157,25 @@ def sheets(work, gate, clips, all_tracks, labels, out_dir, per_sheet=40, cols=8,
     return index
 
 
+def resolve_decisions(dec, all_tracks):
+    """Decisions are anchored to a picture, not to a track id (ids change when the pool changes):
+    [{"clip", "frame", "box", "label"}] -> {"clip#track": label} for the track holding that box."""
+    if isinstance(dec, dict):  # legacy {"clip#track": label}
+        return dec
+    out = {}
+    for d in dec:
+        best, bt = 0.5, None
+        for t in all_tracks.get(d["clip"], []):
+            b = t["frames"].get(d["frame"])
+            if b is not None and iou(b, d["box"]) >= best:
+                best, bt = iou(b, d["box"]), t
+        if bt is None:
+            print(f"warning: decision {d['clip']}@{d['frame']} matches no track; ignored")
+            continue
+        out[f"{d['clip']}#{bt['id']}"] = d["label"]
+    return out
+
+
 def interp_frames(t, n):
     fr = dict(t["frames"])
     ks = sorted(fr)
@@ -194,7 +214,7 @@ def main():
     print(f"sources: {sorted(sources)} + gdino ({len(gd)} keyframes)")
     all_tracks = {c["id"]: pool_clip(c, sources, gd, a.cand_thr, a.gdino_thr) for c in clips}
     labels = {f"{cid}#{t['id']}": default_label(t, a.gdino_person) for cid, ts in all_tracks.items() for t in ts}
-    over = json.load(open(os.path.join(a.work, a.decisions))) if a.decisions else {}
+    over = resolve_decisions(json.load(open(os.path.join(a.work, a.decisions))), all_tracks) if a.decisions else {}
     labels.update(over)
     out_dir = os.path.join(a.work, "review", a.gate.lower())
     idx = sheets(a.work, a.gate, clips, all_tracks, labels, out_dir)
@@ -210,7 +230,7 @@ def main():
             if labels[f"{c['id']}#{t['id']}"] != "person":
                 continue
             for i, b in interp_frames(t, c["frames"]).items():
-                frames[i].append([round(v, 4) for v in b])
+                frames[i].append([round(v, 4) for v in b] + [t["id"]])  # 5th value = person track id
         gt["clips"][c["id"]] = {
             "gate": c["gate"], "light": c.get("light"),
             "source": "pooled candidates + Grounding DINO base 1 fps, tracks checked by eye",

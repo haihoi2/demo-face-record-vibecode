@@ -16,7 +16,12 @@ Definitions (4 frames/s; a frame flag is "seen" if any detection >= threshold sa
   false alarms/h  FP episodes >= 3 s per hour of footage (all frames; an FP is a detection on no
                   person - in an empty stretch or next to real people). Scripted: any detection in
                   an empty passage / empty clip.
-  box recall      share of ground-truth person boxes matched by a detection (per-person proxy)
+  person recall   per ground-truth person track (NVR): share of tracks in view >= D s that the model
+                  itself matched for >= D s (gap-bridged); stricter than passage recall, where one
+                  detected person (e.g. a worker in the background) covers the whole clip
+  moving recall   person recall restricted to tracks whose box centre moves >= 5% of the frame
+                  width (people walking through rather than standing at a bench)
+  box recall      share of ground-truth person boxes matched by a detection
 Zone ("gate") scoring: ground-truth boxes and detections are clipped to the gate area and kept if at
 least 20% of the box lies inside it. Runs with view=gate are cropped inputs; runs with view=full are
 also scored as "full+zone" (full-picture detection, then the zone rule) for ENTRY clips.
@@ -28,6 +33,7 @@ import os
 
 THRESHOLDS = [round(0.10 + 0.05 * k, 2) for k in range(15)]  # 0.10 .. 0.80
 ZONE_MIN_FRAC = 0.2
+MOVING_FRAC = 0.05
 
 
 def area(b):
@@ -57,7 +63,7 @@ def clip_to_zone(boxes, z):
 
 
 def match(dets, gts, thr_iou):
-    """Greedy one-to-one matching by IoU. Returns (n_matched_gt, n_unmatched_det)."""
+    """Greedy one-to-one matching by IoU. Returns (matched gt indices, n_unmatched_det)."""
     used = set()
     unmatched = 0
     for d in sorted(dets, key=lambda d: -d[4]):
@@ -72,7 +78,7 @@ def match(dets, gts, thr_iou):
             used.add(bj)
         else:
             unmatched += 1
-    return len(used), unmatched
+    return used, unmatched
 
 
 def episodes(flags, gap):
@@ -122,13 +128,17 @@ def score_run(run_dir, man, gt, gap, thr_iou, zone_mode):
     res = {}
     for t in THRESHOLDS:
         acc = {"pos3": 0, "hit3": 0, "pos1": 0, "hit1": 0, "fa": 0, "fa_empty": 0, "sec": 0.0, "sec_empty": 0.0,
-               "gt_boxes": 0, "gt_hit": 0, "missed": [], "fa_where": [], "by": {}}
+               "gt_boxes": 0, "gt_hit": 0, "missed": [], "fa_where": [], "by": {},
+               "tpos3": 0, "thit3": 0, "tpos1": 0, "thit1": 0, "tmissed": [],
+               "mpos3": 0, "mhit3": 0, "mmissed": []}
         for c in clips:
             n = c["frames"]
             g_clip = gt["clips"].get(c["id"]) if c["set"] == "nvr" else None
             if c["set"] == "nvr" and g_clip is None:
                 continue
             tp, fp, gt_present, empty = [], [], [], []
+            trk_seen, trk_hit = {}, {}  # track id -> per-frame flags (present / matched)
+            trk_ctr = {}  # track id -> box centres (to tell people walking through from people standing)
             for i in range(n):
                 d = [x for x in dets.get((c["id"], i), []) if x[4] >= t]
                 if c["set"] == "nvr":
@@ -136,9 +146,16 @@ def score_run(run_dir, man, gt, gap, thr_iou, zone_mode):
                     if zone_mode:
                         g = clip_to_zone(g, c["gateArea"])
                         d = clip_to_zone(d, c["gateArea"])
-                    m, um = match(d, g, thr_iou)
+                    used, um = match(d, g, thr_iou)
+                    m = len(used)
                     acc["gt_boxes"] += len(g)
                     acc["gt_hit"] += m
+                    for j, b in enumerate(g):
+                        if len(b) > 4:
+                            tid = b[4]
+                            trk_seen.setdefault(tid, [False] * n)[i] = True
+                            trk_hit.setdefault(tid, [False] * n)[i] = j in used
+                            trk_ctr.setdefault(tid, []).append(((b[0] + b[2]) / 2, (b[1] + b[3]) / 2))
                     tp.append(m > 0)
                     fp.append(um > 0)
                     gt_present.append(len(g) > 0)
@@ -167,6 +184,29 @@ def score_run(run_dir, man, gt, gap, thr_iou, zone_mode):
                             by[kh] += 1
                         elif dur == 3.0:
                             acc["missed"].append(f"{p['id']} (gt {gl / fps:.2f}s, model {ml / fps:.2f}s)")
+            # Per-person recall: every ground-truth person track in view >= D s must itself be
+            # matched for >= D s (gap-bridged) - one detected person cannot cover for another.
+            for tid, seen in trk_seen.items():
+                gl = max((b - a + 1 for a, b in episodes(seen, gap)), default=0)
+                ml = max((b - a + 1 for a, b in episodes(trk_hit.get(tid, [False] * n), gap)), default=0)
+                for dur, kp, kh in ((3.0, "tpos3", "thit3"), (1.0, "tpos1", "thit1")):
+                    need = int(round(dur * fps))
+                    if gl >= need:
+                        acc[kp] += 1
+                        if ml >= need:
+                            acc[kh] += 1
+                        elif dur == 3.0:
+                            acc["tmissed"].append(f"{c['id']}#{tid} (in view {gl / fps:.2f}s, seen {ml / fps:.2f}s)")
+                # "moving" = the box centre travels >= MOVING_FRAC of the frame width from where it
+                # appeared: someone walking through, not a worker standing at a bench.
+                ctr = trk_ctr.get(tid, [])
+                moving = bool(ctr) and max(abs(x - ctr[0][0]) for x, _ in ctr) >= MOVING_FRAC
+                if moving and gl >= int(round(3 * fps)):
+                    acc["mpos3"] += 1
+                    if ml >= int(round(3 * fps)):
+                        acc["mhit3"] += 1
+                    else:
+                        acc["mmissed"].append(f"{c['id']}#{tid} (in view {gl / fps:.2f}s, seen {ml / fps:.2f}s)")
             for a, b in fp_eps:
                 if (b - a + 1) >= int(round(3 * fps)):
                     acc["fa"] += 1

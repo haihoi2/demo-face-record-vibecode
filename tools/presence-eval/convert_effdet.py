@@ -185,6 +185,9 @@ def main():
     while len(g.output):
         g.output.pop()
     g.output.append(helper.make_tensor_value_info("person_dets", TensorProto.FLOAT, [1, anchors.shape[0], 5]))
+    # tf2onnx leaves intermediate shape annotations that onnxruntime-node 1.30 rejects for Lite0
+    # ("[ShapeInferenceError] Incompatible dimensions" on an FPN Add); ORT re-infers them anyway.
+    del g.value_info[:]
     onnx.checker.check_model(m)
     onnx.save(m, a.out)
 

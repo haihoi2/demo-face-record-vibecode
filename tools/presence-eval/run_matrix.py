@@ -34,14 +34,18 @@ def jobs(plan, models, threads=2):
                 for v in views:
                     # The scripted set is synthetic (face tiles on a flat background): full picture only.
                     out.append(dict(model=m["id"], input=inp["key"], view=v, threads=threads, gates=gate,
-                                    tag=gate.lower(), extra=["--sets", "nvr"] if v == "gate" else []))
+                                    tag=gate.lower(),
+                                    extra=["--sets", "nvr"] if v == "gate" or inp.get("nvrOnly") else []))
     elif plan == "timing":
         for m in models:
             for inp in m["inputs"]:
-                for t in (1, 2):
-                    out.append(dict(model=m["id"], input=inp["key"], view="full", threads=t, gates="ENTRY,EXIT",
-                                    tag="timing", extra=["--sets", "nvr", "--limit", "200", "--warmup", "10",
-                                                         "--no-dets"]))
+                # full picture always; the gate-area crop too for dynamic-shape models at 1280 wide
+                views = ["full", "gate"] if "width" in inp and inp["key"] == "1280" else ["full"]
+                for v in views:
+                    for t in (1, 2):
+                        out.append(dict(model=m["id"], input=inp["key"], view=v, threads=t, gates="ENTRY,EXIT",
+                                        tag="timing", extra=["--sets", "nvr", "--limit", "200", "--warmup", "10",
+                                                             "--no-dets"]))
     else:
         raise SystemExit(f"unknown plan {plan}")
     return out
