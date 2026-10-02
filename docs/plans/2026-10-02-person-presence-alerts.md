@@ -1,6 +1,6 @@
 # Plan: person-presence alerts ("human exists, no face")
 
-Status: DRAFT 2026-10-02, for owner review. Nothing is built yet. Owner request: "to make sure not to miss a stranger or a thief, we also need a feature that quickly detects 'human exists' if faces cannot be detected; this should be a quicker thread and notify the other security group." Decisions needed are in section 9.
+Status: DRAFT 2026-10-02 (model candidates updated the same day), for owner review. Nothing is built yet. Owner request: "to make sure not to miss a stranger or a thief, we also need a feature that quickly detects 'human exists' if faces cannot be detected; this should be a quicker thread and notify the other security group." Decisions needed are in section 9.
 
 ## 1. Why: what the cameras show today
 
@@ -36,13 +36,20 @@ camera (one RTSP connection per gate, already open)
 ```
 
 - **Speed:** detection on a 640 px frame is far cheaper than face detection on 4K. Target from a person appearing to the alert: **2-3 seconds**, separate from the face path (the "quicker thread").
-- **Model:** a small, CPU-friendly person detector exported to ONNX. Candidates, chosen by licence (the product is commercial):
-  - YOLOX-Nano/Tiny (Apache-2.0);
-  - RTMDet-tiny (Apache-2.0);
-  - NanoDet-Plus (Apache-2.0).
-  - **Not** YOLOv8/YOLO11: they are AGPL-3.0, which would require publishing our source unless a commercial licence is bought.
+- **Model:** a CPU-friendly person detector run through **ONNX Runtime for Node.js** (1.30, the runtime that already runs the face models). None of the candidates has a Node.js library of its own; all of them run in Node.js only as ONNX. Candidates reviewed 2026-10-02 (owner list + RTMDet):
 
-  Phase 1 picks one by measured recall on our own footage.
+  | Model | In Node.js (via ONNX) | Licence in practice | Fit for CPU, ~4 frames/s/gate | P1 |
+  |---|---|---|---|---|
+  | YOLOX-Nano / Tiny (Megvii) | Easiest: official ONNX export and ONNX Runtime demo; we add NMS (as for SCRFD) | Apache-2.0, code and trained weights | Very good: lightest | **Main candidate** |
+  | RTMDet-tiny (OpenMMLab) | ONNX export available | Apache-2.0 | As light as YOLOX, usually more accurate | Measure |
+  | MediaPipe Object Detector: EfficientDet-Lite0 / Lite2 (Google) | No Node.js library; convert TFLite -> ONNX, built-in NMS usually does not convert, so we add NMS | Apache-2.0 | Light; Lite0 weak on small, far people | Measure |
+  | RT-DETR-R18 (Baidu) | Official ONNX export, no NMS needed | Apache-2.0 **from Baidu's repository only**; the Ultralytics packaging is AGPL-3.0 - do not use it | More accurate, much heavier on CPU (~60 GFLOPs at 640 px) | Measure: accuracy vs CPU |
+  | RF-DETR-Nano / Small (Roboflow) | ONNX export available | Main variants Apache-2.0; **check the licence of the exact variant** before use | DINOv2 backbone, heavier than YOLOX | Measure: accuracy vs CPU |
+  | YOLO-NAS (Deci) | ONNX export possible | Code Apache-2.0, but the **pretrained weights have a separate non-commercial licence**; library largely unmaintained since Deci joined NVIDIA | — | **Excluded** |
+  | Grounding DINO (IDEA) | Possible but complex (image + BERT text model) | Apache-2.0 | Hundreds of ms to seconds per image on CPU; "person" needs no text prompt | **Not for real time**; used offline to pre-label NVR footage for the evaluation set |
+  | YOLOv8 / YOLO11 (Ultralytics) | — | AGPL-3.0 (commercial licence needed) | — | **Excluded** |
+
+  The whole backend stays Node.js (owner question 2026-10-02): decoding (FFmpeg) and inference (ONNX Runtime, C++) dominate CPU whatever the host language, so a Python rewrite would not be lighter. Python is used only offline (evaluation, conversion), and as a small sidecar only if the chosen model cannot run as ONNX.
 - **Linking to faces:** a face box inside the person box in the same frame, or within the track's lifetime, links them. A recognised employee closes the case; a stranger face follows the existing stranger flow and gets a link from the presence event; no face at all is the new "person without a face" case.
 - **Zones and duration:** per gate, reusing the gate-area editor. Rules such as "a person in the zone for at least N seconds" and "count only tracks that pass the door line" suppress passers-by in the background. After-hours rules can be stricter (any person = alert).
 - **Fail-safe:** if the detector or stream is down, the gate shows "presence detection offline", and the security group gets one "offline" notice (not silence).
@@ -84,7 +91,7 @@ camera (one RTSP connection per gate, already open)
 | Phase | What | Output | Effort |
 |---|---|---|---|
 | P0 | Owner decisions (section 9) | decisions recorded here | — |
-| P1 | Model choice offline: run 2-3 Apache-licensed person detectors on NVR footage (both gates, day + night, the 8-day retention window), compare recall of people, false alarms per hour, CPU per frame | short report + chosen model file | 1-2 days |
+| P1 | Model choice offline (no change to the running system): export/convert YOLOX-Nano/Tiny, RTMDet-tiny, EfficientDet-Lite0/Lite2, RT-DETR-R18, RF-DETR-Nano to ONNX; build an evaluation set from NVR footage of both gates, day and night (8-day retention window), pre-labelled with Grounding DINO and checked by hand; compare (1) recall of people - missing nobody comes first, (2) false alarms per hour, (3) ms per frame on this host's CPU under ONNX Runtime for Node.js | short report + chosen model file | 2-3 days |
 | P2 | Presence worker + third stream output + tracker + linking + `presence_events` store; **shadow** (record only, no alerts) on both gates | events visible in the panel, no messages sent | 3-4 days |
 | P3 | Security-group destination, alert rules, schedules, panel with labels, settings, health | alerts to a test group on dev, then the real group | 2-3 days |
 | P4 | Shadow on live for ~1 week, tune zones and durations from labels, then switch alerts on | go-live with measured false-alarm rate | 1 week elapsed |
@@ -113,5 +120,5 @@ Owners: face-engine agent (P1 model evaluation, detector wrapper), INT (worker, 
    c. which hours count as "after hours".
 4. **Zones:** whole picture, or a drawn zone per gate (recommended: zone)?
 5. **Retention of body pictures:** 14 days like stranger faces?
-6. **Model licence:** Apache-licensed models only (recommended), or buy a commercial YOLO licence?
+6. **Model licence:** Apache-licensed models only (recommended; candidate list in section 3), or buy a commercial YOLO licence?
 7. **Exit camera:** re-aim or add a camera so the exit actually sees people's faces and bodies (presence detection helps, but only within what the camera sees).
