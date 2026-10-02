@@ -57,8 +57,8 @@ describe("blur report eligibility and badge state", () => {
   it("the badge shows only for a literal blurReported: true on a per-face photo", () => {
     assert.equal(isBlurReported(faceB), true);
     assert.equal(isBlurReported(faceA), false);
-    assert.equal(isBlurReported(photo({ logId: "L", faceId: "SF-c", blurReported: "true" })), false);
-    assert.equal(isBlurReported(photo({ logId: "L", faceId: "SF-c", blurReported: 1 })), false);
+    assert.equal(isBlurReported(photo({ logId: "L", faceId: "SF-c", blurReported: "true" as unknown as boolean })), false);
+    assert.equal(isBlurReported(photo({ logId: "L", faceId: "SF-c", blurReported: 1 as unknown as boolean })), false);
     // A whole-frame photo never shows the badge, whatever the payload says.
     assert.equal(isBlurReported(legacy), false);
     assert.equal(isBlurReported(undefined), false);
