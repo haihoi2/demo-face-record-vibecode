@@ -1,0 +1,117 @@
+# Plan: person-presence alerts ("human exists, no face")
+
+Status: DRAFT 2026-10-02, for owner review. Nothing is built yet. Owner request: "to make sure not to miss a stranger or a thief, we also need a feature that quickly detects 'human exists' if faces cannot be detected; this should be a quicker thread and notify the other security group." Decisions needed are in section 9.
+
+## 1. Why: what the cameras show today
+
+- **Faces are the exception, not the rule.** In the 2026-09-29 replay of the NVR sequences, 93-96% of the people the real-time engine tracked at the entrance never yielded a usable face (back turned, bowed head, side view, too far, motion blur). At the exit the camera placement gives almost no faces at any detector size (2026-09-30 diagnostic).
+- **Today, nobody without a usable face leaves a trace.** The door engine and the stranger records are built only on face detection (SCRFD). A person walking past with their back to the camera produces no event, no photo and no alert. A thief who avoids looking at the camera is exactly that case.
+- **What exists to build on:**
+  - Each gate already keeps one always-open camera stream (wave D). It decodes once and feeds the face engine and the door scan.
+  - A motion check on the gate area.
+  - Worker threads per gate.
+  - The Eton chat-room webhook, with a stranger alert and cooldown/flood limits.
+  - Append-only event tables.
+  - The operator "label" pattern from blur reports.
+
+## 2. What we build
+
+A **presence detector** per gate, independent of faces:
+
+1. It looks for **people (bodies)** in the camera picture several times a second.
+2. It follows each person while they are in view (a simple tracker).
+3. It links that person to whatever the face engines saw at the same time and place: a recognised employee, a stranger face, or no face.
+4. When a person is in a watched zone, and no recognised employee accounts for them, it records a **presence event** with the best full-body picture. It then **alerts a separate security group** within seconds, without waiting for a face.
+5. It **never opens a door** and never changes a door decision. It only records and alerts.
+
+## 3. How it works
+
+```
+camera (one RTSP connection per gate, already open)
+  -> FFmpeg split: gate-area frames (face engine) | full-picture JPEGs (door scan) | NEW small frames ~640 px, 4 fps
+       -> presence worker thread (one per gate, low priority, own ONNX session)
+            person detector -> tracker -> zone + duration rules
+            -> link with face results (employee / stranger / none) in the same time window
+            -> presence event (+ body crop) -> security-group alert (cooldown, flood cap)
+```
+
+- **Speed:** detection on a 640 px frame is far cheaper than face detection on 4K. Target from a person appearing to the alert: **2-3 seconds**, separate from the face path (the "quicker thread").
+- **Model:** a small, CPU-friendly person detector exported to ONNX. Candidates, chosen by licence (the product is commercial):
+  - YOLOX-Nano/Tiny (Apache-2.0);
+  - RTMDet-tiny (Apache-2.0);
+  - NanoDet-Plus (Apache-2.0).
+  - **Not** YOLOv8/YOLO11: they are AGPL-3.0, which would require publishing our source unless a commercial licence is bought.
+
+  Phase 1 picks one by measured recall on our own footage.
+- **Linking to faces:** a face box inside the person box in the same frame, or within the track's lifetime, links them. A recognised employee closes the case; a stranger face follows the existing stranger flow and gets a link from the presence event; no face at all is the new "person without a face" case.
+- **Zones and duration:** per gate, reusing the gate-area editor. Rules such as "a person in the zone for at least N seconds" and "count only tracks that pass the door line" suppress passers-by in the background. After-hours rules can be stricter (any person = alert).
+- **Fail-safe:** if the detector or stream is down, the gate shows "presence detection offline", and the security group gets one "offline" notice (not silence).
+
+## 4. Data
+
+- New append-only table `presence_events`:
+  - gate, track id, start and end time, duration, person count;
+  - zone hit, face outcome (`none` / `stranger` / `employee`) with linked access-log and face ids;
+  - best body crop (JPEG), alert status and time, model tag.
+- Operator labels on events, same pattern as blur reports: "đúng" (real person, no face), "báo nhầm" (false alarm: shadow, reflection, forklift, poster), "người quen" (an employee). These labels are the data I use to tune thresholds and zones.
+- Body crops are personal data. They get the same governance as stranger faces:
+  - operator+ access with the existing image guard;
+  - audit of reads;
+  - retention `PRESENCE_EVENT_RETENTION_DAYS` (proposal: 14 days for crops, the event row kept as numbers);
+  - no embeddings or re-identification across days in this phase.
+
+## 5. Notifications to the security group
+
+- **Separate destination:** a second, separately configured destination ("Nhóm bảo vệ"), not the existing employee/stranger chat room. It's admin-configured, destination-guarded like the other webhooks, and its URL is never shown back.
+- **Message:** gate, time, duration, "không thấy mặt" / "người lạ" / count, and a link to the event in the dashboard (login required).
+  - If the chat accepts an attached image, the crop can be attached. That's an owner decision, because it sends a person's picture outside the system.
+- **Flood control:**
+  - one alert per person track;
+  - per-gate cooldown;
+  - a max-per-minute cap with a summary ("+5 sự kiện khác");
+  - de-duplication with stranger alerts for the same person.
+- **Schedules:** working hours vs after hours. For example: after hours, every person; working hours, only people without a face who stay longer than N s in a restricted zone.
+
+## 6. Interface
+
+- **"Hiện diện" (presence) panel:** recent events per gate with body crop, time, duration and face outcome, and buttons for the three labels. Filters by gate, outcome, label and time.
+- **Live indicator:** a badge in the top bar for unacknowledged events, like "Cụm Người Lạ".
+- **Per-gate settings (admin):** on/off, zone, minimum duration, schedule, destination, and test alert.
+- **Health:** detector state, fps and last event on the engine card.
+
+## 7. Phases and effort
+
+| Phase | What | Output | Effort |
+|---|---|---|---|
+| P0 | Owner decisions (section 9) | decisions recorded here | — |
+| P1 | Model choice offline: run 2-3 Apache-licensed person detectors on NVR footage (both gates, day + night, the 8-day retention window), compare recall of people, false alarms per hour, CPU per frame | short report + chosen model file | 1-2 days |
+| P2 | Presence worker + third stream output + tracker + linking + `presence_events` store; **shadow** (record only, no alerts) on both gates | events visible in the panel, no messages sent | 3-4 days |
+| P3 | Security-group destination, alert rules, schedules, panel with labels, settings, health | alerts to a test group on dev, then the real group | 2-3 days |
+| P4 | Shadow on live for ~1 week, tune zones and durations from labels, then switch alerts on | go-live with measured false-alarm rate | 1 week elapsed |
+
+Each phase goes through the usual gates (typecheck, lint, unit, integration on SQLite and PostgreSQL), a dev test, and your "deploy …" before staging.
+
+Owners: face-engine agent (P1 model evaluation, detector wrapper), INT (worker, linking, server routes, alerts), data-migrations (store), frontend (panel, settings), security-tester (auth, SSRF on the new destination, crop access, flood limits).
+
+## 8. Costs and risks
+
+- **CPU:** a nano-size detector at 640 px and 4 fps on two gates is expected at well under one core, plus a small extra FFmpeg scale output. To be measured in P1/P2. Host: 18 vCPU, load ~10 today.
+- **False alarms:** shadows, reflections on glass, posters, forklifts, people far behind the gate.
+  - Mitigated by zones, minimum duration, a door-line rule, the shadow phase and labels.
+  - Some will remain, so the cooldown and summary messages matter.
+- **Missed people:** a thief who stays out of the camera's view can't be caught by any software. The exit camera placement already limits coverage there; this plan adds detection, not coverage.
+- **Privacy:** more pictures of people are stored and sent. Retention, access control and the decision to attach images (section 9) must be set before go-live.
+- **Licence:** avoid AGPL detectors unless a commercial licence is bought.
+
+## 9. Owner decisions needed before P2
+
+1. **Destination for the security group:** another Eton chat room (URL from you), or Telegram / Zalo / SMS?
+2. **Send the person's picture in the message,** or only a link that requires login?
+3. **When to alert:**
+   a. after hours, every person;
+   b. working hours, only people without a face staying ≥ N s (default 5 s);
+   c. which hours count as "after hours".
+4. **Zones:** whole picture, or a drawn zone per gate (recommended: zone)?
+5. **Retention of body pictures:** 14 days like stranger faces?
+6. **Model licence:** Apache-licensed models only (recommended), or buy a commercial YOLO licence?
+7. **Exit camera:** re-aim or add a camera so the exit actually sees people's faces and bodies (presence detection helps, but only within what the camera sees).
