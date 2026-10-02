@@ -28,11 +28,12 @@ def main():
     ap.add_argument("--work", default="/data/test-clips/presence-p1")
     ap.add_argument("--metrics", default="metrics-masked.json")
     ap.add_argument("--no-mask", action="store_true")
+    ap.add_argument("--entry-tag", default="entry", help="runs whose operating thresholds are used")
     a = ap.parse_args()
     man = {c["id"]: c for c in json.load(open(os.path.join(a.work, "manifest.json")))["clips"] if c["set"] == "night"}
     met = json.load(open(os.path.join(a.work, a.metrics)))
     ops = {(r["model"], r["input"]): op_threshold(r["byThreshold"]) for r in met["results"]
-           if r["set"] == "nvr" and r["view"] == "full"}
+           if r["set"] == "nvr" and r["view"] == "full" and r["run"].endswith("__" + a.entry_tag)}
     print("| Model | Input | Entry op thr | " + " | ".join(
         f"{g} FP stills / runs @op" for g in ("ENTRY", "EXIT")) + " | " + " | ".join(
         f"ENTRY / EXIT FP stills @{t}" for t in FIXED) + " |")

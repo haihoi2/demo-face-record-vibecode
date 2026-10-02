@@ -67,7 +67,7 @@ def main():
         return v, fa, br
 
     print(f"\n### {a.gate}: real footage, full picture (primary)\n")
-    print("| Model | Input | Licence code / weights | Thr | Person recall >=3 s | Moving-person recall >=3 s | Person recall >=1 s | Passage recall >=3 s | Passage recall >=1 s | False alarms/h (episodes) | Box recall | ms/frame 1 thr mean / p95 | ms/frame 2 thr mean / p95 | Size MB |")
+    print("| Model | Input | Licence code / weights | Thr | Person recall >=3 s | Walking-through recall >=3 s | Person recall >=1 s | Passage recall >=3 s | Passage recall >=1 s | False alarms/h (episodes) | Box recall | ms/frame 1 thr mean / p95 | ms/frame 2 thr mean / p95 | Size MB |")
     print("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|")
     full = sorted([r for r in res if r["set"] == "nvr" and r["view"] == "full"], key=lambda r: (r["model"], r["input"]))
     for r in full:
@@ -96,7 +96,7 @@ def main():
 
     print(f"\n### {a.gate}: threshold sweep (real footage, full picture)\n")
     ths = ["0.15", "0.2", "0.25", "0.3", "0.35", "0.4", "0.5", "0.6"]
-    print("| Model | Input | " + " | ".join(f"t={t} person R3 / moving R3 / FA/h" for t in ths) + " |")
+    print("| Model | Input | " + " | ".join(f"t={t} person R3 / walking R3 / FA/h" for t in ths) + " |")
     print("|---|---|" + "---|" * len(ths))
     for r in full:
         cells = []

@@ -40,7 +40,14 @@ Grounding DINO job (~4 cores) plus a 2-core inference job starved the live camer
 6. Ground truth: `pool_labels.py --gate ENTRY` (presence-p1-torch) pools all candidate detections and
    Grounding DINO into tracks and draws `review/<gate>/sheet-NN.jpg`; look at every sheet, write
    overrides to `labels/decisions-<gate>.json`, then rerun with `--decisions ... --write-gt` to write `labels/gt.json`.
-7. Scores: `python3 $T/score.py --work $W` -> `metrics.json`; `python3 $T/report_tables.py --work $W` prints the
-   report tables (recall at 3 s and 1 s, false alarms per hour, ms/frame, size).
+7. Scores: `python3 $T/score.py --work $W [--mask-overlays --out metrics-masked.json]` -> `metrics.json`;
+   `python3 $T/report_tables.py --work $W [--metrics metrics-masked.json]` prints the report tables (person,
+   walking-through and passage recall at 3 s and 1 s, false alarms per hour, ms/frame, size).
+8. New footage later:
+   - extra NVR exports in `$W/night/clips/<gate>-<channel>-<startUtc>.mp4`: `extract_frames.py --sets nvr,scripted,night,extra`,
+     then `run_matrix.py --plan accuracy-entry --tag entry-add --clips <ids>` and `merge_runs.py --src entry-add --dst entry`,
+     Grounding DINO with `--clips <ids>`, and steps 6-7 again;
+   - night stills (`$W/night/<gate>/<UTC>.jpg`, person-free): `extract_frames.py --sets ...,night`,
+     `run_matrix.py --plan night`, then `night_fa.py --work $W --metrics metrics-masked.json`.
 
 Definitions of every metric are in the `score.py` docstring.
