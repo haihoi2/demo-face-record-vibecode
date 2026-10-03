@@ -807,3 +807,79 @@ describe("StreamReader snapshots", () => {
     source.stop();
   });
 });
+
+// ---------------------------------------------------------------------------
+// Presence frames for the person detector (P2)
+// ---------------------------------------------------------------------------
+
+describe("buildStreamReaderArgs with the presence output", () => {
+  const base = { roi: [0, 0, 3840, 2160] as [number, number, number, number], fps: 8, skipFrame: null, threads: null, lowDelay: true, socketTimeoutMs: 5000 };
+
+  it("adds a scaled whole-picture branch on pipe:4 next to the snapshot JPEGs", () => {
+    const args = buildStreamReaderArgs("rtsp://cam/x", {
+      ...base,
+      snapshot: { fps: 4, qscale: 3, keep: 8 },
+      presence: { width: 960, height: 540, fps: 2, frameBytes: 960 * 540 * 3 },
+    });
+    const fc = args[args.indexOf("-filter_complex") + 1];
+    assert.match(fc, /split=3\[roi\]\[full\]\[pres\]/);
+    assert.match(fc, /\[pres\]scale=960:540,fps=2\[presout\]/);
+    assert.equal(args.filter((a) => a === "-i").length, 1, "still one camera connection");
+    assert.equal(args[args.indexOf("[presout]") - 1], "-map");
+    assert.ok(args.indexOf("pipe:4") > args.indexOf("pipe:3"));
+  });
+
+  it("uses pipe:3 when it is the only extra output", () => {
+    const args = buildStreamReaderArgs("rtsp://cam/x", { ...base, presence: { width: 960, height: 540, fps: 2, frameBytes: 960 * 540 * 3 } });
+    const fc = args[args.indexOf("-filter_complex") + 1];
+    assert.match(fc, /split=2\[roi\]\[pres\]/);
+    assert.ok(args.includes("pipe:3"));
+    assert.ok(!args.includes("pipe:4"));
+    assert.ok(!args.includes("mjpeg"));
+  });
+});
+
+describe("StreamReader presence frames", () => {
+  class PresChild extends FakeChild {
+    snap = new EventEmitter();
+    pres = new EventEmitter();
+    get stdio() {
+      return [null, this.stdout, this.stderr, this.snap, this.pres];
+    }
+  }
+
+  it("slices fixed-size frames, keeps the newest, and forgets them on stop", () => {
+    const children: PresChild[] = [];
+    const stdios: unknown[] = [];
+    const spawn: SpawnLike = (_cmd, args, options) => {
+      stdios.push(options.stdio);
+      const child = new PresChild(3000 + children.length, args);
+      children.push(child);
+      return child;
+    };
+    // Source 128x64 -> presence width 64 -> height 32: 64*32*3 = 6144 bytes per frame.
+    const FB = 64 * 32 * 3;
+    const source = createStreamReader({
+      gate: "entry", streamId: "entry-main", url: SECRET_URL, sourceWidth: 128, sourceHeight: 64, spawn, motion: false,
+      snapshot: { fps: 4 }, presence: { width: 64, fps: 2 },
+    });
+    const got: number[] = [];
+    source.on("presence-frame", (f) => got.push(f.rgb[0]));
+    source.start();
+    assert.deepEqual(stdios[0], ["ignore", "pipe", "pipe", "pipe", "pipe"]);
+    const child = children[0];
+    child.stdout.emit("data", Buffer.alloc(128 * 64 * 3, 1)); // a gate-area frame: streaming
+    const frame = (v: number) => Buffer.alloc(FB, v);
+    child.pres.emit("data", frame(5).subarray(0, 10));
+    child.pres.emit("data", Buffer.concat([frame(5).subarray(10), frame(6), frame(7).subarray(0, 4)]));
+    assert.deepEqual(got, [6], "two frames completed in one chunk: only the newest is emitted");
+    child.pres.emit("data", frame(7).subarray(4));
+    assert.deepEqual(got, [6, 7]);
+    const latest = source.latestPresenceFrame(10_000);
+    assert.equal(latest?.width, 64);
+    assert.equal(latest?.height, 32);
+    assert.equal(latest?.rgb.length, FB);
+    source.stop();
+    assert.equal(source.latestPresenceFrame(10_000), null);
+  });
+});

@@ -46,7 +46,7 @@ export interface ChildLike {
   readonly pid?: number;
   stdout: NodeJS.EventEmitter | null;
   stderr: NodeJS.EventEmitter | null;
-  /** All pipes; [3] is the full-picture JPEG output when `snapshot` is on. */
+  /** All pipes; [3] is the full-picture JPEG output when `snapshot` is on; the presence frames follow on the next pipe. */
   stdio?: ReadonlyArray<NodeJS.EventEmitter | null | undefined>;
   on(event: "exit", listener: (code: number | null, signal: NodeJS.Signals | null) => void): unknown;
   on(event: "error", listener: (err: Error) => void): unknown;
@@ -56,8 +56,28 @@ export interface ChildLike {
 export type SpawnLike = (
   command: string,
   args: string[],
-  options: { stdio: ["ignore", "pipe", "pipe"] | ["ignore", "pipe", "pipe", "pipe"] },
+  options: { stdio: ["ignore", "pipe", "pipe"] | ["ignore", "pipe", "pipe", "pipe"] | ["ignore", "pipe", "pipe", "pipe", "pipe"] },
 ) => ChildLike;
+
+/**
+ * Small whole-picture frames for the person-presence detector (P2, contracts in
+ * src/server/presence/contracts.ts): same connection and decode, scaled to
+ * `width` px (height keeps the aspect, even) at `fps`. Raw RGB, newest only.
+ */
+export interface PresenceOutputOptions {
+  /** Output width in px. Default 960. */
+  width?: number;
+  /** Frames per second. Default 2. */
+  fps?: number;
+}
+
+export interface PresenceFrame {
+  width: number;
+  height: number;
+  rgb: Uint8Array;
+  /** Wall-clock time the frame came out of FFmpeg (ms since epoch). */
+  capturedAtMs: number;
+}
 
 /** One full-picture JPEG from the snapshot output. */
 export interface SnapshotFrame {
@@ -111,6 +131,8 @@ export interface StreamReaderOptions {
   ringSize?: number;
   /** Also emit full-picture JPEGs on a second output (see SnapshotOptions). Default off. */
   snapshot?: SnapshotOptions | null;
+  /** Also emit small whole-picture RGB frames for the presence detector (see PresenceOutputOptions). Default off. */
+  presence?: PresenceOutputOptions | null;
   /** Motion gate settings, or false to disable (`motion()` then always says true). */
   motion?: MotionOptions | false;
   /** Decoder-side savings, measured in the STR handoff. */
@@ -157,6 +179,7 @@ interface ReaderConfig {
   ffmpegPath: string;
   frameBytes: number;
   snapshot: { fps: number; qscale: number; keep: number } | null;
+  presence: { width: number; height: number; fps: number; frameBytes: number } | null;
 }
 
 const MAX_SOURCE_SIDE = 8192;
@@ -234,8 +257,16 @@ function buildConfig(opts: StreamReaderOptions): { config: ReaderConfig | null; 
             keep: Math.floor(num(opts.snapshot.keep, 8, 1, 64)),
           }
         : null,
+      presence: opts.presence ? presenceSize(opts.presence, sw, sh) : null,
     },
   };
+}
+
+/** Presence output size: `width` (even, <= source) and the height that keeps the source aspect (even). */
+function presenceSize(p: PresenceOutputOptions, sw: number, sh: number) {
+  const width = even(Math.min(sw, num(p.width, 960, 64, 4096)));
+  const height = Math.max(2, even(Math.round((width * sh) / sw)));
+  return { width, height, fps: num(p.fps, 2, 0.1, 15), frameBytes: width * height * 3 };
 }
 
 /** FFmpeg arguments for the long-running reader. Exported for tests and the measurement tool. */
@@ -243,6 +274,7 @@ export function buildStreamReaderArgs(
   url: string,
   c: Pick<ReaderConfig, "roi" | "fps" | "skipFrame" | "threads" | "lowDelay" | "socketTimeoutMs"> & {
     snapshot?: ReaderConfig["snapshot"];
+    presence?: ReaderConfig["presence"];
   },
 ): string[] {
   const [x, y, w, h] = c.roi;
@@ -262,14 +294,18 @@ export function buildStreamReaderArgs(
   if (c.skipFrame) args.push("-skip_frame", c.skipFrame);
   if (c.threads != null) args.push("-threads", String(c.threads));
   args.push("-i", url);
-  if (c.snapshot) {
-    // One decode, two outputs: the gate-area frames below (pipe:1) and the
-    // whole picture as JPEGs (pipe:3) for the door scan.
-    args.push(
-      "-filter_complex",
-      `[0:v:0]split=2[roi][full];[roi]crop=${w}:${h}:${x}:${y},fps=${c.fps}[roiout];[full]fps=${c.snapshot.fps}[fullout]`,
-      "-map", "[roiout]", "-an", "-sn", "-dn",
-    );
+  if (c.snapshot || c.presence) {
+    // One decode, several outputs: the gate-area frames below (pipe:1), the
+    // whole picture as JPEGs (pipe:3) for the door scan, and small
+    // whole-picture frames (next pipe) for the presence detector.
+    const branches = ["[roi]", ...(c.snapshot ? ["[full]"] : []), ...(c.presence ? ["[pres]"] : [])];
+    const graph = [
+      `[0:v:0]split=${branches.length}${branches.join("")}`,
+      `[roi]crop=${w}:${h}:${x}:${y},fps=${c.fps}[roiout]`,
+      ...(c.snapshot ? [`[full]fps=${c.snapshot.fps}[fullout]`] : []),
+      ...(c.presence ? [`[pres]scale=${c.presence.width}:${c.presence.height},fps=${c.presence.fps}[presout]`] : []),
+    ];
+    args.push("-filter_complex", graph.join(";"), "-map", "[roiout]", "-an", "-sn", "-dn");
   } else {
     args.push(
       "-map", "0:v:0", "-an", "-sn", "-dn",
@@ -294,6 +330,15 @@ export function buildStreamReaderArgs(
       "-c:v", "mjpeg", "-q:v", String(c.snapshot.qscale), "-pix_fmt", "yuvj420p",
       "-f", "image2pipe",
       "pipe:3",
+    );
+  }
+  if (c.presence) {
+    args.push(
+      "-map", "[presout]",
+      "-fps_mode", "passthrough",
+      "-pix_fmt", "rgb24",
+      "-f", "rawvideo",
+      c.snapshot ? "pipe:4" : "pipe:3",
     );
   }
   return args;
@@ -375,6 +420,9 @@ class StreamReader extends EventEmitter implements FrameSource {
   private readonly now: () => number;
   private readonly ring: RingBuffer<Frame>;
   private snapshotRing: SnapshotFrame[] = [];
+  private presenceBuf: Buffer | null = null;
+  private presenceFilled = 0;
+  private presenceNewest: PresenceFrame | null = null;
   private readonly jpegSplitter = new JpegStreamSplitter();
   private readonly motionDetector: MotionDetector | null;
   private motionResults = new WeakMap<Frame, MotionResult>();
@@ -489,6 +537,13 @@ class StreamReader extends EventEmitter implements FrameSource {
     return this.snapshotRing.filter((s) => now - s.capturedAtMs <= maxAgeMs);
   }
 
+  /** Newest presence frame no older than `maxAgeMs`, only while the stream is healthy; null when the output is off. */
+  latestPresenceFrame(maxAgeMs = 1500): PresenceFrame | null {
+    const f = this.presenceNewest;
+    if (!f || !this.cfg?.presence || this.status !== "streaming") return null;
+    return this.now() - f.capturedAtMs <= maxAgeMs ? f : null;
+  }
+
   latest(): Frame | null {
     const frame = this.ring.newest();
     if (!frame || !this.cfg || this.status !== "streaming") return null;
@@ -552,6 +607,9 @@ class StreamReader extends EventEmitter implements FrameSource {
     this.deliveries = [];
     this.ring.clear();
     this.snapshotRing = [];
+    this.presenceBuf = null;
+    this.presenceFilled = 0;
+    this.presenceNewest = null;
     this.jpegSplitter.reset();
     this.motionResults = new WeakMap();
     this.motionDetector?.reset();
@@ -580,7 +638,11 @@ class StreamReader extends EventEmitter implements FrameSource {
     let proc: ChildLike;
     try {
       proc = this.spawnFn(cfg.ffmpegPath, buildStreamReaderArgs(cfg.url, cfg), {
-        stdio: cfg.snapshot ? ["ignore", "pipe", "pipe", "pipe"] : ["ignore", "pipe", "pipe"],
+        stdio: cfg.snapshot && cfg.presence
+          ? ["ignore", "pipe", "pipe", "pipe", "pipe"]
+          : cfg.snapshot || cfg.presence
+            ? ["ignore", "pipe", "pipe", "pipe"]
+            : ["ignore", "pipe", "pipe"],
       });
     } catch (err: any) {
       this.fail(gen, `ffmpeg could not start: ${err?.message || err}`);
@@ -601,6 +663,11 @@ class StreamReader extends EventEmitter implements FrameSource {
     snapshotPipe?.on("error", ignore);
     snapshotPipe?.on("data", (chunk: Buffer) => {
       if (gen === this.generation) this.onSnapshotData(chunk);
+    });
+    const presencePipe = cfg.presence ? proc.stdio?.[cfg.snapshot ? 4 : 3] : null;
+    presencePipe?.on("error", ignore);
+    presencePipe?.on("data", (chunk: Buffer) => {
+      if (gen === this.generation) this.onPresenceData(chunk);
     });
     proc.stderr?.on("data", (chunk: Buffer) => {
       if (gen !== this.generation) return;
@@ -754,6 +821,35 @@ class StreamReader extends EventEmitter implements FrameSource {
     if (newest) this.deliver(newest);
   }
 
+  /** Slices the presence pipe into fixed-size frames; keeps and emits only the newest complete one per chunk. */
+  private onPresenceData(chunk: Buffer): void {
+    const p = this.cfg?.presence;
+    if (!p) return;
+    let pos = 0;
+    let completed: Buffer | null = null;
+    while (pos < chunk.length) {
+      if (!this.presenceBuf) this.presenceBuf = Buffer.allocUnsafe(p.frameBytes);
+      const n = Math.min(p.frameBytes - this.presenceFilled, chunk.length - pos);
+      chunk.copy(this.presenceBuf, this.presenceFilled, pos, pos + n);
+      this.presenceFilled += n;
+      pos += n;
+      if (this.presenceFilled === p.frameBytes) {
+        completed = this.presenceBuf;
+        this.presenceBuf = null;
+        this.presenceFilled = 0;
+      }
+    }
+    if (!completed) return;
+    const frame: PresenceFrame = {
+      width: p.width,
+      height: p.height,
+      rgb: new Uint8Array(completed.buffer, completed.byteOffset, completed.length),
+      capturedAtMs: this.now(),
+    };
+    this.presenceNewest = frame;
+    this.emit("presence-frame", frame);
+  }
+
   private onSnapshotData(chunk: Buffer): void {
     const keep = this.cfg?.snapshot?.keep ?? 0;
     if (!keep) return;
@@ -798,7 +894,13 @@ class StreamReader extends EventEmitter implements FrameSource {
 /** Creates the reader; call `start()` to open the stream. Never throws. */
 export function createStreamReader(
   opts: StreamReaderOptions,
-): FrameSource & { getState(): SourceState; snapshots(maxAgeMs?: number): SnapshotFrame[]; readonly pid?: number } {
+): FrameSource & {
+  getState(): SourceState;
+  snapshots(maxAgeMs?: number): SnapshotFrame[];
+  latestPresenceFrame(maxAgeMs?: number): PresenceFrame | null;
+  on(event: "presence-frame", listener: (frame: PresenceFrame) => void): unknown;
+  readonly pid?: number;
+} {
   return new StreamReader(opts);
 }
 
