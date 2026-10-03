@@ -10,6 +10,9 @@
  *     -> { success, events: PresenceEventRecord[] newest first (each with label?), hasMore, nextCursor? }
  *   GET  /api/presence/events/:id/crop             (operator, protected image)
  *   POST /api/presence/events/:id/label  { kind }  (operator, CSRF) -> { success, event }
+ * As implemented in server.ts (feat/presence-p2 3ab4912): `label=none` lists
+ * events without a label; a status gate may carry a `note`; `worker` may be
+ * null before the presence host is wired; a row may carry `cropPurgedAt`.
  *
  * The record types are mirrored here instead of imported so the browser bundle
  * never pulls a server module; tests/presenceUi.test.ts checks the mirror
@@ -55,6 +58,8 @@ export interface PresenceEventView {
   hasCrop: boolean;
   createdAt: string;
   label?: PresenceLabelKind;
+  /** Set by the server once the crop was erased by retention. */
+  cropPurgedAt?: string;
 }
 
 export interface PresenceGateStatus {
@@ -65,6 +70,8 @@ export interface PresenceGateStatus {
   lastFrameAgeMs: number | null;
   worker: { state: string | null; restarts: number | null; models: string[] };
   lastEventAt: string | null;
+  /** Server's explanation, e.g. the gate needs the real-time engine stream. Plain text. */
+  note?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -201,6 +208,11 @@ export function presenceModeLabel(mode: string): string {
 
 export const presenceModeTone = (mode: string): PresenceTone => (mode === "shadow" ? "amber" : mode === "off" ? "slate" : "indigo");
 
+/** True when the server reports gates and every one of them is off. */
+export const allOff = (gates: readonly PresenceGateStatus[]): boolean => gates.length > 0 && gates.every((g) => g.mode === "off");
+
+export const ALL_OFF_NOTICE = "Bộ phát hiện hiện diện đang tắt ở mọi cổng: không có sự kiện mới được ghi nhận.";
+
 /** The shadow notice is shown when any gate runs in shadow mode. */
 export const anyShadow = (gates: readonly PresenceGateStatus[]): boolean => gates.some((g) => g.mode === "shadow");
 
@@ -214,7 +226,8 @@ export interface PresenceFilters {
   gate: string; // "all" or a gate id
   period: "all" | PresencePeriod;
   faceOutcome: "all" | PresenceFaceOutcome;
-  label: "all" | PresenceLabelKind;
+  /** "none" = events without a label yet (server-side filter). */
+  label: "all" | "none" | PresenceLabelKind;
 }
 
 export const DEFAULT_PRESENCE_FILTERS: PresenceFilters = { gate: "all", period: "all", faceOutcome: "all", label: "all" };
@@ -232,6 +245,7 @@ export const FACE_OUTCOME_FILTER_OPTIONS: Array<{ value: PresenceFilters["faceOu
 
 export const LABEL_FILTER_OPTIONS: Array<{ value: PresenceFilters["label"]; label: string }> = [
   { value: "all", label: "Tất cả" },
+  { value: "none", label: "Chưa gắn nhãn" },
   ...PRESENCE_LABEL_KINDS.map((v) => ({ value: v, label: LABEL_KIND_LABEL[v] })),
 ];
 
@@ -245,7 +259,7 @@ export function parsePresenceFilters(raw: Partial<Record<keyof PresenceFilters, 
   const faceOutcome = (PRESENCE_FACE_OUTCOMES as readonly unknown[]).includes(raw.faceOutcome)
     ? (raw.faceOutcome as PresenceFaceOutcome)
     : "all";
-  const label = isPresenceLabelKind(raw.label) ? raw.label : "all";
+  const label = raw.label === "none" || isPresenceLabelKind(raw.label) ? raw.label : "all";
   return { gate, period, faceOutcome, label };
 }
 
@@ -320,6 +334,7 @@ export function parsePresenceEvent(raw: unknown): PresenceEventView | null {
     hasCrop: e.hasCrop === true,
     createdAt: str(e.createdAt) ?? startedAt,
     label: isPresenceLabelKind(e.label) ? e.label : undefined,
+    cropPurgedAt: str(e.cropPurgedAt),
   };
 }
 
@@ -353,6 +368,7 @@ export function parsePresenceStatus(data: unknown): PresenceGateStatus[] | null 
     const gateId = str(g.gateId);
     if (!gateId) continue;
     const w = g.worker && typeof g.worker === "object" ? g.worker : {};
+    const note = str(g.note);
     gates.push({
       gateId,
       mode: str(g.mode) ?? "",
@@ -360,6 +376,7 @@ export function parsePresenceStatus(data: unknown): PresenceGateStatus[] | null 
       lastFrameAgeMs: num(g.lastFrameAgeMs),
       worker: { state: str(w.state) ?? null, restarts: num(w.restarts), models: strList(w.models) ?? [] },
       lastEventAt: str(g.lastEventAt) ?? null,
+      ...(note ? { note } : {}),
     });
   }
   return gates;
@@ -434,6 +451,10 @@ export function presenceGateOptions(status: readonly PresenceGateStatus[], event
   }
   return ids;
 }
+
+/** Thumbnail placeholder when there is no crop. */
+export const noCropText = (event: { cropPurgedAt?: string }): string =>
+  event.cropPurgedAt ? "Ảnh đã xóa sau 7 ngày" : "Không có ảnh";
 
 /** Live-region text after a confirmed label. */
 export const labelSuccessText = (kind: PresenceLabelKind): string => `Đã gắn nhãn "${LABEL_KIND_LABEL[kind]}".`;

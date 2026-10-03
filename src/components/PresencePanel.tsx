@@ -33,6 +33,8 @@ import {
   SHADOW_NOTICE,
   WOULD_ALERT_BADGE,
   WOULD_ALERT_HINT,
+  ALL_OFF_NOTICE,
+  allOff,
   anyShadow,
   appendPresencePage,
   buildPresenceEventsUrl,
@@ -59,6 +61,7 @@ import {
   readPresenceLabelResult,
   replacePresenceEvent,
   showWouldAlert,
+  noCropText,
 } from "../utils/presence";
 import { ProtectedImage } from "./ProtectedImage";
 
@@ -131,6 +134,12 @@ const PresenceStatusStrip: React.FC<{ gates: PresenceGateStatus[] | null; error:
           <span>{SHADOW_NOTICE}</span>
         </div>
       )}
+      {gates && allOff(gates) && (
+        <div className="flex items-start gap-2 rounded-xl border border-slate-200 bg-slate-50 px-4 py-2.5 text-sm text-slate-700">
+          <Info className="w-4 h-4 mt-0.5 shrink-0" aria-hidden="true" />
+          <span>{ALL_OFF_NOTICE}</span>
+        </div>
+      )}
       {error && (
         <div role="alert" className="flex items-start gap-2 text-xs font-semibold text-rose-700 bg-rose-50 border border-rose-200 rounded-lg px-3 py-2">
           <AlertTriangle className="w-4 h-4 shrink-0" aria-hidden="true" />
@@ -175,6 +184,7 @@ const PresenceStatusStrip: React.FC<{ gates: PresenceGateStatus[] | null; error:
                     {g.lastEventAt ? formatAgo(g.lastEventAt, loadedAt || Date.now()) : "Chưa có"}
                   </dd>
                 </dl>
+                {g.note && <p className="text-amber-800 bg-amber-50 border border-amber-200 rounded-md px-2 py-1">{g.note}</p>}
               </li>
             );
           })}
@@ -278,7 +288,7 @@ const PresenceEventRow: React.FC<PresenceEventRowProps> = ({ event, pendingKind,
           ) : (
             <span className="flex flex-col items-center gap-1 px-1 text-center text-[10px] text-slate-400">
               <ImageOff className="w-4 h-4" aria-hidden="true" />
-              Không còn ảnh
+              {noCropText(event)}
             </span>
           )}
         </div>

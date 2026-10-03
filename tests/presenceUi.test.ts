@@ -25,6 +25,7 @@ import {
   PresenceFaceOutcome,
   PresenceLabelKind,
   SHADOW_NOTICE,
+  allOff,
   anyShadow,
   appendPresencePage,
   buildPresenceEventsUrl,
@@ -34,6 +35,7 @@ import {
   formatPeople,
   formatPresenceTime,
   labelKindLabel,
+  noCropText,
   parsePresenceEvent,
   parsePresenceEventsPage,
   parsePresenceFilters,
@@ -133,6 +135,9 @@ describe("presence labels and badges", () => {
     assert.equal(anyShadow([g("off"), g("shadow")]), true);
     assert.equal(anyShadow([g("off"), g("alert")]), false);
     assert.equal(anyShadow([]), false);
+    assert.equal(allOff([g("off"), g("off")]), true);
+    assert.equal(allOff([g("off"), g("shadow")]), false);
+    assert.equal(allOff([]), false);
   });
 });
 
@@ -191,6 +196,12 @@ describe("presence filters and URLs", () => {
       faceOutcome: "all",
       label: "real",
     });
+  });
+
+  it("can ask for events without a label (server: label=none)", () => {
+    assert.equal(buildPresenceEventsUrl({ ...DEFAULT_PRESENCE_FILTERS, label: "none" }), "/api/presence/events?label=none&limit=30");
+    assert.equal(parsePresenceFilters({ label: "none" }).label, "none");
+    assert.equal(parsePresenceFilters({ label: "None" }).label, "all");
   });
 
   it("clamps the page size", () => {
@@ -258,6 +269,22 @@ describe("presence response parsing", () => {
     assert.deepEqual(gates[0].worker, { state: "running", restarts: 1, models: ["yolox-nano"] });
     assert.deepEqual(gates[1], { gateId: "exit", mode: "", fps: null, lastFrameAgeMs: null, worker: { state: null, restarts: null, models: [] }, lastEventAt: null });
     assert.equal(parsePresenceStatus({ success: false, gates: [] }), null);
+  });
+
+  it("keeps the server's note, and a null worker (presence host not wired yet)", () => {
+    const gates = parsePresenceStatus({
+      success: true,
+      gates: [{ gateId: "entry", mode: "shadow", fps: null, lastFrameAgeMs: null, worker: null, lastEventAt: null, note: "Cần luồng của engine thời gian thực" }],
+    });
+    assert.ok(gates);
+    assert.equal(gates[0].note, "Cần luồng của engine thời gian thực");
+    assert.deepEqual(gates[0].worker, { state: null, restarts: null, models: [] });
+    assert.equal(anyShadow(gates), true);
+  });
+
+  it("says why there is no crop", () => {
+    assert.equal(noCropText(view("PE-1", { hasCrop: false, cropPurgedAt: "2026-10-10T00:00:00.000Z" })), "Ảnh đã xóa sau 7 ngày");
+    assert.equal(noCropText(view("PE-1", { hasCrop: false })), "Không có ảnh");
   });
 
   it("shows the server's error text as-is", () => {
