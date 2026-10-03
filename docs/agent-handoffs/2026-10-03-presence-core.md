@@ -29,13 +29,16 @@
 ## Source control
 
 - **Branch/worktree:** `feat/presence-core` in `/opt/etonlab/dev/demo-face-record-vibecode/.claude/worktrees/agent-a87784e1f9ac10216`.
-- **Base SHA:** `10fc8ee` (`feat/presence-p2`: contract `836d315` plus the plan update).
-- **Commit SHA(s):**
-  - `d412484` feat(presence): YOLOX-Nano / RTMDet-tiny detectors and presence settings
-  - `7422495` feat(presence): tracker and presence rules (PresenceEventDraft)
-  - `142769f` feat(presence): detector workers and presence host (shadow)
-  - plus one commit for `tools/presence-eval/parity.ts` and one for this handoff (see `git log 10fc8ee..`)
-- **Rebased/updated before handoff:** yes. `feat/presence-p2` has not moved since `10fc8ee`. **Not pushed** (INT pushes).
+- **Base SHA:** started on `10fc8ee`; rebased onto the `feat/presence-p2` tip `070935e` (INT's stream third output, store, routes, UI). `contracts.ts` is unchanged there.
+- **Commit SHA(s)** (after the rebase; see `git log 070935e..feat/presence-core`):
+  - `8553659` feat(presence): YOLOX-Nano / RTMDet-tiny detectors and presence settings
+  - `3ea426f` feat(presence): tracker and presence rules (PresenceEventDraft)
+  - `89c8c2a` feat(presence): detector workers and presence host (shadow)
+  - `798b455` tools(presence-eval): P2 parity replay through the production presence path
+  - `5ff6db2` docs(handoff): this file
+  - `b56f3ce` fix(presence): host stats lastEventAt string|null; ignore a re-offered frame
+  - plus the commit updating this file
+- **Rebased/updated before handoff:** yes, and the gates were re-run after the rebase. **Not pushed** (INT pushes).
 
 ## Ownership
 
@@ -125,13 +128,15 @@ await host.stop();  // final drafts for open qualified tracks are delivered befo
 All runs in the repo's tester image (onnxruntime-node 1.30.0), with this branch's `src/`, `tests/`, `tools/`, `server.ts` and `package.json` mounted, `--cpus 2.5`, one job at a time.
 
 ```text
+After the rebase onto 070935e:
 command: docker run ... presence-p1-tester npm run lint         (tsc --noEmit)
 result: exit 0
 command: docker run ... presence-p1-tester npm test             (WITHOUT nice)
-result: exit 0 - tests 1121, suites 233, pass 1112, fail 0, cancelled 0, skipped 9
+result: exit 0 - tests 1157, suites 242, pass 1148, fail 0, cancelled 0, skipped 9
         (8 pre-existing skips + the real-model test, which needs PRESENCE_TEST_MODEL_DIR)
 command: docker run ... presence-p1-tester npm run build
-result: exit 0 (client, server.cjs, faceWorker.cjs, pipelineWorker.cjs; presence is not wired into server.ts yet)
+result: exit 0 (client, server.cjs 795 kB, faceWorker.cjs, pipelineWorker.cjs; PresenceHost is not wired into server.ts yet)
+Before the rebase (on 10fc8ee): lint exit 0; npm test 1121 tests, 1112 pass, 0 fail, 9 skipped; build exit 0.
 command: ... npx esbuild src/server/presence/presenceWorker.ts --bundle --platform=node --format=cjs --packages=external --outfile=/tmp/presenceWorker.cjs
 result: bundles (the build:presence-worker step INT needs to add)
 command: PRESENCE_TEST_MODEL_DIR=/models/presence node --import tsx --test --test-name-pattern "real models" tests/presenceDetectors.test.ts
@@ -179,10 +184,10 @@ result: pass (both real models load with the pinned sha256, run at 960x544, blan
   - add `"build:presence-worker": "esbuild src/server/presence/presenceWorker.ts --bundle --platform=node --format=cjs --packages=external --sourcemap --outfile=dist/presenceWorker.cjs"`;
   - append `&& npm run build:presence-worker` to `build`.
   - Without it, production cannot find the worker: the host fails closed with "Presence worker entry not found" and keeps retrying with back-off.
-- **Third stream output (INT):**
-  - exactly 960 px wide, `scale=960:-2:flags=area` (what the parity used), RGB24, 2 fps;
-  - give `sourceWidth/sourceHeight` (3840×2160 for the entry) so boxes are in source pixels;
-  - `capturedAtMs` = wall clock at arrival.
+- **Third stream output (INT, `streamReader.ts` at `514e63b`):** compatible. Its `PresenceFrame` {width, height, rgb, capturedAtMs} is accepted as is, and a fresh buffer per frame is safe for the host's crop references. Two requests:
+  - add `:flags=area` to the `[pres]scale=...` filter: the parity and P1 used area downscaling; the default bicubic aliases small, far people differently (not measured);
+  - wire it as `reader.on("presence-frame", (f) => host.offer({ ...f, sourceWidth, sourceHeight }))` with the reader's source size, so boxes come back in source pixels as the contract says. Without them, boxes are in 960 px frame pixels.
+- **`PresenceHostHandle` in server.ts:** `PresenceHost` satisfies it (`stop()`; `stats()` has `fps: number`, `worker`, `lastEventAt: string | null`).
 - **Mount:** `/data/models/presence` → `/app/models/presence:ro`.
 - **CPU:** about 0.7 core per gate (P1b), in two threads at nice 19. Watch the live streams' fps when switching on.
 - **The 1 s after-hours rule** produced 1 genuine false event (the bench bag) in 19 min of replay. Before P3 sends messages, consider one of:
