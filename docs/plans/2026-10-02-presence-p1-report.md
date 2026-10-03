@@ -2,12 +2,151 @@
 
 Date: 2026-10-02. Author: face-engine agent. Branch `eval/presence-p1`. Plan: `docs/plans/2026-10-02-person-presence-alerts.md` (phase P1).
 
-Status:
+Status (updated 2026-10-03 by P1b, section 0):
 - **ENTRY:** done, on limited footage.
-- **Night (lights off):** false alarms done (15 min of stills per gate); recall not done.
+- **Combining the two models:** done (section 0).
+- **Night (lights off):** false alarms done, on 15 min of stills per gate plus 5 min of real IR video. Recall not done: the "night" clips were exported 7 h off and contain nobody (section 0).
 - **EXIT:** not done.
 
 Nothing in the running system was changed.
+
+## 0. P1b (2026-10-03): combining YOLOX-Nano and RTMDet-tiny, night check
+
+**Owner decisions, 2026-10-03:**
+- (a) use both YOLOX-Nano and RTMDet-tiny;
+- (b) working hours are 07:00-19:00 local; events are recorded at all hours, messages go out only 19:00-07:00;
+- (c) RTMDet-tiny is used with its weight licence unconfirmed. The exact weight file is listed at the end of this section.
+
+### Recommendation: "UNION-LOWRATE"
+
+How it works:
+- **YOLOX-Nano** at 960x544, threshold 0.55, runs on every processed frame at 2 frames/s.
+- **RTMDet-tiny** at 960x544, threshold 0.30, runs on every 4th processed frame (0.5 frames/s), whatever YOLOX saw.
+- On the frames where both run, their boxes are merged (NMS, IoU 0.5).
+- The tracker links detections up to 2 s apart (one RTMDet period). It never extends an episode past its last detection.
+- The 3 s rule applies, and the camera's overlays (on-screen clock, logo) are masked.
+
+Results on the real entry footage (21 clips, day and evening, 8.2 min, processed at 2 frames/s):
+
+| | People ≥ 3 s | Walking through ≥ 3 s | False-alarm episodes | Worst time to alert | CPU (cores per gate, 1 thread) |
+|---|---|---|---|---|---|
+| **UNION-LOWRATE (recommended)** | **21/48** | **10/10** | **0** | **4.5 s** | **0.62** |
+| RTMDet-tiny alone | 25/48 | 10/10 | 1 (pallet truck, 3 s) | 5.0 s | 1.24 |
+| UNION, both models on every frame | 26/48 | 10/10 | 1 (same) | 5.0 s | 1.54 |
+| YOLOX-Nano alone | 14/48 | 8/10 | 0 | 4.5 s | 0.30 |
+
+Why this design:
+- **CPU.** It needs half the CPU of RTMDet alone and 40 % of the full union.
+- **People who walk through.** It sees every one of them, 10 of 10.
+- **False alarms.** None, by day, in the evening, or at night (below).
+- **What it gives up:** 4-5 of the 48 people, all workers standing half hidden behind the cage bars. Those are mostly a working-hours case, and no messages are sent during working hours (decision b).
+- **Night.** Messages go out at night, and then any person matters. A person who stands still in view is still seen by RTMDet at 0.5 frames/s, provided they stay at least about 4-5 s.
+
+**If 1.5 cores per gate can be spared:** run both models on every frame (UNION). It gains 5 people (26/48), but also inherits RTMDet's pallet-truck false alarm at 2 frames/s.
+
+**Not recommended:**
+- **CASCADE-A** (RTMDet only when YOLOX sees nobody):
+  - When YOLOX sees one person, a second, half-hidden person is never checked: 19-20 of 48 people, 9 of 10 walkers.
+  - Worst time to alert grows to 11.5-12.5 s.
+  - It saves CPU only while YOLOX sees someone. In an empty scene, for example at night, it costs as much as UNION-LOWRATE (table below).
+- **CASCADE-B** (RTMDet confirms YOLOX candidates found at a lower threshold):
+  - It can never find more than YOLOX's own candidates: 16-20 of 48.
+  - It still costs about 0.97 cores, because clutter keeps producing YOLOX candidates, and each one triggers a whole-picture RTMDet run.
+
+### CPU budget per gate at 2 frames/s (recommended design)
+
+| Item | ms of CPU per second |
+|---|---|
+| YOLOX-Nano inference: 2 × 152 ms | 304 |
+| RTMDet-tiny inference: 0.5 × 620 ms | 310 |
+| Building the input tensors in Node.js (measured 32 ms for YOLOX and 25 ms for RTMDet per frame) | about 76 |
+| FFmpeg third output: 960x540 at 2 frames/s | small, not measured separately |
+| **Total** | **about 0.7 core per gate, the same in any scene** |
+
+- The entry gate goes first (decision 7), so that is about 0.7 core in total.
+- A frame on which both models run needs about 830 ms on one thread. That is longer than the 500 ms frame interval.
+- **RTMDet should therefore run asynchronously:** its own ONNX session in its own worker at one thread, fed every 4th frame. Its result joins the tracker when it is ready, about 0.6 s late. Otherwise YOLOX falls behind.
+- Measure the live camera streams' frame rate in the shadow phase, before and after switching this on.
+
+### All combinations measured
+
+Re-scored from the saved detections, with no new inference, at 2 frames/s. The time to alert runs from the person's first frame in view to the frame on which the 3 s rule fires.
+
+False-alarm rule here: an extra box lying mostly on a real person counts as a duplicate, not a false alarm. P1's tables counted those as false alarms too. Under that stricter rule, RTMDet alone also gets a second episode: a duplicate box on a person in clip 015.
+
+| Strategy | Person recall >=3 s | Walking-through >=3 s | Person recall >=1 s | Passage recall >=3 s | False-alarm episodes (per h) | Time to alert median / max (s) | CPU cores per gate |
+|---|---|---|---|---|---|---|---|
+| YOLOX-Nano 960 @0.55 | 14/48 | 8/10 | 28/82 | 10/14 | 0 (0/h) | 3.0 / 4.5 | 0.3 |
+| RTMDet-tiny 960 @0.3 | 25/48 | 10/10 | 55/82 | 11/14 | 1 (7/h) | 3.0 / 5.0 | 1.24 |
+| UNION: A@0.55 or B@0.3, both every frame | 26/48 | 10/10 | 56/82 | 11/14 | 1 (7/h) | 3.0 / 5.0 | 1.54 |
+| UNION-LOWRATE: A@0.55 every frame, B@0.3 at 0.5 fps | 21/48 | 10/10 | 40/82 | 11/14 | 0 (0/h) | 3.0 / 4.5 | 0.62 |
+| UNION-LOWRATE: A@0.55 every frame, B@0.3 at 1.0 fps | 22/48 | 10/10 | 43/82 | 11/14 | 0 (0/h) | 3.0 / 5.5 | 0.92 |
+| CASCADE-A: A@0.55 every frame, B@0.3 at 0.5 fps when A empty | 19/48 | 9/10 | 36/82 | 11/14 | 0 (0/h) | 3.0 / 12.5 | 0.54 |
+| CASCADE-A: A@0.55 every frame, B@0.3 at 1.0 fps when A empty | 20/48 | 9/10 | 39/82 | 11/14 | 0 (0/h) | 3.0 / 11.5 | 0.76 |
+| CASCADE-A: A@0.55 every frame, B@0.3 at 2.0 fps when A empty | 23/48 | 9/10 | 43/82 | 11/14 | 1 (7/h) | 3.0 / 5.0 | 1.23 |
+| CASCADE-B: A@0.3 candidates confirmed by B@0.15 | 16/48 | 8/10 | 36/82 | 10/14 | 0 (0/h) | 3.0 / 9.0 | 0.96 |
+| CASCADE-B: A@0.3 candidates confirmed by B@0.2 | 16/48 | 8/10 | 36/82 | 10/14 | 0 (0/h) | 3.0 / 9.0 | 0.96 |
+| CASCADE-B: A@0.3 candidates confirmed by B@0.3 | 16/48 | 8/10 | 35/82 | 10/14 | 0 (0/h) | 3.0 / 9.0 | 0.96 |
+| CASCADE-B: A@0.2 candidates confirmed by B@0.15 | 20/48 | 9/10 | 41/82 | 11/14 | 0 (0/h) | 3.0 / 5.0 | 0.97 |
+| CASCADE-B: A@0.2 candidates confirmed by B@0.2 | 20/48 | 9/10 | 41/82 | 11/14 | 0 (0/h) | 3.0 / 5.0 | 0.97 |
+| CASCADE-B: A@0.2 candidates confirmed by B@0.3 | 20/48 | 9/10 | 39/82 | 11/14 | 0 (0/h) | 3.0 / 5.0 | 0.97 |
+
+### Night, lights off
+
+**False alarms: zero for every strategy.**
+- **Data:**
+  - INT's two IR clips, 300 s of real 4-frames/s video in total, 22:07-22:11 and 22:21-22:24 local on 2 Oct (see the time-base note below);
+  - plus P1's 210 night stills.
+- **Nobody is in view** in either clip. I checked this four ways:
+  - by eye at full resolution;
+  - with a motion measure: the mean difference between frames 1 s apart stays flat at 0.53-0.73 median and at most 1.54, while the 13:11:40Z evening clip, where people walk through, spikes to 8.4;
+  - with Grounding DINO at one frame per 4 s;
+  - with every candidate.
+- **Thin margin:** RTMDet-tiny 960 scores a dark object on the cabinet beside the IR lamp at up to 0.27, against its 0.30 threshold. At 1280 px the same spot reached 0.31. Keep RTMDet at 960, or give that spot an exclusion mask.
+
+| Strategy | False-alarm episodes (per h) | CPU cores per gate |
+| --- | --- | --- |
+| YOLOX-Nano 960 @0.55 | 0 (0/h) | 0.3 |
+| RTMDet-tiny 960 @0.3 | 0 (0/h) | 1.24 |
+| UNION: A@0.55 or B@0.3, both every frame | 0 (0/h) | 1.54 |
+| UNION-LOWRATE: A@0.55 every frame, B@0.3 at 0.5 fps | 0 (0/h) | 0.61 |
+| UNION-LOWRATE: A@0.55 every frame, B@0.3 at 1.0 fps | 0 (0/h) | 0.92 |
+| CASCADE-A: A@0.55 every frame, B@0.3 at 0.5 fps when A empty | 0 (0/h) | 0.61 |
+| CASCADE-A: A@0.55 every frame, B@0.3 at 1.0 fps when A empty | 0 (0/h) | 0.92 |
+| CASCADE-A: A@0.55 every frame, B@0.3 at 2.0 fps when A empty | 0 (0/h) | 1.54 |
+| CASCADE-B: A@0.3 candidates confirmed by B@0.15 | 0 (0/h) | 0.3 |
+| CASCADE-B: A@0.3 candidates confirmed by B@0.2 | 0 (0/h) | 0.3 |
+| CASCADE-B: A@0.3 candidates confirmed by B@0.3 | 0 (0/h) | 0.3 |
+| CASCADE-B: A@0.2 candidates confirmed by B@0.15 | 0 (0/h) | 0.3 |
+| CASCADE-B: A@0.2 candidates confirmed by B@0.2 | 0 (0/h) | 0.3 |
+| CASCADE-B: A@0.2 candidates confirmed by B@0.3 | 0 (0/h) | 0.3 |
+
+**Night recall: not measured. Neither "night" clip contains a person, because both were exported 7 h too early.**
+- **The cause:**
+  - the entry camera's on-screen clock shows local time (UTC+7), not UTC;
+  - INT's night stills prove it: the still captured at 15:07:20Z shows "22:07:20" on the clock;
+  - NVR exports are labelled with that same clock: in every clip so far, the on-screen time matches the file name.
+- **What the files really are:**
+  - `entry-2201-20261002T220700Z.mp4` is 22:07 local on 2 Oct (15:07Z), inside the stills window, when the warehouse was empty;
+  - the face engine's tracks (22:07:29-45Z) were at 05:07 local on 3 Oct;
+  - the same holds for `…T222050Z`;
+  - the 12:46:50Z clip shows 12:47 local, which explains why it showed nobody;
+  - the 6 empty log-based clips in P1 are very likely the same 7 h offset;
+  - P1's metrics are unaffected, because their ground truth came from the images.
+- **What INT should do:** re-export in camera local time:
+  - ENTRY 2201: 2026-10-03 05:07:00-05:08:30 and 2026-10-03 05:20:50-05:24:20.
+  - Every later NVR request must also be given in local time. The footage table in section 8 is corrected accordingly.
+  - The note "NVR playback times are UTC" should be re-checked: it does not hold for these exports.
+- **Recall at night is still the open risk.** On IR footage without people, the models' highest scores anywhere are 0.24-0.31. That says nothing about how they score a real person in IR.
+
+### Weight files used (decision c)
+
+| Model | Weight URL | sha256 of the weight file | ONNX used (sha256) |
+|---|---|---|---|
+| RTMDet-tiny (licence unconfirmed; owner accepted) | `https://download.openmmlab.com/mmdetection/v3.0/rtmdet/rtmdet_tiny_8xb32-300e_coco/rtmdet_tiny_8xb32-300e_coco_20220902_112414-78e30dcc.pth` (57,532,893 bytes) | `78e30dcce0c6f594eaff0d6977b84b4103688b4aff0ad1aa16008a8cc854a7fb` | `rtmdet_tiny_person.onnx` (22,297,877 bytes) `31aa4d63d4fb734205619e1927f7df239d12bc2208bca8ff2374cb2fc88b8c70` |
+| YOLOX-Nano (Apache-2.0) | `https://github.com/Megvii-BaseDetection/YOLOX/releases/download/0.1.1rc0/yolox_nano.pth` (7,694,953 bytes) | `cd28f55fbbc1829f99d9ac9b38a16d259a22889739c8728ea877610201feff7b` | `yolox_nano_person.onnx` (3,737,872 bytes) `d37c96c31da5f9e6158b72577bac0ed595201a202aba4133dded1313bf335ace` |
+
+The ONNX files were exported by `tools/presence-eval/export_rtmdet.py` and `export_yolox.py`, and are kept in `/data/models/candidates/presence/` (not in git). Reproduce the combination numbers with `python3 tools/presence-eval/combine.py --work /data/test-clips/presence-p1`.
 
 ## 1. Answer first
 
@@ -326,7 +465,7 @@ onnxruntime-node 1.30, tester image, `graphOptimizationLevel: all`, intra-op thr
 - **EfficientDet-Lite0:** the conversion does not load in onnxruntime-node 1.30 (section 3).
 - **RT-DETR-R18 and RF-DETR-Nano** at other input sizes: not tried. Both are already 2-3x slower than RTMDet-tiny 960 and weaker.
 
-Footage request for INT. NVR times are UTC (local = UTC+7); the NVR keeps about 8 days:
+Footage request for INT. The NVR keeps about 8 days. **Correction (P1b): give the NVR the camera's local time.** Its exports and the on-screen clock are local time (UTC+7). The UTC windows below must be shifted by +7 h when requested.
 
 | Gate (channel) | Window (UTC) | Local time | Why |
 |---|---|---|---|
