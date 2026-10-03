@@ -152,12 +152,10 @@ import { faceCutByFrameEdge } from "./src/server/faceFrameEdge";
 import { newBlurReportId, type BlurReportRecord } from "./src/server/blurReports";
 import type { FaceOutcome, PresenceEventDraft, PresenceEventRecord } from "./src/server/presence/contracts";
 
-/** A gate's presence host (src/server/presence/presenceHost.ts, face-engine agent); wired when it lands. */
-interface PresenceHostHandle {
-  stop(): Promise<void> | void;
-  stats?(): { fps: number | null; worker: unknown; lastEventAt: string | null };
-}
-const presenceHosts = new Map<string, PresenceHostHandle>();
+import { PresenceHost } from "./src/server/presence/presenceHost";
+
+/** A running presence host per gate (two detector worker threads; P2 shadow). */
+const presenceHosts = new Map<string, PresenceHost>();
 import { pickSharpestObservation } from "./src/server/bestFrame";
 import { chooseEnrolFaces } from "./src/server/enrolFace";
 import {
@@ -6879,6 +6877,7 @@ async function startGatePipeline(gate: Gate, want: DesiredPipeline): Promise<voi
     });
     slot.pipeline = pipeline;
     slot.source = { streamId: want.streamId, url: want.url, reader: source };
+    startPresenceHost(gate, source, size.width, size.height);
     pipeline.start();
     if (PIPELINE_STATS_LOG_MS > 0) {
       if (slot.statsLog) clearInterval(slot.statsLog);
@@ -6919,6 +6918,7 @@ function syncPipelines() {
     slot.pipeline = null;
     slot.source = null;
     if (old) void old.stop().then(() => console.log(`[Pipeline ${gateLogTag(gate)}] Đã dừng luồng cũ.`));
+    stopPresenceHost(gate);
     if (want) void startGatePipeline(gate, want);
     if (!configured && !slot.pipeline && !slot.starting) gatePipelines.delete(gate);
   }
@@ -9244,7 +9244,33 @@ const presenceEventIds = new Map<string, string>();
  * store (insert on qualify, complete on final), cut the body crop from the
  * full-resolution JPEG nearest the best frame. Shadow: never messages.
  */
-async function onPresenceDraft(gate: Gate, draft: PresenceEventDraft): Promise<void> {
+/** Starts the gate's presence host on its pipeline stream when PRESENCE_MODE_<GATE>=shadow. Never throws. */
+function startPresenceHost(gate: Gate, reader: ReturnType<typeof createStreamReader>, sourceWidth: number, sourceHeight: number): void {
+  stopPresenceHost(gate);
+  if (presenceModeFor(gate) === "off") return;
+  try {
+    const host = new PresenceHost({
+      gateId: gate,
+      onDraft: (draft, crop) => void onPresenceDraft(gate, draft, crop).catch((err) => console.warn(`[Presence ${gateLogTag(gate)}] Lỗi xử lý sự kiện: ${err?.message || err}`)),
+      onError: (msg) => console.warn(`[Presence ${gateLogTag(gate)}] ${msg}`),
+    });
+    reader.on("presence-frame", (f) => host.offer({ ...f, sourceWidth, sourceHeight }));
+    host.start();
+    presenceHosts.set(gate, host);
+    console.log(`[Presence ${gateLogTag(gate)}] Chạy thử (shadow): ${PRESENCE_FRAME_WIDTH}px, ${PRESENCE_FPS} hình/giây; chỉ ghi nhận, không gửi cảnh báo.`);
+  } catch (err: any) {
+    console.warn(`[Presence ${gateLogTag(gate)}] Không khởi động được: ${err?.message || err}`);
+  }
+}
+
+function stopPresenceHost(gate: Gate): void {
+  const host = presenceHosts.get(gate);
+  if (!host) return;
+  presenceHosts.delete(gate);
+  void Promise.resolve(host.stop()).catch(() => {});
+}
+
+async function onPresenceDraft(gate: Gate, draft: PresenceEventDraft, hostCrop: Buffer | null = null): Promise<void> {
   const key = `${gate}:${draft.trackId}`;
   let id = presenceEventIds.get(key);
   const isNew = !id;
@@ -9265,6 +9291,8 @@ async function onPresenceDraft(gate: Gate, draft: PresenceEventDraft): Promise<v
     if (nearest && Math.abs(nearest.capturedAtMs - target) <= 1500) {
       crop = await cropFaceFromImage(nearest.jpeg, draft.bestBox, { margin: 1.2, minSizePx: 160, maxSizePx: 384 });
     }
+    // Full-resolution crop when the shared stream has the moment; otherwise the host's crop from the detector frame.
+    crop = crop || hostCrop;
   }
   const record: PresenceEventRecord = {
     id,
@@ -9305,6 +9333,7 @@ const PRESENCE_EVENT_ID_RE = /^PE-[A-Za-z0-9-]{1,60}$/;
 app.get("/api/presence/status", requireOperatorRole("viewer"), (_req, res) => {
   const gates = cameraStreamsConfig.gates.map((g) => {
     const host = presenceHosts.get(g.id);
+    const st = host?.stats();
     const reader = gatePipelines.get(g.id)?.source?.reader;
     const frame = reader?.latestPresenceFrame(10_000);
     return {
@@ -9312,10 +9341,10 @@ app.get("/api/presence/status", requireOperatorRole("viewer"), (_req, res) => {
       label: gateLabelOf(g),
       retentionDays: PRESENCE_EVENT_RETENTION_DAYS,
       mode: presenceModeFor(g.id),
-      fps: host?.stats?.().fps ?? null,
+      fps: st?.fps ?? null,
       lastFrameAgeMs: frame ? Math.max(0, Date.now() - frame.capturedAtMs) : null,
-      worker: host?.stats?.().worker ?? null,
-      lastEventAt: host?.stats?.().lastEventAt ?? null,
+      worker: st?.worker ?? null,
+      lastEventAt: st?.lastEventAt ?? null,
       ...(presenceModeFor(g.id) !== "off" && !gatePipelines.get(g.id)?.source
         ? { note: "Cần luồng của engine thời gian thực (chế độ shadow/live) cho cổng này" }
         : {}),

@@ -823,7 +823,7 @@ describe("buildStreamReaderArgs with the presence output", () => {
     });
     const fc = args[args.indexOf("-filter_complex") + 1];
     assert.match(fc, /split=3\[roi\]\[full\]\[pres\]/);
-    assert.match(fc, /\[pres\]scale=960:540,fps=2\[presout\]/);
+    assert.match(fc, /\[pres\]scale=960:540:flags=area,fps=2\[presout\]/, "area scaling, as in the P1 evaluation");
     assert.equal(args.filter((a) => a === "-i").length, 1, "still one camera connection");
     assert.equal(args[args.indexOf("[presout]") - 1], "-map");
     assert.ok(args.indexOf("pipe:4") > args.indexOf("pipe:3"));

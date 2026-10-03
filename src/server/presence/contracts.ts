@@ -14,7 +14,8 @@
  *   PRESENCE_FRAME_WIDTH (960) px at PRESENCE_FPS (2)--> presence host (main
  *   thread, newest frame only, never queued) --> presence worker thread:
  *     YOLOX-Nano on every frame; RTMDet-tiny on every PRESENCE_RTMDET_EVERY-th
- *     frame (4), asynchronously so YOLOX never waits; boxes merged (NMS 0.5);
+ *     frame (4), in a SECOND worker thread so YOLOX never waits (onnxruntime-node
+ *     blocks its own thread per run; two sessions in one thread do not overlap); boxes merged (NMS 0.5);
  *     static overlay mask (OSD clock, logo) applied; tracker links detections
  *     up to PRESENCE_LINK_GAP_MS (2000) apart; a track becomes an event once it
  *     has been in view for the minimum time of the current period.

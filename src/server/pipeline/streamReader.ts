@@ -303,7 +303,7 @@ export function buildStreamReaderArgs(
       `[0:v:0]split=${branches.length}${branches.join("")}`,
       `[roi]crop=${w}:${h}:${x}:${y},fps=${c.fps}[roiout]`,
       ...(c.snapshot ? [`[full]fps=${c.snapshot.fps}[fullout]`] : []),
-      ...(c.presence ? [`[pres]scale=${c.presence.width}:${c.presence.height},fps=${c.presence.fps}[presout]`] : []),
+      ...(c.presence ? [`[pres]scale=${c.presence.width}:${c.presence.height}:flags=area,fps=${c.presence.fps}[presout]`] : []),
     ];
     args.push("-filter_complex", graph.join(";"), "-map", "[roiout]", "-an", "-sn", "-dn");
   } else {
