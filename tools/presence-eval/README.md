@@ -54,8 +54,11 @@ Grounding DINO job (~4 cores) plus a 2-core inference job starved the live camer
 9. Combining two models (P1b): `python3 $T/combine.py --work $W` re-scores the saved YOLOX-Nano 960 and
    RTMDet-tiny 960 detections at 2 frames/s as A alone, B alone, UNION, UNION-LOWRATE, CASCADE-A and CASCADE-B
    (definitions in its docstring), split day+evening vs night, with time to alert and CPU per gate.
+   Lighting phases inside a clip (IR / dawn / lit) go in `$W/labels/light-segments.json`
+   (`{clip: [[first_frame, last_frame, set_name], ...]}`); each part is scored as its own set.
 
-**Time base:** the cameras' on-screen clock and the NVR export times are the camera's LOCAL time (UTC+7), even
-when a file name ends in "Z". Ask the NVR for local times (UTC + 7 h).
+**Time base (confirmed by INT 2026-10-03):** the cameras' on-screen clock and the NVR's time strings are the
+camera's LOCAL time (UTC+7), even when a file name ends in "Z"; face-engine log times are true UTC. Ask the
+NVR for local times (log UTC + 7 h).
 
 Definitions of every metric are in the `score.py` docstring.

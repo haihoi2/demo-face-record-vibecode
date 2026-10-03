@@ -22,7 +22,10 @@ Strategies (A = YOLOX-Nano 960, B = RTMDet-tiny 960; thresholds on the command l
 Metrics as in score.py, evaluated on the processed frames only (gap of <= 0.5 s bridged):
 person recall >= 3 s / 1 s, walking-through recall >= 3 s, passage recall >= 3 s, false-alarm
 episodes >= 3 s, and CPU = sum of 1-thread session.run means of the inferences actually made, in cores per
-gate (ms per second / 1000). Set split: day+evening clips vs night (lights off) clips.
+gate (ms per second / 1000). Sets: day+evening clips (P1), empty night clips (manifest light "night"), and
+the lighting phases of labels/light-segments.json ({clip: [[first_frame, last_frame, set_name], ...]}): a
+segmented clip is cut into those frame ranges and each part is scored on its own (a person must be seen for
+>= 3 s inside the part; tracks crossing a boundary are cut there).
 """
 import argparse
 import json
@@ -151,12 +154,19 @@ def main():
     B = load_jsonl(os.path.join(a.work, "runs", a.b, "dets.jsonl"))
     sim = Sim(A, B, a.ta, a.tb, a.cost_a, a.cost_b)
     step = int(round(4 / a.fps))
-    sets = {"day+evening": [], "night": []}
+    segp = os.path.join(a.work, "labels", "light-segments.json")
+    segs = {k: v for k, v in json.load(open(segp)).items() if not k.startswith("_")} if os.path.exists(segp) else {}
+    sets = {"day+evening": [], "night, empty (IR)": []}
     for cid, g in gt.items():
         c = man.get(cid)
         if not c or c["gate"] != "ENTRY" or (cid, 0) not in A or (cid, 0) not in B:
             continue
-        sets["night" if c.get("light") == "night" else "day+evening"].append(cid)
+        if cid in segs:
+            for lo, hi, name in segs[cid]:
+                sets.setdefault(name, []).append((cid, lo, hi))
+        else:
+            name = "night, empty (IR)" if c.get("light") == "night" else "day+evening"
+            sets[name].append((cid, 0, c["frames"] - 1))
     plans = [("A", None, f"YOLOX-Nano 960 @{a.ta}"), ("B", None, f"RTMDet-tiny 960 @{a.tb}"),
              ("UNION", None, f"UNION: A@{a.ta} or B@{a.tb}, both every frame")]
     plans += [("LOWRATE", r, f"UNION-LOWRATE: A@{a.ta} every frame, B@{a.tb} at {r} fps") for r in (0.5, 1.0)]
@@ -168,8 +178,8 @@ def main():
         row = {"strategy": label, "kind": kind, "param": param, "fps": a.fps}
         for sname, cids in sets.items():
             acc = dict(p3=0, h3=0, p1=0, h1=0, mp=0, mh=0, pp=0, ph=0, fa=0, sec=0.0, ms=0.0, lat=[])
-            for cid in sorted(cids):
-                frames = list(range(0, man[cid]["frames"], step))
+            for cid, lo, hi in sorted(cids):
+                frames = [i for i in range(0, man[cid]["frames"], step) if lo <= i <= hi]
                 res, ms = sim.run(kind, cid, frames, gt[cid]["frames"], step, param)
                 gap_s = (1 / param - 1 / a.fps) if kind in ("CASCADE-A", "LOWRATE") else 0.5
                 score_clip(res, gt[cid]["frames"], frames, a.fps, acc, max(0.5, gap_s))
@@ -187,7 +197,7 @@ def main():
     f = lambda h, n: f"{h}/{n}" if n else "-"  # noqa: E731
     print(f"processing rate {a.fps} fps; CPU from 1-thread means A {a.cost_a} ms, B {a.cost_b} ms per inference\n")
     for sname in sets:
-        print(f"#### {sname} ({out[0][sname]['clips']} clips, {out[0][sname]['sec'] / 60:.1f} min)\n")
+        print(f"#### {sname} ({out[0][sname]['clips']} parts, {out[0][sname]['sec'] / 60:.1f} min)\n")
         print("| Strategy | Person recall >=3 s | Walking-through >=3 s | Person recall >=1 s | Passage recall >=3 s | False-alarm episodes (per h) | Time to alert median / max (s) | CPU cores per gate |")
         print("|---|---|---|---|---|---|---|---|")
         for r in out:
