@@ -5,12 +5,12 @@ Date: 2026-10-02. Author: face-engine agent. Branch `eval/presence-p1`. Plan: `d
 Status (updated 2026-10-03 by P1b, section 0):
 - **ENTRY:** done, on limited footage.
 - **Combining the two models:** done (section 0).
-- **Night (lights off):** false alarms done, on 15 min of stills per gate plus 5 min of real IR video. Recall not done: the "night" clips were exported 7 h off and contain nobody (section 0).
+- **Night (lights off):** false alarms done (15 min of stills per gate plus 5 min of empty IR video). Recall checked on the only lights-off person so far: he was in view 2.75 s and detected by RTMDet-tiny and by UNION-LOWRATE (section 0).
 - **EXIT:** not done.
 
 Nothing in the running system was changed.
 
-## 0. P1b (2026-10-03): combining YOLOX-Nano and RTMDet-tiny, night check
+## 0. P1b (2026-10-03): combining YOLOX-Nano and RTMDet-tiny, night recall
 
 **Owner decisions, 2026-10-03:**
 - (a) use both YOLOX-Nano and RTMDet-tiny;
@@ -41,6 +41,7 @@ Why this design:
 - **False alarms.** None, by day, in the evening, or at night (below).
 - **What it gives up:** 4-5 of the 48 people, all workers standing half hidden behind the cage bars. Those are mostly a working-hours case, and no messages are sent during working hours (decision b).
 - **Night.** Messages go out at night, and then any person matters. A person who stands still in view is still seen by RTMDet at 0.5 frames/s, provided they stay at least about 4-5 s.
+- **Lights off.** The only lights-off person so far (2.75 s in view, too short for any 3 s alert) was tracked for at least 1 s by RTMDet-tiny and by UNION-LOWRATE, but not by YOLOX-Nano alone. One case, but it points the same way: keep RTMDet in the mix.
 
 **If 1.5 cores per gate can be spared:** run both models on every frame (UNION). It gains 5 people (26/48), but also inherits RTMDet's pallet-truck false alarm at 2 frames/s.
 
@@ -95,7 +96,7 @@ False-alarm rule here: an extra box lying mostly on a real person counts as a du
 
 **False alarms: zero for every strategy.**
 - **Data:**
-  - INT's two IR clips, 300 s of real 4-frames/s video in total, 22:07-22:11 and 22:21-22:24 local on 2 Oct (see the time-base note below);
+  - INT's two empty IR clips, 300 s of real 4-frames/s video in total, 22:07-22:09 and 22:20-22:24 local on 2 Oct;
   - plus P1's 210 night stills.
 - **Nobody is in view** in either clip. I checked this four ways:
   - by eye at full resolution;
@@ -121,23 +122,61 @@ False-alarm rule here: an extra box lying mostly on a real person counts as a du
 | CASCADE-B: A@0.2 candidates confirmed by B@0.2 | 0 (0/h) | 0.3 |
 | CASCADE-B: A@0.2 candidates confirmed by B@0.3 | 0 (0/h) | 0.3 |
 
-**Night recall: not measured. Neither "night" clip contains a person, because both were exported 7 h too early.**
-- **The cause:**
-  - the entry camera's on-screen clock shows local time (UTC+7), not UTC;
-  - INT's night stills prove it: the still captured at 15:07:20Z shows "22:07:20" on the clock;
-  - NVR exports are labelled with that same clock: in every clip so far, the on-screen time matches the file name.
-- **What the files really are:**
-  - `entry-2201-20261002T220700Z.mp4` is 22:07 local on 2 Oct (15:07Z), inside the stills window, when the warehouse was empty;
-  - the face engine's tracks (22:07:29-45Z) were at 05:07 local on 3 Oct;
-  - the same holds for `…T222050Z`;
-  - the 12:46:50Z clip shows 12:47 local, which explains why it showed nobody;
-  - the 6 empty log-based clips in P1 are very likely the same 7 h offset;
-  - P1's metrics are unaffected, because their ground truth came from the images.
-- **What INT should do:** re-export in camera local time:
-  - ENTRY 2201: 2026-10-03 05:07:00-05:08:30 and 2026-10-03 05:20:50-05:24:20.
-  - Every later NVR request must also be given in local time. The footage table in section 8 is corrected accordingly.
-  - The note "NVR playback times are UTC" should be re-checked: it does not hold for these exports.
-- **Recall at night is still the open risk.** On IR footage without people, the models' highest scores anywhere are 0.24-0.31. That says nothing about how they score a real person in IR.
+**Night recall (INT's re-export, 2026-10-03 05:07-05:08:30 local, entry camera).**
+
+The time-base error is fixed: INT confirmed that the camera clock and NVR exports use local time, and that face-engine logs are true UTC.
+
+The clip has three lighting phases, measured from frame saturation and brightness and checked by eye:
+- **IR, lights off:** 0-30 s, frames 0-120;
+- **dawn colour, lamps still off:** 30-51 s;
+- **lamps on:** from 51 s.
+
+Each phase was scored on its own: a person must be seen inside that phase. The ground truth was pooled from the candidates plus Grounding DINO, then checked by eye (the IR part frame by frame).
+
+**Lights-off result:** exactly one person is in view in IR.
+- He walks into view far left behind the cages at about 25 s and behind the left cabinet by 27.75 s: about 2.75 s in view.
+- The face engine's 4 tracks at 05:07:29-45 come after the lights changed (dawn and lit phases).
+- **No design could have alerted on him under the 3 s rule.** He was not in view long enough, and every strategy correctly raised no 3 s alert.
+- **He was detected:**
+  - RTMDet-tiny 960 scored him 0.60, 0.67, 0.57, 0.44, 0.44 and 0.47 on frames 101-106 at 4 fps (threshold 0.30);
+  - YOLOX-Nano 960 scored him 0.71, 0.57 and 0.63 on frames 101-103 (threshold 0.55), then 0.54 and 0.48 just below it.
+  - At 2 frames/s, RTMDet-tiny, UNION, UNION-LOWRATE and CASCADE-A each see him for at least 1 s; YOLOX-Nano alone does not.
+- **Caveat:** this is a single person, so it shows the models do fire on a person in this camera's IR picture (scores 0.44-0.71), not a recall rate. More lights-off people are needed: early arrivals before about 05:30, guard rounds.
+- **Reading the table:** the "0/1" in the 3 s columns is a borderline frame count, not a miss. At 2 frames/s the scorer counts his 6 processed frames (100-110) as 3 s in view. At 4 frames/s (11 frames, 2.75 s) he does not count as a 3 s person at all.
+
+| Strategy | Person recall >=3 s | Walking-through >=3 s | Person recall >=1 s | Passage recall >=3 s | False-alarm episodes (per h) | Time to alert median / max (s) | CPU cores per gate |
+|---|---|---|---|---|---|---|---|
+| YOLOX-Nano 960 @0.55 | 0/1 | 0/1 | 0/1 | 0/1 | 0 (0/h) | - | 0.3 |
+| RTMDet-tiny 960 @0.3 | 0/1 | 0/1 | 1/1 | 0/1 | 0 (0/h) | - | 1.24 |
+| UNION: A@0.55 or B@0.3, both every frame | 0/1 | 0/1 | 1/1 | 0/1 | 0 (0/h) | - | 1.54 |
+| UNION-LOWRATE: A@0.55 every frame, B@0.3 at 0.5 fps | 0/1 | 0/1 | 1/1 | 0/1 | 0 (0/h) | - | 0.63 |
+| CASCADE-A: A@0.55 every frame, B@0.3 at 0.5 fps when A empty | 0/1 | 0/1 | 1/1 | 0/1 | 0 (0/h) | - | 0.63 |
+
+**Dawn, colour, lamps off (30-51 s):** one person in view at least 3 s. Every design alerts after 3.0 s.
+
+| Strategy | Person recall >=3 s | Walking-through >=3 s | Person recall >=1 s | Passage recall >=3 s | False-alarm episodes (per h) | Time to alert median / max (s) | CPU cores per gate |
+|---|---|---|---|---|---|---|---|
+| YOLOX-Nano 960 @0.55 | 1/1 | 1/1 | 1/1 | 1/1 | 0 (0/h) | 3.0 / 3.0 | 0.3 |
+| RTMDet-tiny 960 @0.3 | 1/1 | 1/1 | 1/1 | 1/1 | 0 (0/h) | 3.0 / 3.0 | 1.24 |
+| UNION: A@0.55 or B@0.3, both every frame | 1/1 | 1/1 | 1/1 | 1/1 | 0 (0/h) | 3.0 / 3.0 | 1.54 |
+| UNION-LOWRATE: A@0.55 every frame, B@0.3 at 0.5 fps | 1/1 | 1/1 | 1/1 | 1/1 | 0 (0/h) | 3.0 / 3.0 | 0.61 |
+| CASCADE-A: A@0.55 every frame, B@0.3 at 0.5 fps when A empty | 1/1 | 1/1 | 1/1 | 1/1 | 0 (0/h) | 3.0 / 3.0 | 0.46 |
+
+**Early morning, lit:** the rest of the 05:07 clip plus INT's 05:20:50 clip (210 s, lamps on), 4.2 min with 11 people at least 3 s.
+- **UNION-LOWRATE** finds 8/11 and all 6 people walking through, with no false alarm; worst time to alert 11 s.
+- **RTMDet alone** finds 7/11; worst time to alert 10 s.
+- **YOLOX-Nano alone** finds 6/11, and for one person 3 s of detection was reached only after 42.5 s.
+- As in P1, the people in view in this set who are hard to see are the workers at the conveyor behind the cage bars (review sheets). I did not check which of them each design missed.
+
+| Strategy | Person recall >=3 s | Walking-through >=3 s | Person recall >=1 s | Passage recall >=3 s | False-alarm episodes (per h) | Time to alert median / max (s) | CPU cores per gate |
+|---|---|---|---|---|---|---|---|
+| YOLOX-Nano 960 @0.55 | 6/11 | 6/6 | 8/19 | 2/2 | 0 (0/h) | 6.5 / 42.5 | 0.3 |
+| RTMDet-tiny 960 @0.3 | 7/11 | 6/6 | 12/19 | 2/2 | 0 (0/h) | 3.0 / 10.0 | 1.24 |
+| UNION: A@0.55 or B@0.3, both every frame | 7/11 | 6/6 | 12/19 | 2/2 | 0 (0/h) | 3.0 / 10.0 | 1.54 |
+| UNION-LOWRATE: A@0.55 every frame, B@0.3 at 0.5 fps | 8/11 | 6/6 | 10/19 | 2/2 | 0 (0/h) | 3.5 / 11.0 | 0.61 |
+| CASCADE-A: A@0.55 every frame, B@0.3 at 0.5 fps when A empty | 8/11 | 6/6 | 10/19 | 2/2 | 0 (0/h) | 3.5 / 11.0 | 0.5 |
+
+**Night false alarms stay at zero** on the two empty 22:07 / 22:20 local IR clips and on the 210 stills.
 
 ### Weight files used (decision c)
 
@@ -302,7 +341,7 @@ Without the mask, the operating points on this footage are identical (raw table 
   - YOLOX-Nano 1280 at 0.30: a water bottle on the bench;
   - RT-DETR-R18 at 0.15-0.17: the edge of a shelf.
 - **Caveat:** these are stills, not a stream. Read as a stream at one frame per 9 s, every false still would have been a ≥ 3 s alert, and a detection that flickers between stills is invisible.
-- **Not measured:** night recall. No lights-off footage with people exists yet.
+- **Night recall:** not measured in P1. P1b (section 0) has one lights-off person: detected by RTMDet-tiny, but in view only 2.75 s.
 
 | Model | Input | Entry op thr | ENTRY FP stills / runs @op | EXIT FP stills / runs @op | ENTRY / EXIT FP stills @0.2 | ENTRY / EXIT FP stills @0.3 | ENTRY / EXIT FP stills @0.4 |
 |---|---|---|---|---|---|---|---|
@@ -396,7 +435,7 @@ Results, for people inside the gate area (40 people ≥ 3 s, 21 clips):
 **Light.**
 - Evening clips with the lights on are not harder than day clips: RTMDet-tiny 960 passage recall day 3/5, evening 8/9; the day misses are standing workers.
 - One morning clip (012) is in grey IR mode. Nobody is in it, and no model raised a false alarm on it at its operating threshold.
-- Lights-off night: no false alarms at the operating thresholds (section 4). Recall with lights off is untested.
+- Lights-off night: no false alarms at the operating thresholds (section 4). Recall: one IR person so far (P1b, section 0).
 
 **Weak labels.** 6 of 19 "people" clips show nobody at all (section 2). Without image-checked ground truth these would have counted as misses for every model.
 
@@ -460,7 +499,7 @@ onnxruntime-node 1.30, tester image, `graphOptimizationLevel: all`, intra-op thr
 ## 8. Not done, and footage INT should export
 
 - **EXIT gate:** not evaluated (INT priority: entry first; CPU budget). Night false alarms at the exit were measured (zero at every operating threshold). The harness runs unchanged with `--plan accuracy-exit`; the ground-truth review must be repeated for the exit picture.
-- **Night (lights off):** false alarms measured on 15 min of stills per gate. Recall is not measured: no lights-off footage with people exists yet. INT is looking for early arrivals before the lights come on.
+- **Night (lights off):** false alarms measured on 15 min of stills per gate and 5 min of empty IR video. Recall: only one IR person so far (P1b, section 0); more lights-off people are needed.
 - **False alarms per hour:** needs long continuous footage, not 15-70 s clips around events.
 - **EfficientDet-Lite0:** the conversion does not load in onnxruntime-node 1.30 (section 3).
 - **RT-DETR-R18 and RF-DETR-Nano** at other input sizes: not tried. Both are already 2-3x slower than RTMDet-tiny 960 and weaker.

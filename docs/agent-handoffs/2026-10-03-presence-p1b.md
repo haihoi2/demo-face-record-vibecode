@@ -76,3 +76,31 @@ result: tables in report section 0 (21 day/evening clips, 8.2 min; 2 night clips
 - **Requested integration action:**
   1. P2: build UNION-LOWRATE (YOLOX-Nano 960 @0.55 at 2 fps, plus RTMDet-tiny 960 @0.30 at 0.5 fps, asynchronous, union, 2 s tracker bridging), at about 0.7 core per gate.
   2. Re-export the night windows, then I re-run night recall with `combine.py`.
+
+## Addendum 2026-10-03 (night recall on INT's re-export)
+
+- **Data:**
+  - INT re-exported in camera local time: `entry-2201-local-20261003T050700Z.mp4` (IR, then dawn colour, then lamps on) and `entry-2201-local-20261003T052050Z.mp4` (lit).
+  - INT confirmed the time base: the NVR and the camera clock use local time; face-engine logs are true UTC.
+- **Method:**
+  - frames extracted with `extract_frames.py --add`;
+  - YOLOX-Nano and RTMDet-tiny run on all inputs (2.5 CPUs, nice 19, one job at a time) and merged into the entry runs;
+  - Grounding DINO at 0.5 fps (05:07 clip) and 0.25 fps (05:20 clip);
+  - pooled with `pool_labels.py --clips`; 11 corrections by eye plus 14 anchored boxes extending the IR walker (frames 105-110);
+  - the IR walker's 5 fragment tracks merged into one (recorded under `patches` in `labels/gt.json`);
+  - lighting phases in `labels/light-segments.json`; `combine.py` scores each phase on its own.
+- **Result:**
+  - One person in IR, in view 2.75 s: no 3 s alert is possible under the decided rule.
+  - Detected for at least 1 s by RTMDet-tiny 960, UNION and UNION-LOWRATE; YOLOX-Nano 960 alone saw him under 1 s at 2 fps (scores 0.71, 0.57 and 0.63 at 4 fps).
+  - Dawn (lamps off, colour): 1/1 for every design.
+  - Early morning, lit: UNION-LOWRATE 8/11 and 6/6 walking through, RTMDet 7/11, YOLOX 6/11.
+  - No false alarms anywhere.
+- **Recommendation unchanged:** UNION-LOWRATE.
+- **Still open:** a real night recall rate. Only one lights-off person exists so far.
+- **Changed files:**
+  - `tools/presence-eval/combine.py` (light segments);
+  - `tools/presence-eval/README.md`;
+  - `docs/plans/2026-10-02-presence-p1-report.md` (section 0 night recall; P1 sections 4, 5 and 8 night lines);
+  - this file.
+- **Verification:** `combine.py` at 2 fps and 4 fps (tables in report section 0). No TypeScript changed, so the gates were not re-run.
+- **Not pushed** (push is blocked for this agent); INT pushes.
