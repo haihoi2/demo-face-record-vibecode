@@ -49,5 +49,13 @@ Grounding DINO job (~4 cores) plus a 2-core inference job starved the live camer
      Grounding DINO with `--clips <ids>`, and steps 6-7 again;
    - night stills (`$W/night/<gate>/<UTC>.jpg`, person-free): `extract_frames.py --sets ...,night`,
      `run_matrix.py --plan night`, then `night_fa.py --work $W --metrics metrics-masked.json`.
+   - after frames were deleted, add new clips without re-extracting the old ones: `extract_frames.py --sets
+     nvr,scripted,night,extra --add`; pool and review only the new clips with `pool_labels.py --clips <ids>`.
+9. Combining two models (P1b): `python3 $T/combine.py --work $W` re-scores the saved YOLOX-Nano 960 and
+   RTMDet-tiny 960 detections at 2 frames/s as A alone, B alone, UNION, UNION-LOWRATE, CASCADE-A and CASCADE-B
+   (definitions in its docstring), split day+evening vs night, with time to alert and CPU per gate.
+
+**Time base:** the cameras' on-screen clock and the NVR export times are the camera's LOCAL time (UTC+7), even
+when a file name ends in "Z". Ask the NVR for local times (UTC + 7 h).
 
 Definitions of every metric are in the `score.py` docstring.

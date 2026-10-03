@@ -168,6 +168,9 @@ def main():
     ap.add_argument("--work", default=os.path.join(CLIPS, "presence-p1"))
     ap.add_argument("--sets", default="nvr,scripted", help="nvr, scripted, night (INT's IR stills), extra (INT's extra NVR exports)")
     ap.add_argument("--fps", type=float, default=4.0)
+    ap.add_argument("--add", action="store_true",
+                    help="merge into the existing manifest: extract only clips not in it yet (frames of the old "
+                         "clips may already be deleted)")
     a = ap.parse_args()
     os.makedirs(a.work, mode=0o700, exist_ok=True)
     clips = []
@@ -180,6 +183,11 @@ def main():
         clips += night_clips(a.work)
     if "extra" in sets:
         clips += extra_clips(a.work)
+    old = {}
+    mp = os.path.join(a.work, "manifest.json")
+    if a.add and os.path.exists(mp):
+        old = {c["id"]: c for c in json.load(open(mp))["clips"]}
+        clips = [c for c in clips if c["id"] not in old]
     for c in clips:
         frames = extract_stills(c, a.work) if c["set"] == "night" else extract(c, a.work, a.fps)
         c["fps"] = 1 / c["stillStepS"] if c["set"] == "night" else a.fps
@@ -187,6 +195,8 @@ def main():
         c["storeHeight"] = round(c["height"] * c["storeWidth"] / c["width"] / 2) * 2
         c["gateArea"] = gate_area_frac(c["gate"])
         print(f"{c['id']}: {len(frames)} frames", flush=True)
+    if a.add:
+        clips = list(old.values()) + clips
     man = {"schemaVersion": 1, "fps": a.fps, "gateAreas": GATE_AREAS, "clips": clips}
     p = os.path.join(a.work, "manifest.json")
     with open(p, "w") as f:

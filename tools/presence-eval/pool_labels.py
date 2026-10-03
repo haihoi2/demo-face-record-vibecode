@@ -202,9 +202,12 @@ def main():
     ap.add_argument("--gdino-person", type=float, default=0.35)
     ap.add_argument("--decisions", default="")
     ap.add_argument("--write-gt", action="store_true")
+    ap.add_argument("--clips", default="", help="only these clip ids (others keep their ground truth)")
     a = ap.parse_args()
     man = json.load(open(os.path.join(a.work, "manifest.json")))
     clips = [c for c in man["clips"] if c["set"] == "nvr" and c["gate"] == a.gate]
+    if a.clips:
+        clips = [c for c in clips if c["id"] in a.clips.split(",")]
     sources = {}
     for rd in sorted(glob.glob(os.path.join(a.work, a.runs))):
         name = os.path.basename(rd)
