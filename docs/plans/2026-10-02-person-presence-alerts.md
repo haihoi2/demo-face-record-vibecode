@@ -122,7 +122,7 @@ Owners: face-engine agent (P1 model evaluation, detector wrapper), INT (worker, 
 
 1. ~~**Destination for the security group**~~ **Decided 2026-10-02:** admins can declare more notification channels; for now all alerts use the existing shared Eton channel (section 5).
 2. ~~**Send the person's picture in the message**~~ **Decided 2026-10-02: NO** - messages carry text and a login-protected link only; no image leaves the system.
-3. **Decided 2026-10-02, revised 2026-10-03 after P1:** a person in view for at least 3 s is **recorded at all times**, but **messages are sent only outside working hours**; during working hours events are recorded only (visible in the panel, no message). Reason: P1 found people in view in >= 70 % of frames in 11 of 14 working clips, mostly without a visible face, so "all hours" would message the group almost continuously. Working hours: to be given by the owner (configurable per gate, with a holiday/override switch). Original options:
+3. **Decided 2026-10-02, revised 2026-10-03 after P1:** a person in view for at least 3 s is **recorded at all times**, but **messages are sent only outside working hours**; during working hours events are recorded only (visible in the panel, no message). Reason: P1 found people in view in >= 70 % of frames in 11 of 14 working clips, mostly without a visible face, so "all hours" would message the group almost continuously. Working hours (owner, 2026-10-03): **07:00-19:00 local, every day** for now (weekends not specified; configurable per gate, with a holiday/override switch). Messages go out 19:00-07:00. Original options:
    a. after hours, every person;
    b. working hours, only people without a face staying ≥ N s (default 5 s);
    c. which hours count as "after hours".
