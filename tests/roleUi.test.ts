@@ -32,8 +32,8 @@ describe("tabs by role", () => {
     assert.deepEqual(visible(as("viewer")), ["cameras", "logs", "mobile", "scanner"]);
   });
 
-  it("operator adds registration and manual recognition", () => {
-    assert.deepEqual(visible(as("operator")), ["cameras", "catalog", "logs", "manual", "mobile", "register", "scanner"]);
+  it("operator adds registration, manual recognition and presence review", () => {
+    assert.deepEqual(visible(as("operator")), ["cameras", "catalog", "logs", "manual", "mobile", "presence", "register", "scanner"]);
   });
 
   it("admin sees everything, including accounts and the door/webhook/AI settings", () => {

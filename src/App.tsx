@@ -25,6 +25,7 @@ import { safeJsonFetch, operatorJsonFetch, normalizeApiUrl, getApiBaseUrl, getCu
 import { OperatorSessionBar } from "./components/OperatorSessionBar";
 import { UsersPage } from "./components/UsersPage";
 import { OrgCatalogPage } from "./components/OrgCatalogPage";
+import { PresencePanel } from "./components/PresencePanel";
 import { StorageAlert } from "./components/StorageAlert";
 import { useOperatorSession } from "./utils/session";
 import {
@@ -67,6 +68,7 @@ const HASH_TAB_ALIASES: Record<string, NavTabType> = {
   webhook: "webhook",
   door: "door",
   config: "config",
+  presence: "presence",
 };
 
 /** Normalizes `#/strangers/LOG-1%20/` -> `strangers/LOG-1`. */
@@ -847,6 +849,8 @@ export default function App() {
         {activeTab === "catalog" && canSeeTab(operatorSession, "catalog") && (
           <OrgCatalogPage onEmployeesChanged={() => void fetchData()} />
         )}
+
+        {activeTab === "presence" && canSeeTab(operatorSession, "presence") && <PresencePanel />}
 
         {activeTab === "config" && (
           <AiConfigPage

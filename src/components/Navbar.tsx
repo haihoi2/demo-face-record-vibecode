@@ -17,6 +17,7 @@ import {
   Camera,
   Users,
   Building2,
+  PersonStanding,
 } from "lucide-react";
 import { SmartLockState } from "../types";
 import type { OperatorRole, OperatorSessionInfo } from "../utils/api";
@@ -34,7 +35,8 @@ export type NavTabType =
   | "cameras"
   | "config"
   | "users"
-  | "catalog";
+  | "catalog"
+  | "presence";
 
 /**
  * The least role that sees each tab. Hiding a tab is a courtesy - the server
@@ -53,6 +55,7 @@ export const TAB_MIN_ROLE: Record<NavTabType, OperatorRole> = {
   config: "admin",
   users: "admin",
   catalog: "operator",
+  presence: "operator",
 };
 
 /** Signed out, only the viewer-level tabs show; every call behind them asks to sign in. */
@@ -68,6 +71,7 @@ const NAV_ITEMS: Array<{ id: NavTabType; label: string; title?: string; Icon: Re
   { id: "register", label: "Đăng Ký Khuôn Mặt", Icon: UserPlus, active: INDIGO },
   { id: "catalog", label: "Phòng ban & Chức vụ", title: "Danh mục phòng ban và chức vụ dùng khi đăng ký nhân viên", Icon: Building2, iconClass: "text-indigo-600", active: INDIGO },
   { id: "logs", label: "Nhật Ký Vào Ra", Icon: ClipboardList, active: INDIGO },
+  { id: "presence", label: "Hiện diện", title: "Sự kiện có người trong khung hình ở cổng (kể cả không thấy mặt); gắn nhãn để hiệu chỉnh", Icon: PersonStanding, iconClass: "text-indigo-600", active: INDIGO },
   { id: "mobile", label: "App Di Động", Icon: Smartphone, active: INDIGO },
   { id: "webhook", label: "Webhook Eton", Icon: Send, iconClass: "text-indigo-600", active: INDIGO },
   { id: "door", label: "API Mở Cửa", Icon: KeyRound, iconClass: "text-emerald-600", active: "bg-emerald-50 text-emerald-700 border-emerald-200" },
