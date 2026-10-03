@@ -104,6 +104,7 @@ import {
   gatesFromStoredConfig,
   isDoorId,
   isGateDirection,
+  gateEnvSuffix,
   isGateId,
   legacyDirectionOf,
   LEGACY_DOOR_ID,
@@ -149,6 +150,14 @@ import type { Gate, PipelineMode } from "./src/server/pipeline/contracts";
 import type { ExtractedFace, UnclearReason } from "./src/server/faceEmbedding";
 import { faceCutByFrameEdge } from "./src/server/faceFrameEdge";
 import { newBlurReportId, type BlurReportRecord } from "./src/server/blurReports";
+import type { FaceOutcome, PresenceEventDraft, PresenceEventRecord } from "./src/server/presence/contracts";
+
+/** A gate's presence host (src/server/presence/presenceHost.ts, face-engine agent); wired when it lands. */
+interface PresenceHostHandle {
+  stop(): Promise<void> | void;
+  stats?(): { fps: number | null; worker: unknown; lastEventAt: string | null };
+}
+const presenceHosts = new Map<string, PresenceHostHandle>();
 import { pickSharpestObservation } from "./src/server/bestFrame";
 import { chooseEnrolFaces } from "./src/server/enrolFace";
 import {
@@ -2134,6 +2143,20 @@ const DOOR_SCAN_SHARED_STREAM = (process.env.DOOR_SCAN_SHARED_STREAM ?? "true").
 const DOOR_SCAN_SNAPSHOT_FPS = envFloat("DOOR_SCAN_SNAPSHOT_FPS", 4, 0.5, 15);
 /** The newest shared-stream JPEG must be at most this old, or the scan dials the camera. */
 const DOOR_SCAN_SNAPSHOT_MAX_AGE_MS = 1500;
+/**
+ * Person presence (plan docs/plans/2026-10-02-person-presence-alerts.md, P2 =
+ * shadow: record only, never message; contract src/server/presence/contracts.ts).
+ * Needs the gate's pipeline stream (pipeline mode shadow/live): the stream
+ * reader adds a small whole-picture output for the detector. Default off.
+ */
+const PRESENCE_FPS = envFloat("PRESENCE_FPS", 2, 0.5, 8);
+const PRESENCE_FRAME_WIDTH = envInt("PRESENCE_FRAME_WIDTH", 960, 320, 1920);
+const PRESENCE_EVENT_RETENTION_DAYS = envInt("PRESENCE_EVENT_RETENTION_DAYS", 7, 0, 365);
+/** Presence mode of a gate: PRESENCE_MODE_<GATE> = off | shadow (default off). "live" (messages) comes with P3. */
+function presenceModeFor(gate: Gate): "off" | "shadow" {
+  const raw = String(process.env[`PRESENCE_MODE_${gateEnvSuffix(gate)}`] || "").trim().toLowerCase();
+  return raw === "shadow" ? "shadow" : "off";
+}
 /**
  * Sharpest of several frames (owner 2026-10-01): when the newest shared-stream
  * picture of a scan contains a face, this many slightly older pictures from
@@ -6841,6 +6864,7 @@ async function startGatePipeline(gate: Gate, want: DesiredPipeline): Promise<voi
       roi,
       fps: PIPELINE_FPS,
       ...(DOOR_SCAN_SHARED_STREAM ? { snapshot: { fps: DOOR_SCAN_SNAPSHOT_FPS } } : {}),
+      ...(presenceModeFor(gate) !== "off" ? { presence: { width: PRESENCE_FRAME_WIDTH, fps: PRESENCE_FPS } } : {}),
       // F12: stale/reconnect/recovery transitions, without URL or host, rate-limited by the reader.
       log: (line) => console.warn(`[Pipeline ${gateLogTag(gate)}] ${line}`),
     });
@@ -9180,6 +9204,181 @@ app.get("/api/strangers/blur-reports", requireOperatorRole("admin"), async (req,
     res.status(err instanceof RangeError ? 400 : 500).json({ success: false, error: err instanceof RangeError ? "since phải là thời gian ISO" : err?.message || "Lỗi đọc báo cáo ảnh mờ" });
   }
 });
+
+// ---- Person presence (P2, shadow): link, store, routes, retention ----
+
+/**
+ * What the face engines saw at this gate while the person was in view: a
+ * recognised employee (door-engine grant or real-time-engine employee
+ * outcome), a stranger face (door-engine DENIED event), or nothing.
+ */
+async function presenceFaceOutcome(gateId: string, startedAt: string, lastSeenAt: string): Promise<{ faceOutcome: FaceOutcome; logIds: string[]; employeeIds: string[] }> {
+  const from = new Date(Date.parse(startedAt) - 2000).toISOString();
+  const to = new Date(Date.parse(lastSeenAt) + 2000).toISOString();
+  const logIds: string[] = [];
+  const employeeIds = new Set<string>();
+  let stranger = false;
+  try {
+    const { logs } = await db.queryAccessLogs({ gateId, from, to } as any, null, 50);
+    for (const l of logs) {
+      logIds.push(l.id);
+      if (l.status === "GRANTED" && l.employeeId) employeeIds.add(l.employeeId);
+      else if (l.status === "DENIED") stranger = true;
+    }
+  } catch (err: any) {
+    console.warn(`[Presence ${gateId}] Không đọc được nhật ký để liên kết: ${err?.message || err}`);
+  }
+  try {
+    const { results } = await db.getShadowResultsPage(null, 50, { gate: gateId, sinceIso: from });
+    for (const r of results) if (r.decidedAt <= to && r.outcome === "employee" && r.employeeId) employeeIds.add(r.employeeId);
+  } catch {}
+  const faceOutcome: FaceOutcome = employeeIds.size ? "employee" : stranger ? "stranger" : "none";
+  return { faceOutcome, logIds: logIds.slice(0, 50), employeeIds: [...employeeIds].slice(0, 50) };
+}
+
+/** trackKey -> event id, so a track's final draft completes the row its qualifying draft created. */
+const presenceEventIds = new Map<string, string>();
+
+/**
+ * One presence draft from a gate's presence host: link with face results,
+ * store (insert on qualify, complete on final), cut the body crop from the
+ * full-resolution JPEG nearest the best frame. Shadow: never messages.
+ */
+async function onPresenceDraft(gate: Gate, draft: PresenceEventDraft): Promise<void> {
+  const key = `${gate}:${draft.trackId}`;
+  let id = presenceEventIds.get(key);
+  const isNew = !id;
+  if (!id) {
+    id = `PE-${randomUUID()}`;
+    presenceEventIds.set(key, id);
+    if (presenceEventIds.size > 5000) presenceEventIds.delete(presenceEventIds.keys().next().value!);
+  }
+  if (draft.final) presenceEventIds.delete(key);
+  const link = await presenceFaceOutcome(gate, draft.startedAt, draft.lastSeenAt);
+  let crop: Buffer | null = null;
+  if (isNew) {
+    const shared = gatePipelines.get(gate)?.source?.reader;
+    const target = Date.parse(draft.bestFrameAt);
+    const snaps = shared?.snapshots(4000) || [];
+    const nearest = snaps.reduce<{ jpeg: Buffer; capturedAtMs: number } | null>(
+      (best, s) => (!best || Math.abs(s.capturedAtMs - target) < Math.abs(best.capturedAtMs - target) ? s : best), null);
+    if (nearest && Math.abs(nearest.capturedAtMs - target) <= 1500) {
+      crop = await cropFaceFromImage(nearest.jpeg, draft.bestBox, { margin: 1.2, minSizePx: 160, maxSizePx: 384 });
+    }
+  }
+  const record: PresenceEventRecord = {
+    id,
+    gateId: gate,
+    trackId: draft.trackId,
+    startedAt: draft.startedAt,
+    ...(draft.final ? { endedAt: draft.lastSeenAt } : {}),
+    inViewMs: draft.inViewMs,
+    framesSeen: draft.framesSeen,
+    peakPersons: draft.peakPersons,
+    period: draft.period,
+    faceOutcome: link.faceOutcome,
+    linkedLogIds: link.logIds,
+    linkedEmployeeIds: link.employeeIds,
+    // P3 rule (owner 2026-10-03): message only after hours and when no recognised employee accounts for the person.
+    wouldAlert: draft.period === "after-hours" && link.faceOutcome !== "employee",
+    alertSentAt: null,
+    bestBox: draft.bestBox,
+    bestScore: draft.bestScore,
+    bestFrameAt: draft.bestFrameAt,
+    models: draft.models,
+    hasCrop: Boolean(crop),
+    createdAt: new Date().toISOString(),
+  };
+  const ok = await db.savePresenceEvent(record, crop);
+  if (!ok) console.warn(`[Presence ${gateLogTag(gate)}] Không lưu được sự kiện hiện diện ${id}.`);
+  else if (isNew) {
+    console.log(
+      `[Presence ${gateLogTag(gate)}] Có người (${draft.period === "working" ? "giờ làm" : "ngoài giờ"}, ${Math.round(draft.inViewMs / 100) / 10}s, ` +
+        `${draft.peakPersons} người, mặt: ${link.faceOutcome})${record.wouldAlert ? " - sẽ cảnh báo khi bật P3" : ""}`
+    );
+    broadcastSSE("presence_event", { id, gateId: gate, startedAt: draft.startedAt, period: draft.period, faceOutcome: link.faceOutcome, wouldAlert: record.wouldAlert });
+  }
+}
+
+const PRESENCE_EVENT_ID_RE = /^PE-[A-Za-z0-9-]{1,60}$/;
+
+app.get("/api/presence/status", requireOperatorRole("viewer"), (_req, res) => {
+  const gates = cameraStreamsConfig.gates.map((g) => {
+    const host = presenceHosts.get(g.id);
+    const reader = gatePipelines.get(g.id)?.source?.reader;
+    const frame = reader?.latestPresenceFrame(10_000);
+    return {
+      gateId: g.id,
+      mode: presenceModeFor(g.id),
+      fps: host?.stats?.().fps ?? null,
+      lastFrameAgeMs: frame ? Math.max(0, Date.now() - frame.capturedAtMs) : null,
+      worker: host?.stats?.().worker ?? null,
+      lastEventAt: host?.stats?.().lastEventAt ?? null,
+      ...(presenceModeFor(g.id) !== "off" && !gatePipelines.get(g.id)?.source
+        ? { note: "Cần luồng của engine thời gian thực (chế độ shadow/live) cho cổng này" }
+        : {}),
+    };
+  });
+  res.json({ success: true, gates });
+});
+
+app.get("/api/presence/events", requireOperatorRole("operator"), async (req, res) => {
+  const q = req.query as Record<string, unknown>;
+  const str = (v: unknown, max: number) => (typeof v === "string" && v && v.length <= max ? v : undefined);
+  const period = str(q.period, 16);
+  const faceOutcome = str(q.faceOutcome, 16);
+  const label = str(q.label, 16);
+  if (period && !["working", "after-hours"].includes(period)) return res.status(400).json({ success: false, error: "period phải là working hoặc after-hours" });
+  if (faceOutcome && !["employee", "stranger", "none"].includes(faceOutcome)) return res.status(400).json({ success: false, error: "faceOutcome phải là employee, stranger hoặc none" });
+  if (label && !["real", "false-alarm", "employee", "none"].includes(label)) return res.status(400).json({ success: false, error: "label không hợp lệ" });
+  try {
+    const page = await db.getPresenceEventsPage({
+      gateId: str(q.gate, 32), period, faceOutcome, label, before: str(q.before, 140), limit: boundedInt(q.limit, 50, 1, 100),
+    });
+    const last = page.events[page.events.length - 1];
+    res.json({ success: true, events: page.events, hasMore: page.hasMore, ...(page.hasMore && last ? { nextCursor: `${last.startedAt}|${last.id}` } : {}) });
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: `Không đọc được sự kiện hiện diện: ${err?.message || err}` });
+  }
+});
+
+app.get("/api/presence/events/:id/crop", requireOperatorRole("operator"), async (req, res) => {
+  if (!guardBiometricImage(req, res)) return;
+  const id = String(req.params.id || "");
+  if (!PRESENCE_EVENT_ID_RE.test(id)) return res.status(400).json({ success: false, error: "Mã sự kiện không hợp lệ" });
+  const crop = await db.getPresenceEventCrop(id);
+  if (!crop) return res.status(404).json({ success: false, error: "Ảnh không tồn tại hoặc đã hết hạn lưu trữ" });
+  console.log(`[Presence] ${operatorActor(req) || "unknown"} xem ảnh sự kiện ${id}`);
+  res.setHeader("Content-Type", "image/jpeg");
+  res.setHeader("Content-Length", String(crop.length));
+  res.setHeader("Content-Security-Policy", "default-src 'none'; sandbox");
+  res.setHeader("Cache-Control", "private, no-store");
+  res.send(crop);
+});
+
+app.post("/api/presence/events/:id/label", requireOperatorRole("operator"), requireCsrf, async (req, res) => {
+  const id = String(req.params.id || "");
+  if (!PRESENCE_EVENT_ID_RE.test(id)) return res.status(400).json({ success: false, error: "Mã sự kiện không hợp lệ" });
+  const kind = req.body?.kind;
+  if (!["real", "false-alarm", "employee"].includes(kind)) return res.status(400).json({ success: false, error: "kind phải là real, false-alarm hoặc employee" });
+  const event = await db.getPresenceEvent(id);
+  if (!event) return res.status(404).json({ success: false, error: `Không tìm thấy sự kiện ${id}` });
+  const ok = await db.addPresenceLabel({ id: `PL-${randomUUID()}`, eventId: id, kind, actor: operatorActor(req) || "unknown", at: new Date().toISOString() });
+  if (!ok) return res.status(503).json({ success: false, error: "Chưa lưu được nhãn; thử lại sau." });
+  console.log(`[Presence] ${operatorActor(req) || "unknown"} gắn nhãn ${kind} cho ${id}`);
+  res.json({ success: true, event: { ...event, label: kind } });
+});
+
+if (PRESENCE_EVENT_RETENTION_DAYS > 0) {
+  const purgePresence = () => {
+    const cutoff = new Date(Date.now() - PRESENCE_EVENT_RETENTION_DAYS * 86_400_000).toISOString();
+    db.purgePresenceCrops(cutoff)
+      .then((n) => { if (n > 0) console.log(`[Presence] Đã xóa ${n} ảnh hiện diện cũ hơn ${PRESENCE_EVENT_RETENTION_DAYS} ngày.`); })
+      .catch((err) => console.warn("[Presence] Lỗi dọn ảnh hiện diện:", err?.message || err));
+  };
+  setTimeout(purgePresence, 90_000).unref?.();
+  setInterval(purgePresence, 6 * 60 * 60 * 1000).unref?.();
+}
 
 app.get("/api/strangers/lookup", requireOperatorRole("viewer"), async (req, res) => {
   if (req.query.faceId !== undefined) {
