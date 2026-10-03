@@ -16,6 +16,7 @@ import type { StrangerFacePage, StrangerFaceRecord, StrangerFaceStore } from "./
 import type { ShadowAccuracySummary, ShadowAgreement, ShadowResultRecord, ShadowResultStore } from "./shadowResults";
 import { LOGIN_EVENT_KINDS, type LoginEventQuery, type LoginEventRecord, type LoginEventStore } from "./loginEvents";
 import type { BlurReportRecord, BlurReportStore } from "./blurReports";
+import type { PresenceEventRecord, PresenceLabelKind } from "./presence/contracts";
 import type { FaceTemplate } from "../types";
 import { gateIdForLegacyRow, isDoorId, isGateId, LEGACY_DOOR_ID } from "./gates";
 
@@ -1276,6 +1277,144 @@ function rowToBlurReport(r: any): BlurReportRecord {
   return out;
 }
 
+/**
+ * presence_events / presence_event_labels (src/server/presence/contracts.ts, P2):
+ * one row per qualified person track (inserted when it qualifies, completed
+ * when it ends), the body crop erased after PRESENCE_EVENT_RETENTION_DAYS (the
+ * row stays as numbers), operator labels append-only. Body crops are personal
+ * data: only the crop route returns them. Rollback: DROP both tables.
+ */
+const PG_PRESENCE_DDL = `
+  CREATE TABLE IF NOT EXISTS presence_events (
+    id VARCHAR(64) COLLATE "C" PRIMARY KEY,
+    "gateId" VARCHAR(32) NOT NULL,
+    "trackId" VARCHAR(64) NOT NULL,
+    "startedAt" VARCHAR(64) COLLATE "C" NOT NULL,
+    "endedAt" VARCHAR(64),
+    "inViewMs" INTEGER NOT NULL,
+    "framesSeen" INTEGER NOT NULL,
+    "peakPersons" INTEGER NOT NULL,
+    period VARCHAR(16) NOT NULL,
+    "faceOutcome" VARCHAR(16) NOT NULL,
+    "linkedLogIds" TEXT,
+    "linkedEmployeeIds" TEXT,
+    "wouldAlert" BOOLEAN NOT NULL,
+    "alertSentAt" VARCHAR(64),
+    "bestBox" TEXT NOT NULL,
+    "bestScore" REAL NOT NULL,
+    "bestFrameAt" VARCHAR(64) NOT NULL,
+    models TEXT NOT NULL,
+    crop BYTEA,
+    "cropPurgedAt" VARCHAR(64),
+    "createdAt" VARCHAR(64) NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS idx_presence_events_started ON presence_events ("startedAt" DESC, id DESC);
+  CREATE INDEX IF NOT EXISTS idx_presence_events_gate ON presence_events ("gateId", "startedAt" DESC);
+  CREATE TABLE IF NOT EXISTS presence_event_labels (
+    id VARCHAR(64) COLLATE "C" PRIMARY KEY,
+    "eventId" VARCHAR(64) NOT NULL,
+    kind VARCHAR(16) NOT NULL,
+    actor VARCHAR(64) NOT NULL,
+    at VARCHAR(64) COLLATE "C" NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS idx_presence_event_labels_event ON presence_event_labels ("eventId", at DESC);
+`;
+
+const SQLITE_PRESENCE_DDL = `
+  CREATE TABLE IF NOT EXISTS presence_events (
+    id TEXT PRIMARY KEY,
+    gateId TEXT NOT NULL,
+    trackId TEXT NOT NULL,
+    startedAt TEXT NOT NULL,
+    endedAt TEXT,
+    inViewMs INTEGER NOT NULL,
+    framesSeen INTEGER NOT NULL,
+    peakPersons INTEGER NOT NULL,
+    period TEXT NOT NULL,
+    faceOutcome TEXT NOT NULL,
+    linkedLogIds TEXT,
+    linkedEmployeeIds TEXT,
+    wouldAlert INTEGER NOT NULL,
+    alertSentAt TEXT,
+    bestBox TEXT NOT NULL,
+    bestScore REAL NOT NULL,
+    bestFrameAt TEXT NOT NULL,
+    models TEXT NOT NULL,
+    crop BLOB,
+    cropPurgedAt TEXT,
+    createdAt TEXT NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS idx_presence_events_started ON presence_events (startedAt DESC, id DESC);
+  CREATE INDEX IF NOT EXISTS idx_presence_events_gate ON presence_events (gateId, startedAt DESC);
+  CREATE TABLE IF NOT EXISTS presence_event_labels (
+    id TEXT PRIMARY KEY,
+    eventId TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    actor TEXT NOT NULL,
+    at TEXT NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS idx_presence_event_labels_event ON presence_event_labels (eventId, at DESC);
+`;
+
+const PRESENCE_COLUMNS = ["id", "gateId", "trackId", "startedAt", "endedAt", "inViewMs", "framesSeen", "peakPersons", "period",
+  "faceOutcome", "linkedLogIds", "linkedEmployeeIds", "wouldAlert", "alertSentAt", "bestBox", "bestScore", "bestFrameAt", "models",
+  "cropPurgedAt", "createdAt"] as const;
+const PRESENCE_COLUMNS_PG = PRESENCE_COLUMNS.map((c) => (/[A-Z]/.test(c) ? `"${c}"` : c)).join(", ");
+const PRESENCE_COLUMNS_SQLITE = PRESENCE_COLUMNS.join(", ");
+const PRESENCE_LABEL_KINDS: readonly PresenceLabelKind[] = ["real", "false-alarm", "employee"];
+
+export interface PresenceEventRow extends PresenceEventRecord {
+  label?: PresenceLabelKind;
+  cropPurgedAt?: string;
+}
+
+/** Validates and clamps an event for storage; null when it cannot be stored. */
+function normalizePresenceEvent(e: PresenceEventRecord): PresenceEventRecord | null {
+  const iso = (v: unknown) => (typeof v === "string" && Number.isFinite(Date.parse(v)) ? new Date(v).toISOString() : null);
+  const int = (v: unknown) => (Number.isFinite(Number(v)) ? Math.max(0, Math.round(Number(v))) : null);
+  const startedAt = iso(e?.startedAt);
+  const bestFrameAt = iso(e?.bestFrameAt);
+  if (!e || typeof e.id !== "string" || !/^PE-[A-Za-z0-9-]{1,60}$/.test(e.id) || !startedAt || !bestFrameAt) return null;
+  if (typeof e.gateId !== "string" || !/^[a-z][a-z0-9-]{1,31}$/.test(e.gateId) || typeof e.trackId !== "string" || !e.trackId || e.trackId.length > 64) return null;
+  if (e.period !== "working" && e.period !== "after-hours") return null;
+  if (e.faceOutcome !== "employee" && e.faceOutcome !== "stranger" && e.faceOutcome !== "none") return null;
+  const box = Array.isArray(e.bestBox) && e.bestBox.length === 4 && e.bestBox.every((v) => Number.isFinite(v)) ? e.bestBox.map((v) => Math.round(v)) : null;
+  if (!box || !Number.isFinite(e.bestScore)) return null;
+  const ids = (v: unknown) => (Array.isArray(v) ? v.filter((x) => typeof x === "string" && x.length <= 64).slice(0, 50) : undefined);
+  return {
+    id: e.id, gateId: e.gateId, trackId: e.trackId, startedAt, ...(iso(e.endedAt) ? { endedAt: iso(e.endedAt)! } : {}),
+    inViewMs: int(e.inViewMs) ?? 0, framesSeen: int(e.framesSeen) ?? 0, peakPersons: Math.max(1, int(e.peakPersons) ?? 1),
+    period: e.period, faceOutcome: e.faceOutcome, linkedLogIds: ids(e.linkedLogIds), linkedEmployeeIds: ids(e.linkedEmployeeIds),
+    wouldAlert: Boolean(e.wouldAlert), alertSentAt: iso(e.alertSentAt), bestBox: box as [number, number, number, number],
+    bestScore: Math.round(e.bestScore * 1000) / 1000, bestFrameAt,
+    models: Array.isArray(e.models) ? e.models.filter((m) => typeof m === "string").slice(0, 4) : [],
+    hasCrop: Boolean(e.hasCrop), createdAt: iso(e.createdAt) || new Date().toISOString(),
+  };
+}
+
+function presenceParams(e: PresenceEventRecord, wouldAlert: unknown): unknown[] {
+  return [e.id, e.gateId, e.trackId, e.startedAt, e.endedAt ?? null, e.inViewMs, e.framesSeen, e.peakPersons, e.period, e.faceOutcome,
+    e.linkedLogIds ? JSON.stringify(e.linkedLogIds) : null, e.linkedEmployeeIds ? JSON.stringify(e.linkedEmployeeIds) : null,
+    wouldAlert, e.alertSentAt ?? null, JSON.stringify(e.bestBox), e.bestScore, e.bestFrameAt, JSON.stringify(e.models), null, e.createdAt];
+}
+
+function rowToPresenceEvent(r: any): PresenceEventRow {
+  const parse = (v: unknown) => { try { return typeof v === "string" && v ? JSON.parse(v) : undefined; } catch { return undefined; } };
+  const out: PresenceEventRow = {
+    id: String(r.id), gateId: String(r.gateId), trackId: String(r.trackId), startedAt: String(r.startedAt),
+    inViewMs: Number(r.inViewMs), framesSeen: Number(r.framesSeen), peakPersons: Number(r.peakPersons), period: r.period,
+    faceOutcome: r.faceOutcome, wouldAlert: r.wouldAlert === true || r.wouldAlert === 1, alertSentAt: r.alertSentAt ?? null,
+    bestBox: parse(r.bestBox) || [0, 0, 0, 0], bestScore: Number(r.bestScore), bestFrameAt: String(r.bestFrameAt),
+    models: parse(r.models) || [], hasCrop: r.hasCrop === true || r.hasCrop === 1 || r.hasCrop === "1", createdAt: String(r.createdAt),
+  };
+  if (r.endedAt) out.endedAt = String(r.endedAt);
+  const logs = parse(r.linkedLogIds); if (logs) out.linkedLogIds = logs;
+  const emps = parse(r.linkedEmployeeIds); if (emps) out.linkedEmployeeIds = emps;
+  if (r.cropPurgedAt) out.cropPurgedAt = String(r.cropPurgedAt);
+  if (r.label && PRESENCE_LABEL_KINDS.includes(r.label)) out.label = r.label;
+  return out;
+}
+
 const LOGIN_EVENT_PAGE_MAX = 200;
 const LOGIN_EVENT_COLUMNS_PG = `id, at, kind, method, "userId", username, reason, ip, "userAgent"`;
 const LOGIN_EVENT_COLUMNS_SQLITE = "id, at, kind, method, userId, username, reason, ip, userAgent";
@@ -1891,6 +2030,8 @@ class SQLiteStorage implements StrangerFaceStore, ShadowResultStore, LoginEventS
   private pgShadowResultsReady = false;
   /** login_events exists on PostgreSQL (same pattern). */
   private pgLoginEventsReady = false;
+  /** presence_events / presence_event_labels exist on PostgreSQL (same pattern). */
+  private pgPresenceReady = false;
   /** stranger_face_reports exists on PostgreSQL (same pattern). */
   private pgBlurReportsReady = false;
   /**
@@ -2539,6 +2680,12 @@ class SQLiteStorage implements StrangerFaceStore, ShadowResultStore, LoginEventS
       }
       try {
         await this.pgPool.query(PG_LOGIN_EVENTS_DDL);
+        try {
+          await this.pgPool.query(PG_PRESENCE_DDL);
+          this.pgPresenceReady = true;
+        } catch (err) {
+          console.error("[PostgreSQL] Lỗi khởi tạo bảng presence_events:", err);
+        }
         this.pgLoginEventsReady = true;
       } catch (err) {
         console.error("[PostgreSQL] Lỗi khởi tạo bảng login_events:", err);
@@ -2820,6 +2967,11 @@ class SQLiteStorage implements StrangerFaceStore, ShadowResultStore, LoginEventS
     }
     try {
       this.db.exec(SQLITE_LOGIN_EVENTS_DDL);
+      try {
+        this.db.exec(SQLITE_PRESENCE_DDL);
+      } catch (err) {
+        console.error("[SQLite] Lỗi khởi tạo bảng presence_events:", err);
+      }
     } catch (err) {
       console.error("[SQLite] Lỗi khởi tạo bảng login_events:", err);
     }
@@ -2857,6 +3009,8 @@ class SQLiteStorage implements StrangerFaceStore, ShadowResultStore, LoginEventS
     stranger_faces?: StrangerFaceJson[];
     pipeline_shadow_results?: ShadowResultRecord[];
     login_events?: LoginEventRecord[];
+    presence_events?: Array<PresenceEventRecord & { crop?: string; cropPurgedAt?: string }>;
+    presence_event_labels?: Array<{ id: string; eventId: string; kind: PresenceLabelKind; actor: string; at: string }>;
     stranger_face_reports?: BlurReportRecord[];
     /** Lock state per door (N-gate wave); door "main" is also smart_lock_state. */
     door_lock_states?: Record<string, { state: SmartLockStateRecord; updatedAt: string }>;
@@ -3952,6 +4106,188 @@ class SQLiteStorage implements StrangerFaceStore, ShadowResultStore, LoginEventS
   // ================= SIGN-IN AUDIT (login_events) =================
   // Single authority like shadow results: PostgreSQL once its table exists,
   // else SQLite, else JSON; refused while PostgreSQL is configured but not ready.
+
+  // ================= PRESENCE EVENTS (P2) =================
+
+  private presenceMode(): "postgresql" | "sqlite" | "json" | null {
+    return this.singleStoreMode(this.pgPresenceReady);
+  }
+
+  /** Insert or replace an event (by id). The crop is written only when given; replacing never drops an existing crop. */
+  async savePresenceEvent(event: PresenceEventRecord, crop?: Buffer | null): Promise<boolean> {
+    const e = normalizePresenceEvent(event);
+    if (!e) return false;
+    const mode = this.presenceMode();
+    if (!mode) return false;
+    const cols = PRESENCE_COLUMNS.filter((c) => c !== "cropPurgedAt");
+    try {
+      if (mode === "postgresql") {
+        const params = presenceParams(e, e.wouldAlert).filter((_, i) => PRESENCE_COLUMNS[i] !== "cropPurgedAt");
+        const colSql = cols.map((c) => (/[A-Z]/.test(c) ? `"${c}"` : c));
+        const set = colSql.filter((c) => c !== "id" && c !== '"createdAt"').map((c) => `${c} = EXCLUDED.${c}`).join(", ");
+        await this.pgPool!.query(
+          `INSERT INTO presence_events (${colSql.join(", ")}${crop ? ", crop" : ""}) VALUES (${params.map((_, i) => `$${i + 1}`).join(",")}${crop ? `, $${params.length + 1}` : ""})
+           ON CONFLICT (id) DO UPDATE SET ${set}${crop ? ", crop = EXCLUDED.crop" : ""}`,
+          crop ? [...params, crop] : params,
+        );
+        return true;
+      }
+      if (mode === "sqlite") {
+        const params = presenceParams(e, e.wouldAlert ? 1 : 0).filter((_, i) => PRESENCE_COLUMNS[i] !== "cropPurgedAt");
+        const set = cols.filter((c) => c !== "id" && c !== "createdAt").map((c) => `${c} = excluded.${c}`).join(", ");
+        this.db.prepare(
+          `INSERT INTO presence_events (${cols.join(", ")}${crop ? ", crop" : ""}) VALUES (${params.map(() => "?").join(",")}${crop ? ", ?" : ""})
+           ON CONFLICT (id) DO UPDATE SET ${set}${crop ? ", crop = excluded.crop" : ""}`,
+        ).run(...params, ...(crop ? [crop] : []));
+        return true;
+      }
+      const existing = this.fallbackData.presence_events || [];
+      const prev = existing.find((x) => x.id === e.id);
+      const row = { ...e, createdAt: prev?.createdAt || e.createdAt, ...(crop ? { crop: crop.toString("base64") } : prev?.crop ? { crop: prev.crop } : {}), ...(prev?.cropPurgedAt ? { cropPurgedAt: prev.cropPurgedAt } : {}) };
+      const staged = [row, ...existing.filter((x) => x.id !== e.id)];
+      this.writeFallback({ ...this.fallbackData, presence_events: staged });
+      this.fallbackData.presence_events = staged;
+      return true;
+    } catch (err: any) {
+      console.error(`[Presence] Lỗi lưu sự kiện hiện diện (${mode}): ${err?.message}`);
+      return false;
+    }
+  }
+
+  /** Newest first by (startedAt DESC, id DESC), with each event's newest label; cursor = "<startedAt>|<id>". */
+  async getPresenceEventsPage(q: { gateId?: string; period?: string; faceOutcome?: string; label?: string; before?: string; limit: number }): Promise<{ events: PresenceEventRow[]; hasMore: boolean }> {
+    const n = Math.min(100, Math.max(1, Number.isFinite(q?.limit) ? Math.trunc(q.limit) : 50));
+    const cur = typeof q?.before === "string" && q.before.includes("|") ? { at: q.before.slice(0, q.before.indexOf("|")), id: q.before.slice(q.before.indexOf("|") + 1) } : null;
+    const mode = this.presenceMode();
+    let rows: PresenceEventRow[] = [];
+    const want = (r: PresenceEventRow) =>
+      (!q.gateId || r.gateId === q.gateId) && (!q.period || r.period === q.period) && (!q.faceOutcome || r.faceOutcome === q.faceOutcome) &&
+      (!q.label || (q.label === "none" ? !r.label : r.label === q.label));
+    if (mode === "postgresql" || mode === "sqlite") {
+      const pg = mode === "postgresql";
+      const params: unknown[] = [];
+      const ph = () => (pg ? `$${params.length}` : "?");
+      const col = (c: string) => (pg && /[A-Z]/.test(c) ? `"${c}"` : c);
+      const where: string[] = [];
+      if (q.gateId) { params.push(q.gateId); where.push(`e.${col("gateId")} = ${ph()}`); }
+      if (q.period) { params.push(q.period); where.push(`e.period = ${ph()}`); }
+      if (q.faceOutcome) { params.push(q.faceOutcome); where.push(`e.${col("faceOutcome")} = ${ph()}`); }
+      if (cur) {
+        params.push(cur.at); const a = ph(); params.push(cur.at); const b = ph(); params.push(cur.id); const c = ph();
+        where.push(`(e.${col("startedAt")} < ${a} OR (e.${col("startedAt")} = ${b} AND e.id < ${c}))`);
+      }
+      const label = `(SELECT l.kind FROM presence_event_labels l WHERE l.${col("eventId")} = e.id ORDER BY l.at DESC, l.id DESC LIMIT 1)`;
+      const cols = (pg ? PRESENCE_COLUMNS_PG : PRESENCE_COLUMNS_SQLITE).split(", ").map((c) => `e.${c}`).join(", ");
+      // Over-fetch when filtering by label (applied after the subquery), bounded.
+      const fetchN = q.label ? Math.min(1000, n * 10 + 1) : n + 1;
+      params.push(fetchN);
+      const sql = `SELECT ${cols}, ${label} AS label, (e.crop IS NOT NULL) AS ${pg ? '"hasCrop"' : "hasCrop"} FROM presence_events e
+        ${where.length ? `WHERE ${where.join(" AND ")}` : ""} ORDER BY e.${col("startedAt")} DESC, e.id DESC LIMIT ${ph()}`;
+      const raw = pg ? (await this.pgPool!.query(sql, params)).rows : (this.db.prepare(sql).all(...params) as any[]);
+      rows = raw.map(rowToPresenceEvent).filter(want);
+    } else if (mode === "json") {
+      const labels = this.fallbackData.presence_event_labels || [];
+      rows = (this.fallbackData.presence_events || [])
+        .map((e) => {
+          const l = labels.filter((x) => x.eventId === e.id).sort((a, b) => (a.at < b.at ? 1 : -1))[0];
+          return { ...e, hasCrop: Boolean(e.crop), ...(l ? { label: l.kind } : {}) } as PresenceEventRow;
+        })
+        .filter((e) => !cur || e.startedAt < cur.at || (e.startedAt === cur.at && e.id < cur.id))
+        .filter(want)
+        .sort((a, b) => (a.startedAt === b.startedAt ? (a.id < b.id ? 1 : -1) : a.startedAt < b.startedAt ? 1 : -1));
+      rows = rows.map(({ crop: _c, ...r }: any) => r);
+    }
+    return { events: rows.slice(0, n), hasMore: rows.length > n };
+  }
+
+  async getPresenceEvent(id: string): Promise<PresenceEventRow | null> {
+    const mode = this.presenceMode();
+    if (mode === "postgresql") {
+      const r = (await this.pgPool!.query(`SELECT ${PRESENCE_COLUMNS_PG}, (crop IS NOT NULL) AS "hasCrop" FROM presence_events WHERE id = $1`, [id])).rows[0];
+      return r ? rowToPresenceEvent(r) : null;
+    }
+    if (mode === "sqlite") {
+      const r = this.db.prepare(`SELECT ${PRESENCE_COLUMNS_SQLITE}, (crop IS NOT NULL) AS hasCrop FROM presence_events WHERE id = ?`).get(id) as any;
+      return r ? rowToPresenceEvent(r) : null;
+    }
+    if (mode === "json") {
+      const e = (this.fallbackData.presence_events || []).find((x) => x.id === id);
+      if (!e) return null;
+      const { crop, ...rest } = e as any;
+      return { ...rest, hasCrop: Boolean(crop) };
+    }
+    return null;
+  }
+
+  async getPresenceEventCrop(id: string): Promise<Buffer | null> {
+    const mode = this.presenceMode();
+    if (mode === "postgresql") {
+      const r = (await this.pgPool!.query("SELECT crop FROM presence_events WHERE id = $1", [id])).rows[0];
+      return r?.crop ? Buffer.from(r.crop) : null;
+    }
+    if (mode === "sqlite") {
+      const r = this.db.prepare("SELECT crop FROM presence_events WHERE id = ?").get(id) as any;
+      return r?.crop ? Buffer.from(r.crop) : null;
+    }
+    if (mode === "json") {
+      const e = (this.fallbackData.presence_events || []).find((x) => x.id === id);
+      return e?.crop ? Buffer.from(e.crop, "base64") : null;
+    }
+    return null;
+  }
+
+  /** Appends a label row; the newest label is the event's label. */
+  async addPresenceLabel(row: { id: string; eventId: string; kind: PresenceLabelKind; actor: string; at: string }): Promise<boolean> {
+    if (!PRESENCE_LABEL_KINDS.includes(row.kind)) return false;
+    const mode = this.presenceMode();
+    const params = [row.id, row.eventId, row.kind, String(row.actor || "unknown").slice(0, 64), row.at];
+    try {
+      if (mode === "postgresql") {
+        await this.pgPool!.query(`INSERT INTO presence_event_labels (id, "eventId", kind, actor, at) VALUES ($1,$2,$3,$4,$5) ON CONFLICT (id) DO NOTHING`, params);
+        return true;
+      }
+      if (mode === "sqlite") {
+        this.db.prepare("INSERT INTO presence_event_labels (id, eventId, kind, actor, at) VALUES (?,?,?,?,?) ON CONFLICT (id) DO NOTHING").run(...params);
+        return true;
+      }
+      if (mode === "json") {
+        const staged = [...(this.fallbackData.presence_event_labels || []), { ...row, actor: String(params[3]) }];
+        this.writeFallback({ ...this.fallbackData, presence_event_labels: staged });
+        this.fallbackData.presence_event_labels = staged;
+        return true;
+      }
+      return false;
+    } catch (err: any) {
+      console.error(`[Presence] Lỗi lưu nhãn sự kiện (${mode}): ${err?.message}`);
+      return false;
+    }
+  }
+
+  /** Erases body crops of events started before cutoffIso (rows stay). Returns crops erased. */
+  async purgePresenceCrops(cutoffIso: string): Promise<number> {
+    const cutoff = normIso(cutoffIso);
+    if (!cutoff) throw new RangeError("purgePresenceCrops: invalid cutoff");
+    const now = new Date().toISOString();
+    const mode = this.presenceMode();
+    if (mode === "postgresql") {
+      return (await this.pgPool!.query(`UPDATE presence_events SET crop = NULL, "cropPurgedAt" = $2 WHERE "startedAt" < $1 AND crop IS NOT NULL`, [cutoff, now])).rowCount || 0;
+    }
+    if (mode === "sqlite") {
+      return Number(this.db.prepare("UPDATE presence_events SET crop = NULL, cropPurgedAt = ? WHERE startedAt < ? AND crop IS NOT NULL").run(now, cutoff)?.changes || 0);
+    }
+    if (mode === "json") {
+      let n = 0;
+      const staged = (this.fallbackData.presence_events || []).map((e) => {
+        if (e.startedAt < cutoff && e.crop) { n++; const { crop: _c, ...rest } = e; return { ...rest, cropPurgedAt: now }; }
+        return e;
+      });
+      if (!n) return 0;
+      this.writeFallback({ ...this.fallbackData, presence_events: staged });
+      this.fallbackData.presence_events = staged;
+      return n;
+    }
+    return 0;
+  }
 
   private loginEventMode(): "postgresql" | "sqlite" | "json" | null {
     return this.singleStoreMode(this.pgLoginEventsReady);
