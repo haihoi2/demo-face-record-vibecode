@@ -9309,6 +9309,8 @@ app.get("/api/presence/status", requireOperatorRole("viewer"), (_req, res) => {
     const frame = reader?.latestPresenceFrame(10_000);
     return {
       gateId: g.id,
+      label: gateLabelOf(g),
+      retentionDays: PRESENCE_EVENT_RETENTION_DAYS,
       mode: presenceModeFor(g.id),
       fps: host?.stats?.().fps ?? null,
       lastFrameAgeMs: frame ? Math.max(0, Date.now() - frame.capturedAtMs) : null,

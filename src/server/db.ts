@@ -4177,10 +4177,11 @@ class SQLiteStorage implements StrangerFaceStore, ShadowResultStore, LoginEventS
         where.push(`(e.${col("startedAt")} < ${a} OR (e.${col("startedAt")} = ${b} AND e.id < ${c}))`);
       }
       const label = `(SELECT l.kind FROM presence_event_labels l WHERE l.${col("eventId")} = e.id ORDER BY l.at DESC, l.id DESC LIMIT 1)`;
+      // The label filter is part of the query (newest label per event), so paging stays exact.
+      if (q.label === "none") where.push(`${label} IS NULL`);
+      else if (q.label) { params.push(q.label); where.push(`${label} = ${ph()}`); }
       const cols = (pg ? PRESENCE_COLUMNS_PG : PRESENCE_COLUMNS_SQLITE).split(", ").map((c) => `e.${c}`).join(", ");
-      // Over-fetch when filtering by label (applied after the subquery), bounded.
-      const fetchN = q.label ? Math.min(1000, n * 10 + 1) : n + 1;
-      params.push(fetchN);
+      params.push(n + 1);
       const sql = `SELECT ${cols}, ${label} AS label, (e.crop IS NOT NULL) AS ${pg ? '"hasCrop"' : "hasCrop"} FROM presence_events e
         ${where.length ? `WHERE ${where.join(" AND ")}` : ""} ORDER BY e.${col("startedAt")} DESC, e.id DESC LIMIT ${ph()}`;
       const raw = pg ? (await this.pgPool!.query(sql, params)).rows : (this.db.prepare(sql).all(...params) as any[]);
