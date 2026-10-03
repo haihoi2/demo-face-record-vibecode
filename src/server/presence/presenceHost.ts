@@ -119,7 +119,8 @@ export interface PresenceHostStats {
   droppedUnqualified: number;
   lastFrameAt?: string;
   lastFrameAgeMs?: number;
-  lastEventAt?: string;
+  /** Time the last draft was produced; null before the first one. */
+  lastEventAt: string | null;
   errors: number;
   lastError?: string;
   models: Array<Pick<PresenceModelConfig, "id" | "file" | "sha256" | "threshold" | "inputWidth"> & { tag: string }>;
@@ -287,11 +288,17 @@ export class PresenceHost {
     this.bestFrames.clear();
   }
 
-  /** Offers a frame (push). The newest frame wins; nothing is queued. */
+  /**
+   * Offers a frame (push), e.g. from the stream reader's "presence-frame" event
+   * (add sourceWidth/sourceHeight so boxes come back in source pixels). The
+   * newest frame wins; nothing is queued. Offering the frame already accepted
+   * again (same capturedAtMs, e.g. when polling latestPresenceFrame()) is ignored.
+   */
   offer(frame: PresenceFrame): void {
     if (!this.running) return;
     const now = this.opts.now();
     const t = Number(frame?.capturedAtMs);
+    if (t === this.lastAcceptedAt) return;
     const ok =
       frame && frame.rgb instanceof Uint8Array && Number.isInteger(frame.width) && Number.isInteger(frame.height) &&
       frame.width > 0 && frame.height > 0 && frame.rgb.length === frame.width * frame.height * 3 && Number.isFinite(t);
@@ -354,7 +361,7 @@ export class PresenceHost {
       finals: c.finals,
       droppedUnqualified: c.droppedUnqualified,
       ...(this.s.lastFrameAt !== undefined ? { lastFrameAt: new Date(this.s.lastFrameAt).toISOString(), lastFrameAgeMs: Math.max(0, now - this.s.lastFrameAt) } : {}),
-      ...(this.s.lastEventAt !== undefined ? { lastEventAt: new Date(this.s.lastEventAt).toISOString() } : {}),
+      lastEventAt: this.s.lastEventAt !== undefined ? new Date(this.s.lastEventAt).toISOString() : null,
       errors: this.s.errors,
       ...(this.s.lastError ? { lastError: this.s.lastError } : {}),
       models: Object.values(this.slots).map((s) => ({ id: s.cfg.id, file: s.cfg.file, sha256: s.cfg.sha256, threshold: s.cfg.threshold, inputWidth: s.cfg.inputWidth, tag: modelTag(s.cfg) })),

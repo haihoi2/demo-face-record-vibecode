@@ -104,7 +104,7 @@ await host.stop();  // final drafts for open qualified tracks are delivered befo
 **Stats** (`PresenceHostStats`): `gateId`, `running`, `engineReady`, plus:
 - frames and timing: `fps` (last 10 s), `framesReceived`, `framesProcessed`, `framesDroppedBusy`, `framesSkippedNotReady`, `framesRejected`, `lastFrameAt`, `lastFrameAgeMs`;
 - detections: `detections{yolox-nano, rtmdet-tiny}`, `rtmdetRuns`, `rtmdetSkippedBusy`;
-- tracks and events: `openTracks`, `tracks`, `qualified`, `finals`, `droppedUnqualified`, `lastEventAt`;
+- tracks and events: `openTracks`, `tracks`, `qualified`, `finals`, `droppedUnqualified`, `lastEventAt` (string, or null before the first draft);
 - errors: `errors`, `lastError`;
 - models: `models[{id, file, sha256, threshold, inputWidth, tag}]`;
 - per worker: `workers{<model>: {state, restarts, ready, tag, loadError?, runs, lastRunMs?, lastLoopMs?}}`;

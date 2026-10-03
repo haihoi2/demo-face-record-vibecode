@@ -122,7 +122,7 @@ describe("presence host: frames -> drafts (fake engines)", () => {
     assert.equal(st.detections["yolox-nano"], 6);
     assert.equal(st.worker.state, "running");
     assert.deepEqual(st.worker.models, ["yolox-nano@d37c96c31da5", "rtmdet-tiny@31aa4d63d4fb"]);
-    assert.ok(st.lastEventAt);
+    assert.equal(typeof st.lastEventAt, "string");
     await h.host.stop();
     assert.equal(h.host.stats().running, false);
   });
@@ -149,10 +149,12 @@ describe("presence host: frames -> drafts (fake engines)", () => {
     const h = makeHost({});
     h.host.start();
     await until(() => h.host.stats().engineReady, 2000, "engine ready");
+    assert.equal(h.host.stats().lastEventAt, null);
     h.host.offer({ width: 10, height: 10, rgb: new Uint8Array(5), capturedAtMs: T0 });
     h.host.offer(h.frame(T0 - 6000)); // older than maxFrameAgeMs
     h.host.offer(h.frame(T0));
-    h.host.offer(h.frame(T0)); // not newer
+    h.host.offer(h.frame(T0)); // the same frame again (polling): ignored, not counted
+    h.host.offer(h.frame(T0 - 100)); // older than the last accepted one
     assert.equal(h.host.stats().framesRejected, 3);
     assert.equal(h.host.stats().framesReceived, 1);
     await h.host.stop();
