@@ -2,8 +2,10 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 
 import {
+  DEFAULT_NVR_UTC_OFFSET_MINUTES,
   DEFAULT_RECORDING_WINDOW,
   nvrTime,
+  parseUtcOffset,
   playbackFailure,
   playbackFfmpegArgs,
   playbackUrl,
@@ -57,17 +59,40 @@ describe("recording config from the environment", () => {
 describe("playback window and URL", () => {
   const event = Date.parse("2026-09-26T13:19:08.000Z");
 
-  it("plays 8 s before to 7 s after the event, in UTC NVR format", () => {
+  it("plays 8 s before to 7 s after the event, in the NVR's local time (default GMT+07:00)", () => {
     const w = recordingWindow(event, event + 60_000);
     assert.ok(w.ok);
     if (!w.ok) return;
-    assert.equal(nvrTime(w.startMs), "20260926T131900Z");
-    assert.equal(nvrTime(w.endMs), "20260926T131915Z");
+    assert.equal(nvrTime(w.startMs, 0), "20260926T131900Z");
+    assert.equal(nvrTime(w.startMs, 420), "20260926T201900Z");
     const cfg = recordingConfigFromEnv({ RECORDING_NVR_URL: NVR, RECORDING_EXIT_CHANNEL: "501" })!;
+    assert.equal(cfg.utcOffsetMinutes, DEFAULT_NVR_UTC_OFFSET_MINUTES);
+    // 13:19:08Z is 20:19:08 on the NVR's GMT+07:00 clock (ticket #429: UTC digits played 7 h early).
     assert.equal(
       playbackUrl(cfg, "501", w.startMs, w.endMs),
-      `${NVR}/Streaming/tracks/501?starttime=20260926T131900Z&endtime=20260926T131915Z`,
+      `${NVR}/Streaming/tracks/501?starttime=20260926T201900Z&endtime=20260926T201915Z`,
     );
+  });
+
+  it("crosses midnight on the NVR's clock", () => {
+    const late = Date.parse("2026-10-04T17:00:05.000Z"); // 00:00:05 on 10-05 in GMT+07:00
+    assert.equal(nvrTime(late, 420), "20261005T000005Z");
+  });
+
+  it("follows RECORDING_NVR_UTC_OFFSET, and turns playback off when it is invalid", () => {
+    const at = (v: string) => recordingConfigFromEnv({ RECORDING_NVR_URL: NVR, RECORDING_EXIT_CHANNEL: "501", RECORDING_NVR_UTC_OFFSET: v });
+    assert.equal(at("+00:00")!.utcOffsetMinutes, 0);
+    assert.equal(at(" +0700 ")!.utcOffsetMinutes, 420);
+    assert.equal(at("+7")!.utcOffsetMinutes, 420);
+    assert.equal(at("-03:30")!.utcOffsetMinutes, -210);
+    assert.equal(at("")!.utcOffsetMinutes, DEFAULT_NVR_UTC_OFFSET_MINUTES);
+    for (const bad of ["7", "UTC+7", "+07:60", "+15:00", "Asia/Ho_Chi_Minh", "+07:00:00"]) {
+      assert.equal(at(bad), null, bad);
+      assert.equal(parseUtcOffset(bad), null, bad);
+    }
+    const utc = at("+00:00")!;
+    const w = recordingWindow(event, event + 60_000);
+    if (w.ok) assert.match(playbackUrl(utc, "501", w.startMs, w.endMs), /starttime=20260926T131900Z&endtime=20260926T131915Z$/);
   });
 
   it("stops short of now for an event that just happened, or asks to retry", () => {

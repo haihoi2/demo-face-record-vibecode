@@ -8,8 +8,12 @@
  *
  * Facts this module relies on (tested on the site's DS-9632NI-I8, 2026-09-26):
  *  - playback is `<base>/Streaming/tracks/<channel>?starttime=..&endtime=..`
- *    with times in UTC, `YYYYMMDDTHHMMSSZ`; a time in the future answers
+ *    with times as `YYYYMMDDTHHMMSSZ`; a time in the future answers
  *    400 Bad Request;
+ *  - despite the trailing "Z", the NVR reads those digits as ITS OWN local
+ *    time (site NVR and cameras: GMT+07:00, NTP; verified 2026-10-03 and in
+ *    helpdesk ticket #429, where UTC digits played footage 7 h early). The
+ *    NVR's offset is RECORDING_NVR_UTC_OFFSET, default +07:00;
  *  - delivery is about real time, and starts at the keyframe BEFORE the
  *    requested time (1-4 s early), so the window is padded;
  *  - the recording carries G.711 audio (not playable in MP4) and HEVC video
@@ -32,6 +36,26 @@ export interface RecordingConfig {
   baseUrl: string;
   /** NVR channel per gate id; only gates with a valid (numeric) channel are present. */
   channels: Record<string, string>;
+  /** The NVR's clock offset from UTC, in minutes (+420 = GMT+07:00). */
+  utcOffsetMinutes: number;
+}
+
+/** The site NVR's time zone (GMT+07:00, no DST) when RECORDING_NVR_UTC_OFFSET is unset. */
+export const DEFAULT_NVR_UTC_OFFSET_MINUTES = 7 * 60;
+const UTC_OFFSET_RE = /^([+-])(\d{1,2})(?::?(\d{2}))?$/;
+
+/**
+ * "+07:00", "+0700", "+7", "-03:30" -> minutes; empty -> the default; anything
+ * else (or beyond +-14:00) -> null.
+ */
+export function parseUtcOffset(raw: string | undefined): number | null {
+  const v = String(raw || "").trim();
+  if (!v) return DEFAULT_NVR_UTC_OFFSET_MINUTES;
+  const m = UTC_OFFSET_RE.exec(v);
+  if (!m) return null;
+  const minutes = Number(m[2]) * 60 + Number(m[3] || 0);
+  if (Number(m[3] || 0) > 59 || minutes > 14 * 60) return null;
+  return m[1] === "-" ? -minutes : minutes;
 }
 
 const CHANNEL_RE = /^[0-9]{1,5}$/;
@@ -45,9 +69,11 @@ function gateIdFromEnvSuffix(suffix: string): string | null {
 }
 
 /**
- * Reads RECORDING_NVR_URL and every RECORDING_<GATE>_CHANNEL. Null (feature
- * off) unless the NVR URL is a plain rtsp:// origin and at least one gate has
- * a numeric channel. Never throws; never echoes the URL.
+ * Reads RECORDING_NVR_URL, every RECORDING_<GATE>_CHANNEL and
+ * RECORDING_NVR_UTC_OFFSET. Null (feature off) unless the NVR URL is a plain
+ * rtsp:// origin, at least one gate has a numeric channel, and the offset (when
+ * set) is valid - a mistyped offset would play the wrong hour, so it plays
+ * nothing. Never throws; never echoes the URL.
  */
 export function recordingConfigFromEnv(env: Record<string, string | undefined> = process.env): RecordingConfig | null {
   const raw = String(env.RECORDING_NVR_URL || "").trim();
@@ -68,8 +94,10 @@ export function recordingConfigFromEnv(env: Record<string, string | undefined> =
     if (gateId && CHANNEL_RE.test(c)) channels[gateId] = c;
   }
   if (Object.keys(channels).length === 0) return null;
+  const utcOffsetMinutes = parseUtcOffset(env.RECORDING_NVR_UTC_OFFSET);
+  if (utcOffsetMinutes === null) return null;
   const auth = url.username ? `${url.username}${url.password ? `:${url.password}` : ""}@` : "";
-  return { baseUrl: `rtsp://${auth}${url.hostname}${url.port ? `:${url.port}` : ""}`, channels };
+  return { baseUrl: `rtsp://${auth}${url.hostname}${url.port ? `:${url.port}` : ""}`, channels, utcOffsetMinutes };
 }
 
 /** The NVR channel a gate is recorded on, or null when that gate has none. */
@@ -77,9 +105,12 @@ export function recordingChannelFor(cfg: RecordingConfig, gateId: string): strin
   return Object.prototype.hasOwnProperty.call(cfg.channels, gateId) ? cfg.channels[gateId] : null;
 }
 
-/** NVR playback time: UTC, `YYYYMMDDTHHMMSSZ`. */
-export function nvrTime(ms: number): string {
-  return new Date(ms).toISOString().replace(/[-:]/g, "").replace(/\.\d{3}Z$/, "Z");
+/**
+ * NVR playback time: the NVR's local wall clock as `YYYYMMDDTHHMMSSZ` (the "Z"
+ * is the format the NVR accepts, not a time zone - see the module comment).
+ */
+export function nvrTime(ms: number, utcOffsetMinutes: number): string {
+  return new Date(ms + utcOffsetMinutes * 60_000).toISOString().replace(/[-:]/g, "").replace(/\.\d{3}Z$/, "Z");
 }
 
 export interface RecordingWindowOptions {
@@ -128,7 +159,7 @@ export function recordingWindowFailure(w: RecordingWindow): Extract<RecordingWin
 }
 
 export function playbackUrl(cfg: RecordingConfig, channel: string, startMs: number, endMs: number): string {
-  return `${cfg.baseUrl}/Streaming/tracks/${channel}?starttime=${nvrTime(startMs)}&endtime=${nvrTime(endMs)}`;
+  return `${cfg.baseUrl}/Streaming/tracks/${channel}?starttime=${nvrTime(startMs, cfg.utcOffsetMinutes)}&endtime=${nvrTime(endMs, cfg.utcOffsetMinutes)}`;
 }
 
 /**
