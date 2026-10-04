@@ -8491,22 +8491,36 @@ app.get(["/api/employees/:id/face-samples", "/api/employees/:id/face-samples/"],
   console.log(`[Employees] ${operatorActor(req) || "unknown"} xem ảnh đối chiếu của ${employee.employeeCode || employee.id} (${samples.length} ảnh nhận diện, ${templateFrames.length} khung mẫu)`);
   res.json({
     success: true,
-    employee: { id: employee.id, name: employee.name, employeeCode: employee.employeeCode, department: employee.department, hasPhoto: /^data:image\/(?:jpeg|png|webp);base64,/i.test(String(employee.photoUrl || "")) },
+    employee: { id: employee.id, name: employee.name, employeeCode: employee.employeeCode, department: employee.department, hasPhoto: /^data:image\/(?:jpeg|png|webp);base64,/i.test(String(employee.photoUrl || "")) || Boolean(internalPhotoPath(employee.photoUrl)) },
     samples,
     templateFrames,
   });
 });
 
+/** A registration photo that is one of this app's protected picture routes (merged stranger face, event frame). */
+function internalPhotoPath(photoUrl: unknown): string | null {
+  const v = typeof photoUrl === "string" ? photoUrl.trim() : "";
+  return /^\/api\/(?:strangers\/faces|logs)\/[A-Za-z0-9._:-]{1,128}\/image$/.test(v) ? v : null;
+}
+
 /**
  * GET /api/employees/:id/photo (operator): the employee's registration photo as
  * an image. JSON responses never carry photoUrl (sanitizePublicJson strips it),
  * so pictures that must be shown - the merge comparison - load through here,
- * behind the biometric-image guard, and every view is logged. Only stored data
- * URLs are served; a remote URL is never fetched (no server-side request).
+ * behind the biometric-image guard, and every view is logged. A stored data URL
+ * is served directly; an internal picture path (merged stranger face, event
+ * frame) is a redirect to that protected route; a remote URL is never fetched.
  */
 app.get(["/api/employees/:id/photo", "/api/employees/:id/photo/"], requireOperatorRole("operator"), (req, res) => {
   if (!guardBiometricImage(req, res)) return;
   const employee = employees.find((e) => e.id === req.params.id);
+  // Most registration photos are a merged stranger face or an event frame: their own protected routes.
+  const internal = employee ? internalPhotoPath(employee.photoUrl) : null;
+  if (internal) {
+    console.log(`[Employees] ${operatorActor(req) || "unknown"} xem ảnh đăng ký của ${employee!.employeeCode || employee!.id}`);
+    res.redirect(302, internal);
+    return;
+  }
   const m = typeof employee?.photoUrl === "string" ? /^data:(image\/(?:jpeg|png|webp));base64,([A-Za-z0-9+/=\s]+)$/i.exec(employee.photoUrl) : null;
   if (!employee || !m) {
     res.status(404).json({ success: false, error: "Nhân viên chưa có ảnh đăng ký lưu trên hệ thống" });

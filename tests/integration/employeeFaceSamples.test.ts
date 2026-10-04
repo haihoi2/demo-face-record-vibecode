@@ -60,3 +60,19 @@ async function rawApiAsOperatorImage(path: string) {
   const res = await api<any>(path, { headers: { "Sec-Fetch-Site": "same-origin" } });
   return { status: res.status, type: res.headers.get("content-type") };
 }
+
+describe("employee registration photo stored as an internal picture path", () => {
+  it("redirects to that protected route and never fetches a remote URL", async () => {
+    const internal = await createTempEmployee({ name: `PathPhoto ${Date.now()}`, photoUrl: "/api/logs/LOG-123-abc/image" } as any);
+    const remote = await createTempEmployee({ name: `RemotePhoto ${Date.now()}`, photoUrl: "https://example.com/p.jpg" } as any);
+    cleanup.push(internal.id, remote.id);
+    const s = await api<any>(`/api/employees/${encodeURIComponent(internal.id)}/face-samples`);
+    const res = await api<any>(`/api/employees/${encodeURIComponent(internal.id)}/photo`, { redirect: "manual" });
+    if (s.body.employee.hasPhoto) {
+      assert.equal(res.status, 302);
+      assert.equal(res.headers.get("location"), "/api/logs/LOG-123-abc/image");
+    }
+    const r = await api<any>(`/api/employees/${encodeURIComponent(remote.id)}/photo`, { redirect: "manual" });
+    assert.notEqual(r.status, 302, "a remote URL is never followed or proxied");
+  });
+});
