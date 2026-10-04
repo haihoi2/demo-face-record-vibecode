@@ -33,6 +33,8 @@ import { readSuggestion, suggestionAsEmployee, suggestionMergeLabel, suggestionT
 import { normalizeApiAssetUrl, operatorJsonFetch } from "../utils/api";
 import { ProtectedImage } from "./ProtectedImage";
 import { FaceImage, FaceThumb, ImageZoomDialog } from "./FaceImage";
+import { MergeCompareDialog } from "./MergeCompareDialog";
+import { compareSuggestion } from "../utils/mergeCompare";
 import { orgChoice, orgOptions, orgPlaceholder, useOrgCatalog } from "../utils/orgCatalog";
 import { soundEffects } from "../utils/audio";
 import {
@@ -131,7 +133,7 @@ const SuggestionBox: React.FC<{
         id={`btn-merge-suggestion-${clusterId}`}
         onClick={onMerge}
         className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold border border-emerald-300 bg-white text-emerald-700 hover:bg-emerald-50 transition-colors shrink-0 focus:outline-hidden focus-visible:ring-2 focus-visible:ring-emerald-500"
-        title="Mở biểu mẫu gộp với nhân viên này đã được chọn sẵn; bạn vẫn phải xác nhận."
+        title="Mở so sánh ảnh với nhân viên này; chỉ gộp khi bạn bấm Xác nhận gộp."
       >
         <Link2 className="w-3.5 h-3.5" />
         <span>{suggestionMergeLabel(suggestion)}</span>
@@ -180,6 +182,9 @@ export const StrangerClusterModal: React.FC<StrangerClusterModalProps> = ({
   const [searchingEmployees, setSearchingEmployees] = useState<boolean>(false);
   const [mergeTarget, setMergeTarget] = useState<Employee | null>(null);
   const [adoptPhoto, setAdoptPhoto] = useState<boolean>(false);
+  // Owner 2026-10-04: every merge first opens the photo comparison; the merge
+  // request is sent only from its "Xác nhận gộp".
+  const [compareOpen, setCompareOpen] = useState<boolean>(false);
 
   // --- Blur reports (a label for tuning the blur filter; the photo is never deleted or hidden) ---
   // The toggle is a courtesy for operator/admin; the server checks the role on every request.
@@ -318,6 +323,7 @@ export const StrangerClusterModal: React.FC<StrangerClusterModalProps> = ({
     setEmployeeQuery("");
     setEmployeeResults([]);
     setAdoptPhoto(false);
+    setCompareOpen(false);
   };
 
   /**
@@ -330,6 +336,8 @@ export const StrangerClusterModal: React.FC<StrangerClusterModalProps> = ({
     setFormMode("MERGE");
     setMergeTarget(suggestionAsEmployee(suggestion));
     setEmployeeQuery(suggestion.employeeCode || suggestion.name);
+    // Straight to the photo comparison; nothing is sent until "Xác nhận gộp".
+    setCompareOpen(true);
   };
 
   // Search the authoritative server roster; failures stay failures rather than local success.
@@ -362,13 +370,20 @@ export const StrangerClusterModal: React.FC<StrangerClusterModalProps> = ({
     return () => clearTimeout(timer);
   }, [employeeQuery, formMode, isOpen]);
 
-  const handleSubmitMerge = async (e: React.FormEvent) => {
+  // The merge form's submit only opens the comparison; sendMerge runs from its "Xác nhận gộp".
+  const handleSubmitMerge = (e: React.FormEvent) => {
     e.preventDefault();
     if (!selectedCluster) return;
     if (!mergeTarget) {
       alert("Vui lòng chọn nhân viên cần gộp cụm ảnh này vào");
       return;
     }
+    setCompareOpen(true);
+  };
+
+  // The existing merge request, unchanged; on failure the comparison stays open.
+  const sendMerge = async () => {
+    if (!selectedCluster || !mergeTarget || submitting) return;
 
     setSubmitting(true);
     try {
@@ -417,6 +432,7 @@ export const StrangerClusterModal: React.FC<StrangerClusterModalProps> = ({
           ? `Đã adjudicate ${adjudicatedCount} lượt quét cho ${merged.name} và tạo mẫu nhận diện.`
           : `Đã adjudicate ${adjudicatedCount} lượt quét cho ${merged.name}; chưa tạo được mẫu nhận diện nên quyền mở cửa chưa được kích hoạt.${templateRejectHint(res.data.faceTemplateRejected)}`
       );
+      setCompareOpen(false);
       setSelectedCluster(null);
       setMergeTarget(null);
       setEmployeeQuery("");
@@ -1111,6 +1127,7 @@ export const StrangerClusterModal: React.FC<StrangerClusterModalProps> = ({
                                 onMerge={() => {
                                   setMergeTarget(suggestionAsEmployee(suggestion));
                                   setEmployeeQuery(suggestion.employeeCode || suggestion.name);
+                                  setCompareOpen(true);
                                 }}
                               />
                             )}
@@ -1249,6 +1266,7 @@ export const StrangerClusterModal: React.FC<StrangerClusterModalProps> = ({
                                 id={`btn-submit-merge-${cluster.clusterId}`}
                                 type="submit"
                                 disabled={submitting || !mergeTarget}
+                                title="Mở so sánh ảnh; chỉ gộp khi bạn bấm Xác nhận gộp"
                                 className="inline-flex items-center gap-2 px-5 py-2.5 rounded-xl text-xs font-semibold bg-emerald-600 hover:bg-emerald-700 text-white shadow-sm shadow-emerald-200 transition-colors disabled:opacity-50"
                               >
                                 {submitting ? (
@@ -1482,6 +1500,20 @@ export const StrangerClusterModal: React.FC<StrangerClusterModalProps> = ({
           </button>
         </div>
       </div>
+
+      {/* Photo comparison before any merge into an existing employee (sends nothing itself) */}
+      {compareOpen && selectedCluster && mergeTarget && formMode === "MERGE" && (
+        <MergeCompareDialog
+          cluster={selectedCluster}
+          activeObservationId={activeObservationId}
+          employee={mergeTarget}
+          suggestion={compareSuggestion(selectedCluster, mergeTarget)}
+          adoptPhoto={adoptPhoto}
+          submitting={submitting}
+          onConfirm={() => void sendMerge()}
+          onCancel={() => setCompareOpen(false)}
+        />
+      )}
 
       {/* Enlarged photo: natural size, 2x/3x for small crops, Escape/backdrop closes */}
       {previewEnlargedPhoto && (
