@@ -37,6 +37,7 @@ import { MergeCompareDialog } from "./MergeCompareDialog";
 import { compareSuggestion } from "../utils/mergeCompare";
 import { orgChoice, orgOptions, orgPlaceholder, useOrgCatalog } from "../utils/orgCatalog";
 import { soundEffects } from "../utils/audio";
+import { templateRejectReason } from "../utils/templateReject";
 import {
   defaultActiveObservationId,
   findPhotoByObservationId,
@@ -80,20 +81,10 @@ interface StrangerClusterModalProps {
   initialPreselectedFaceId?: string | null;
 }
 
-/** Why no template was made from the chosen photo, for the reasons an operator can act on. */
+/** Why no template was made from the chosen photo (leading space, or empty). */
 export function templateRejectHint(reason?: string | null): string {
-  switch (reason) {
-    case "multiple-faces":
-      return " Ảnh có nhiều người nên không biết chọn khuôn mặt nào - hãy chọn ảnh chỉ có người này.";
-    case "face-mismatch":
-      return " Không tìm thấy đúng khuôn mặt của cụm trong ảnh - hãy chọn ảnh khác của người này.";
-    case "not-frontal":
-      return " Khuôn mặt không nhìn thẳng - hãy chọn ảnh nhìn thẳng.";
-    case "low-quality":
-      return " Khuôn mặt quá nhỏ hoặc mờ - hãy chọn ảnh rõ hơn.";
-    default:
-      return "";
-  }
+  const text = templateRejectReason(reason);
+  return text ? ` ${text}` : "";
 }
 
 /**
@@ -406,7 +397,11 @@ export const StrangerClusterModal: React.FC<StrangerClusterModalProps> = ({
         adjudicatedLogsCount: number;
         recognitionReady: boolean;
         partialFailure: boolean;
+        /** The template made from the chosen photo; null when none was added. */
+        faceTemplate?: { id: string } | null;
         faceTemplateRejected?: string | null;
+        /** A repeated request: the cluster was already merged, nothing new was made. */
+        idempotentReplay?: boolean;
       }>("/api/strangers/merge", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -428,9 +423,13 @@ export const StrangerClusterModal: React.FC<StrangerClusterModalProps> = ({
       setClusters((prev) => prev.filter((c) => c.clusterId !== resolvedId));
 
       setSuccessToast(
-        res.data.recognitionReady
+        res.data.faceTemplate
           ? `Đã adjudicate ${adjudicatedCount} lượt quét cho ${merged.name} và tạo mẫu nhận diện.`
-          : `Đã adjudicate ${adjudicatedCount} lượt quét cho ${merged.name}; chưa tạo được mẫu nhận diện nên quyền mở cửa chưa được kích hoạt.${templateRejectHint(res.data.faceTemplateRejected)}`
+          : res.data.idempotentReplay && res.data.recognitionReady
+            ? `Cụm này đã được gộp cho ${merged.name} trước đó.`
+          : res.data.recognitionReady
+            ? `Đã adjudicate ${adjudicatedCount} lượt quét cho ${merged.name}; không thêm mẫu từ ảnh này.${templateRejectHint(res.data.faceTemplateRejected)} ${merged.name} vẫn được nhận diện bằng các mẫu hiện có.`
+            : `Đã adjudicate ${adjudicatedCount} lượt quét cho ${merged.name}; chưa tạo được mẫu nhận diện nên quyền mở cửa chưa được kích hoạt.${templateRejectHint(res.data.faceTemplateRejected)}`
       );
       setCompareOpen(false);
       setSelectedCluster(null);

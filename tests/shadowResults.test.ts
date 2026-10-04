@@ -49,7 +49,8 @@ describe("server wiring", () => {
   });
 
   it("the manual template cap ignores adaptation templates", () => {
-    assert.match(src, /getFaceTemplatesForEmployee\(employeeId\)\.filter\(\(t\) => t\.source !== "adaptation"\)/);
+    // The rule itself is countsAgainstTemplateCap (tests/templateCap.test.ts).
+    assert.match(src, /getFaceTemplatesForEmployee\(employeeId\)\.filter\(\(t\) => countsAgainstTemplateCap\(t\)\)/);
   });
 
   it("a group suggestion is only ever a suggestion (evidence floor, no grant path)", () => {

@@ -121,6 +121,8 @@ import type {
   ObservationMatch,
 } from "./src/types";
 import { runLocalFaceRecognition } from "./src/utils/localBiometrics";
+import { templateRejectReason } from "./src/utils/templateReject";
+import { countsAgainstTemplateCap, templateCapRefuses } from "./src/server/templateCap";
 import {
   clusterStrangerFaces,
   clusterStrangerObservations,
@@ -2518,7 +2520,7 @@ app.get(["/api/face-engine/status", "/api/face-engine/status/", "/api/face-engin
 function enforceTemplateCap(employeeId: string, keepRoom = 0): string[] {
   // Adaptation templates are capped per camera by planAdaptation and never
   // count against (or get evicted by) the manual cap.
-  const existing = db.getFaceTemplatesForEmployee(employeeId).filter((t) => t.source !== "adaptation");
+  const existing = db.getFaceTemplatesForEmployee(employeeId).filter((t) => countsAgainstTemplateCap(t));
   const limit = Math.max(0, FACE_TEMPLATE_MAX - keepRoom);
   if (existing.length <= limit) return [];
   const evicted = [...existing]
@@ -7940,9 +7942,6 @@ async function prepareTemplateFromImage(
   if (!faceEngineActive()) {
     return { rejected: activeFaceEngine() === "unavailable" ? "engine-unavailable" : "engine-disabled" };
   }
-  if (db.getFaceTemplatesForEmployee(employeeId).length >= FACE_TEMPLATE_MAX) {
-    return { rejected: "template-cap" };
-  }
   try {
     const found = await extractFaces(image);
     if (found.length === 0) return { rejected: "no-face", detectedFaces: 0 };
@@ -7977,6 +7976,14 @@ async function prepareTemplateFromImage(
     if (best.quality < FACE_ENROLL_MIN_QUALITY) {
       return { rejected: "low-quality", quality: Math.round(best.quality * 1000) / 1000, detectedFaces: faces.length };
     }
+    // Camera adaptation templates do not count (templateCap.ts). A full
+    // employee still takes a better photo: the caller trims the worst one
+    // after the commit (enforceTemplateCap).
+    const quality = Math.round(best.quality * 1000) / 1000;
+    const existingTemplates = db.getFaceTemplatesForEmployee(employeeId);
+    if (templateCapRefuses(existingTemplates, quality, FACE_TEMPLATE_MAX)) {
+      return { rejected: "template-cap", quality, detectedFaces: faces.length };
+    }
     const record: FaceTemplateRecord = {
       id: `FT-${randomUUID()}`,
       employeeId,
@@ -7984,7 +7991,7 @@ async function prepareTemplateFromImage(
       dims: best.embedding.length,
       modelTag: faceModelTag(),
       source: opts.source,
-      quality: Math.round(best.quality * 1000) / 1000,
+      quality,
       capturedAt: new Date().toISOString(),
       sourceLogId: opts.sourceLogId,
       ...(opts.streamId ? { streamId: opts.streamId } : {}),
@@ -10148,14 +10155,24 @@ app.post(["/api/strangers/merge", "/api/strangers/assign"], requireOperatorRole(
     }
     const resolution = commit.resolution;
     if (nextPhotoUrl) target.photoUrl = nextPhotoUrl;
+    // The new template may have taken the 13th slot: drop the worst one.
+    const evictedTemplates = enrolled.record ? enforceTemplateCap(target.id) : [];
+    if (evictedTemplates.length) await db.settleFaceTemplateWrites();
+    const recognitionReady = recognitionReadyForEmployee(target.id);
+    if (enrolled.rejected) {
+      console.warn(`[Strangers] Gộp cụm ${validated.clusterId} vào ${target.id}: không thêm mẫu (${enrolled.rejected}); nhận diện sẵn sàng=${recognitionReady}`);
+    }
 
+    const rejectReason = templateRejectReason(enrolled.rejected);
     const notif: MobileNotificationRecord = {
       id: "NOTIF-" + Date.now(),
-      title: enrolled.saved ? "Đã gộp cụm ảnh người lạ" : "Đã adjudicate nhưng chưa tạo được mẫu khuôn mặt",
+      title: enrolled.saved || recognitionReady ? "Đã gộp cụm ảnh người lạ" : "Đã gộp cụm ảnh nhưng chưa có mẫu khuôn mặt",
       body: enrolled.saved
         ? `Đã xác định ${validated.logIds.length} lượt DENIED là ${target.name} (${target.employeeCode}) và tạo mẫu nhận diện.`
-        : `Đã xác định lịch sử thuộc ${target.name}, nhưng enrollment thất bại; lịch sử DENIED và trạng thái khóa được giữ nguyên.`,
-      timestamp: new Date().toISOString(), type: enrolled.saved ? "SUCCESS" : "WARNING", read: false,
+        : recognitionReady
+          ? `Đã xác định ${validated.logIds.length} lượt DENIED là ${target.name} (${target.employeeCode}). Không thêm mẫu từ ảnh này: ${rejectReason} Nhân viên vẫn được nhận diện bằng các mẫu hiện có.`
+          : `Đã xác định lịch sử thuộc ${target.name}, nhưng chưa tạo được mẫu nhận diện: ${rejectReason} Lịch sử DENIED và trạng thái khóa được giữ nguyên.`,
+      timestamp: new Date().toISOString(), type: enrolled.saved || recognitionReady ? "SUCCESS" : "WARNING", read: false,
       employeeId: target.id, employeeName: target.name,
     };
     mobileNotifications.unshift(notif);
@@ -10177,8 +10194,9 @@ app.post(["/api/strangers/merge", "/api/strangers/assign"], requireOperatorRole(
       clusterResolved: true,
       faceTemplate: enrolled.saved || null,
       faceTemplateRejected: enrolled.rejected || null,
-      recognitionReady: recognitionReadyForEmployee(target.id),
-      partialFailure: !recognitionReadyForEmployee(target.id),
+      faceTemplateEvicted: evictedTemplates,
+      recognitionReady,
+      partialFailure: !recognitionReady,
       resolution,
       idempotentReplay: false,
       faceEngine: activeFaceEngine(),

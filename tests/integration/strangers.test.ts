@@ -318,6 +318,11 @@ describe("immutable DENIED history and durable idempotent resolutions", () => {
     assert.equal(first.body.adjudicatedLogsCount, payload.clusterLogIds.length);
     assert.equal(first.body.updatedLogsCount, 0);
     assert.equal(first.body.resolution.action, "MERGE");
+    // A template is either made or refused with a code; never a silent cap on
+    // a target that has no templates (the cap ignores camera adaptation).
+    assert.ok(Array.isArray(first.body.faceTemplateEvicted));
+    assert.equal(Boolean(first.body.faceTemplate), !first.body.faceTemplateRejected);
+    assert.notEqual(first.body.faceTemplateRejected, "template-cap");
 
     const second = await postJson<any>("/api/strangers/merge", payload);
     assert.equal(second.status, 200, second.text.slice(0, 300));
