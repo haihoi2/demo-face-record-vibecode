@@ -230,11 +230,11 @@ export function templateFrameCaptionParts(frame: Pick<CompareTemplateFrame, "cap
 /**
  * The suggestion's score with its strength: "Độ giống 55% - yếu" below the
  * door engine's single-view accept (same line as the panel's "(yếu ...)"),
- * otherwise "- khá". A hint's strength, never a result.
+ * otherwise "- gần giống" (owner wording 2026-10-04). A hint's strength, never a result.
  */
 export function suggestionStrengthLabel(cosine: number): string {
   const weak = !Number.isFinite(cosine) || cosine < SUGGESTION_WEAK_BELOW;
-  return `Độ giống ${formatCosinePercent(cosine)} - ${weak ? "yếu" : "khá"}`;
+  return `Độ giống ${formatCosinePercent(cosine)} - ${weak ? "yếu" : "gần giống"}`;
 }
 
 export function isWeakSuggestion(cosine: number): boolean {

@@ -176,7 +176,7 @@ describe("labels", () => {
 
   it("words the suggestion's score with its strength on the panel's weak line", () => {
     assert.equal(suggestionStrengthLabel(0.55 - 0.004), "Độ giống 55% - yếu");
-    assert.equal(suggestionStrengthLabel(0.62), "Độ giống 62% - khá");
+    assert.equal(suggestionStrengthLabel(0.62), "Độ giống 62% - gần giống");
     assert.equal(suggestionStrengthLabel(Number.NaN), "Độ giống — - yếu");
     assert.match(MERGE_COMPARE_CAUTION, /Chỉ là gợi ý/);
     assert.match(MERGE_COMPARE_CAUTION, /so ảnh/);
