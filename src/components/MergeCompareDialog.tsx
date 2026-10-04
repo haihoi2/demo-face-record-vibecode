@@ -130,8 +130,9 @@ export const MergeCompareView: React.FC<MergeCompareViewProps> = ({
   const viewedId = viewed ? observationIdOf(viewed) : "";
   const viewedIndex = viewed ? cluster.photos.indexOf(viewed) : -1;
   const viewedCaption = viewed ? strangerPhotoCaptionParts(viewed).join(" · ") : "";
-  // hasPhoto is known only once the server answered for this employee.
-  const regState = registrationPhotoState(employee.photoUrl, samples.employee ? samples.employee.hasPhoto : null);
+  // JSON never carries photoUrl (server privacy rule); a stored photo loads through the protected photo route.
+  const regSrc = employee.photoUrl || (samples.employee?.hasPhoto ? `/api/employees/${encodeURIComponent(employee.id)}/photo` : "");
+  const regState = regSrc ? "photo" : registrationPhotoState(employee.photoUrl, samples.employee ? samples.employee.hasPhoto : null);
   const emptyNotice = !loading && !loadError ? noSamplesNotice(samples) : null;
   const statusText = loading
     ? "Đang tải ảnh đối chiếu của nhân viên…"
@@ -281,12 +282,12 @@ export const MergeCompareView: React.FC<MergeCompareViewProps> = ({
                 )}
               </div>
 
-              {/* Registration photo (from the roster record the panel already holds) */}
+              {/* Registration photo: the roster record's, else the protected /api/employees/:id/photo */}
               <div className="space-y-1.5">
                 <SectionTitle>Ảnh đăng ký</SectionTitle>
                 {regState === "photo" ? (
                   <ZoomableImage
-                    src={employee.photoUrl}
+                    src={regSrc}
                     alt={`Ảnh đăng ký của ${heading}`}
                     caption="Ảnh đăng ký"
                     className="w-40 h-40"

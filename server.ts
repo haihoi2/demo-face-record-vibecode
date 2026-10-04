@@ -8491,10 +8491,34 @@ app.get(["/api/employees/:id/face-samples", "/api/employees/:id/face-samples/"],
   console.log(`[Employees] ${operatorActor(req) || "unknown"} xem ảnh đối chiếu của ${employee.employeeCode || employee.id} (${samples.length} ảnh nhận diện, ${templateFrames.length} khung mẫu)`);
   res.json({
     success: true,
-    employee: { id: employee.id, name: employee.name, employeeCode: employee.employeeCode, department: employee.department, hasPhoto: Boolean(employee.photoUrl) },
+    employee: { id: employee.id, name: employee.name, employeeCode: employee.employeeCode, department: employee.department, hasPhoto: /^data:image\/(?:jpeg|png|webp);base64,/i.test(String(employee.photoUrl || "")) },
     samples,
     templateFrames,
   });
+});
+
+/**
+ * GET /api/employees/:id/photo (operator): the employee's registration photo as
+ * an image. JSON responses never carry photoUrl (sanitizePublicJson strips it),
+ * so pictures that must be shown - the merge comparison - load through here,
+ * behind the biometric-image guard, and every view is logged. Only stored data
+ * URLs are served; a remote URL is never fetched (no server-side request).
+ */
+app.get(["/api/employees/:id/photo", "/api/employees/:id/photo/"], requireOperatorRole("operator"), (req, res) => {
+  if (!guardBiometricImage(req, res)) return;
+  const employee = employees.find((e) => e.id === req.params.id);
+  const m = typeof employee?.photoUrl === "string" ? /^data:(image\/(?:jpeg|png|webp));base64,([A-Za-z0-9+/=\s]+)$/i.exec(employee.photoUrl) : null;
+  if (!employee || !m) {
+    res.status(404).json({ success: false, error: "Nhân viên chưa có ảnh đăng ký lưu trên hệ thống" });
+    return;
+  }
+  const bytes = Buffer.from(m[2].replace(/\s+/g, ""), "base64");
+  console.log(`[Employees] ${operatorActor(req) || "unknown"} xem ảnh đăng ký của ${employee.employeeCode || employee.id}`);
+  res.setHeader("Content-Type", m[1].toLowerCase());
+  res.setHeader("Content-Length", String(bytes.length));
+  res.setHeader("Content-Security-Policy", "default-src 'none'; sandbox");
+  res.setHeader("Cache-Control", "private, no-store");
+  res.send(bytes);
 });
 
 app.get("/api/employees/merges", requireOperatorRole("admin"), (_req, res) => {

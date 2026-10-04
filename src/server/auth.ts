@@ -64,7 +64,7 @@ const RULES: readonly Rule[] = [
   // --- admin-only reads: account records and configuration that names secrets
   { methods: READ, pattern: /^\/api\/users(?:\/|$)/, role: "admin" },
   // Face pictures of an employee for the merge comparison: biometric -> operator.
-  { methods: READ, pattern: /^\/api\/employees\/[^/]+\/face-samples$/, role: "operator" },
+  { methods: READ, pattern: /^\/api\/employees\/[^/]+\/(?:face-samples|photo)$/, role: "operator" },
   // Who merged which employee record into which (names of removed records).
   { methods: READ, pattern: /^\/api\/employees\/merges$/, role: "admin" },
   { methods: READ, pattern: /^\/api\/door-controller\/config$/, role: "admin" },
