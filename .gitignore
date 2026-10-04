@@ -9,3 +9,6 @@ coverage/
 
 # Runtime data (SQLite DB, JSON fallback, uploads) - written by the container, never versioned
 data/
+
+# Agent worktrees (local, never committed)
+.claude/worktrees/
