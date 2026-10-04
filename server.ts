@@ -8454,6 +8454,49 @@ app.post(["/api/employees/merge", "/employees/merge"], requireOperatorRole("admi
 });
 
 /** Recorded employee merges (admin): who merged which record into which, and when. */
+/**
+ * GET /api/employees/:id/face-samples (operator): pictures of an employee to
+ * compare with a stranger before merging (owner 2026-10-04: "mở xem ảnh ... để
+ * xác nhận gộp"). Ids only - the images come through the existing protected
+ * routes: recent face crops of this person at the gates (recognised-face
+ * observations, kept FACE_STRANGER_FACE_RETENTION_DAYS) via
+ * /api/strangers/faces/:faceId/image, and the camera frames their templates
+ * came from via /api/logs/:logId/image. The read is logged with the actor.
+ */
+app.get(["/api/employees/:id/face-samples", "/api/employees/:id/face-samples/"], requireOperatorRole("operator"), async (req, res) => {
+  const employee = employees.find((e) => e.id === req.params.id);
+  if (!employee) {
+    res.status(404).json({ success: false, error: `Không tìm thấy nhân viên ${req.params.id}` });
+    return;
+  }
+  let samples: Array<{ faceId: string; capturedAt: string; gateId?: string; matchCosine?: number }> = [];
+  try {
+    const since = new Date(Date.now() - 30 * 86_400_000).toISOString();
+    const faces = await db.getRecognisedFaceObservations(since, employee.id, 8);
+    samples = faces.map((f: any) => ({
+      faceId: f.id,
+      capturedAt: f.capturedAt,
+      ...(typeof f.gateId === "string" ? { gateId: f.gateId } : {}),
+      ...(typeof f.matchCosine === "number" ? { matchCosine: Math.round(f.matchCosine * 1000) / 1000 } : {}),
+    }));
+  } catch (err: any) {
+    console.warn(`[Employees] Không đọc được ảnh nhận diện của ${employee.id}: ${err?.message || err}`);
+  }
+  const templateFrames = db
+    .getFaceTemplatesForEmployee(employee.id)
+    .filter((t) => typeof t.sourceLogId === "string" && t.sourceLogId)
+    .sort((a, b) => String(b.capturedAt).localeCompare(String(a.capturedAt)))
+    .slice(0, 4)
+    .map((t) => ({ logId: t.sourceLogId as string, capturedAt: t.capturedAt, source: t.source, ...(t.streamId ? { streamId: t.streamId } : {}) }));
+  console.log(`[Employees] ${operatorActor(req) || "unknown"} xem ảnh đối chiếu của ${employee.employeeCode || employee.id} (${samples.length} ảnh nhận diện, ${templateFrames.length} khung mẫu)`);
+  res.json({
+    success: true,
+    employee: { id: employee.id, name: employee.name, employeeCode: employee.employeeCode, department: employee.department, hasPhoto: Boolean(employee.photoUrl) },
+    samples,
+    templateFrames,
+  });
+});
+
 app.get("/api/employees/merges", requireOperatorRole("admin"), (_req, res) => {
   res.json({ success: true, merges: db.getEmployeeMerges() });
 });
