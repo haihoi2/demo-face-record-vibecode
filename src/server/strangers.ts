@@ -42,11 +42,23 @@ export interface StrangerCluster {
   similarityScore: number | null;
   suggestedName?: string;
   notes?: string;
+  /**
+   * Set when an operator split these photos off another group: the split's id
+   * and full membership, so the panel can offer "Gộp lại" (restore).
+   */
+  split?: { clusterId: string; observationIds: string[] };
 }
 
 export interface StrangerClusterOptions {
   includeDemoSeeds?: boolean;
   cosineThreshold?: number;
+  /**
+   * Operator splits (db.getStrangerSplitPartitions): an observation only ever
+   * groups with observations of the same split; unsplit ones share "".
+   */
+  partitionOf?: ReadonlyMap<string, string>;
+  /** Each split's full membership, attached to a group made only of that split's photos. */
+  splits?: ReadonlyMap<string, string[]>;
 }
 
 // Demo-only data. Production callers must explicitly opt in.
@@ -195,10 +207,14 @@ export function clusterStrangerObservations(
     .slice()
     .sort((a, b) => membershipKey(a).localeCompare(membershipKey(b)));
 
+  const partitionOf = (o: StrangerObservation) => options.partitionOf?.get(o.observationId) || "";
   const groups: StrangerObservation[][] = [];
+  const groupPartitions: string[] = [];
   for (const item of items) {
+    const partition = partitionOf(item);
     if (!item.embedding?.length || !item.modelTag) {
       groups.push([item]);
+      groupPartitions.push(partition);
       continue;
     }
 
@@ -206,6 +222,8 @@ export function clusterStrangerObservations(
     let bestMinimumSimilarity = -Infinity;
     for (let groupIndex = 0; groupIndex < groups.length; groupIndex++) {
       const group = groups[groupIndex];
+      // Photos an operator split apart never rejoin automatically.
+      if (groupPartitions[groupIndex] !== partition) continue;
       if (group.some((member) => !member.embedding?.length || member.modelTag !== item.modelTag)) continue;
       const similarities = group.map((member) => cosineSimilarity(item.embedding!, member.embedding!));
       const minimumSimilarity = Math.min(...similarities);
@@ -215,12 +233,15 @@ export function clusterStrangerObservations(
       }
     }
     if (bestGroup >= 0) groups[bestGroup].push(item);
-    else groups.push([item]);
+    else {
+      groups.push([item]);
+      groupPartitions.push(partition);
+    }
   }
 
   const clusters: StrangerCluster[] = [];
   let index = 1;
-  for (const members of groups) {
+  for (const [groupIndex, members] of groups.entries()) {
     const clusterId = clusterIdFor(members.map(membershipKey));
     if (resolved.has(clusterId)) continue;
 
@@ -266,6 +287,9 @@ export function clusterStrangerObservations(
       primaryPhoto: photos[0].photoSnapshot,
       similarityScore,
       notes: `Đã phát hiện ${photos.length} lần quét tại ${photos[0].doorName}.`,
+      ...(groupPartitions[groupIndex] && options.splits?.has(groupPartitions[groupIndex])
+        ? { split: { clusterId: groupPartitions[groupIndex], observationIds: [...options.splits.get(groupPartitions[groupIndex])!] } }
+        : {}),
     });
     index++;
   }

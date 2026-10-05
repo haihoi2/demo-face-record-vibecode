@@ -27,6 +27,9 @@ import {
   ExternalLink,
   Lightbulb,
   Focus,
+  Scissors,
+  EyeOff,
+  RotateCcw,
 } from "lucide-react";
 import { StrangerCluster, StrangerClusterSuggestion, StrangerPhoto, Employee, AccessLog } from "../types";
 import { readSuggestion, suggestionAsEmployee, suggestionMergeLabel, suggestionText } from "../utils/accuracyUi";
@@ -38,6 +41,14 @@ import { compareSuggestion } from "../utils/mergeCompare";
 import { orgChoice, orgOptions, orgPlaceholder, useOrgCatalog } from "../utils/orgCatalog";
 import { soundEffects } from "../utils/audio";
 import { templateRejectReason } from "../utils/templateReject";
+import {
+  ClusterEditAction,
+  ClusterEditUndo,
+  clusterEditRequest,
+  clusterEditSuccessText,
+  splitUndoRequest,
+  toggleObservation,
+} from "../utils/clusterEdit";
 import {
   defaultActiveObservationId,
   findPhotoByObservationId,
@@ -180,6 +191,12 @@ export const StrangerClusterModal: React.FC<StrangerClusterModalProps> = ({
   // --- Blur reports (a label for tuning the blur filter; the photo is never deleted or hidden) ---
   // The toggle is a courtesy for operator/admin; the server checks the role on every request.
   const canReportBlur = hasRole(useOperatorSession(), "operator");
+  // Group editing (split / take photos out): operator and admin, same as the blur toggle.
+  const canEditClusters = canReportBlur;
+  const [editingClusterId, setEditingClusterId] = useState<string | null>(null);
+  const [editSelection, setEditSelection] = useState<string[]>([]);
+  const [editPending, setEditPending] = useState(false);
+  const [editNotice, setEditNotice] = useState<{ kind: "success" | "error"; text: string; undo?: ClusterEditUndo } | null>(null);
   const [blurPending, setBlurPending] = useState<Record<string, boolean>>({});
   const [blurNotice, setBlurNotice] = useState<{ kind: "success" | "error"; text: string } | null>(null);
 
@@ -300,6 +317,8 @@ export const StrangerClusterModal: React.FC<StrangerClusterModalProps> = ({
   }, [isOpen, initialPreselectedLogId, initialPreselectedFaceId]);
 
   const handleOpenRegister = (cluster: StrangerCluster, preferredObservationId?: string) => {
+    setEditingClusterId(null);
+    setEditSelection([]);
     setSelectedCluster(cluster);
     setActiveObservationId(defaultActiveObservationId(cluster, preferredObservationId));
     // Auto-suggest next employee code
@@ -478,6 +497,62 @@ export const StrangerClusterModal: React.FC<StrangerClusterModalProps> = ({
       alert(`Từ chối cụm ảnh thất bại: ${err?.message || "Lỗi máy chủ"}`);
     } finally {
       setDismissingId(null);
+    }
+  };
+
+  const startClusterEdit = (cluster: StrangerCluster) => {
+    if (selectedCluster?.clusterId === cluster.clusterId) setSelectedCluster(null);
+    setEditingClusterId(cluster.clusterId);
+    setEditSelection([]);
+    setEditNotice(null);
+  };
+  const stopClusterEdit = () => {
+    setEditingClusterId(null);
+    setEditSelection([]);
+  };
+
+  /**
+   * Split the picked photos into their own group, or take them out of the
+   * group. The server records it (append-only) and returns what undoes it; the
+   * list reloads because the groups change.
+   */
+  const handleClusterEdit = async (action: ClusterEditAction, cluster: StrangerCluster) => {
+    const count = editSelection.length;
+    if (!count || editPending) return;
+    if (action === "split" && count >= cluster.photos.length) return;
+    if (action === "remove" && !window.confirm(
+      `Bỏ ${count} ảnh khỏi "${cluster.label}"?\nẢnh sẽ được ẩn khỏi danh sách người lạ (không bị xóa, nhật ký vẫn giữ nguyên) và có thể hoàn tác.`
+    )) return;
+    setEditPending(true);
+    setEditNotice(null);
+    try {
+      const { url, init } = clusterEditRequest(action, cluster, editSelection);
+      const res = await operatorJsonFetch<{ success: boolean; error?: string; undo?: ClusterEditUndo }>(url, init);
+      if (!res.ok || !res.data?.success) throw new Error(res.data?.error || `HTTP ${res.status}`);
+      setEditNotice({ kind: "success", text: clusterEditSuccessText(action, count), undo: res.data.undo });
+      stopClusterEdit();
+      loadClusters(currentCursor, cursorHistory);
+    } catch (err: any) {
+      setEditNotice({ kind: "error", text: `${action === "split" ? "Tách cụm" : "Bỏ ảnh khỏi cụm"} thất bại: ${err?.message || "Lỗi máy chủ"}` });
+    } finally {
+      setEditPending(false);
+    }
+  };
+
+  /** Undo the last edit, or re-join a split group ("Gộp lại"). */
+  const handleUndoClusterEdit = async (undo: ClusterEditUndo, doneText: string) => {
+    if (editPending) return;
+    setEditPending(true);
+    try {
+      const { url, init } = splitUndoRequest(undo);
+      const res = await operatorJsonFetch<{ success: boolean; error?: string }>(url, init);
+      if (!res.ok || !res.data?.success) throw new Error(res.data?.error || `HTTP ${res.status}`);
+      setEditNotice({ kind: "success", text: doneText });
+      loadClusters(currentCursor, cursorHistory);
+    } catch (err: any) {
+      setEditNotice({ kind: "error", text: `Hoàn tác thất bại: ${err?.message || "Lỗi máy chủ"}` });
+    } finally {
+      setEditPending(false);
     }
   };
 
@@ -703,6 +778,46 @@ export const StrangerClusterModal: React.FC<StrangerClusterModalProps> = ({
           )}
         </div>
 
+        {/* Group edit result (split / take out / undo), with an undo button */}
+        <div id="cluster-edit-notice" aria-live={editNotice?.kind === "error" ? "assertive" : "polite"} aria-atomic="true">
+          {editNotice && (
+            <div
+              className={`mx-6 mt-4 p-3 rounded-2xl border flex items-center gap-2.5 text-xs animate-in slide-in-from-top duration-300 ${
+                editNotice.kind === "error" ? "bg-rose-50 border-rose-200 text-rose-900" : "bg-emerald-50 border-emerald-200 text-emerald-900"
+              }`}
+            >
+              {editNotice.kind === "error" ? (
+                <AlertTriangle className="w-4 h-4 text-rose-600 shrink-0" aria-hidden="true" />
+              ) : (
+                <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" aria-hidden="true" />
+              )}
+              <span className="flex-1 leading-relaxed">{editNotice.text}</span>
+              {editNotice.undo && (
+                <button
+                  id="btn-undo-cluster-edit"
+                  type="button"
+                  disabled={editPending}
+                  onClick={() => handleUndoClusterEdit(editNotice.undo!, "Đã hoàn tác.")}
+                  className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg border border-emerald-300 bg-white font-semibold text-emerald-800 hover:bg-emerald-100 disabled:opacity-50 focus:outline-hidden focus-visible:ring-2 focus-visible:ring-emerald-500"
+                >
+                  <RotateCcw className="w-3 h-3" aria-hidden="true" />
+                  Hoàn tác
+                </button>
+              )}
+              <button
+                id="btn-dismiss-cluster-edit-notice"
+                type="button"
+                onClick={() => setEditNotice(null)}
+                aria-label="Đóng thông báo"
+                title="Đóng thông báo"
+                className="p-1 rounded-lg opacity-70 hover:opacity-100 hover:bg-white/60 transition-colors shrink-0 focus:outline-hidden focus-visible:ring-2 focus-visible:ring-indigo-500"
+              >
+                <X className="w-3.5 h-3.5" />
+              </button>
+            </div>
+          )}
+        </div>
+
         {/* Modal Body */}
         <div className="p-6 overflow-y-auto flex-1 space-y-6">
           {/* Information Callout */}
@@ -750,6 +865,8 @@ export const StrangerClusterModal: React.FC<StrangerClusterModalProps> = ({
                 const activeFramePath = activePhoto ? frameLinkPath(activePhoto) : null;
                 const suggestion = readSuggestion(cluster.suggestion);
                 const suggestionSelected = !!suggestion && isSelected && formMode === "MERGE" && mergeTarget?.id === suggestion.employeeId;
+                const isEditing = editingClusterId === cluster.clusterId;
+                const splitInfo = (cluster as StrangerCluster & { split?: ClusterEditUndo & { observationIds: string[] } }).split;
 
                 return (
                   <div
@@ -776,6 +893,12 @@ export const StrangerClusterModal: React.FC<StrangerClusterModalProps> = ({
                                 {cluster.similarityScore}% trùng khớp
                               </span>
                             )}
+                            {splitInfo && (
+                              <span className="px-2 py-0.5 rounded-full text-[11px] font-semibold bg-violet-50 text-violet-700 border border-violet-200 flex items-center gap-1">
+                                <Scissors className="w-3 h-3" aria-hidden="true" />
+                                Đã tách thủ công
+                              </span>
+                            )}
                             {cluster.estimatedGender && (
                               <span className="px-2 py-0.5 rounded-full text-[11px] font-medium bg-slate-100 text-slate-700">
                                 {cluster.estimatedGender}
@@ -787,7 +910,38 @@ export const StrangerClusterModal: React.FC<StrangerClusterModalProps> = ({
                       </div>
 
                       {/* Action Buttons */}
-                      <div className="flex items-center gap-2">
+                      <div className="flex items-center gap-2 flex-wrap justify-end">
+                        {canEditClusters && splitInfo && !isEditing && (
+                          <button
+                            id={`btn-rejoin-split-${cluster.clusterId}`}
+                            type="button"
+                            disabled={editPending}
+                            onClick={() => handleUndoClusterEdit(
+                              { clusterId: splitInfo.clusterId, clusterObservationIds: splitInfo.observationIds },
+                              "Đã gộp lại cụm đã tách.",
+                            )}
+                            title="Bỏ thao tác tách: các ảnh này được gom cụm tự động trở lại"
+                            className="inline-flex items-center gap-2 px-3 py-2 rounded-xl text-xs font-semibold border border-violet-200 text-violet-700 bg-white hover:bg-violet-50 transition-colors disabled:opacity-50"
+                          >
+                            <RotateCcw className="w-3.5 h-3.5" />
+                            <span>Gộp lại</span>
+                          </button>
+                        )}
+                        {canEditClusters && !isSelected && (
+                          <button
+                            id={`btn-edit-cluster-${cluster.clusterId}`}
+                            type="button"
+                            onClick={() => (isEditing ? stopClusterEdit() : startClusterEdit(cluster))}
+                            aria-pressed={isEditing}
+                            title="Chọn ảnh để tách thành cụm mới hoặc bỏ khỏi cụm"
+                            className={`inline-flex items-center gap-2 px-3 py-2 rounded-xl text-xs font-semibold border transition-colors ${
+                              isEditing ? "border-indigo-600 bg-indigo-600 text-white" : "border-slate-200 text-slate-700 bg-white hover:bg-slate-50"
+                            }`}
+                          >
+                            <Scissors className="w-3.5 h-3.5" />
+                            <span>{isEditing ? "Xong" : "Sửa cụm"}</span>
+                          </button>
+                        )}
                         <button
                           id={`btn-dismiss-cluster-${cluster.clusterId}`}
                           type="button"
@@ -834,9 +988,42 @@ export const StrangerClusterModal: React.FC<StrangerClusterModalProps> = ({
                           {cluster.photos.length} hình chụp nhận diện tương đồng của cùng người này:
                         </span>
                         <span className="text-[11px] text-slate-400">
-                          (Nhấp vào ảnh để phóng to hoặc chọn làm avatar chính)
+                          {isEditing ? "(Nhấp vào ảnh để chọn / bỏ chọn)" : "(Nhấp vào ảnh để phóng to hoặc chọn làm avatar chính)"}
                         </span>
                       </div>
+
+                      {isEditing && (
+                        <div
+                          id={`cluster-edit-toolbar-${cluster.clusterId}`}
+                          className="mb-3 p-2.5 rounded-xl border border-indigo-200 bg-indigo-50/60 flex flex-wrap items-center gap-2 text-xs"
+                        >
+                          <span className="font-semibold text-indigo-900 mr-auto" aria-live="polite">
+                            Đã chọn {editSelection.length}/{cluster.photos.length} ảnh
+                          </span>
+                          <button
+                            id={`btn-split-cluster-${cluster.clusterId}`}
+                            type="button"
+                            disabled={editPending || editSelection.length === 0 || editSelection.length >= cluster.photos.length}
+                            onClick={() => handleClusterEdit("split", cluster)}
+                            title={editSelection.length >= cluster.photos.length ? "Phải để lại ít nhất một ảnh trong cụm cũ" : "Các ảnh đã chọn là người khác: tách thành cụm riêng"}
+                            className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg font-semibold bg-indigo-600 text-white hover:bg-indigo-700 disabled:opacity-40"
+                          >
+                            <Scissors className="w-3.5 h-3.5" aria-hidden="true" />
+                            Tách thành cụm mới
+                          </button>
+                          <button
+                            id={`btn-remove-photos-${cluster.clusterId}`}
+                            type="button"
+                            disabled={editPending || editSelection.length === 0}
+                            onClick={() => handleClusterEdit("remove", cluster)}
+                            title="Ẩn các ảnh đã chọn khỏi danh sách người lạ (không xóa, có thể hoàn tác)"
+                            className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg font-semibold border border-rose-200 text-rose-700 bg-white hover:bg-rose-50 disabled:opacity-40"
+                          >
+                            <EyeOff className="w-3.5 h-3.5" aria-hidden="true" />
+                            Bỏ khỏi cụm
+                          </button>
+                        </div>
+                      )}
 
                       <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-6 gap-3">
                         {cluster.photos.map((photo, pIdx) => {
@@ -849,6 +1036,7 @@ export const StrangerClusterModal: React.FC<StrangerClusterModalProps> = ({
                           const blurReported = isBlurReported(photo);
                           const showBlurToggle = canReportBlur && canBlurReport(photo);
                           const blurBusy = canBlurReport(photo) && !!blurPending[photo.faceId];
+                          const isPicked = isEditing && editSelection.includes(tileId);
 
                           return (
                             <div
@@ -856,7 +1044,9 @@ export const StrangerClusterModal: React.FC<StrangerClusterModalProps> = ({
                               id={`photo-card-${cluster.clusterId}-${pIdx}`}
                               data-observation-id={tileId}
                               className={`relative group aspect-square rounded-xl overflow-hidden border bg-slate-900 transition-all ${
-                                isPrimary
+                                isPicked
+                                  ? "ring-2 ring-rose-500 border-rose-500 shadow-md"
+                                  : isPrimary
                                   ? "ring-2 ring-indigo-600 border-indigo-600 shadow-md"
                                   : "border-slate-200 hover:border-slate-300 hover:shadow-xs"
                               }`}
@@ -871,18 +1061,22 @@ export const StrangerClusterModal: React.FC<StrangerClusterModalProps> = ({
                               <button
                                 type="button"
                                 onClick={() => {
-                                  if (isSelected) {
+                                  if (isEditing) {
+                                    setEditSelection((prev) => toggleObservation(prev, tileId));
+                                  } else if (isSelected) {
                                     setActiveObservationId(tileId);
                                   } else {
                                     setPreviewEnlargedPhoto(photo.photoSnapshot);
                                   }
                                 }}
-                                aria-pressed={isSelected ? isPrimary : undefined}
-                                // Not registering: the zoom button below is the keyboard path; skip this duplicate.
-                                tabIndex={isSelected ? 0 : -1}
-                                aria-hidden={isSelected ? undefined : true}
+                                aria-pressed={isEditing ? isPicked : isSelected ? isPrimary : undefined}
+                                // Not registering or editing: the zoom button below is the keyboard path; skip this duplicate.
+                                tabIndex={isSelected || isEditing ? 0 : -1}
+                                aria-hidden={isSelected || isEditing ? undefined : true}
                                 aria-label={
-                                  isSelected
+                                  isEditing
+                                    ? `${isPicked ? "Bỏ chọn" : "Chọn"} ảnh khuôn mặt ${pIdx + 1}`
+                                    : isSelected
                                     ? `Chọn ảnh khuôn mặt ${pIdx + 1} làm ảnh chính`
                                     : `Phóng to ảnh khuôn mặt ${pIdx + 1}`
                                 }
@@ -935,6 +1129,17 @@ export const StrangerClusterModal: React.FC<StrangerClusterModalProps> = ({
                                     <Focus className="w-3 h-3" aria-hidden="true" />
                                   )}
                                 </button>
+                              )}
+
+                              {isEditing && (
+                                <div
+                                  aria-hidden="true"
+                                  className={`pointer-events-none absolute ${showBlurToggle ? "top-8" : "top-1.5"} right-1.5 w-5 h-5 rounded-md border-2 flex items-center justify-center ${
+                                    isPicked ? "bg-rose-500 border-rose-500 text-white" : "bg-black/40 border-white/80"
+                                  }`}
+                                >
+                                  {isPicked && <Check className="w-3.5 h-3.5" />}
+                                </div>
                               )}
 
                               {/* Primary tag badge (below the blur toggle when there is one) */}

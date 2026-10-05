@@ -24,6 +24,7 @@ import {
   FaceTemplateRecord,
   StrangerResolutionRecord,
   sameResolutionIntent,
+  isRestorableResolutionAction,
   UserRecord,
   OrgCatalogRecord,
   OrgEntryRecord,
@@ -9064,14 +9065,15 @@ async function strangerWindow(): Promise<{ logs: AccessLogRecord[]; faces: Stran
   const logs = await collectStrangerWindow((cursor, limit) => db.getStrangerCandidateLogsPage(cursor, limit), STRANGER_CLUSTER_WINDOW);
   const faces = await collectStrangerFaceWindow(STRANGER_CLUSTER_WINDOW);
   const retired = db.getRetiredStrangerObservationIds();
+  const { partitionOf, splits, key: splitKey } = db.getStrangerSplitPartitions();
   const key = [
     logs.length, logs[0]?.id || "", logs[logs.length - 1]?.id || "",
     faces.length, faces[0]?.id || "", faces[faces.length - 1]?.id || "",
-    retired.length, DEMO_DATA_ENABLED,
+    retired.length, splitKey, DEMO_DATA_ENABLED,
   ].join("|");
   if (strangerWindowCache?.key === key) return strangerWindowCache;
   const observations = [...observationsFromLogs(logs, retired), ...observationsFromFaces(faces, retired)];
-  const clusters = clusterStrangerObservations(observations, retired, { includeDemoSeeds: DEMO_DATA_ENABLED });
+  const clusters = clusterStrangerObservations(observations, retired, { includeDemoSeeds: DEMO_DATA_ENABLED, partitionOf, splits });
   attachClusterSuggestions(clusters, observations);
   registerStrangerClusters(clusters, logs, faces);
   strangerWindowCache = { key, logs, faces, clusters };
@@ -9907,6 +9909,109 @@ app.post(["/api/strangers/dismiss", "/api/strangers/reject"], requireOperatorRol
 });
 
 /**
+ * Group editing (2026-10-05): the photos an operator picked out of one group.
+ * The group must be the one on screen (membership or clusterVersion, as for
+ * merge/dismiss) and every picked photo one of its members.
+ */
+async function pickedFromStrangerCluster(req: Request): Promise<
+  | { validated: Exclude<Awaited<ReturnType<typeof validatedStrangerCluster>>, { error: string }>; logIds: string[]; faceIds: string[]; observationIds: string[]; reason: string }
+  | { status: number; error: string }
+> {
+  const membership = requestedMembership(req.body);
+  if ("error" in membership) return { status: 400, error: membership.error };
+  const picked = parseObservationIds(req.body?.selectedObservationIds);
+  if (!picked) return { status: 400, error: "selectedObservationIds không hợp lệ" };
+  const observationIds = [...picked.logIds.map((id) => `log:${id}`), ...picked.faceIds.map(faceObservationId)].sort();
+  if (observationIds.length === 0) return { status: 400, error: "Chưa chọn ảnh nào" };
+  if (observationIds.length > 500) return { status: 400, error: "Chọn tối đa 500 ảnh mỗi lần" };
+  const reasonError = stringFieldError(req.body, ["reason"]);
+  if (reasonError) return { status: 400, error: reasonError };
+  const validated = await validatedStrangerCluster(req.params.clusterId, membership, req.body?.clusterVersion);
+  if ("error" in validated) return { status: 409, error: validated.error };
+  const members = new Set(validated.observationIds);
+  if (observationIds.some((id) => !members.has(id))) return { status: 409, error: "Ảnh đã chọn không thuộc cụm này" };
+  const reason = (optionalTrimmedString(req.body?.reason) || "").slice(0, 120);
+  return { validated, logIds: picked.logIds, faceIds: picked.faceIds, observationIds, reason };
+}
+
+/**
+ * Split photos off a stranger group into their own group (they are a different
+ * person). Append-only SPLIT adjudication: nothing is hidden or deleted, the
+ * access history stays as it was, and /api/strangers/restore undoes it.
+ */
+app.post("/api/strangers/clusters/:clusterId/split", requireOperatorRole("operator"), requireCsrf, async (req, res) => {
+  try {
+    const picked = await pickedFromStrangerCluster(req);
+    if ("error" in picked) {
+      res.status(picked.status).json({ success: false, error: picked.error });
+      return;
+    }
+    if (picked.observationIds.length >= picked.validated.observationIds.length) {
+      res.status(400).json({ success: false, error: "Phải để lại ít nhất một ảnh trong cụm cũ" });
+      return;
+    }
+    const clusterId = `SPLIT-${randomUUID()}`;
+    const commit = await db.commitStrangerResolution({
+      resolution: {
+        id: resolutionId(clusterId), clusterId, action: "SPLIT", actor: operatorActor(req), resolvedAt: new Date().toISOString(),
+        logIds: picked.logIds, faceIds: picked.faceIds,
+        metadata: { kind: "split", fromClusterId: picked.validated.clusterId, reason: picked.reason || null },
+      },
+    });
+    if (commit.status === "conflict") {
+      res.status(409).json({ success: false, error: "Không ghi được thao tác tách cụm" });
+      return;
+    }
+    strangerWindowCache = null;
+    strangerClusterRegistry.delete(picked.validated.clusterId);
+    console.log(`[Strangers] ${operatorActor(req)} tách ${picked.observationIds.length}/${picked.validated.observationIds.length} ảnh khỏi ${picked.validated.clusterId} (${clusterId})`);
+    broadcastSSE("stranger_split", { clusterId, fromClusterId: picked.validated.clusterId, clusterObservationIds: picked.observationIds });
+    res.json({ success: true, message: `Đã tách ${picked.observationIds.length} ảnh thành cụm mới`, resolution: commit.resolution,
+      undo: { clusterId, clusterObservationIds: picked.observationIds } });
+  } catch (err: any) {
+    console.error("[Strangers] Lỗi tách cụm ảnh người lạ:", err);
+    res.status(500).json({ success: false, error: err?.message || "Lỗi tách cụm ảnh người lạ" });
+  }
+});
+
+/**
+ * Take photos out of a stranger group (wrong person, not a face, unusable).
+ * The same append-only DISMISS an operator uses for a whole group, for just
+ * these photos: hidden from the panel, nothing deleted, restorable.
+ */
+app.post("/api/strangers/clusters/:clusterId/remove-photos", requireOperatorRole("operator"), requireCsrf, async (req, res) => {
+  try {
+    const picked = await pickedFromStrangerCluster(req);
+    if ("error" in picked) {
+      res.status(picked.status).json({ success: false, error: picked.error });
+      return;
+    }
+    const reason = picked.reason || "Bỏ khỏi cụm thủ công";
+    const clusterId = `REMOVED-${randomUUID()}`;
+    const commit = await db.commitStrangerResolution({
+      resolution: {
+        id: resolutionId(clusterId), clusterId, action: "DISMISS", actor: operatorActor(req), resolvedAt: new Date().toISOString(),
+        logIds: picked.logIds, faceIds: picked.faceIds,
+        metadata: { intent: { reason }, kind: "removed-from-group", fromClusterId: picked.validated.clusterId, reason },
+      },
+    });
+    if (commit.status === "conflict") {
+      res.status(409).json({ success: false, error: "Không ghi được thao tác bỏ ảnh khỏi cụm" });
+      return;
+    }
+    strangerWindowCache = null;
+    strangerClusterRegistry.delete(picked.validated.clusterId);
+    console.log(`[Strangers] ${operatorActor(req)} bỏ ${picked.observationIds.length}/${picked.validated.observationIds.length} ảnh khỏi ${picked.validated.clusterId} (${clusterId})`);
+    broadcastSSE("stranger_dismissed", { clusterId, clusterLogIds: picked.logIds, clusterObservationIds: picked.observationIds });
+    res.json({ success: true, message: `Đã bỏ ${picked.observationIds.length} ảnh khỏi cụm`, resolution: commit.resolution,
+      undo: { clusterId, clusterObservationIds: picked.observationIds } });
+  } catch (err: any) {
+    console.error("[Strangers] Lỗi bỏ ảnh khỏi cụm người lạ:", err);
+    res.status(500).json({ success: false, error: err?.message || "Lỗi bỏ ảnh khỏi cụm" });
+  }
+});
+
+/**
  * Admin: retire stored stranger captures that are not (usable) faces - found
  * by re-scoring the stored photos (scripts/strangers/score-captures.ts). The
  * access events stay as they are (immutable history); the captures leave the
@@ -9994,8 +10099,9 @@ app.post("/api/strangers/restore", requireOperatorRole("operator"), requireCsrf,
       return;
     }
     const resolution = db.getStrangerResolution(clusterId);
-    if (!resolution || resolution.action !== "DISMISS") {
-      res.status(409).json({ success: false, error: "Không tìm thấy adjudication DISMISS có thể khôi phục" });
+    // DISMISS (a hidden group or photos) or SPLIT (photos split off a group).
+    if (!resolution || !isRestorableResolutionAction(resolution.action)) {
+      res.status(409).json({ success: false, error: "Không tìm thấy thao tác ẩn hoặc tách cụm có thể khôi phục" });
       return;
     }
     const actual = [...resolution.logIds].sort();
@@ -10023,7 +10129,7 @@ app.post("/api/strangers/restore", requireOperatorRole("operator"), requireCsrf,
     broadcastSSE("stranger_restored", {
       clusterId, clusterLogIds: actual, clusterObservationIds: actualFaces.map(faceObservationId), actor: operatorActor(req),
     });
-    res.json({ success: true, message: "Đã khôi phục cụm ảnh người lạ", resolution: restored });
+    res.json({ success: true, message: resolution.action === "SPLIT" ? "Đã gộp lại cụm đã tách" : "Đã khôi phục cụm ảnh người lạ", resolution: restored });
   } catch (err: any) {
     if (err?.message === "restore-conflict") {
       res.status(409).json({ success: false, error: "Adjudication đã thay đổi; không thể khôi phục" });

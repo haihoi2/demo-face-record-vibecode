@@ -648,7 +648,17 @@ function accumulateStats(rows: Array<Pick<AccessLogRecord, "timestamp" | "type" 
   return stats;
 }
 
-export type StrangerResolutionAction = "QUICK_REGISTER" | "MERGE" | "DISMISS" | "RESTORE";
+/**
+ * SPLIT (2026-10-05): an operator split photos off a stranger group. Unlike the
+ * others it does NOT take the photos out of the panel - they form their own
+ * group (getStrangerSplitPartitions) and never rejoin the old one automatically.
+ */
+export type StrangerResolutionAction = "QUICK_REGISTER" | "MERGE" | "DISMISS" | "SPLIT" | "RESTORE";
+
+/** Adjudications an operator can undo with /api/strangers/restore. */
+export function isRestorableResolutionAction(action: string | undefined): boolean {
+  return action === "DISMISS" || action === "SPLIT";
+}
 
 /**
  * One employee merge (duplicate records of the same person). Append-only:
@@ -3611,10 +3621,30 @@ class SQLiteStorage implements StrangerFaceStore, ShadowResultStore, LoginEventS
 
   /** Observation ids covered by a current adjudication: `log:<id>` per logId, `face:<id>` per faceId. */
   getRetiredStrangerObservationIds(): string[] {
-    return this.getStrangerResolutions().flatMap((resolution) => [
+    // A split keeps its photos in the panel, as their own group.
+    return this.getStrangerResolutions().filter((resolution) => resolution.action !== "SPLIT").flatMap((resolution) => [
       ...resolution.logIds.map((id) => `log:${id}`),
       ...(resolution.faceIds || []).map((id) => `face:${id}`),
     ]);
+  }
+
+  /**
+   * Current splits: which split each observation (`log:`/`face:`) belongs to
+   * (the newest split wins when photos were split again), each split's own
+   * membership (for "Gộp lại"), and a key that changes whenever they do.
+   */
+  getStrangerSplitPartitions(): { partitionOf: Map<string, string>; splits: Map<string, string[]>; key: string } {
+    const splits = this.getStrangerResolutions()
+      .filter((resolution) => resolution.action === "SPLIT")
+      .sort((a, b) => a.resolvedAt.localeCompare(b.resolvedAt) || a.clusterId.localeCompare(b.clusterId));
+    const partitionOf = new Map<string, string>();
+    const members = new Map<string, string[]>();
+    for (const split of splits) {
+      const ids = [...split.logIds.map((id) => `log:${id}`), ...(split.faceIds || []).map((id) => `face:${id}`)].sort();
+      members.set(split.clusterId, ids);
+      for (const id of ids) partitionOf.set(id, split.clusterId);
+    }
+    return { partitionOf, splits: members, key: splits.map((split) => split.clusterId).join(",") };
   }
 
   // ================= STRANGER FACES =================
@@ -6221,7 +6251,7 @@ class SQLiteStorage implements StrangerFaceStore, ShadowResultStore, LoginEventS
       metadata: { ...(record.metadata || {}) },
     };
     const existing = this.getStrangerResolution(restore.clusterId);
-    if (!existing || existing.action !== "DISMISS" || !sameResolutionIntent(
+    if (!existing || !isRestorableResolutionAction(existing.action) || !sameResolutionIntent(
       existing,
       { ...existing, logIds: restore.logIds, faceIds: restore.faceIds },
     )) throw new Error("restore-conflict");
@@ -6235,7 +6265,7 @@ class SQLiteStorage implements StrangerFaceStore, ShadowResultStore, LoginEventS
           [restore.clusterId],
         );
         const current = found.rows[0] ? rowToStrangerResolution(found.rows[0]) : undefined;
-        if (!current || current.action !== "DISMISS" || !sameResolutionIntent(current, { ...current, logIds: restore.logIds, faceIds: restore.faceIds })) {
+        if (!current || !isRestorableResolutionAction(current.action) || !sameResolutionIntent(current, { ...current, logIds: restore.logIds, faceIds: restore.faceIds })) {
           await client.query("ROLLBACK");
           throw new Error("restore-conflict");
         }
@@ -6259,7 +6289,7 @@ class SQLiteStorage implements StrangerFaceStore, ShadowResultStore, LoginEventS
       try {
         const found = this.db.prepare("SELECT * FROM stranger_resolutions WHERE clusterId=?").get(restore.clusterId) as any;
         const current = found ? rowToStrangerResolution(found) : undefined;
-        if (!current || current.action !== "DISMISS" || !sameResolutionIntent(current, { ...current, logIds: restore.logIds, faceIds: restore.faceIds })) {
+        if (!current || !isRestorableResolutionAction(current.action) || !sameResolutionIntent(current, { ...current, logIds: restore.logIds, faceIds: restore.faceIds })) {
           throw new Error("restore-conflict");
         }
         this.db.prepare("INSERT INTO stranger_resolution_events (id,clusterId,action,employeeId,actor,resolvedAt,logIds,sourceLogId,metadata,faceIds) VALUES (?,?,?,?,?,?,?,?,?,?)")
@@ -6276,7 +6306,7 @@ class SQLiteStorage implements StrangerFaceStore, ShadowResultStore, LoginEventS
     } else {
       const staged = JSON.parse(JSON.stringify(this.fallbackData)) as typeof this.fallbackData;
       const current = (staged.stranger_resolutions || []).find((item) => item.clusterId === restore.clusterId);
-      if (!current || current.action !== "DISMISS" || !sameResolutionIntent(current, { ...current, logIds: restore.logIds, faceIds: restore.faceIds })) {
+      if (!current || !isRestorableResolutionAction(current.action) || !sameResolutionIntent(current, { ...current, logIds: restore.logIds, faceIds: restore.faceIds })) {
         throw new Error("restore-conflict");
       }
       (staged.stranger_resolution_events ||= []).push(restore);

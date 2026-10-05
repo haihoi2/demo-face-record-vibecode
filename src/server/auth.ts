@@ -96,6 +96,8 @@ const RULES: readonly Rule[] = [
     pattern: /^\/api\/strangers\/(?:quick-register|register|merge|assign|dismiss|reject|restore)$/,
     role: "operator",
   },
+  // Group editing: split photos into their own group / take photos out (both append-only, restorable).
+  { methods: ["POST"], pattern: /^\/api\/strangers\/clusters\/[^/]+\/(?:split|remove-photos)$/, role: "operator" },
   // Blur reports: labels on stranger faces (never delete anything). The report list is admin.
   { methods: ["POST", "DELETE"], pattern: /^\/api\/strangers\/faces\/[^/]+\/blur-report$/, role: "operator" },
   { methods: READ, pattern: /^\/api\/strangers\/blur-reports$/, role: "admin" },
