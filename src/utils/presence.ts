@@ -26,7 +26,7 @@
 export type PresencePeriod = "working" | "after-hours";
 export type PresenceFaceOutcome = "employee" | "stranger" | "none";
 export type PresenceLabelKind = "real" | "false-alarm" | "employee";
-export type PresenceMode = "off" | "shadow";
+export type PresenceMode = "off" | "shadow" | "live";
 
 export const PRESENCE_PERIODS: readonly PresencePeriod[] = ["working", "after-hours"];
 export const PRESENCE_FACE_OUTCOMES: readonly PresenceFaceOutcome[] = ["employee", "stranger", "none"];
@@ -203,6 +203,7 @@ export function formatAgo(iso: string | null | undefined, nowMs: number): string
 export function presenceModeLabel(mode: string): string {
   if (mode === "off") return "Đang tắt";
   if (mode === "shadow") return "Chạy thử";
+  if (mode === "live") return "Đang báo";
   return mode ? String(mode) : "—";
 }
 

@@ -116,7 +116,7 @@ export type PresenceLabelKind = "real" | "false-alarm" | "employee";
 
 /*
  * Server API (INT):
- *   GET  /api/presence/status              viewer  -> { success, gates: [{ gateId, mode: "off"|"shadow", fps, lastFrameAgeMs,
+ *   GET  /api/presence/status              viewer  -> { success, gates: [{ gateId, mode: "off"|"shadow"|"live", fps, lastFrameAgeMs,
  *                                                       worker: { state, restarts, models }, lastEventAt }] }
  *   GET  /api/presence/events?gate&period&faceOutcome&label&before&limit
  *                                          operator -> { success, events: PresenceEventRecord[] newest first, hasMore, nextCursor? }

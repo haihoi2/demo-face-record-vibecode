@@ -156,6 +156,14 @@ import { newBlurReportId, type BlurReportRecord } from "./src/server/blurReports
 import type { FaceOutcome, PresenceEventDraft, PresenceEventRecord } from "./src/server/presence/contracts";
 
 import { PresenceHost } from "./src/server/presence/presenceHost";
+import {
+  PresenceAlertBatcher,
+  PresenceAlertBatch,
+  PresenceHealthState,
+  presenceAlertPayload,
+  presenceHealthPayload,
+  presenceHealthTransition,
+} from "./src/server/presence/alerts";
 
 /** A running presence host per gate (two detector worker threads; P2 shadow). */
 const presenceHosts = new Map<string, PresenceHost>();
@@ -2153,11 +2161,21 @@ const DOOR_SCAN_SNAPSHOT_MAX_AGE_MS = 1500;
 const PRESENCE_FPS = envFloat("PRESENCE_FPS", 2, 0.5, 8);
 const PRESENCE_FRAME_WIDTH = envInt("PRESENCE_FRAME_WIDTH", 960, 320, 1920);
 const PRESENCE_EVENT_RETENTION_DAYS = envInt("PRESENCE_EVENT_RETENTION_DAYS", 7, 0, 365);
-/** Presence mode of a gate: PRESENCE_MODE_<GATE> = off | shadow (default off). "live" (messages) comes with P3. */
-function presenceModeFor(gate: Gate): "off" | "shadow" {
+/**
+ * Presence mode of a gate: PRESENCE_MODE_<GATE> = off | shadow | live (default
+ * off). shadow records events only; live also messages the security group
+ * (P3a, src/server/presence/alerts.ts).
+ */
+function presenceModeFor(gate: Gate): "off" | "shadow" | "live" {
   const raw = String(process.env[`PRESENCE_MODE_${gateEnvSuffix(gate)}`] || "").trim().toLowerCase();
-  return raw === "shadow" ? "shadow" : "off";
+  return raw === "shadow" || raw === "live" ? raw : "off";
 }
+/** Live mode: after the first alert, at most one message per this many seconds per gate (owner: 5 minutes). */
+const PRESENCE_ALERT_WINDOW_SECONDS = envInt("PRESENCE_ALERT_WINDOW_SECONDS", 300, 30, 3600);
+/** Live mode: an event is decided this long after it arrives, so a face recognised a moment later still counts. */
+const PRESENCE_ALERT_HOLD_MS = envInt("PRESENCE_ALERT_HOLD_MS", 3000, 0, 30000);
+/** Live mode: no picture for this long -> one "offline" notice (and one "online" notice when pictures return). */
+const PRESENCE_OFFLINE_AFTER_SECONDS = envInt("PRESENCE_OFFLINE_AFTER_SECONDS", 120, 30, 3600);
 /**
  * Sharpest of several frames (owner 2026-10-01): when the newest shared-stream
  * picture of a scan contains a face, this many slightly older pictures from
@@ -9347,7 +9365,9 @@ function startPresenceHost(gate: Gate, reader: ReturnType<typeof createStreamRea
     reader.on("presence-frame", (f) => host.offer({ ...f, sourceWidth, sourceHeight }));
     host.start();
     presenceHosts.set(gate, host);
-    console.log(`[Presence ${gateLogTag(gate)}] Chạy thử (shadow): ${PRESENCE_FRAME_WIDTH}px, ${PRESENCE_FPS} hình/giây; chỉ ghi nhận, không gửi cảnh báo.`);
+    console.log(presenceModeFor(gate) === "live"
+      ? `[Presence ${gateLogTag(gate)}] Đang báo (live): ${PRESENCE_FRAME_WIDTH}px, ${PRESENCE_FPS} hình/giây; ngoài giờ, không thấy mặt -> nhắn nhóm bảo vệ (tối đa 1 tin/${PRESENCE_ALERT_WINDOW_SECONDS}s mỗi cổng).`
+      : `[Presence ${gateLogTag(gate)}] Chạy thử (shadow): ${PRESENCE_FRAME_WIDTH}px, ${PRESENCE_FPS} hình/giây; chỉ ghi nhận, không gửi cảnh báo.`);
   } catch (err: any) {
     console.warn(`[Presence ${gateLogTag(gate)}] Không khởi động được: ${err?.message || err}`);
   }
@@ -9399,7 +9419,8 @@ async function onPresenceDraft(gate: Gate, draft: PresenceEventDraft, hostCrop: 
     linkedEmployeeIds: link.employeeIds,
     // P3 rule (owner 2026-10-03): message only after hours and when no recognised employee accounts for the person.
     wouldAlert: draft.period === "after-hours" && link.faceOutcome !== "employee",
-    alertSentAt: null,
+    // Kept through later updates of the same event (the upsert writes every column).
+    alertSentAt: presenceAlertedAt.get(id) ?? null,
     bestBox: draft.bestBox,
     bestScore: draft.bestScore,
     bestFrameAt: draft.bestFrameAt,
@@ -9408,15 +9429,147 @@ async function onPresenceDraft(gate: Gate, draft: PresenceEventDraft, hostCrop: 
     createdAt: new Date().toISOString(),
   };
   const ok = await db.savePresenceEvent(record, crop);
+  rememberPresenceRecord(record);
+  if (ok && presenceModeFor(gate) === "live") {
+    presenceAlerts.offer({
+      id, gateId: gate, startedAt: record.startedAt, inViewMs: record.inViewMs, peakPersons: record.peakPersons,
+      period: record.period, faceOutcome: record.faceOutcome,
+    }, Date.now());
+  }
   if (!ok) console.warn(`[Presence ${gateLogTag(gate)}] Không lưu được sự kiện hiện diện ${id}.`);
   else if (isNew) {
     console.log(
       `[Presence ${gateLogTag(gate)}] Có người (${draft.period === "working" ? "giờ làm" : "ngoài giờ"}, ${Math.round(draft.inViewMs / 100) / 10}s, ` +
-        `${draft.peakPersons} người, mặt: ${link.faceOutcome})${record.wouldAlert ? " - sẽ cảnh báo khi bật P3" : ""}`
+        `${draft.peakPersons} người, mặt: ${link.faceOutcome})${record.wouldAlert && presenceModeFor(gate) !== "live" ? " - sẽ cảnh báo khi bật live" : ""}`
     );
     broadcastSSE("presence_event", { id, gateId: gate, startedAt: draft.startedAt, period: draft.period, faceOutcome: link.faceOutcome, wouldAlert: record.wouldAlert });
   }
 }
+
+// ---- Presence alerts (P3a): grouping, sending, alertSentAt, offline notice ----
+const presenceAlerts = new PresenceAlertBatcher({ windowMs: PRESENCE_ALERT_WINDOW_SECONDS * 1000, holdMs: PRESENCE_ALERT_HOLD_MS });
+/** When each event was messaged, so later updates of the event keep it. */
+const presenceAlertedAt = new Map<string, string>();
+/** Latest version of recent events, to record alertSentAt without a read. */
+const presenceLatestRecords = new Map<string, PresenceEventRecord>();
+function rememberPresenceRecord(record: PresenceEventRecord): void {
+  presenceLatestRecords.delete(record.id);
+  presenceLatestRecords.set(record.id, record);
+  while (presenceLatestRecords.size > 2000) presenceLatestRecords.delete(presenceLatestRecords.keys().next().value!);
+}
+const presenceHealth = new Map<string, PresenceHealthState>();
+const presenceStartedAtMs = Date.now();
+
+function presenceGateLabel(gate: string): string {
+  const g = cameraStreamsConfig.gates.find((x) => x.id === gate);
+  return g ? gateLabelOf(g) : gate;
+}
+function presencePanelLink(): string {
+  const base = normalizeAppBaseUrl(resolveAppBaseUrl());
+  return base ? `${base}/#presence` : "";
+}
+
+/**
+ * One message to the shared Eton channel (the stranger alert's webhook, owner
+ * decision 1 - declarable channels come with P3b). Same destination guard, no
+ * redirects, and a webhook log entry like every other message.
+ */
+async function sendPresenceWebhook(gate: string, payload: WebhookLogRecord["payload"]): Promise<boolean> {
+  webhookConfig = db.getWebhookConfig(DEFAULT_WEBHOOK_CONFIG);
+  if (!webhookConfig.enabled || !webhookConfig.url) {
+    console.warn(`[Presence ${gateLogTag(gate)}] Webhook đang tắt: không gửi được cảnh báo hiện diện.`);
+    return false;
+  }
+  const direction = cameraStreamsConfig.gates.find((x) => x.id === gate)?.direction === "EXIT" ? "EXIT" : "ENTRY";
+  const logEntry: WebhookLogRecord = {
+    id: "WH-" + Date.now() + "-" + Math.floor(Math.random() * 1000),
+    timestamp: new Date().toISOString(),
+    url: webhookConfig.url,
+    method: "POST",
+    payload,
+    success: false,
+    scanType: direction,
+    userName: "Hiện diện",
+  };
+  try {
+    const refusal = await destinationRefusal(webhookConfig.url, NET_POLICY.webhook);
+    if (refusal) throw new DestinationRefusedError(refusal);
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 7000);
+    const response = await fetch(webhookConfig.url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) EtonWebhookBot/1.0" },
+      body: JSON.stringify(payload),
+      signal: controller.signal,
+      redirect: "manual",
+    });
+    clearTimeout(timeoutId);
+    logEntry.statusCode = response.status;
+    logEntry.statusText = response.statusText;
+    logEntry.responseBody = (await response.text()).substring(0, 500);
+    logEntry.success = response.ok;
+    if (response.status >= 300 && response.status < 400) logEntry.error = REDIRECT_NOT_FOLLOWED;
+  } catch (err: any) {
+    logEntry.error = err?.message || String(err);
+    if (err instanceof DestinationRefusedError) logEntry.code = err.code;
+  }
+  webhookLogs.unshift(logEntry);
+  if (webhookLogs.length > 60) webhookLogs = webhookLogs.slice(0, 60);
+  db.saveWebhookLog(logEntry);
+  broadcastSSE("webhook_log", logEntry);
+  console.log(`[Presence ${gateLogTag(gate)}] Gửi cảnh báo hiện diện: ${logEntry.success ? `thành công (${logEntry.statusCode})` : `thất bại (${logEntry.error || logEntry.statusCode})`}`);
+  return logEntry.success;
+}
+
+async function sendPresenceBatch(batch: PresenceAlertBatch): Promise<void> {
+  const ok = await sendPresenceWebhook(batch.gateId, presenceAlertPayload(batch, presenceGateLabel(batch.gateId), presencePanelLink()));
+  if (!ok) return;
+  const at = new Date().toISOString();
+  for (const e of batch.events) {
+    presenceAlertedAt.set(e.id, at);
+    if (presenceAlertedAt.size > 5000) presenceAlertedAt.delete(presenceAlertedAt.keys().next().value!);
+    const latest = presenceLatestRecords.get(e.id);
+    if (latest) {
+      const updated = { ...latest, alertSentAt: at };
+      rememberPresenceRecord(updated);
+      await db.savePresenceEvent(updated, null);
+    }
+  }
+}
+
+let presenceAlertTickBusy = false;
+setInterval(() => {
+  if (presenceAlertTickBusy) return;
+  const batches = presenceAlerts.due(Date.now());
+  if (!batches.length) return;
+  presenceAlertTickBusy = true;
+  void (async () => {
+    for (const batch of batches) {
+      try {
+        await sendPresenceBatch(batch);
+      } catch (err: any) {
+        console.warn(`[Presence ${gateLogTag(batch.gateId)}] Lỗi gửi cảnh báo hiện diện: ${err?.message || err}`);
+      }
+    }
+  })().finally(() => { presenceAlertTickBusy = false; });
+}, 1000).unref?.();
+
+/** Live gates: one notice when detection stops (no picture for PRESENCE_OFFLINE_AFTER_SECONDS) and one when it is back. */
+setInterval(() => {
+  const offlineAfterMs = PRESENCE_OFFLINE_AFTER_SECONDS * 1000;
+  if (Date.now() - presenceStartedAtMs < offlineAfterMs) return;
+  for (const g of cameraStreamsConfig.gates) {
+    if (presenceModeFor(g.id) !== "live") continue;
+    const frame = gatePipelines.get(g.id)?.source?.reader?.latestPresenceFrame(offlineAfterMs * 2);
+    const ageMs = frame ? Math.max(0, Date.now() - frame.capturedAtMs) : null;
+    const t = presenceHealthTransition(presenceHealth.get(g.id) || "unknown", ageMs, offlineAfterMs);
+    presenceHealth.set(g.id, t.state);
+    if (t.notice) {
+      console.warn(`[Presence ${gateLogTag(g.id)}] Phát hiện người ${t.notice === "offline" ? "NGỪNG hoạt động" : "hoạt động lại"}.`);
+      void sendPresenceWebhook(g.id, presenceHealthPayload(t.notice, gateLabelOf(g), new Date().toISOString(), presencePanelLink()));
+    }
+  }
+}, 10_000).unref?.();
 
 const PRESENCE_EVENT_ID_RE = /^PE-[A-Za-z0-9-]{1,60}$/;
 
@@ -9435,6 +9588,9 @@ app.get("/api/presence/status", requireOperatorRole("viewer"), (_req, res) => {
       lastFrameAgeMs: frame ? Math.max(0, Date.now() - frame.capturedAtMs) : null,
       worker: st?.worker ?? null,
       lastEventAt: st?.lastEventAt ?? null,
+      ...(presenceModeFor(g.id) === "live"
+        ? { alerts: { windowSeconds: PRESENCE_ALERT_WINDOW_SECONDS, health: presenceHealth.get(g.id) || "unknown" } }
+        : {}),
       ...(presenceModeFor(g.id) !== "off" && !gatePipelines.get(g.id)?.source
         ? { note: "Cần luồng của engine thời gian thực (chế độ shadow/live) cho cổng này" }
         : {}),

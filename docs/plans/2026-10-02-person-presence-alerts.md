@@ -1,6 +1,6 @@
 # Plan: person-presence alerts ("human exists, no face")
 
-Status: P1/P1b DONE, P2 STARTED 2026-10-03 (owner "đồng ý p2"; contract src/server/presence/contracts.ts, models YOLOX-Nano + RTMDet-tiny UNION-LOWRATE). All decisions taken 2026-10-02: 1 declarable channels (shared Eton channel for now), 2 no image in messages, 3 all hours / >= 3 s in view, 4 whole picture, 5 body pictures kept 7 days, 6 free licence only, 7 entry gate first. Nothing is built yet. Owner request: "to make sure not to miss a stranger or a thief, we also need a feature that quickly detects 'human exists' if faces cannot be detected; this should be a quicker thread and notify the other security group." Decisions needed are in section 9.
+Status (2026-10-05): P1/P1b/P2 DONE; P3a BUILT (alerts: live mode, after hours + no face, first alert at once then one grouped message per 5 min per gate, offline notice); P3b (declarable channels, settings screen) next. Earlier: P1/P1b DONE, P2 STARTED 2026-10-03 (owner "đồng ý p2"; contract src/server/presence/contracts.ts, models YOLOX-Nano + RTMDet-tiny UNION-LOWRATE). All decisions taken 2026-10-02: 1 declarable channels (shared Eton channel for now), 2 no image in messages, 3 all hours / >= 3 s in view, 4 whole picture, 5 body pictures kept 7 days, 6 free licence only, 7 entry gate first. Nothing is built yet. Owner request: "to make sure not to miss a stranger or a thief, we also need a feature that quickly detects 'human exists' if faces cannot be detected; this should be a quicker thread and notify the other security group." Decisions needed are in section 9.
 
 ## 1. Why: what the cameras show today
 
@@ -130,3 +130,9 @@ Owners: face-engine agent (P1 model evaluation, detector wrapper), INT (worker, 
 5. ~~**Retention of body pictures**~~ **Decided 2026-10-02: 7 days** (`PRESENCE_EVENT_RETENTION_DAYS=7`; the event row stays as numbers).
 6. ~~**Model licence**~~ **Decided 2026-10-02: free licence only** (Apache-2.0 models; candidate list in section 3). P1 started the same day.
 7. **Decided 2026-10-02: entry gate first.** Presence detection is built and switched on for the entry gate; the exit camera stays as it is for now (it can be added as a second gate later with the same settings).
+8. **Decided 2026-10-05 (owner "go with your choice", after two mornings of shadow data: 93 would-be messages, 61 of them 06:19-07:00 on 04/10, none 19:00-04:00):**
+   - group alerts: per gate, the first alert at once, then at most one message per 5 minutes summarising the events meanwhile (`PRESENCE_ALERT_WINDOW_SECONDS=300`);
+   - keep the 19:00-07:00 window for now; revisit after the after-hours events (especially 04:10 on 05/10) are labelled;
+   - a face seen as a stranger is not alerted again (the stranger alert covers it); an event is decided 3 s after it starts (`PRESENCE_ALERT_HOLD_MS`) so a door scan a moment later still counts;
+   - "offline" notice after 2 minutes without pictures on a live gate, and "online" when back (`PRESENCE_OFFLINE_AFTER_SECONDS=120`).
+   Messages start only when a gate is switched to `PRESENCE_MODE_<GATE>=live`.
