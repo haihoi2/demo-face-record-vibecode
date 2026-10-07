@@ -97,6 +97,8 @@ const RULES: readonly Rule[] = [
 
   // --- operator: approving new members
   { methods: ["POST"], pattern: /^\/api\/employees$/, role: "operator" },
+  // Profile correction (name, department, position, registration photo): admin only.
+  { methods: ["PATCH"], pattern: /^\/api\/employees\/[^/]+$/, role: "admin" },
   {
     methods: ["POST"],
     pattern: /^\/api\/strangers\/(?:quick-register|register|merge|assign|dismiss|reject|restore)$/,
