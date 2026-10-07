@@ -1212,6 +1212,90 @@ const SQLITE_LOGIN_EVENTS_DDL = `
 `;
 
 /**
+ * app_settings (P3b): small admin settings documents by key, e.g.
+ * "notification_channels". One row per key, overwritten in place; the row
+ * carries the last writer and time only (no history). Values are owned by the
+ * server and may hold credential-bearing URLs: the storage layer never logs
+ * them. Additive: CREATE TABLE IF NOT EXISTS; nothing references the table.
+ * Rollback: DROP TABLE app_settings.
+ */
+const PG_APP_SETTINGS_DDL = `
+  CREATE TABLE IF NOT EXISTS app_settings (
+    key VARCHAR(64) PRIMARY KEY CONSTRAINT app_settings_key_format CHECK (key ~ '^[a-z][a-z0-9_]{1,63}$'),
+    value JSONB NOT NULL,
+    "updatedAt" VARCHAR(64) NOT NULL,
+    "updatedBy" VARCHAR(255) NOT NULL
+  );
+`;
+
+const SQLITE_APP_SETTINGS_DDL = `
+  CREATE TABLE IF NOT EXISTS app_settings (
+    key TEXT PRIMARY KEY CHECK (
+      length(key) BETWEEN 2 AND 64 AND substr(key, 1, 1) GLOB '[a-z]' AND key NOT GLOB '*[^a-z0-9_]*'
+    ),
+    value TEXT NOT NULL,
+    updatedAt TEXT NOT NULL,
+    updatedBy TEXT NOT NULL
+  );
+`;
+
+/** One settings document as stored (db.getAppSetting / db.saveAppSetting). */
+export interface AppSettingRecord<T = unknown> { key: string; value: T; updatedAt: string; updatedBy: string }
+
+/** Keys accepted by the settings store; anything else reads undefined and is never written. */
+export const APP_SETTING_KEY_PATTERN = /^[a-z][a-z0-9_]{1,63}$/;
+/** Largest accepted value: UTF-8 bytes of JSON.stringify(value). */
+export const APP_SETTING_MAX_BYTES = 64 * 1024;
+const APP_SETTING_MAX_ACTOR = 255;
+
+/** Result of db.updateAppSetting (read-modify-write inside the settings write queue). */
+export type AppSettingUpdateResult<T = unknown> =
+  | { status: "saved"; record: AppSettingRecord<T> }
+  | { status: "unchanged"; record: AppSettingRecord<T> | undefined }
+  | { status: "failed" };
+
+type PreparedAppSetting = { key: string; json: string; actor: string };
+
+/**
+ * Validate one write and freeze it as canonical JSON (what every store reads
+ * back), so later changes to the caller's object never reach the store or the
+ * cache. Strings containing NUL are refused everywhere because PostgreSQL JSONB
+ * cannot hold them, keeping the three stores identical.
+ */
+function prepareAppSetting(key: unknown, value: unknown, actor: unknown): PreparedAppSetting | null {
+  if (typeof key !== "string" || !APP_SETTING_KEY_PATTERN.test(key)) return null;
+  if (typeof actor !== "string") return null;
+  const who = actor.trim();
+  if (!who || who.length > APP_SETTING_MAX_ACTOR) return null;
+  let json: string | undefined;
+  let hasNul = false;
+  try {
+    json = JSON.stringify(value, (k, v) => {
+      if (k.includes("\u0000") || (typeof v === "string" && v.includes("\u0000"))) hasNul = true;
+      return v;
+    });
+  } catch {
+    return null; // circular, BigInt, a throwing toJSON
+  }
+  if (typeof json !== "string" || hasNul) return null; // undefined, a function, a symbol
+  if (Buffer.byteLength(json, "utf8") > APP_SETTING_MAX_BYTES) return null;
+  return { key, json, actor: who };
+}
+
+/** A stored row, or null when it is not a well-formed settings record (skipped, key logged). */
+function toAppSettingRecord(key: unknown, rawValue: unknown, updatedAt: unknown, updatedBy: unknown, valueIsJsonText: boolean): AppSettingRecord | null {
+  if (typeof key !== "string" || !APP_SETTING_KEY_PATTERN.test(key)) return null;
+  if (typeof updatedAt !== "string" || typeof updatedBy !== "string") return null;
+  try {
+    const value = valueIsJsonText ? JSON.parse(String(rawValue)) : rawValue;
+    if (value === undefined) return null;
+    return { key, value, updatedAt, updatedBy };
+  } catch {
+    return null;
+  }
+}
+
+/**
  * stranger_face_reports (src/server/blurReports.ts): append-only operator labels
  * ("too blurred") on stranger faces, with the face's scores at report time. No
  * images, no embeddings; outlives the face's crop retention as numbers.
@@ -2044,6 +2128,8 @@ class SQLiteStorage implements StrangerFaceStore, ShadowResultStore, LoginEventS
   private pgPresenceReady = false;
   /** stranger_face_reports exists on PostgreSQL (same pattern). */
   private pgBlurReportsReady = false;
+  /** app_settings exists on PostgreSQL AND its rows are in appSettingsCache (same pattern). */
+  private pgAppSettingsReady = false;
   /**
    * Resolves once the PostgreSQL schema migration has run (or failed, which is
    * logged). PostgreSQL becomes the active store just before the migration, so
@@ -2707,6 +2793,15 @@ class SQLiteStorage implements StrangerFaceStore, ShadowResultStore, LoginEventS
         console.error("[PostgreSQL] Lỗi khởi tạo bảng stranger_face_reports:", err);
       }
       try {
+        await this.pgPool.query(PG_APP_SETTINGS_DDL);
+        // Hydrated here, before syncWithPostgres fires onSync, so getAppSetting
+        // is correct for the first onSync callback.
+        await this.loadAppSettings();
+        this.pgAppSettingsReady = true;
+      } catch (err: any) {
+        console.error("[PostgreSQL] Lỗi khởi tạo bảng app_settings:", err?.message);
+      }
+      try {
         await this.pgPool.query(PG_DOOR_LOCK_STATES_DDL);
         this.pgDoorLockStatesReady = true;
       } catch (err) {
@@ -2991,6 +3086,11 @@ class SQLiteStorage implements StrangerFaceStore, ShadowResultStore, LoginEventS
       console.error("[SQLite] Lỗi khởi tạo bảng stranger_face_reports:", err);
     }
     try {
+      this.db.exec(SQLITE_APP_SETTINGS_DDL);
+    } catch (err) {
+      console.error("[SQLite] Lỗi khởi tạo bảng app_settings:", err);
+    }
+    try {
       this.db.exec(SQLITE_DOOR_LOCK_STATES_DDL);
     } catch (err) {
       console.error("[SQLite] Lỗi khởi tạo bảng door_lock_states:", err);
@@ -3022,6 +3122,8 @@ class SQLiteStorage implements StrangerFaceStore, ShadowResultStore, LoginEventS
     presence_events?: Array<PresenceEventRecord & { crop?: string; cropPurgedAt?: string }>;
     presence_event_labels?: Array<{ id: string; eventId: string; kind: PresenceLabelKind; actor: string; at: string }>;
     stranger_face_reports?: BlurReportRecord[];
+    /** Admin settings documents by key (P3b). */
+    app_settings?: Record<string, AppSettingRecord>;
     /** Lock state per door (N-gate wave); door "main" is also smart_lock_state. */
     door_lock_states?: Record<string, { state: SmartLockStateRecord; updatedAt: string }>;
   } = {
@@ -4419,6 +4521,181 @@ class SQLiteStorage implements StrangerFaceStore, ShadowResultStore, LoginEventS
       return removed;
     }
     return 0;
+  }
+
+  // ================= APP SETTINGS (P3b) =================
+  // Small admin settings documents by key. Single authority like the tables
+  // above: PostgreSQL when active (table migrated and rows hydrated), else
+  // native SQLite, else JSON; while PostgreSQL is configured but not usable,
+  // reads are undefined and writes refused, so a value never lands in a local
+  // store the gateway stops reading once connected. Reads are synchronous from
+  // appSettingsCache; every write goes through one FIFO queue, so the cache
+  // always matches the order the store applied the writes in.
+
+  private appSettingsCache = new Map<string, AppSettingRecord>();
+  /** Which store appSettingsCache holds (null = not hydrated). */
+  private appSettingsCacheMode: "postgresql" | "sqlite" | "json" | null = null;
+  private appSettingsQueue: Promise<unknown> = Promise.resolve();
+  private appSettingsReadErrorLogged = false;
+
+  private appSettingsMode(): "postgresql" | "sqlite" | "json" | null {
+    return this.singleStoreMode(this.pgAppSettingsReady);
+  }
+
+  private readLocalAppSettings(mode: "sqlite" | "json"): Map<string, AppSettingRecord> {
+    const out = new Map<string, AppSettingRecord>();
+    const skipped: string[] = [];
+    if (mode === "sqlite") {
+      const rows = this.db.prepare("SELECT key, value, updatedAt, updatedBy FROM app_settings").all() as any[];
+      for (const r of rows) {
+        const rec = toAppSettingRecord(r.key, r.value, r.updatedAt, r.updatedBy, true);
+        if (rec) out.set(rec.key, rec); else skipped.push(String(r.key).slice(0, 64));
+      }
+    } else {
+      for (const [key, r] of Object.entries(this.fallbackData.app_settings || {})) {
+        const rec = r && typeof r === "object" ? toAppSettingRecord(key, (r as any).value, (r as any).updatedAt, (r as any).updatedBy, false) : null;
+        if (rec) out.set(rec.key, rec); else skipped.push(key.slice(0, 64));
+      }
+    }
+    if (skipped.length) console.warn(`[AppSettings] Bỏ qua cài đặt hỏng (${mode}): ${skipped.join(", ")}`);
+    return out;
+  }
+
+  /** The cache for the active store, hydrating a local store on first use; null while no store is usable. */
+  private appSettingsView(): Map<string, AppSettingRecord> | null {
+    const mode = this.appSettingsMode();
+    if (!mode) return null;
+    if (mode !== "postgresql" && this.appSettingsCacheMode !== mode) {
+      try {
+        this.appSettingsCache = this.readLocalAppSettings(mode);
+        this.appSettingsCacheMode = mode;
+      } catch (err: any) {
+        // Retried on the next call; logged once (reads can be frequent).
+        if (!this.appSettingsReadErrorLogged) console.error(`[AppSettings] Lỗi đọc cài đặt (${mode}): ${err?.message}`);
+        this.appSettingsReadErrorLogged = true;
+        return null;
+      }
+    }
+    return this.appSettingsCacheMode === mode ? this.appSettingsCache : null;
+  }
+
+  /** PostgreSQL rows into the cache (throws on failure; the caller then leaves the store not ready). */
+  private async loadAppSettings() {
+    if (!this.pgPool) return;
+    const res = await this.pgPool.query(`SELECT key, value, "updatedAt", "updatedBy" FROM app_settings`);
+    const loaded = new Map<string, AppSettingRecord>();
+    for (const r of res.rows) {
+      const rec = toAppSettingRecord(r.key, r.value, r.updatedAt, r.updatedBy, false);
+      if (rec) loaded.set(rec.key, rec);
+    }
+    this.appSettingsCache = loaded;
+    this.appSettingsCacheMode = "postgresql";
+    // Values written during an earlier SQLite/JSON fallback period are NOT
+    // copied over (that would make the local store a second authority); they
+    // are reported by key so an admin can re-enter them. Values are never logged.
+    try {
+      const local = this.readLocalAppSettings(this.isNativeSqlite && this.db ? "sqlite" : "json");
+      const stranded = [...local.values()]
+        .filter((l) => { const pg = loaded.get(l.key); return !pg || l.updatedAt > pg.updatedAt; })
+        .map((l) => l.key);
+      if (stranded.length) {
+        console.warn(`[AppSettings] Cài đặt chỉ nằm trong kho cục bộ (ghi khi PostgreSQL không khả dụng), không được dùng: ${stranded.join(", ")}`);
+      }
+    } catch {}
+    if (loaded.size) console.log(`[PostgreSQL] Đã nạp ${loaded.size} mục cài đặt (app_settings).`);
+  }
+
+  private enqueueAppSettingWrite<R>(task: () => Promise<R>): Promise<R> {
+    const run = this.appSettingsQueue.then(task, task);
+    this.appSettingsQueue = run.catch(() => {});
+    return run;
+  }
+
+  /** Durable write to the active store, then the cache. Runs inside the queue. Never rejects. */
+  private async writeAppSetting(p: PreparedAppSetting): Promise<AppSettingRecord | null> {
+    const mode = this.appSettingsMode();
+    const cache = this.appSettingsView();
+    if (!mode || !cache) return null;
+    const record: AppSettingRecord = { key: p.key, value: JSON.parse(p.json), updatedAt: new Date().toISOString(), updatedBy: p.actor };
+    try {
+      if (mode === "postgresql") {
+        await this.pgPool!.query(
+          `INSERT INTO app_settings (key, value, "updatedAt", "updatedBy") VALUES ($1, $2::jsonb, $3, $4)
+           ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, "updatedAt" = EXCLUDED."updatedAt", "updatedBy" = EXCLUDED."updatedBy"`,
+          [p.key, p.json, record.updatedAt, record.updatedBy],
+        );
+      } else if (mode === "sqlite") {
+        this.db.prepare(
+          `INSERT INTO app_settings (key, value, updatedAt, updatedBy) VALUES (?, ?, ?, ?)
+           ON CONFLICT(key) DO UPDATE SET value = excluded.value, updatedAt = excluded.updatedAt, updatedBy = excluded.updatedBy`,
+        ).run(p.key, p.json, record.updatedAt, record.updatedBy);
+      } else {
+        const staged = { ...(this.fallbackData.app_settings || {}), [p.key]: record };
+        this.writeFallback({ ...this.fallbackData, app_settings: staged });
+        this.fallbackData.app_settings = staged;
+      }
+    } catch (err: any) {
+      console.error(`[AppSettings] Lỗi lưu cài đặt "${p.key}" (${mode}): ${err?.message}`);
+      return null;
+    }
+    cache.set(p.key, record);
+    return record;
+  }
+
+  /**
+   * The settings document stored under `key` (a deep copy), or undefined when
+   * there is none, the key is malformed, or no store is usable yet (PostgreSQL
+   * configured but not hydrated). Synchronous; on PostgreSQL it is correct from
+   * the first db.onSync callback on.
+   */
+  getAppSetting<T = unknown>(key: string): AppSettingRecord<T> | undefined {
+    if (typeof key !== "string" || !APP_SETTING_KEY_PATTERN.test(key)) return undefined;
+    const rec = this.appSettingsView()?.get(key);
+    return rec ? (structuredClone(rec) as AppSettingRecord<T>) : undefined;
+  }
+
+  /**
+   * Insert or replace the document under `key`. True once the authoritative
+   * store has it (awaited), then the cache is updated; false for a malformed
+   * key, a value that is not JSON-serialisable or exceeds APP_SETTING_MAX_BYTES,
+   * an empty or over-long actor (> 255), a store error, or no usable store.
+   * Writes apply in call order. Never rejects.
+   */
+  async saveAppSetting<T>(key: string, value: T, actor: string): Promise<boolean> {
+    const prepared = prepareAppSetting(key, value, actor);
+    if (!prepared) return false;
+    try {
+      return Boolean(await this.enqueueAppSettingWrite(() => this.writeAppSetting(prepared)));
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Read-modify-write without lost updates: `mutate` runs inside the settings
+   * write queue, so it sees every earlier write, and no other write lands
+   * between its read and its save. It receives a deep copy of the current
+   * record and returns the new value, or undefined to leave the document as it
+   * is ("unchanged"). An exception from `mutate` rejects this call and nothing
+   * is written; every store problem or invalid input is { status: "failed" }.
+   */
+  async updateAppSetting<T>(
+    key: string,
+    mutate: (current: AppSettingRecord<T> | undefined) => T | undefined,
+    actor: string,
+  ): Promise<AppSettingUpdateResult<T>> {
+    if (typeof key !== "string" || !APP_SETTING_KEY_PATTERN.test(key) || typeof mutate !== "function") return { status: "failed" };
+    if (!prepareAppSetting(key, null, actor)) return { status: "failed" };
+    return this.enqueueAppSettingWrite(async (): Promise<AppSettingUpdateResult<T>> => {
+      if (!this.appSettingsView()) return { status: "failed" };
+      const current = this.getAppSetting<T>(key);
+      const next = mutate(current);
+      if (next === undefined) return { status: "unchanged", record: current };
+      const prepared = prepareAppSetting(key, next, actor);
+      if (!prepared) return { status: "failed" };
+      const saved = await this.writeAppSetting(prepared);
+      return saved ? { status: "saved", record: structuredClone(saved) as AppSettingRecord<T> } : { status: "failed" };
+    });
   }
 
   // ================= SHADOW RESULTS (accuracy wave) =================
