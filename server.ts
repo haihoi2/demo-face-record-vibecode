@@ -25,6 +25,7 @@ import {
   StrangerResolutionRecord,
   sameResolutionIntent,
   isRestorableResolutionAction,
+  APP_SETTING_MAX_BYTES,
   UserRecord,
   OrgCatalogRecord,
   OrgEntryRecord,
@@ -9720,6 +9721,34 @@ app.get("/api/presence/status", requireOperatorRole("viewer"), (_req, res) => {
   res.json({ success: true, gates });
 });
 
+// ---- P3b settings writes: read-modify-write inside the store's write queue (db.updateAppSetting) ----
+/** A route's own refusal thrown inside an update: nothing is written, the route answers with it. */
+class SettingsRefusal extends Error {
+  constructor(readonly status: number, readonly body: Record<string, unknown>) {
+    super(String(body.error || "refused"));
+  }
+}
+async function updateSettingDocument<T>(
+  key: string,
+  mutate: (current: T | undefined) => T | undefined,
+  actor: string,
+): Promise<{ ok: true } | { ok: false; status: number; body: Record<string, unknown> }> {
+  try {
+    const r = await db.updateAppSetting<T>(key, (cur) => {
+      const next = mutate(cur?.value);
+      if (next !== undefined && Buffer.byteLength(JSON.stringify(next), "utf8") > APP_SETTING_MAX_BYTES) {
+        throw new SettingsRefusal(400, { success: false, code: "SETTINGS_TOO_LARGE", error: "Cài đặt quá lớn" });
+      }
+      return next;
+    }, actor);
+    if (r.status === "failed") return { ok: false, status: 503, body: { success: false, error: "Chưa lưu được cài đặt (kho dữ liệu chưa sẵn sàng); thử lại sau." } };
+    return { ok: true };
+  } catch (err) {
+    if (err instanceof SettingsRefusal) return { ok: false, status: err.status, body: err.body };
+    throw err;
+  }
+}
+
 // ---- P3b: per-gate presence settings (saved over .env) ----
 function presenceSettingsView(gate: { id: string; label?: string; name?: string }) {
   const { values, source } = presenceGateSettings(gate.id as Gate);
@@ -9742,14 +9771,14 @@ app.put("/api/presence/settings/:gateId", requireOperatorRole("admin"), requireC
   const gate = cameraStreamsConfig.gates.find((g) => g.id === String(req.params.gateId || ""));
   if (!gate) return res.status(404).json({ success: false, error: "Không tìm thấy cổng" });
   const parsed = parsePresenceGatePatch(req.body);
-  if (!parsed.ok) return res.status(400).json({ success: false, error: parsed.error, field: parsed.field });
+  if ("error" in parsed) return res.status(400).json({ success: false, error: parsed.error, field: parsed.field });
   const before = presenceGateSettings(gate.id).values;
-  const all = presenceGateOverrides();
   const actor = operatorActor(req) || "admin";
-  const next = { ...all, [gate.id]: applyPresenceGatePatch(all[gate.id], parsed.patch, actor, new Date().toISOString()) };
-  if (!(await db.saveAppSetting(PRESENCE_GATE_SETTINGS_KEY, { gates: next }, actor))) {
-    return res.status(503).json({ success: false, error: "Chưa lưu được cài đặt (kho dữ liệu chưa sẵn sàng); thử lại sau." });
-  }
+  const saved = await updateSettingDocument<{ gates?: Record<string, PresenceGateOverride> }>(PRESENCE_GATE_SETTINGS_KEY, (cur) => {
+    const gates = cur?.gates && typeof cur.gates === "object" ? cur.gates : {};
+    return { gates: { ...gates, [gate.id]: applyPresenceGatePatch(gates[gate.id], parsed.patch, actor, new Date().toISOString()) } };
+  }, actor);
+  if ("status" in saved) return res.status(saved.status).json(saved.body);
   const after = presenceGateSettings(gate.id).values;
   const impact = presenceSettingsImpact(before, after);
   console.log(`[Presence ${gateLogTag(gate.id)}] ${actor} đổi cài đặt: ${JSON.stringify(parsed.patch)}${impact.stream ? " - khởi động lại luồng" : impact.detector ? " - khởi động lại bộ phát hiện" : ""}`);
@@ -9772,19 +9801,14 @@ function notificationChannelsResponse() {
   return { channels: channelViews(channels, builtInChannel(), routes), routes };
 }
 
-async function saveChannels(channels: NotificationChannel[], actor: string): Promise<boolean> {
-  return db.saveAppSetting(NOTIFICATION_CHANNELS_KEY, { channels }, actor);
-}
-
 app.get("/api/notification-channels", requireOperatorRole("admin"), (_req, res) => {
   res.json({ success: true, ...notificationChannelsResponse() });
 });
 
 app.post("/api/notification-channels", requireOperatorRole("admin"), requireCsrf, async (req, res) => {
   const parsed = parseChannelInput(req.body, "create");
-  if (!parsed.ok) return res.status(400).json({ success: false, error: parsed.error, field: parsed.field });
-  const channels = notificationChannels();
-  if (channels.length >= MAX_CHANNELS) return res.status(400).json({ success: false, code: "CHANNEL_LIMIT", error: `Tối đa ${MAX_CHANNELS} kênh` });
+  if ("error" in parsed) return res.status(400).json({ success: false, error: parsed.error, field: parsed.field });
+  if (notificationChannels().length >= MAX_CHANNELS) return res.status(400).json({ success: false, code: "CHANNEL_LIMIT", error: `Tối đa ${MAX_CHANNELS} kênh` });
   const check = await destinationSaveCheck(parsed.value.url!, NET_POLICY.webhook, "url");
   if (check.refused) return res.status(400).json(check.refused);
   const actor = operatorActor(req) || "admin";
@@ -9793,9 +9817,12 @@ app.post("/api/notification-channels", requireOperatorRole("admin"), requireCsrf
     id: `CH-${randomUUID()}`, name: parsed.value.name!, type: "eton-webhook", url: parsed.value.url!,
     enabled: parsed.value.enabled !== false, createdAt: at, createdBy: actor, updatedAt: at, updatedBy: actor,
   };
-  if (!(await saveChannels([...channels, channel], actor))) {
-    return res.status(503).json({ success: false, error: "Chưa lưu được kênh (kho dữ liệu chưa sẵn sàng); thử lại sau." });
-  }
+  const saved = await updateSettingDocument<{ channels?: unknown[] }>(NOTIFICATION_CHANNELS_KEY, (cur) => {
+    const channels = readChannels(cur);
+    if (channels.length >= MAX_CHANNELS) throw new SettingsRefusal(400, { success: false, code: "CHANNEL_LIMIT", error: `Tối đa ${MAX_CHANNELS} kênh` });
+    return { channels: [...channels, channel] };
+  }, actor);
+  if ("status" in saved) return res.status(saved.status).json(saved.body);
   console.log(`[Channels] ${actor} thêm kênh "${channel.name}" (${channel.id}) ${maskWebhookUrl(channel.url)}`);
   const view = notificationChannelsResponse().channels.find((c) => c.id === channel.id);
   res.json({ success: true, channel: view, ...(check.warning ? { warning: check.warning } : {}) });
@@ -9809,7 +9836,7 @@ app.patch("/api/notification-channels/:id", requireOperatorRole("admin"), requir
   const current = channels.find((c) => c.id === id);
   if (!current) return res.status(404).json({ success: false, error: "Không tìm thấy kênh" });
   const parsed = parseChannelInput(req.body, "update");
-  if (!parsed.ok) return res.status(400).json({ success: false, error: parsed.error, field: parsed.field });
+  if ("error" in parsed) return res.status(400).json({ success: false, error: parsed.error, field: parsed.field });
   let warning: unknown;
   if (parsed.value.url !== undefined && parsed.value.url !== current.url) {
     const check = await destinationSaveCheck(parsed.value.url, NET_POLICY.webhook, "url");
@@ -9817,11 +9844,15 @@ app.patch("/api/notification-channels/:id", requireOperatorRole("admin"), requir
     warning = check.warning;
   }
   const actor = operatorActor(req) || "admin";
-  const updated: NotificationChannel = { ...current, ...parsed.value, updatedAt: new Date().toISOString(), updatedBy: actor };
-  if (!(await saveChannels(channels.map((c) => (c.id === id ? updated : c)), actor))) {
-    return res.status(503).json({ success: false, error: "Chưa lưu được kênh (kho dữ liệu chưa sẵn sàng); thử lại sau." });
-  }
-  console.log(`[Channels] ${actor} sửa kênh "${updated.name}" (${id}): ${Object.keys(parsed.value).join(", ")}`);
+  const saved = await updateSettingDocument<{ channels?: unknown[] }>(NOTIFICATION_CHANNELS_KEY, (cur) => {
+    const list = readChannels(cur);
+    const c = list.find((x) => x.id === id);
+    if (!c) throw new SettingsRefusal(404, { success: false, error: "Không tìm thấy kênh" });
+    const updated: NotificationChannel = { ...c, ...parsed.value, updatedAt: new Date().toISOString(), updatedBy: actor };
+    return { channels: list.map((x) => (x.id === id ? updated : x)) };
+  }, actor);
+  if ("status" in saved) return res.status(saved.status).json(saved.body);
+  console.log(`[Channels] ${actor} sửa kênh "${parsed.value.name || current.name}" (${id}): ${Object.keys(parsed.value).join(", ")}`);
   res.json({ success: true, channel: notificationChannelsResponse().channels.find((c) => c.id === id), ...(warning ? { warning } : {}) });
 });
 
@@ -9836,9 +9867,17 @@ app.delete("/api/notification-channels/:id", requireOperatorRole("admin"), requi
   const usedFor = ALERT_ROUTES.filter((r) => routes[r] === id);
   if (usedFor.length) return res.status(409).json({ success: false, code: "CHANNEL_IN_USE", error: "Kênh đang được dùng để nhận cảnh báo; đổi nơi nhận trước khi xóa", usedFor });
   const actor = operatorActor(req) || "admin";
-  if (!(await saveChannels(channels.filter((c) => c.id !== id), actor))) {
-    return res.status(503).json({ success: false, error: "Chưa xóa được kênh (kho dữ liệu chưa sẵn sàng); thử lại sau." });
-  }
+  const saved = await updateSettingDocument<{ channels?: unknown[] }>(NOTIFICATION_CHANNELS_KEY, (cur) => {
+    const list = readChannels(cur);
+    if (!list.some((x) => x.id === id)) throw new SettingsRefusal(404, { success: false, error: "Không tìm thấy kênh" });
+    // Checked again inside the write: a route may have moved to this channel meanwhile.
+    const nowRoutes = notificationRoutes(list);
+    if (ALERT_ROUTES.some((r) => nowRoutes[r] === id)) {
+      throw new SettingsRefusal(409, { success: false, code: "CHANNEL_IN_USE", error: "Kênh đang được dùng để nhận cảnh báo; đổi nơi nhận trước khi xóa" });
+    }
+    return { channels: list.filter((x) => x.id !== id) };
+  }, actor);
+  if ("status" in saved) return res.status(saved.status).json(saved.body);
   console.log(`[Channels] ${actor} xóa kênh "${current.name}" (${id})`);
   res.json({ success: true });
 });
@@ -9866,12 +9905,12 @@ app.post("/api/notification-channels/:id/test", requireOperatorRole("admin"), re
 app.put("/api/notification-routes", requireOperatorRole("admin"), requireCsrf, async (req, res) => {
   const channels = notificationChannels();
   const parsed = parseRoutesPatch(req.body, new Set(channels.map((c) => c.id)));
-  if (!parsed.ok) return res.status(400).json({ success: false, code: parsed.code, error: parsed.error, field: parsed.field });
+  if ("error" in parsed) return res.status(400).json({ success: false, code: parsed.code, error: parsed.error, field: parsed.field });
   const actor = operatorActor(req) || "admin";
-  const routes = { ...notificationRoutes(channels), ...parsed.patch };
-  if (!(await db.saveAppSetting(NOTIFICATION_ROUTES_KEY, routes, actor))) {
-    return res.status(503).json({ success: false, error: "Chưa lưu được nơi nhận (kho dữ liệu chưa sẵn sàng); thử lại sau." });
-  }
+  const known = new Set(channels.map((c) => c.id));
+  const saved = await updateSettingDocument<NotificationRoutes>(NOTIFICATION_ROUTES_KEY, (cur) => ({ ...readRoutes(cur, known), ...parsed.patch }), actor);
+  if ("status" in saved) return res.status(saved.status).json(saved.body);
+  const routes = notificationRoutes();
   console.log(`[Channels] ${actor} đổi nơi nhận cảnh báo: ${JSON.stringify(parsed.patch)}`);
   res.json({ success: true, routes });
 });
