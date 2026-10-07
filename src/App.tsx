@@ -511,6 +511,14 @@ export default function App() {
           } catch {}
         });
 
+        // Employee Updated (admin correction, or a photo adopted from a stranger group)
+        eventSource.addEventListener("employee_updated", (e: MessageEvent) => {
+          try {
+            const emp = JSON.parse(e.data);
+            if (emp?.id) setEmployees((prev) => prev.map((item) => (item.id === emp.id ? { ...item, ...emp } : item)));
+          } catch {}
+        });
+
         // Employee Deleted
         eventSource.addEventListener("employee_deleted", (e: MessageEvent) => {
           try {
@@ -801,6 +809,7 @@ export default function App() {
             onEmployeeDeleted={handleEmployeeDeleted}
             onTestEmployee={handleTestEmployee}
             onOpenStrangerClusters={() => handleOpenStrangerModal()}
+            onEmployeeUpdated={(emp) => setEmployees((prev) => prev.map((item) => (item.id === emp.id ? emp : item)))}
           />
         )}
 

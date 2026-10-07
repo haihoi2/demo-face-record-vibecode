@@ -20,6 +20,7 @@ import {
   XCircle,
   Clock,
   Activity,
+  Pencil,
 } from "lucide-react";
 import {
   Employee,
@@ -30,6 +31,8 @@ import {
 import { safeJsonFetch, compressImage } from "../utils/api";
 import { directionLabel, gateDisplayLabel, gatesOf } from "../utils/gates";
 import { ProtectedImage } from "./ProtectedImage";
+import { EmployeeEditDialog } from "./EmployeeEditDialog";
+import { hasRole, useOperatorSession } from "../utils/session";
 import { orgChoice, orgOptions, orgPlaceholder, useOrgCatalog } from "../utils/orgCatalog";
 import {
   ADAPTATION_TAG,
@@ -168,6 +171,8 @@ interface EmployeeRegistrationProps {
   onEmployeeDeleted: (id: string) => void;
   onTestEmployee: (employee: Employee) => void;
   onOpenStrangerClusters?: () => void;
+  /** After an admin correction (name, department, position, photo). */
+  onEmployeeUpdated?: (employee: Employee) => void;
 }
 
 export const EmployeeRegistration: React.FC<EmployeeRegistrationProps> = ({
@@ -176,7 +181,11 @@ export const EmployeeRegistration: React.FC<EmployeeRegistrationProps> = ({
   onEmployeeDeleted,
   onTestEmployee,
   onOpenStrangerClusters,
+  onEmployeeUpdated,
 }) => {
+  // Profile correction is admin-only (the server enforces it too).
+  const isAdmin = hasRole(useOperatorSession(), "admin");
+  const [editingEmployee, setEditingEmployee] = useState<Employee | null>(null);
   const [name, setName] = useState<string>("");
   const [employeeCode, setEmployeeCode] = useState<string>("");
   const [department, setDepartment] = useState<string>("Phòng Kỹ Thuật AI");
@@ -1598,6 +1607,18 @@ export const EmployeeRegistration: React.FC<EmployeeRegistrationProps> = ({
                   <Scan className="w-3.5 h-3.5" /> Quét Thử
                 </button>
 
+                {isAdmin && (
+                  <button
+                    type="button"
+                    id={`btn-edit-employee-${emp.id}`}
+                    onClick={() => setEditingEmployee(emp)}
+                    className="text-xs font-semibold text-slate-600 hover:text-slate-900 flex items-center gap-1 transition"
+                    title="Sửa họ tên, bộ phận, chức vụ hoặc ảnh đăng ký"
+                  >
+                    <Pencil className="w-3.5 h-3.5" /> Sửa
+                  </button>
+                )}
+
                 <button
                   type="button"
                   id={`btn-delete-employee-${emp.id}`}
@@ -1613,6 +1634,18 @@ export const EmployeeRegistration: React.FC<EmployeeRegistrationProps> = ({
           })}
         </div>
       </div>
+
+      {editingEmployee && (
+        <EmployeeEditDialog
+          employee={editingEmployee}
+          onClose={() => setEditingEmployee(null)}
+          onSaved={(updated, note) => {
+            setEditingEmployee(null);
+            onEmployeeUpdated?.(updated);
+            setSuccessMsg(note);
+          }}
+        />
+      )}
     </div>
   );
 };

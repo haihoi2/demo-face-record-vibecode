@@ -124,6 +124,7 @@ import type {
 } from "./src/types";
 import { runLocalFaceRecognition } from "./src/utils/localBiometrics";
 import { templateRejectReason } from "./src/utils/templateReject";
+import { describeEmployeeChanges, parseEmployeeEdit } from "./src/server/employeeEdit";
 import { countsAgainstTemplateCap, templateCapRefuses } from "./src/server/templateCap";
 import {
   clusterStrangerFaces,
@@ -7997,6 +7998,63 @@ app.post(EMPLOYEE_ROUTES, async (req, res) => {
   });
 });
 
+
+// ---- Admin profile correction (2026-10-07): name, department, position, registration photo ----
+app.patch(["/api/employees/:id", "/api/employees/:id/"], requireOperatorRole("admin"), requireCsrf, async (req, res) => {
+  const idx = employees.findIndex((e) => e.id === String(req.params.id || ""));
+  if (idx === -1) return res.status(404).json({ success: false, error: "Không tìm thấy nhân viên" });
+  const parsed = parseEmployeeEdit(req.body);
+  if ("error" in parsed) return res.status(400).json({ success: false, error: parsed.error, field: parsed.field });
+  const before = employees[idx];
+  const edit = parsed.value;
+  let department = before.department;
+  let position = before.position;
+  if (edit.department !== undefined) {
+    const d = resolveOrgName("departments", edit.department, before.department);
+    if ("error" in d) return res.status(400).json({ success: false, code: "UNKNOWN_DEPARTMENT", error: d.error, field: "department" });
+    department = d.name;
+  }
+  if (edit.position !== undefined) {
+    const p = resolveOrgName("positions", edit.position, before.position);
+    if ("error" in p) return res.status(400).json({ success: false, code: "UNKNOWN_POSITION", error: p.error, field: "position" });
+    position = p.name;
+  }
+  const updated: EmployeeRecord = {
+    ...before,
+    name: edit.name ?? before.name,
+    department,
+    position,
+    ...(edit.photo ? { photoUrl: edit.photo } : {}),
+  };
+  const changes = describeEmployeeChanges(before, updated, Boolean(edit.photo));
+  if (!changes.length) return res.json({ success: true, employee: updated, changes: [] });
+  employees[idx] = updated;
+  db.saveEmployee(updated);
+  // A new registration photo is also a template, like at registration (best-effort, template cap applies).
+  const enrolled = edit.photo
+    ? await enrollTemplateFromImage(updated.id, edit.photo, { source: "manual" })
+    : null;
+  const actor = operatorActor(req) || "admin";
+  // Persistent, actor-attributed record of the correction (no photo in it).
+  const notif: MobileNotificationRecord = {
+    id: "NOTIF-" + Date.now(),
+    title: "Đã sửa hồ sơ nhân viên",
+    body: `${actor} sửa hồ sơ ${updated.employeeCode}: ${changes.join("; ")}.`,
+    timestamp: new Date().toISOString(), type: "INFO", read: false,
+    employeeId: updated.id, employeeName: updated.name,
+  };
+  mobileNotifications.unshift(notif);
+  db.saveNotification(notif);
+  broadcastSSE("notification", notif);
+  broadcastSSE("employee_updated", updated);
+  console.log(`[Employees] ${actor} sửa ${updated.id} (${updated.employeeCode}): ${changes.join("; ")}${enrolled ? ` - mẫu: ${enrolled.saved ? "đã tạo" : enrolled.rejected}` : ""}`);
+  res.json({
+    success: true,
+    employee: updated,
+    changes,
+    ...(enrolled ? { faceTemplate: enrolled.saved || null, faceTemplateRejected: enrolled.rejected || null } : {}),
+  });
+});
 
 // ---- Face templates: the enrolled gallery an employee is recognised from ----
 // Measured on this site: the SAME person scores 0.50-0.62 within cam02 but only
