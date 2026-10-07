@@ -16,6 +16,7 @@ import type { StrangerFacePage, StrangerFaceRecord, StrangerFaceStore } from "./
 import type { ShadowAccuracySummary, ShadowAgreement, ShadowResultRecord, ShadowResultStore } from "./shadowResults";
 import { LOGIN_EVENT_KINDS, type LoginEventQuery, type LoginEventRecord, type LoginEventStore } from "./loginEvents";
 import type { BlurReportRecord, BlurReportStore } from "./blurReports";
+import { isBlurReportOnlyKind, isStoredFaceReportKind } from "./blurReports";
 import type { PresenceEventRecord, PresenceLabelKind } from "./presence/contracts";
 import type { FaceTemplate } from "../types";
 import { gateIdForLegacyRow, isDoorId, isGateId, LEGACY_DOOR_ID } from "./gates";
@@ -1348,7 +1349,7 @@ function normalizeBlurReport(r: BlurReportRecord): BlurReportRecord | null {
   const at = typeof r?.at === "string" && Number.isFinite(Date.parse(r.at)) ? new Date(r.at).toISOString() : null;
   if (!r || typeof r.id !== "string" || !r.id || r.id.length > 64 || !at) return null;
   if (typeof r.faceId !== "string" || !r.faceId || r.faceId.length > 64) return null;
-  if (r.kind !== "blur" && r.kind !== "blur-withdrawn") return null;
+  if (!isStoredFaceReportKind(r.kind)) return null;
   const num = (v: unknown) => (typeof v === "number" && Number.isFinite(v) ? v : null);
   const text = (v: unknown, n: number) => (typeof v === "string" && v ? v.slice(0, n) : null);
   return {
@@ -4228,6 +4229,8 @@ class SQLiteStorage implements StrangerFaceStore, ShadowResultStore, LoginEventS
     }
     const seen = new Set<string>();
     for (const r of rows) {
+      // Sharpness ratings share the store but never change the blur-report state.
+      if (!isBlurReportOnlyKind(r.kind)) continue;
       if (seen.has(r.faceId)) continue; // newest row per face only
       seen.add(r.faceId);
       if (r.kind === "blur") out.add(r.faceId);

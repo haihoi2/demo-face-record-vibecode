@@ -42,6 +42,7 @@ import { orgChoice, orgOptions, orgPlaceholder, useOrgCatalog } from "../utils/o
 import { soundEffects } from "../utils/audio";
 import { templateRejectReason } from "../utils/templateReject";
 import { employeeAvatarSrc, employeeInitials } from "../utils/employeeAvatar";
+import { SharpnessLabeler } from "./SharpnessLabeler";
 import {
   ClusterEditAction,
   ClusterEditUndo,
@@ -194,6 +195,7 @@ export const StrangerClusterModal: React.FC<StrangerClusterModalProps> = ({
   const canReportBlur = hasRole(useOperatorSession(), "operator");
   // Group editing (split / take photos out): operator and admin, same as the blur toggle.
   const canEditClusters = canReportBlur;
+  const [showSharpnessLabeler, setShowSharpnessLabeler] = useState(false);
   const [editingClusterId, setEditingClusterId] = useState<string | null>(null);
   const [editSelection, setEditSelection] = useState<string[]>([]);
   const [editPending, setEditPending] = useState(false);
@@ -698,6 +700,18 @@ export const StrangerClusterModal: React.FC<StrangerClusterModalProps> = ({
           </div>
 
           <div className="flex items-center gap-2">
+            {canReportBlur && (
+              <button
+                id="btn-open-sharpness-labeler"
+                type="button"
+                onClick={() => setShowSharpnessLabeler(true)}
+                title="Gán nhãn Rõ / Mờ cho ảnh người lạ để tinh chỉnh bộ lọc ảnh mờ"
+                className="inline-flex items-center gap-1.5 px-3 py-2 rounded-xl text-xs font-semibold border border-slate-200 text-slate-700 hover:bg-slate-50 transition-colors"
+              >
+                <Focus className="w-3.5 h-3.5" />
+                <span className="hidden sm:inline">Gán nhãn độ nét</span>
+              </button>
+            )}
             <button
               id="btn-refresh-stranger-clusters"
               onClick={() => loadClusters("", [])}
@@ -1738,6 +1752,9 @@ export const StrangerClusterModal: React.FC<StrangerClusterModalProps> = ({
           onClose={() => setPreviewEnlargedPhoto(null)}
         />
       )}
+
+      {/* Face sharpness S0: labelling round (operator/admin) */}
+      {showSharpnessLabeler && <SharpnessLabeler onClose={() => setShowSharpnessLabeler(false)} />}
     </div>
   );
 };
