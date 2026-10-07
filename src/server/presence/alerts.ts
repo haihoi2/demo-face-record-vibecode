@@ -10,7 +10,9 @@
  *    alert, so it is not alerted twice;
  *  - an event is decided `holdMs` after it first arrives, on its latest
  *    version, so a door scan that recognises the person a moment later still
- *    counts;
+ *    counts (2026-10-07: the scan comes 5.8 s after the person appears at the
+ *    median, 17 s at the 90th percentile; 3 s alerted 8 employees in one
+ *    morning, so the server default is 15 s);
  *  - per gate, the first alert goes out at once; after that at most one
  *    message per `windowMs`, summarising everything that arrived meanwhile
  *    (owner: "một tin gộp mỗi 5 phút" - 93 single messages in two mornings
@@ -85,6 +87,17 @@ export class PresenceAlertBatcher {
     return out;
   }
 
+  /**
+   * A message that could not be sent: its events go back to the front of the
+   * gate's queue for the next message (the window still applies). Events older
+   * than `maxAgeMs` are dropped rather than reported late.
+   */
+  requeue(batch: PresenceAlertBatch, nowMs: number, maxAgeMs: number): number {
+    const fresh = batch.events.filter((e) => nowMs - Date.parse(e.startedAt) <= maxAgeMs);
+    this.queued.set(batch.gateId, [...fresh, ...(this.queued.get(batch.gateId) || [])]);
+    return fresh.length;
+  }
+
   /** Events waiting for a decision or for the next message (for status and tests). */
   backlog(): { pending: number; queued: number } {
     let queued = 0;
@@ -137,6 +150,16 @@ export function presenceAlertPayload(
   };
   if (link) attachment.title_link = link;
   return { text: link ? `${text}\n[Mở bảng Hiện diện](${link})` : text, attachments: [attachment] };
+}
+
+/**
+ * How long the detector has gone without a picture: since the last picture
+ * seen, or since start when none has been seen yet. A stream reconnect swaps
+ * the reader and briefly has no picture at all - that is not "2 minutes
+ * without pictures" (2026-10-06: 28 false offline/online pairs in one day).
+ */
+export function presenceDetectorAgeMs(lastFrameAtMs: number | null | undefined, sinceMs: number, nowMs: number): number {
+  return Math.max(0, nowMs - (lastFrameAtMs ?? sinceMs));
 }
 
 /**

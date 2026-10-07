@@ -162,6 +162,7 @@ import {
   PresenceHealthState,
   presenceAlertPayload,
   presenceHealthPayload,
+  presenceDetectorAgeMs,
   presenceHealthTransition,
 } from "./src/server/presence/alerts";
 
@@ -2172,8 +2173,11 @@ function presenceModeFor(gate: Gate): "off" | "shadow" | "live" {
 }
 /** Live mode: after the first alert, at most one message per this many seconds per gate (owner: 5 minutes). */
 const PRESENCE_ALERT_WINDOW_SECONDS = envInt("PRESENCE_ALERT_WINDOW_SECONDS", 300, 30, 3600);
-/** Live mode: an event is decided this long after it arrives, so a face recognised a moment later still counts. */
-const PRESENCE_ALERT_HOLD_MS = envInt("PRESENCE_ALERT_HOLD_MS", 3000, 0, 30000);
+/**
+ * Live mode: an event is decided this long after it arrives, so a face recognised a moment later still counts
+ * (measured 2026-10-07: median 5.8 s, 90th percentile 17 s from presence start to the recognised scan).
+ */
+const PRESENCE_ALERT_HOLD_MS = envInt("PRESENCE_ALERT_HOLD_MS", 15000, 0, 30000);
 /** Live mode: no picture for this long -> one "offline" notice (and one "online" notice when pictures return). */
 const PRESENCE_OFFLINE_AFTER_SECONDS = envInt("PRESENCE_OFFLINE_AFTER_SECONDS", 120, 30, 3600);
 /**
@@ -9458,6 +9462,8 @@ function rememberPresenceRecord(record: PresenceEventRecord): void {
   while (presenceLatestRecords.size > 2000) presenceLatestRecords.delete(presenceLatestRecords.keys().next().value!);
 }
 const presenceHealth = new Map<string, PresenceHealthState>();
+/** Capture time of the last picture each live gate's detector got (survives reader swaps on reconnect). */
+const presenceLastFrameAt = new Map<string, number>();
 const presenceStartedAtMs = Date.now();
 
 function presenceGateLabel(gate: string): string {
@@ -9523,7 +9529,12 @@ async function sendPresenceWebhook(gate: string, payload: WebhookLogRecord["payl
 
 async function sendPresenceBatch(batch: PresenceAlertBatch): Promise<void> {
   const ok = await sendPresenceWebhook(batch.gateId, presenceAlertPayload(batch, presenceGateLabel(batch.gateId), presencePanelLink()));
-  if (!ok) return;
+  if (!ok) {
+    // Not lost: back in the queue for the next message (events older than an hour are dropped).
+    const kept = presenceAlerts.requeue(batch, Date.now(), 60 * 60 * 1000);
+    console.warn(`[Presence ${gateLogTag(batch.gateId)}] Giữ lại ${kept}/${batch.events.length} sự kiện cho tin cảnh báo kế tiếp.`);
+    return;
+  }
   const at = new Date().toISOString();
   for (const e of batch.events) {
     presenceAlertedAt.set(e.id, at);
@@ -9561,7 +9572,8 @@ setInterval(() => {
   for (const g of cameraStreamsConfig.gates) {
     if (presenceModeFor(g.id) !== "live") continue;
     const frame = gatePipelines.get(g.id)?.source?.reader?.latestPresenceFrame(offlineAfterMs * 2);
-    const ageMs = frame ? Math.max(0, Date.now() - frame.capturedAtMs) : null;
+    if (frame) presenceLastFrameAt.set(g.id, Math.max(presenceLastFrameAt.get(g.id) || 0, frame.capturedAtMs));
+    const ageMs = presenceDetectorAgeMs(presenceLastFrameAt.get(g.id), presenceStartedAtMs, Date.now());
     const t = presenceHealthTransition(presenceHealth.get(g.id) || "unknown", ageMs, offlineAfterMs);
     presenceHealth.set(g.id, t.state);
     if (t.notice) {

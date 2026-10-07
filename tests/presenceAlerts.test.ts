@@ -11,6 +11,7 @@ import {
   PresenceAlertBatcher,
   presenceAlertEligible,
   presenceAlertPayload,
+  presenceDetectorAgeMs,
   presenceHealthPayload,
   presenceHealthTransition,
   type PresenceAlertEvent,
@@ -82,6 +83,22 @@ describe("grouping per gate", () => {
   });
 });
 
+describe("a message that could not be sent", () => {
+  it("goes back to the queue for the next message; stale events are dropped", () => {
+    const b = new PresenceAlertBatcher({ windowMs: 5 * MIN, holdMs: 0 });
+    const t0 = Date.parse("2026-10-07T00:00:00Z");
+    b.offer(ev("PE-old", { startedAt: new Date(t0 - 2 * 60 * MIN).toISOString() }), t0);
+    b.offer(ev("PE-1", { startedAt: new Date(t0).toISOString() }), t0);
+    const [failed] = b.due(t0);
+    assert.equal(failed.events.length, 2);
+    assert.equal(b.requeue(failed, t0, 60 * MIN), 1, "the 2-hour-old event is dropped");
+    b.offer(ev("PE-2", { startedAt: new Date(t0 + MIN).toISOString() }), t0 + MIN);
+    assert.deepEqual(b.due(t0 + 2 * MIN), [], "still inside the window");
+    const [retry] = b.due(t0 + 5 * MIN);
+    assert.deepEqual(retry.events.map((e) => e.id), ["PE-1", "PE-2"]);
+  });
+});
+
 describe("messages", () => {
   it("one event: gate, local time, duration, no image, login link", () => {
     const p = presenceAlertPayload({ gateId: "entry", events: [ev("PE-1")] }, "Cổng vào", "https://gw.example/#presence");
@@ -104,6 +121,14 @@ describe("messages", () => {
 
 describe("offline notice", () => {
   const AFTER = 120_000;
+  it("a 6 s stream reconnect (no picture at all for a moment) is not offline", () => {
+    const start = 0, last = 500_000;
+    // Reader swapped: no picture right now, the last one 6 s ago.
+    const age = presenceDetectorAgeMs(last, start, last + 6000);
+    assert.equal(age, 6000);
+    assert.deepEqual(presenceHealthTransition("online", age, AFTER), { state: "online", notice: null });
+    assert.equal(presenceDetectorAgeMs(undefined, start, 130_000), 130_000, "never a picture since start");
+  });
   it("one notice when pictures stop, one when they return; a healthy start is silent", () => {
     let s = presenceHealthTransition("unknown", 500, AFTER);
     assert.deepEqual(s, { state: "online", notice: null });
@@ -128,6 +153,11 @@ describe("wiring", () => {
   it("only live gates message; shadow records only", () => {
     assert.match(src, /return raw === "shadow" \|\| raw === "live" \? raw : "off";/);
     assert.match(src, /if \(ok && presenceModeFor\(gate\) === "live"\) \{\n\s+presenceAlerts\.offer\(/);
+  });
+  it("the hold defaults to 15 s and a failed message is requeued", () => {
+    assert.match(src, /envInt\("PRESENCE_ALERT_HOLD_MS", 15000, 0, 30000\)/);
+    assert.match(src, /presenceAlerts\.requeue\(batch, Date\.now\(\), 60 \* 60 \* 1000\)/);
+    assert.match(src, /presenceDetectorAgeMs\(presenceLastFrameAt\.get\(g\.id\), presenceStartedAtMs, Date\.now\(\)\)/);
   });
   it("alertSentAt survives later updates of the event", () => {
     assert.match(src, /alertSentAt: presenceAlertedAt\.get\(id\) \?\? null,/);
