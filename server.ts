@@ -165,6 +165,30 @@ import {
   presenceDetectorAgeMs,
   presenceHealthTransition,
 } from "./src/server/presence/alerts";
+import { presenceSettingsFromEnv, type PresenceSettings } from "./src/server/presence/presenceConfig";
+import {
+  applyPresenceGatePatch,
+  effectivePresenceGateSettings,
+  parsePresenceGatePatch,
+  presenceSettingsImpact,
+  type PresenceGateOverride,
+  type PresenceGateValues,
+} from "./src/server/presence/gateSettings";
+import {
+  ALERT_ROUTES,
+  BUILT_IN_CHANNEL_ID,
+  MAX_CHANNELS,
+  type AlertRoute,
+  type NotificationChannel,
+  type NotificationRoutes,
+  channelViews,
+  maskWebhookUrl,
+  parseChannelInput,
+  parseRoutesPatch,
+  readChannels,
+  readRoutes,
+  routeTarget,
+} from "./src/server/notificationChannels";
 
 /** A running presence host per gate (two detector worker threads; P2 shadow). */
 const presenceHosts = new Map<string, PresenceHost>();
@@ -2162,14 +2186,17 @@ const DOOR_SCAN_SNAPSHOT_MAX_AGE_MS = 1500;
 const PRESENCE_FPS = envFloat("PRESENCE_FPS", 2, 0.5, 8);
 const PRESENCE_FRAME_WIDTH = envInt("PRESENCE_FRAME_WIDTH", 960, 320, 1920);
 const PRESENCE_EVENT_RETENTION_DAYS = envInt("PRESENCE_EVENT_RETENTION_DAYS", 7, 0, 365);
-/**
- * Presence mode of a gate: PRESENCE_MODE_<GATE> = off | shadow | live (default
- * off). shadow records events only; live also messages the security group
- * (P3a, src/server/presence/alerts.ts).
- */
-function presenceModeFor(gate: Gate): "off" | "shadow" | "live" {
+/** PRESENCE_MODE_<GATE> = off | shadow | live (default off): the .env default of a gate's mode. */
+function presenceEnvModeFor(gate: Gate): "off" | "shadow" | "live" {
   const raw = String(process.env[`PRESENCE_MODE_${gateEnvSuffix(gate)}`] || "").trim().toLowerCase();
   return raw === "shadow" || raw === "live" ? raw : "off";
+}
+/**
+ * Presence mode of a gate: the admin's saved setting (P3b), else .env. shadow
+ * records events only; live also messages the security group (P3a alerts).
+ */
+function presenceModeFor(gate: Gate): "off" | "shadow" | "live" {
+  return presenceGateSettings(gate).values.mode;
 }
 /** Live mode: after the first alert, at most one message per this many seconds per gate (owner: 5 minutes). */
 const PRESENCE_ALERT_WINDOW_SECONDS = envInt("PRESENCE_ALERT_WINDOW_SECONDS", 300, 30, 3600);
@@ -2180,6 +2207,44 @@ const PRESENCE_ALERT_WINDOW_SECONDS = envInt("PRESENCE_ALERT_WINDOW_SECONDS", 30
 const PRESENCE_ALERT_HOLD_MS = envInt("PRESENCE_ALERT_HOLD_MS", 15000, 0, 30000);
 /** Live mode: no picture for this long -> one "offline" notice (and one "online" notice when pictures return). */
 const PRESENCE_OFFLINE_AFTER_SECONDS = envInt("PRESENCE_OFFLINE_AFTER_SECONDS", 120, 30, 3600);
+/** Detector settings from .env (read once; .env does not change while running). */
+const presenceEnvSettings: { settings: PresenceSettings; errors: string[] } = presenceSettingsFromEnv();
+/** Saved per-gate overrides (P3b, app_settings "presence_gate_settings"). */
+const PRESENCE_GATE_SETTINGS_KEY = "presence_gate_settings";
+function presenceGateOverrides(): Record<string, PresenceGateOverride> {
+  const gates = (db.getAppSetting<{ gates?: Record<string, PresenceGateOverride> }>(PRESENCE_GATE_SETTINGS_KEY)?.value as any)?.gates;
+  return gates && typeof gates === "object" ? gates : {};
+}
+function presenceEnvDefaults(gate: Gate): PresenceGateValues {
+  const r = presenceEnvSettings.settings.rules;
+  return {
+    mode: presenceEnvModeFor(gate),
+    workingHours: `${r.workingHours.start}-${r.workingHours.end}`,
+    minSecondsWorking: r.minInViewMsWorking / 1000,
+    minSecondsAfterHours: r.minInViewMsAfterHours / 1000,
+    alertWindowSeconds: PRESENCE_ALERT_WINDOW_SECONDS,
+    alertHoldSeconds: PRESENCE_ALERT_HOLD_MS / 1000,
+  };
+}
+/** A gate's presence settings now: saved values over .env, and where each comes from. */
+function presenceGateSettings(gate: Gate) {
+  return effectivePresenceGateSettings(presenceEnvDefaults(gate), presenceGateOverrides()[gate]);
+}
+/** Detector settings for a gate: .env, with the gate's hours and minimum seconds. */
+function presenceDetectorSettings(gate: Gate): PresenceSettings {
+  const v = presenceGateSettings(gate).values;
+  const base = presenceEnvSettings.settings;
+  const [start, end] = v.workingHours.split("-");
+  return {
+    ...base,
+    rules: {
+      ...base.rules,
+      workingHours: { ...base.rules.workingHours, start, end },
+      minInViewMsWorking: Math.round(v.minSecondsWorking * 1000),
+      minInViewMsAfterHours: Math.round(v.minSecondsAfterHours * 1000),
+    },
+  };
+}
 /**
  * Sharpest of several frames (owner 2026-10-01): when the newest shared-stream
  * picture of a scan contains a face, this many slightly older pictures from
@@ -2887,9 +2952,11 @@ async function sendStrangerWebhook({
     db.saveWebhookConfig(webhookConfig);
   }
 
-  if (!webhookConfig.enabled) return null;
   // Opt-out is explicit `false`; an old config without the field stays enabled.
   if (webhookConfig.strangerAlertEnabled === false) return null;
+  // The channel stranger alerts are routed to (P3b); the built-in one is this webhook.
+  const strangerTarget = currentRouteTarget("stranger");
+  if (!strangerTarget) return null;
 
   const cooldownSeconds =
     typeof webhookConfig.strangerCooldownSeconds === "number" && webhookConfig.strangerCooldownSeconds >= 0
@@ -2991,7 +3058,7 @@ async function sendStrangerWebhook({
   const logEntry: WebhookLogRecord = {
     id: "WH-" + Date.now() + "-" + Math.floor(Math.random() * 1000),
     timestamp: new Date().toISOString(),
-    url: webhookConfig.url,
+    url: strangerTarget.builtIn ? strangerTarget.url : `${maskWebhookUrl(strangerTarget.url)} (${strangerTarget.name})`,
     method: "POST",
     payload,
     success: false,
@@ -3002,13 +3069,13 @@ async function sendStrangerWebhook({
   try {
     // Destination guard at send time: a stored URL the current policy refuses
     // is not contacted; the log entry says why.
-    const refusal = await destinationRefusal(webhookConfig.url, NET_POLICY.webhook);
+    const refusal = await destinationRefusal(strangerTarget.url, NET_POLICY.webhook);
     if (refusal) throw new DestinationRefusedError(refusal);
 
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), 7000);
 
-    const response = await fetch(webhookConfig.url, {
+    const response = await fetch(strangerTarget.url, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -6824,7 +6891,7 @@ interface GatePipelineSlot {
   retry: NodeJS.Timeout | null;
   statsLog: NodeJS.Timeout | null;
   /** The pipeline's stream reader while it runs: door scans read its whole-picture JPEGs. */
-  source: { streamId: string; url: string; reader: ReturnType<typeof createStreamReader> } | null;
+  source: { streamId: string; url: string; reader: ReturnType<typeof createStreamReader>; width: number; height: number } | null;
   /** The destination guard refused the stream: not started until the config changes. */
   blocked: { code: string; reason: string; since: string } | null;
 }
@@ -6850,7 +6917,9 @@ function desiredPipeline(gate: Gate): DesiredPipeline | null {
   const url = String(stream?.rtspUrl || "").trim();
   if (!stream?.enabled || stream.sourceType !== "RTSP" || !/^rtsps?:\/\//i.test(url)) return null;
   const area = normalizeGateArea(stream.roi) ?? null;
-  return { key: JSON.stringify([mode, stream.id, url, stream.rtspTransport, area, PIPELINE_FPS]), url, streamId: stream.id, area };
+  // Presence on/off is part of the stream (an extra output), so switching it restarts the stream.
+  const presenceOn = presenceModeFor(gate) !== "off";
+  return { key: JSON.stringify([mode, stream.id, url, stream.rtspTransport, area, PIPELINE_FPS, presenceOn]), url, streamId: stream.id, area };
 }
 
 async function startGatePipeline(gate: Gate, want: DesiredPipeline): Promise<void> {
@@ -6901,7 +6970,7 @@ async function startGatePipeline(gate: Gate, want: DesiredPipeline): Promise<voi
       crops: false,
     });
     slot.pipeline = pipeline;
-    slot.source = { streamId: want.streamId, url: want.url, reader: source };
+    slot.source = { streamId: want.streamId, url: want.url, reader: source, width: size.width, height: size.height };
     startPresenceHost(gate, source, size.width, size.height);
     pipeline.start();
     if (PIPELINE_STATS_LOG_MS > 0) {
@@ -9357,20 +9426,28 @@ const presenceEventIds = new Map<string, string>();
  * full-resolution JPEG nearest the best frame. Shadow: never messages.
  */
 /** Starts the gate's presence host on its pipeline stream when PRESENCE_MODE_<GATE>=shadow. Never throws. */
+/** Readers already forwarding their pictures to the gate's current host (a reader's listener cannot be removed). */
+const presenceFeedReaders = new WeakSet<object>();
 function startPresenceHost(gate: Gate, reader: ReturnType<typeof createStreamReader>, sourceWidth: number, sourceHeight: number): void {
   stopPresenceHost(gate);
   if (presenceModeFor(gate) === "off") return;
   try {
     const host = new PresenceHost({
       gateId: gate,
+      // .env with the gate's saved hours and minimum seconds (P3b settings).
+      settings: presenceDetectorSettings(gate),
       onDraft: (draft, crop) => void onPresenceDraft(gate, draft, crop).catch((err) => console.warn(`[Presence ${gateLogTag(gate)}] Lỗi xử lý sự kiện: ${err?.message || err}`)),
       onError: (msg) => console.warn(`[Presence ${gateLogTag(gate)}] ${msg}`),
     });
-    reader.on("presence-frame", (f) => host.offer({ ...f, sourceWidth, sourceHeight }));
+    if (presenceEnvSettings.errors.length) console.warn(`[Presence ${gateLogTag(gate)}] ${presenceEnvSettings.errors.join("; ")}`);
+    if (!presenceFeedReaders.has(reader)) {
+      presenceFeedReaders.add(reader);
+      reader.on("presence-frame", (f) => presenceHosts.get(gate)?.offer({ ...f, sourceWidth, sourceHeight }));
+    }
     host.start();
     presenceHosts.set(gate, host);
     console.log(presenceModeFor(gate) === "live"
-      ? `[Presence ${gateLogTag(gate)}] Đang báo (live): ${PRESENCE_FRAME_WIDTH}px, ${PRESENCE_FPS} hình/giây; ngoài giờ, không thấy mặt -> nhắn nhóm bảo vệ (tối đa 1 tin/${PRESENCE_ALERT_WINDOW_SECONDS}s mỗi cổng).`
+      ? `[Presence ${gateLogTag(gate)}] Đang báo (live): ${PRESENCE_FRAME_WIDTH}px, ${PRESENCE_FPS} hình/giây; ngoài giờ, không thấy mặt -> nhắn nhóm bảo vệ (tối đa 1 tin/${presenceGateSettings(gate).values.alertWindowSeconds}s mỗi cổng).`
       : `[Presence ${gateLogTag(gate)}] Chạy thử (shadow): ${PRESENCE_FRAME_WIDTH}px, ${PRESENCE_FPS} hình/giây; chỉ ghi nhận, không gửi cảnh báo.`);
   } catch (err: any) {
     console.warn(`[Presence ${gateLogTag(gate)}] Không khởi động được: ${err?.message || err}`);
@@ -9438,7 +9515,7 @@ async function onPresenceDraft(gate: Gate, draft: PresenceEventDraft, hostCrop: 
     presenceAlerts.offer({
       id, gateId: gate, startedAt: record.startedAt, inViewMs: record.inViewMs, peakPersons: record.peakPersons,
       period: record.period, faceOutcome: record.faceOutcome,
-    }, Date.now());
+    }, Date.now(), presenceGateSettings(gate).values.alertHoldSeconds * 1000);
   }
   if (!ok) console.warn(`[Presence ${gateLogTag(gate)}] Không lưu được sự kiện hiện diện ${id}.`);
   else if (isNew) {
@@ -9451,7 +9528,11 @@ async function onPresenceDraft(gate: Gate, draft: PresenceEventDraft, hostCrop: 
 }
 
 // ---- Presence alerts (P3a): grouping, sending, alertSentAt, offline notice ----
-const presenceAlerts = new PresenceAlertBatcher({ windowMs: PRESENCE_ALERT_WINDOW_SECONDS * 1000, holdMs: PRESENCE_ALERT_HOLD_MS });
+const presenceAlerts = new PresenceAlertBatcher({
+  windowMs: PRESENCE_ALERT_WINDOW_SECONDS * 1000,
+  holdMs: PRESENCE_ALERT_HOLD_MS,
+  windowMsFor: (gateId) => presenceGateSettings(gateId as Gate).values.alertWindowSeconds * 1000,
+});
 /** When each event was messaged, so later updates of the event keep it. */
 const presenceAlertedAt = new Map<string, string>();
 /** Latest version of recent events, to record alertSentAt without a read. */
@@ -9475,34 +9556,50 @@ function presencePanelLink(): string {
   return base ? `${base}/#presence` : "";
 }
 
-/**
- * One message to the shared Eton channel (the stranger alert's webhook, owner
- * decision 1 - declarable channels come with P3b). Same destination guard, no
- * redirects, and a webhook log entry like every other message.
- */
-async function sendPresenceWebhook(gate: string, payload: WebhookLogRecord["payload"]): Promise<boolean> {
+// ---- Notification channels and routing (P3b, src/server/notificationChannels.ts) ----
+const NOTIFICATION_CHANNELS_KEY = "notification_channels";
+const NOTIFICATION_ROUTES_KEY = "notification_routes";
+function notificationChannels(): NotificationChannel[] {
+  return readChannels(db.getAppSetting(NOTIFICATION_CHANNELS_KEY)?.value);
+}
+function notificationRoutes(channels: NotificationChannel[] = notificationChannels()): NotificationRoutes {
+  return readRoutes(db.getAppSetting(NOTIFICATION_ROUTES_KEY)?.value, new Set(channels.map((c) => c.id)));
+}
+function builtInChannel(): { url: string; enabled: boolean } {
   webhookConfig = db.getWebhookConfig(DEFAULT_WEBHOOK_CONFIG);
-  if (!webhookConfig.enabled || !webhookConfig.url) {
-    console.warn(`[Presence ${gateLogTag(gate)}] Webhook đang tắt: không gửi được cảnh báo hiện diện.`);
-    return false;
-  }
-  const direction = cameraStreamsConfig.gates.find((x) => x.id === gate)?.direction === "EXIT" ? "EXIT" : "ENTRY";
+  return { url: String(webhookConfig.url || ""), enabled: Boolean(webhookConfig.enabled) };
+}
+/** Where an alert type goes now; null when its channel is off. */
+function currentRouteTarget(route: AlertRoute) {
+  const channels = notificationChannels();
+  return routeTarget(route, notificationRoutes(channels), channels, builtInChannel());
+}
+
+/**
+ * POST one message to a channel: destination guard at send time, no redirects,
+ * 7 s timeout, a webhook log entry (a declared channel's URL is logged masked).
+ */
+async function postToChannel(
+  target: { id: string; name: string; url: string; builtIn: boolean },
+  payload: WebhookLogRecord["payload"],
+  meta: { scanType: "ENTRY" | "EXIT"; userName: string },
+): Promise<WebhookLogRecord> {
   const logEntry: WebhookLogRecord = {
     id: "WH-" + Date.now() + "-" + Math.floor(Math.random() * 1000),
     timestamp: new Date().toISOString(),
-    url: webhookConfig.url,
+    url: target.builtIn ? target.url : `${maskWebhookUrl(target.url)} (${target.name})`,
     method: "POST",
     payload,
     success: false,
-    scanType: direction,
-    userName: "Hiện diện",
+    scanType: meta.scanType,
+    userName: meta.userName,
   };
   try {
-    const refusal = await destinationRefusal(webhookConfig.url, NET_POLICY.webhook);
+    const refusal = await destinationRefusal(target.url, NET_POLICY.webhook);
     if (refusal) throw new DestinationRefusedError(refusal);
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), 7000);
-    const response = await fetch(webhookConfig.url, {
+    const response = await fetch(target.url, {
       method: "POST",
       headers: { "Content-Type": "application/json", "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) EtonWebhookBot/1.0" },
       body: JSON.stringify(payload),
@@ -9523,7 +9620,19 @@ async function sendPresenceWebhook(gate: string, payload: WebhookLogRecord["payl
   if (webhookLogs.length > 60) webhookLogs = webhookLogs.slice(0, 60);
   db.saveWebhookLog(logEntry);
   broadcastSSE("webhook_log", logEntry);
-  console.log(`[Presence ${gateLogTag(gate)}] Gửi cảnh báo hiện diện: ${logEntry.success ? `thành công (${logEntry.statusCode})` : `thất bại (${logEntry.error || logEntry.statusCode})`}`);
+  return logEntry;
+}
+
+/** A presence message (alert or detector health) to the channel its alert type is routed to. */
+async function sendPresenceWebhook(gate: string, payload: WebhookLogRecord["payload"], route: AlertRoute = "presence"): Promise<boolean> {
+  const target = currentRouteTarget(route);
+  if (!target) {
+    console.warn(`[Presence ${gateLogTag(gate)}] Kênh nhận ${route === "presence" ? "cảnh báo hiện diện" : "thông báo tình trạng"} đang tắt: không gửi.`);
+    return false;
+  }
+  const direction = cameraStreamsConfig.gates.find((x) => x.id === gate)?.direction === "EXIT" ? "EXIT" : "ENTRY";
+  const logEntry = await postToChannel(target, payload, { scanType: direction, userName: "Hiện diện" });
+  console.log(`[Presence ${gateLogTag(gate)}] Gửi ${route === "presence" ? "cảnh báo hiện diện" : "thông báo tình trạng"} tới "${target.name}": ${logEntry.success ? `thành công (${logEntry.statusCode})` : `thất bại (${logEntry.error || logEntry.statusCode})`}`);
   return logEntry.success;
 }
 
@@ -9578,7 +9687,7 @@ setInterval(() => {
     presenceHealth.set(g.id, t.state);
     if (t.notice) {
       console.warn(`[Presence ${gateLogTag(g.id)}] Phát hiện người ${t.notice === "offline" ? "NGỪNG hoạt động" : "hoạt động lại"}.`);
-      void sendPresenceWebhook(g.id, presenceHealthPayload(t.notice, gateLabelOf(g), new Date().toISOString(), presencePanelLink()));
+      void sendPresenceWebhook(g.id, presenceHealthPayload(t.notice, gateLabelOf(g), new Date().toISOString(), presencePanelLink()), "presenceHealth");
     }
   }
 }, 10_000).unref?.();
@@ -9601,7 +9710,7 @@ app.get("/api/presence/status", requireOperatorRole("viewer"), (_req, res) => {
       worker: st?.worker ?? null,
       lastEventAt: st?.lastEventAt ?? null,
       ...(presenceModeFor(g.id) === "live"
-        ? { alerts: { windowSeconds: PRESENCE_ALERT_WINDOW_SECONDS, health: presenceHealth.get(g.id) || "unknown" } }
+        ? { alerts: { windowSeconds: presenceGateSettings(g.id).values.alertWindowSeconds, health: presenceHealth.get(g.id) || "unknown" } }
         : {}),
       ...(presenceModeFor(g.id) !== "off" && !gatePipelines.get(g.id)?.source
         ? { note: "Cần luồng của engine thời gian thực (chế độ shadow/live) cho cổng này" }
@@ -9609,6 +9718,162 @@ app.get("/api/presence/status", requireOperatorRole("viewer"), (_req, res) => {
     };
   });
   res.json({ success: true, gates });
+});
+
+// ---- P3b: per-gate presence settings (saved over .env) ----
+function presenceSettingsView(gate: { id: string; label?: string; name?: string }) {
+  const { values, source } = presenceGateSettings(gate.id as Gate);
+  const saved = presenceGateOverrides()[gate.id];
+  return {
+    gateId: gate.id,
+    label: gateLabelOf(gate),
+    ...values,
+    source,
+    ...(saved?.updatedAt ? { updatedAt: saved.updatedAt, updatedBy: saved.updatedBy } : {}),
+    ...(values.mode !== "off" && !gatePipelines.get(gate.id)?.source ? { needsStream: true } : {}),
+  };
+}
+
+app.get("/api/presence/settings", requireOperatorRole("operator"), (_req, res) => {
+  res.json({ success: true, gates: cameraStreamsConfig.gates.map(presenceSettingsView) });
+});
+
+app.put("/api/presence/settings/:gateId", requireOperatorRole("admin"), requireCsrf, async (req, res) => {
+  const gate = cameraStreamsConfig.gates.find((g) => g.id === String(req.params.gateId || ""));
+  if (!gate) return res.status(404).json({ success: false, error: "Không tìm thấy cổng" });
+  const parsed = parsePresenceGatePatch(req.body);
+  if (!parsed.ok) return res.status(400).json({ success: false, error: parsed.error, field: parsed.field });
+  const before = presenceGateSettings(gate.id).values;
+  const all = presenceGateOverrides();
+  const actor = operatorActor(req) || "admin";
+  const next = { ...all, [gate.id]: applyPresenceGatePatch(all[gate.id], parsed.patch, actor, new Date().toISOString()) };
+  if (!(await db.saveAppSetting(PRESENCE_GATE_SETTINGS_KEY, { gates: next }, actor))) {
+    return res.status(503).json({ success: false, error: "Chưa lưu được cài đặt (kho dữ liệu chưa sẵn sàng); thử lại sau." });
+  }
+  const after = presenceGateSettings(gate.id).values;
+  const impact = presenceSettingsImpact(before, after);
+  console.log(`[Presence ${gateLogTag(gate.id)}] ${actor} đổi cài đặt: ${JSON.stringify(parsed.patch)}${impact.stream ? " - khởi động lại luồng" : impact.detector ? " - khởi động lại bộ phát hiện" : ""}`);
+  if (impact.stream) {
+    syncPipelines();
+  } else if (impact.detector) {
+    const src = gatePipelines.get(gate.id)?.source;
+    if (src) startPresenceHost(gate.id, src.reader, src.width, src.height);
+  }
+  if (before.mode === "live" && after.mode !== "live") presenceHealth.delete(gate.id);
+  res.json({ success: true, gate: presenceSettingsView(gate) });
+});
+
+// ---- P3b: notification channels and alert routing (admin) ----
+const CHANNEL_ROUTE_ID_RE = /^(?:eton-default|CH-[0-9a-f-]{36})$/;
+
+function notificationChannelsResponse() {
+  const channels = notificationChannels();
+  const routes = notificationRoutes(channels);
+  return { channels: channelViews(channels, builtInChannel(), routes), routes };
+}
+
+async function saveChannels(channels: NotificationChannel[], actor: string): Promise<boolean> {
+  return db.saveAppSetting(NOTIFICATION_CHANNELS_KEY, { channels }, actor);
+}
+
+app.get("/api/notification-channels", requireOperatorRole("admin"), (_req, res) => {
+  res.json({ success: true, ...notificationChannelsResponse() });
+});
+
+app.post("/api/notification-channels", requireOperatorRole("admin"), requireCsrf, async (req, res) => {
+  const parsed = parseChannelInput(req.body, "create");
+  if (!parsed.ok) return res.status(400).json({ success: false, error: parsed.error, field: parsed.field });
+  const channels = notificationChannels();
+  if (channels.length >= MAX_CHANNELS) return res.status(400).json({ success: false, code: "CHANNEL_LIMIT", error: `Tối đa ${MAX_CHANNELS} kênh` });
+  const check = await destinationSaveCheck(parsed.value.url!, NET_POLICY.webhook, "url");
+  if (check.refused) return res.status(400).json(check.refused);
+  const actor = operatorActor(req) || "admin";
+  const at = new Date().toISOString();
+  const channel: NotificationChannel = {
+    id: `CH-${randomUUID()}`, name: parsed.value.name!, type: "eton-webhook", url: parsed.value.url!,
+    enabled: parsed.value.enabled !== false, createdAt: at, createdBy: actor, updatedAt: at, updatedBy: actor,
+  };
+  if (!(await saveChannels([...channels, channel], actor))) {
+    return res.status(503).json({ success: false, error: "Chưa lưu được kênh (kho dữ liệu chưa sẵn sàng); thử lại sau." });
+  }
+  console.log(`[Channels] ${actor} thêm kênh "${channel.name}" (${channel.id}) ${maskWebhookUrl(channel.url)}`);
+  const view = notificationChannelsResponse().channels.find((c) => c.id === channel.id);
+  res.json({ success: true, channel: view, ...(check.warning ? { warning: check.warning } : {}) });
+});
+
+app.patch("/api/notification-channels/:id", requireOperatorRole("admin"), requireCsrf, async (req, res) => {
+  const id = String(req.params.id || "");
+  if (id === BUILT_IN_CHANNEL_ID) return res.status(400).json({ success: false, code: "CHANNEL_BUILT_IN", error: "Kênh Eton (chung) được sửa trong phần Webhook" });
+  if (!CHANNEL_ROUTE_ID_RE.test(id)) return res.status(400).json({ success: false, error: "Mã kênh không hợp lệ" });
+  const channels = notificationChannels();
+  const current = channels.find((c) => c.id === id);
+  if (!current) return res.status(404).json({ success: false, error: "Không tìm thấy kênh" });
+  const parsed = parseChannelInput(req.body, "update");
+  if (!parsed.ok) return res.status(400).json({ success: false, error: parsed.error, field: parsed.field });
+  let warning: unknown;
+  if (parsed.value.url !== undefined && parsed.value.url !== current.url) {
+    const check = await destinationSaveCheck(parsed.value.url, NET_POLICY.webhook, "url");
+    if (check.refused) return res.status(400).json(check.refused);
+    warning = check.warning;
+  }
+  const actor = operatorActor(req) || "admin";
+  const updated: NotificationChannel = { ...current, ...parsed.value, updatedAt: new Date().toISOString(), updatedBy: actor };
+  if (!(await saveChannels(channels.map((c) => (c.id === id ? updated : c)), actor))) {
+    return res.status(503).json({ success: false, error: "Chưa lưu được kênh (kho dữ liệu chưa sẵn sàng); thử lại sau." });
+  }
+  console.log(`[Channels] ${actor} sửa kênh "${updated.name}" (${id}): ${Object.keys(parsed.value).join(", ")}`);
+  res.json({ success: true, channel: notificationChannelsResponse().channels.find((c) => c.id === id), ...(warning ? { warning } : {}) });
+});
+
+app.delete("/api/notification-channels/:id", requireOperatorRole("admin"), requireCsrf, async (req, res) => {
+  const id = String(req.params.id || "");
+  if (id === BUILT_IN_CHANNEL_ID) return res.status(400).json({ success: false, code: "CHANNEL_BUILT_IN", error: "Không xóa được kênh Eton (chung)" });
+  if (!CHANNEL_ROUTE_ID_RE.test(id)) return res.status(400).json({ success: false, error: "Mã kênh không hợp lệ" });
+  const channels = notificationChannels();
+  const current = channels.find((c) => c.id === id);
+  if (!current) return res.status(404).json({ success: false, error: "Không tìm thấy kênh" });
+  const routes = notificationRoutes(channels);
+  const usedFor = ALERT_ROUTES.filter((r) => routes[r] === id);
+  if (usedFor.length) return res.status(409).json({ success: false, code: "CHANNEL_IN_USE", error: "Kênh đang được dùng để nhận cảnh báo; đổi nơi nhận trước khi xóa", usedFor });
+  const actor = operatorActor(req) || "admin";
+  if (!(await saveChannels(channels.filter((c) => c.id !== id), actor))) {
+    return res.status(503).json({ success: false, error: "Chưa xóa được kênh (kho dữ liệu chưa sẵn sàng); thử lại sau." });
+  }
+  console.log(`[Channels] ${actor} xóa kênh "${current.name}" (${id})`);
+  res.json({ success: true });
+});
+
+app.post("/api/notification-channels/:id/test", requireOperatorRole("admin"), requireCsrf, async (req, res) => {
+  const id = String(req.params.id || "");
+  if (!CHANNEL_ROUTE_ID_RE.test(id)) return res.status(400).json({ success: false, error: "Mã kênh không hợp lệ" });
+  const builtIn = builtInChannel();
+  const c = id === BUILT_IN_CHANNEL_ID ? null : notificationChannels().find((x) => x.id === id);
+  if (id !== BUILT_IN_CHANNEL_ID && !c) return res.status(404).json({ success: false, error: "Không tìm thấy kênh" });
+  const target = id === BUILT_IN_CHANNEL_ID
+    ? { id, name: "Eton (chung)", url: builtIn.url, builtIn: true }
+    : { id, name: c!.name, url: c!.url, builtIn: false };
+  if (!target.url) return res.status(400).json({ success: false, error: "Kênh chưa có URL" });
+  const actor = operatorActor(req) || "admin";
+  const at = new Date().toLocaleString("vi-VN", { timeZone: "Asia/Ho_Chi_Minh", hour12: false });
+  const log = await postToChannel(target, {
+    text: `🔔 Tin thử từ SmartFace Gate Watch - kênh "${target.name}" (${at})`,
+    attachments: [{ title: "Tin thử", text: `Gửi bởi ${actor}. Kênh này nhận được tin là đã cấu hình đúng.` }],
+  }, { scanType: "ENTRY", userName: "Tin thử" });
+  console.log(`[Channels] ${actor} gửi thử kênh "${target.name}": ${log.success ? "thành công" : "thất bại"}`);
+  res.json({ success: log.success, ...(log.statusCode ? { statusCode: log.statusCode } : {}), ...(log.success ? {} : { error: log.error || `HTTP ${log.statusCode}` }) });
+});
+
+app.put("/api/notification-routes", requireOperatorRole("admin"), requireCsrf, async (req, res) => {
+  const channels = notificationChannels();
+  const parsed = parseRoutesPatch(req.body, new Set(channels.map((c) => c.id)));
+  if (!parsed.ok) return res.status(400).json({ success: false, code: parsed.code, error: parsed.error, field: parsed.field });
+  const actor = operatorActor(req) || "admin";
+  const routes = { ...notificationRoutes(channels), ...parsed.patch };
+  if (!(await db.saveAppSetting(NOTIFICATION_ROUTES_KEY, routes, actor))) {
+    return res.status(503).json({ success: false, error: "Chưa lưu được nơi nhận (kho dữ liệu chưa sẵn sàng); thử lại sau." });
+  }
+  console.log(`[Channels] ${actor} đổi nơi nhận cảnh báo: ${JSON.stringify(parsed.patch)}`);
+  res.json({ success: true, routes });
 });
 
 app.get("/api/presence/events", requireOperatorRole("operator"), async (req, res) => {

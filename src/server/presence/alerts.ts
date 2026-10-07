@@ -38,6 +38,8 @@ export interface PresenceAlertBatch {
 export interface PresenceAlertOptions {
   windowMs: number;
   holdMs: number;
+  /** Per-gate window (P3b settings); default `windowMs`. */
+  windowMsFor?: (gateId: string) => number;
 }
 
 /** Whether an event messages the security group (see the module comment). */
@@ -54,11 +56,11 @@ export class PresenceAlertBatcher {
 
   constructor(private readonly opts: PresenceAlertOptions) {}
 
-  /** A new or updated event. Updates after the decision change nothing. */
-  offer(e: PresenceAlertEvent, nowMs: number): void {
+  /** A new or updated event. Updates after the decision change nothing. `holdMs`: per-gate hold (P3b settings). */
+  offer(e: PresenceAlertEvent, nowMs: number, holdMs: number = this.opts.holdMs): void {
     if (this.decided.has(e.id)) return;
     this.latest.set(e.id, { ...e });
-    if (!this.pending.has(e.id)) this.pending.set(e.id, nowMs + this.opts.holdMs);
+    if (!this.pending.has(e.id)) this.pending.set(e.id, nowMs + holdMs);
   }
 
   /** The messages to send now (at most one per gate). */
@@ -78,7 +80,8 @@ export class PresenceAlertBatcher {
     for (const [gateId, events] of this.queued) {
       if (!events.length) continue;
       const last = this.lastSentAt.get(gateId);
-      if (last !== undefined && nowMs - last < this.opts.windowMs) continue;
+      const windowMs = this.opts.windowMsFor?.(gateId) ?? this.opts.windowMs;
+      if (last !== undefined && nowMs - last < windowMs) continue;
       events.sort((a, b) => a.startedAt.localeCompare(b.startedAt));
       out.push({ gateId, events: [...events] });
       this.queued.set(gateId, []);

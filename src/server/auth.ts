@@ -69,6 +69,12 @@ const RULES: readonly Rule[] = [
   { methods: READ, pattern: /^\/api\/employees\/merges$/, role: "admin" },
   { methods: READ, pattern: /^\/api\/door-controller\/config$/, role: "admin" },
   { methods: READ, pattern: /^\/api\/webhook\/config$/, role: "admin" },
+  // P3b: notification channels and alert routing (URLs are secrets, masked anyway) - admin only.
+  { methods: READ, pattern: /^\/api\/notification-channels$/, role: "admin" },
+  { methods: WRITE, pattern: /^\/api\/notification-(?:channels(?:\/[^/]+(?:\/test)?)?|routes)$/, role: "admin" },
+  // P3b: per-gate presence settings - operators read, admins change.
+  { methods: READ, pattern: /^\/api\/presence\/settings$/, role: "operator" },
+  { methods: ["PUT"], pattern: /^\/api\/presence\/settings\/[^/]+$/, role: "admin" },
   { methods: READ, pattern: /^\/api\/system\//, role: "admin" },
 
   // --- any signed-in account may change its own password

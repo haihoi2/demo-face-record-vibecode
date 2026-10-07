@@ -163,8 +163,9 @@ describe("wiring", () => {
     assert.match(src, /alertSentAt: presenceAlertedAt\.get\(id\) \?\? null,/);
   });
   it("messages go through the destination guard, never follow redirects, and are logged", () => {
-    const fn = src.slice(src.indexOf("async function sendPresenceWebhook"), src.indexOf("async function sendPresenceBatch"));
-    assert.match(fn, /destinationRefusal\(webhookConfig\.url, NET_POLICY\.webhook\)/);
+    // P3b: every channel message goes through postToChannel.
+    const fn = src.slice(src.indexOf("async function postToChannel"), src.indexOf("async function sendPresenceBatch"));
+    assert.match(fn, /destinationRefusal\(target\.url, NET_POLICY\.webhook\)/);
     assert.match(fn, /redirect: "manual"/);
     assert.match(fn, /db\.saveWebhookLog\(logEntry\)/);
     assert.doesNotMatch(fn, /crop|unlockDoor|lockDoor/);
