@@ -1079,6 +1079,8 @@ function publicEmployee(employee: EmployeeRecord) {
     position: employee.position,
     registeredAt: employee.registeredAt,
     accessLevel: employee.accessLevel,
+    // Never the photo itself: whether GET /api/employees/:id/photo has one (list avatars, 2026-10-07).
+    hasPhoto: employeeHasPhoto(employee),
   };
 }
 
@@ -8591,13 +8593,18 @@ app.get(["/api/employees/:id/face-samples", "/api/employees/:id/face-samples/"],
   console.log(`[Employees] ${operatorActor(req) || "unknown"} xem ảnh đối chiếu của ${employee.employeeCode || employee.id} (${samples.length} ảnh nhận diện, ${templateFrames.length} khung mẫu)`);
   res.json({
     success: true,
-    employee: { id: employee.id, name: employee.name, employeeCode: employee.employeeCode, department: employee.department, hasPhoto: /^data:image\/(?:jpeg|png|webp);base64,/i.test(String(employee.photoUrl || "")) || Boolean(internalPhotoPath(employee.photoUrl)) },
+    employee: { id: employee.id, name: employee.name, employeeCode: employee.employeeCode, department: employee.department, hasPhoto: employeeHasPhoto(employee) },
     samples,
     templateFrames,
   });
 });
 
 /** A registration photo that is one of this app's protected picture routes (merged stranger face, event frame). */
+/** Whether GET /api/employees/:id/photo can serve this employee's registration photo (stored inline or as an internal picture path). */
+function employeeHasPhoto(e: { photoUrl?: unknown }): boolean {
+  return /^data:image\/(?:jpeg|png|webp);base64,/i.test(String(e.photoUrl || "")) || Boolean(internalPhotoPath(e.photoUrl));
+}
+
 function internalPhotoPath(photoUrl: unknown): string | null {
   const v = typeof photoUrl === "string" ? photoUrl.trim() : "";
   return /^\/api\/(?:strangers\/faces|logs)\/[A-Za-z0-9._:-]{1,128}\/image$/.test(v) ? v : null;
@@ -10640,6 +10647,7 @@ app.get(["/api/strangers/search-employees", "/api/strangers/employees"], require
       success: true,
       query: q,
       total: matches.length,
+      // photoUrl never leaves the server; publicEmployee adds hasPhoto for the list avatar.
       employees: matches,
     });
   } catch (err: any) {

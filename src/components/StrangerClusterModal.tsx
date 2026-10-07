@@ -41,6 +41,7 @@ import { compareSuggestion } from "../utils/mergeCompare";
 import { orgChoice, orgOptions, orgPlaceholder, useOrgCatalog } from "../utils/orgCatalog";
 import { soundEffects } from "../utils/audio";
 import { templateRejectReason } from "../utils/templateReject";
+import { employeeAvatarSrc, employeeInitials } from "../utils/employeeAvatar";
 import {
   ClusterEditAction,
   ClusterEditUndo,
@@ -1383,11 +1384,21 @@ export const StrangerClusterModal: React.FC<StrangerClusterModalProps> = ({
                                         picked ? "bg-emerald-50" : "hover:bg-slate-50"
                                       }`}
                                     >
-                                      <ProtectedImage
-                                        src={emp.photoUrl}
-                                        alt={emp.name}
-                                        className="w-9 h-9 rounded-lg object-cover bg-slate-200 shrink-0"
-                                      />
+                                      {employeeAvatarSrc(emp as Employee & { hasPhoto?: boolean }) ? (
+                                        <ProtectedImage
+                                          src={employeeAvatarSrc(emp as Employee & { hasPhoto?: boolean })}
+                                          alt={emp.name}
+                                          loading="lazy"
+                                          className="w-9 h-9 rounded-lg object-cover bg-slate-200 shrink-0"
+                                        />
+                                      ) : (
+                                        <span
+                                          aria-hidden="true"
+                                          className="w-9 h-9 rounded-lg bg-slate-200 text-slate-600 text-[11px] font-bold flex items-center justify-center shrink-0"
+                                        >
+                                          {employeeInitials(emp.name)}
+                                        </span>
+                                      )}
                                       <div className="min-w-0 flex-1">
                                         <p className="text-xs font-semibold text-slate-900 truncate">
                                           {emp.name}
@@ -1417,7 +1428,7 @@ export const StrangerClusterModal: React.FC<StrangerClusterModalProps> = ({
                                 />
                                 <ArrowRight className="w-4 h-4 text-emerald-600 shrink-0" />
                                 <ProtectedImage
-                                  src={mergeTarget.photoUrl}
+                                  src={employeeAvatarSrc(mergeTarget as Employee & { hasPhoto?: boolean })}
                                   alt={mergeTarget.name}
                                   className="w-10 h-10 rounded-lg object-cover bg-slate-200"
                                 />
