@@ -154,7 +154,18 @@ import type { DecisionContext, TrackDecisionResult } from "./src/server/pipeline
 import type { Gate, PipelineMode } from "./src/server/pipeline/contracts";
 import type { ExtractedFace, UnclearReason } from "./src/server/faceEmbedding";
 import { faceCutByFrameEdge } from "./src/server/faceFrameEdge";
-import { newBlurReportId, type BlurReportRecord } from "./src/server/blurReports";
+import {
+  FACE_RATINGS,
+  SHARPNESS_LABEL_TARGET,
+  isBlurReportOnlyKind,
+  isFaceRatingKind,
+  latestRatings,
+  newBlurReportId,
+  ratingSummary,
+  sharpnessSampleOrder,
+  type BlurReportKind,
+  type BlurReportRecord,
+} from "./src/server/blurReports";
 import type { FaceOutcome, PresenceEventDraft, PresenceEventRecord } from "./src/server/presence/contracts";
 
 import { PresenceHost } from "./src/server/presence/presenceHost";
@@ -9395,7 +9406,7 @@ app.get(["/api/strangers/clusters", "/api/strangers", "/api/strangers/"], requir
 // ---- Blur reports: operator labels for re-tuning the blur filter (src/server/blurReports.ts) ----
 const BLUR_REPORT_FACE_ID_RE = /^SF-[A-Za-z0-9-]{1,60}$/;
 
-async function recordBlurReport(req: Request, res: Response, kind: "blur" | "blur-withdrawn") {
+async function recordBlurReport(req: Request, res: Response, kind: BlurReportKind) {
   const faceId = String(req.params.faceId || "");
   if (!BLUR_REPORT_FACE_ID_RE.test(faceId)) {
     res.status(400).json({ success: false, error: "Chỉ báo mờ được ảnh khuôn mặt riêng (mã SF-...); ảnh cả khung hình cũ không hỗ trợ." });
@@ -9409,6 +9420,10 @@ async function recordBlurReport(req: Request, res: Response, kind: "blur" | "blu
   const [face] = await db.getStrangerFacesByIds([faceId]);
   if (!face) {
     res.status(404).json({ success: false, error: `Không tìm thấy ảnh khuôn mặt ${faceId}` });
+    return;
+  }
+  if (isFaceRatingKind(kind) && (face.purgedAt || face.employeeId)) {
+    res.status(409).json({ success: false, error: "Ảnh này không còn trong kho ảnh người lạ" });
     return;
   }
   const f = face as any;
@@ -9431,6 +9446,10 @@ async function recordBlurReport(req: Request, res: Response, kind: "blur" | "blu
     res.status(503).json({ success: false, error: "Chưa lưu được báo cáo ảnh mờ (kho dữ liệu chưa sẵn sàng); thử lại sau." });
     return;
   }
+  if (isFaceRatingKind(kind)) {
+    res.json({ success: true, faceId, rating: kind });
+    return;
+  }
   console.log(`[Strangers] ${report.actor} ${kind === "blur" ? "báo ảnh mờ" : "bỏ báo ảnh mờ"} ${faceId}`);
   res.json({ success: true, faceId, blurReported: kind === "blur", report });
 }
@@ -9442,13 +9461,64 @@ app.get("/api/strangers/blur-reports", requireOperatorRole("admin"), async (req,
   try {
     const limit = boundedInt(req.query.limit, 500, 1, 1000);
     const since = typeof req.query.since === "string" && req.query.since ? req.query.since : undefined;
-    const reports = await db.getBlurReports({ sinceIso: since, limit });
+    // Sharpness ratings (labelling page) share the store; this list stays blur reports only.
+    const reports = (await db.getBlurReports({ sinceIso: since, limit })).filter((r) => isBlurReportOnlyKind(r.kind));
     const latest = new Map<string, { faceId: string; blurReported: boolean; at: string }>();
-    for (const r of reports) if (!latest.has(r.faceId)) latest.set(r.faceId, { faceId: r.faceId, blurReported: r.kind === "blur", at: r.at });
+    for (const r of reports) if (isBlurReportOnlyKind(r.kind) && !latest.has(r.faceId)) latest.set(r.faceId, { faceId: r.faceId, blurReported: r.kind === "blur", at: r.at });
     console.log(`[Strangers] ${operatorActor(req) || "unknown"} xem báo cáo ảnh mờ: ${reports.length} dòng`);
     res.json({ success: true, reports, current: [...latest.values()] });
   } catch (err: any) {
     res.status(err instanceof RangeError ? 400 : 500).json({ success: false, error: err instanceof RangeError ? "since phải là thời gian ISO" : err?.message || "Lỗi đọc báo cáo ảnh mờ" });
+  }
+});
+
+// ---- Face sharpness S0: labelling round (plan docs/plans/2026-10-07-face-sharpness.md) ----
+/** Every rating row (append-only; the store keeps a few thousand at most during the round). */
+async function sharpnessRatingRows() {
+  return (await db.getBlurReports({ limit: 10000 })).filter((r) => isFaceRatingKind(r.kind));
+}
+
+/**
+ * The next faces for this labeller: stored stranger faces (not purged, not a
+ * recognised employee, with a crop), in the same hash order for everyone, minus
+ * those this person has rated. No image bytes: tiles load the protected crop.
+ */
+app.get("/api/strangers/sharpness/sample", requireOperatorRole("operator"), async (req, res) => {
+  try {
+    const limit = boundedInt(req.query.limit, 24, 1, 100);
+    const me = operatorActor(req) || "unknown";
+    const mine = latestRatings(await sharpnessRatingRows()).filter((r) => r.actor === me);
+    const rated = new Set(mine.map((r) => r.faceId));
+    const faces = (await collectStrangerFaceWindow(STRANGER_CLUSTER_WINDOW)).filter((f) => !f.purgedAt && !f.employeeId);
+    const ordered = sharpnessSampleOrder(faces);
+    const next = ordered.filter((f) => !rated.has(f.id)).slice(0, limit);
+    res.json({
+      success: true,
+      faces: next.map((f) => ({ faceId: f.id, imageUrl: faceImageUrl(f.id), capturedAt: f.capturedAt, gateId: (f as any).gateId || null })),
+      ratedByMe: mine.length,
+      available: faces.length,
+      target: SHARPNESS_LABEL_TARGET,
+    });
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: err?.message || "Lỗi lấy ảnh để gán nhãn" });
+  }
+});
+
+/** One rating: "sharp" | "blurry" | "not-face" (append-only; rating again replaces this person's earlier rating). */
+app.post("/api/strangers/faces/:faceId/rating", requireOperatorRole("operator"), requireCsrf, (req, res) => {
+  const rating = req.body?.rating;
+  if (rating !== "sharp" && rating !== "blurry" && rating !== "not-face") {
+    res.status(400).json({ success: false, error: "rating phải là sharp, blurry hoặc not-face" });
+    return;
+  }
+  void recordBlurReport(req, res, FACE_RATINGS[rating as "sharp" | "blurry" | "not-face"]);
+});
+
+app.get("/api/strangers/sharpness/summary", requireOperatorRole("admin"), async (_req, res) => {
+  try {
+    res.json({ success: true, ...ratingSummary(await sharpnessRatingRows()) });
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: err?.message || "Lỗi đọc tổng hợp nhãn" });
   }
 });
 

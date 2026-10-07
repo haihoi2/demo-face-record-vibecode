@@ -109,6 +109,10 @@ const RULES: readonly Rule[] = [
   // Blur reports: labels on stranger faces (never delete anything). The report list is admin.
   { methods: ["POST", "DELETE"], pattern: /^\/api\/strangers\/faces\/[^/]+\/blur-report$/, role: "operator" },
   { methods: READ, pattern: /^\/api\/strangers\/blur-reports$/, role: "admin" },
+  // Face sharpness S0: labelling round - operators rate, admins see the summary.
+  { methods: READ, pattern: /^\/api\/strangers\/sharpness\/sample$/, role: "operator" },
+  { methods: ["POST"], pattern: /^\/api\/strangers\/faces\/[^/]+\/rating$/, role: "operator" },
+  { methods: READ, pattern: /^\/api\/strangers\/sharpness\/summary$/, role: "admin" },
   // Person presence (P2): events and body crops are personal data -> operator; labels operator.
   { methods: READ, pattern: /^\/api\/presence\/events(?:\/[^/]+\/crop)?$/, role: "operator" },
   { methods: ["POST"], pattern: /^\/api\/presence\/events\/[^/]+\/label$/, role: "operator" },
