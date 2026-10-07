@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from "react";
+import React, { useState, useEffect, useCallback, useRef } from "react";
 import {
   Send,
   Radio,
@@ -27,6 +27,9 @@ import {
   UserX,
   Link2,
   Timer,
+  BellRing,
+  Pencil,
+  Plus,
 } from "lucide-react";
 import {
   WebhookConfig,
@@ -35,7 +38,36 @@ import {
   MobileNotification,
   STRANGER_DEEP_LINK_HASH,
 } from "../types";
-import { buildEventSourceUrl, safeJsonFetch } from "../utils/api";
+import { buildEventSourceUrl, operatorJsonFetch, safeJsonFetch } from "../utils/api";
+import { hasRole, useOperatorSession } from "../utils/session";
+import {
+  BUILT_IN_NOTE,
+  CHANNELS_URL,
+  CHANNEL_NAME_MAX,
+  CHANNEL_USES,
+  ChannelDraft,
+  ChannelFieldErrors,
+  ChannelView,
+  NotificationRoutes,
+  buildCreateChannelRequest,
+  buildDeleteChannelRequest,
+  buildRoutesRequest,
+  buildTestChannelRequest,
+  buildToggleChannelRequest,
+  buildUpdateChannelRequest,
+  channelErrorText,
+  channelUses,
+  isBuiltInChannel,
+  maskedUrlText,
+  parseChannelsResponse,
+  readChannelResult,
+  readDeleteResult,
+  readRoutesResult,
+  readTestResult,
+  routeOptions,
+  channelUseLabel,
+} from "../utils/notificationChannels";
+import { ModalDialog } from "./ModalDialog";
 import { soundEffects } from "../utils/audio";
 import {
   getStoredWebhookConfig,
@@ -111,6 +143,8 @@ export const WebhookIntegration: React.FC<WebhookIntegrationProps> = ({
   employees,
   onNewNotification,
 }) => {
+  const session = useOperatorSession();
+  const isAdmin = hasRole(session, "admin");
   const [config, setConfig] = useState<WebhookConfig>(
     withStrangerDefaults({
       enabled: false,
@@ -1223,6 +1257,9 @@ export const WebhookIntegration: React.FC<WebhookIntegrationProps> = ({
         </div>
       </div>
 
+      {/* Notification channels and alert routing (P3b): admin only, hidden for others. */}
+      {isAdmin && <NotificationChannelsSection />}
+
       {/* Network IP & Whitelist Guide for Network Team */}
       <div className="bg-gradient-to-br from-slate-900 via-slate-800 to-indigo-950 rounded-2xl border border-slate-700 p-6 text-white shadow-lg">
         <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 border-b border-slate-700/80 pb-4 mb-5">
@@ -1533,5 +1570,710 @@ Trân trọng cảm ơn!`;
         )}
       </div>
     </div>
+  );
+};
+
+// ---------------------------------------------------------------------------
+// "Kênh thông báo" - notification channels and alert routing (P3b, admin only)
+// ---------------------------------------------------------------------------
+
+type RowMessage = { ok: boolean; text: string };
+
+const inputClass = (invalid: boolean) =>
+  `w-full px-3 py-2 rounded-xl border text-xs bg-slate-50 text-slate-800 focus:bg-white focus:outline-hidden focus-visible:ring-2 focus-visible:ring-indigo-500 ${
+    invalid ? "border-rose-400" : "border-slate-200 focus:border-indigo-500"
+  }`;
+
+const FieldError: React.FC<{ id: string; text?: string }> = ({ id, text }) =>
+  text ? (
+    <p id={id} className="mt-1 text-[11px] font-semibold text-rose-700">
+      {text}
+    </p>
+  ) : null;
+
+const SECTION_BUTTON =
+  "inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg border text-xs font-semibold transition focus:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500 aria-disabled:opacity-60 aria-disabled:cursor-wait";
+
+const EMPTY_DRAFT: ChannelDraft = { name: "", url: "", enabled: true };
+
+/**
+ * Admin-only. Every value shown comes from the server; a change appears only
+ * after a 2xx reply and a refusal shows the server's own text. A channel URL is
+ * never shown (only the server's `urlMasked`), never logged, never stored: the
+ * URL typed in a form is sent once and the field is emptied after success.
+ */
+export const NotificationChannelsSection: React.FC = () => {
+  const [channels, setChannels] = useState<ChannelView[] | null>(null);
+  const [routes, setRoutes] = useState<NotificationRoutes | null>(null);
+  const [routeDraft, setRouteDraft] = useState<NotificationRoutes | null>(null);
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [notice, setNotice] = useState("");
+  const [rowBusy, setRowBusy] = useState<Record<string, "test" | "toggle">>({});
+  const [rowMessages, setRowMessages] = useState<Record<string, RowMessage>>({});
+
+  const [addDraft, setAddDraft] = useState<ChannelDraft>(EMPTY_DRAFT);
+  const [addErrors, setAddErrors] = useState<ChannelFieldErrors>({});
+  const [addError, setAddError] = useState<string | null>(null);
+  const [adding, setAdding] = useState(false);
+
+  const [editing, setEditing] = useState<ChannelView | null>(null);
+  const [editDraft, setEditDraft] = useState<ChannelDraft>(EMPTY_DRAFT);
+  const [editErrors, setEditErrors] = useState<ChannelFieldErrors>({});
+  const [editError, setEditError] = useState<string | null>(null);
+  const [editBusy, setEditBusy] = useState(false);
+
+  const [deleting, setDeleting] = useState<ChannelView | null>(null);
+  const [deleteError, setDeleteError] = useState<string | null>(null);
+  const [deleteBusy, setDeleteBusy] = useState(false);
+
+  const [routesBusy, setRoutesBusy] = useState(false);
+  const [routesError, setRoutesError] = useState<string | null>(null);
+
+  const mounted = useRef(true);
+  const generation = useRef(0);
+  /** Synchronous guard: one request per channel row at a time, even on a double click. */
+  const rowInFlight = useRef<Set<string>>(new Set());
+  const headingRef = useRef<HTMLHeadingElement | null>(null);
+
+  const load = useCallback(async () => {
+    const gen = ++generation.current;
+    setLoading(true);
+    const res = await operatorJsonFetch<any>(CHANNELS_URL);
+    if (!mounted.current || gen !== generation.current) return;
+    const parsed = res.ok ? parseChannelsResponse(res.data) : null;
+    if (parsed) {
+      setChannels(parsed.channels);
+      setRoutes(parsed.routes);
+      setRouteDraft(parsed.routes);
+      setLoadError(null);
+    } else {
+      // Keep what is on screen; the error says it may be stale.
+      setLoadError(res.ok ? "Máy chủ trả về dữ liệu không hợp lệ." : channelErrorText(res));
+    }
+    setLoading(false);
+  }, []);
+
+  useEffect(() => {
+    mounted.current = true;
+    void load();
+    return () => {
+      mounted.current = false;
+      generation.current++;
+    };
+  }, [load]);
+
+  const setRowMessage = (id: string, message: RowMessage | null) =>
+    setRowMessages((prev) => {
+      if (!message) {
+        if (!(id in prev)) return prev;
+        const { [id]: _drop, ...rest } = prev;
+        return rest;
+      }
+      return { ...prev, [id]: message };
+    });
+
+  const startRow = (id: string, kind: "test" | "toggle"): boolean => {
+    if (rowInFlight.current.has(id)) return false;
+    rowInFlight.current.add(id);
+    setRowBusy((prev) => ({ ...prev, [id]: kind }));
+    setRowMessage(id, null);
+    return true;
+  };
+  const endRow = (id: string) => {
+    rowInFlight.current.delete(id);
+    setRowBusy((prev) => {
+      const { [id]: _done, ...rest } = prev;
+      return rest;
+    });
+  };
+
+  const replaceChannel = (channel: ChannelView) =>
+    setChannels((prev) => (prev ? prev.map((c) => (c.id === channel.id ? channel : c)) : prev));
+
+  // ---- add ----
+  const onAdd = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (adding) return;
+    setAddError(null);
+    const built = buildCreateChannelRequest(addDraft);
+    if (built.ok === false) {
+      setAddErrors(built.errors);
+      return;
+    }
+    setAddErrors({});
+    setAdding(true);
+    const res = await operatorJsonFetch<any>(built.request.url, built.request.init);
+    if (!mounted.current) return;
+    setAdding(false);
+    const outcome = readChannelResult(res);
+    if (outcome.ok === true) {
+      const channel = outcome.channel;
+      setChannels((prev) => (prev ? [...prev.filter((c) => c.id !== channel.id), channel] : [channel]));
+      setAddDraft(EMPTY_DRAFT); // the typed URL leaves browser memory here
+      setNotice(`Đã thêm kênh ${channel.name}.`);
+      void load();
+    } else if (outcome.field === "url" || outcome.field === "name") {
+      setAddErrors({ [outcome.field]: outcome.error });
+      setNotice("");
+    } else {
+      setAddError(outcome.error);
+      setNotice("");
+    }
+  };
+
+  // ---- edit ----
+  const openEdit = (channel: ChannelView) => {
+    setEditing(channel);
+    setEditDraft({ name: channel.name, url: "", enabled: channel.enabled });
+    setEditErrors({});
+    setEditError(null);
+  };
+  const closeEdit = () => {
+    if (editBusy) return;
+    setEditing(null);
+    setEditDraft(EMPTY_DRAFT);
+  };
+  const onSaveEdit = async (e?: React.FormEvent) => {
+    e?.preventDefault();
+    if (!editing || editBusy) return;
+    setEditError(null);
+    const built = buildUpdateChannelRequest(editing, editDraft);
+    if (built.ok === false) {
+      setEditErrors(built.errors);
+      if (built.error) setEditError(built.error);
+      return;
+    }
+    setEditErrors({});
+    if (!built.request) {
+      closeEdit();
+      return;
+    }
+    setEditBusy(true);
+    const res = await operatorJsonFetch<any>(built.request.url, built.request.init);
+    if (!mounted.current) return;
+    setEditBusy(false);
+    const outcome = readChannelResult(res);
+    if (outcome.ok === true) {
+      replaceChannel(outcome.channel);
+      setEditing(null);
+      setEditDraft(EMPTY_DRAFT); // the typed URL leaves browser memory here
+      setNotice(`Đã lưu kênh ${outcome.channel.name}.`);
+    } else if (outcome.field === "url" || outcome.field === "name") {
+      setEditErrors({ [outcome.field]: outcome.error });
+    } else {
+      setEditError(outcome.error);
+    }
+  };
+
+  // ---- delete ----
+  const onConfirmDelete = async () => {
+    if (!deleting || deleteBusy) return;
+    const request = buildDeleteChannelRequest(deleting);
+    if (!request) {
+      setDeleteError(BUILT_IN_NOTE);
+      return;
+    }
+    setDeleteBusy(true);
+    setDeleteError(null);
+    const res = await operatorJsonFetch<any>(request.url, request.init);
+    if (!mounted.current) return;
+    setDeleteBusy(false);
+    const outcome = readDeleteResult(res);
+    if (outcome.ok === true) {
+      const { id, name } = deleting;
+      setChannels((prev) => (prev ? prev.filter((c) => c.id !== id) : prev));
+      setRowMessage(id, null);
+      setDeleting(null);
+      setNotice(`Đã xóa kênh ${name}.`);
+      // The row (and the button that opened the dialog) is gone: land on the heading.
+      window.setTimeout(() => headingRef.current?.focus(), 0);
+    } else {
+      setDeleteError(outcome.error);
+    }
+  };
+
+  // ---- toggle / test ----
+  const onToggle = async (channel: ChannelView) => {
+    const request = buildToggleChannelRequest(channel, !channel.enabled);
+    if (!request || !startRow(channel.id, "toggle")) return;
+    const res = await operatorJsonFetch<any>(request.url, request.init);
+    if (!mounted.current) return;
+    endRow(channel.id);
+    const outcome = readChannelResult(res);
+    if (outcome.ok === true) {
+      replaceChannel(outcome.channel);
+      setNotice(`Kênh ${outcome.channel.name} ${outcome.channel.enabled ? "đã bật" : "đã tắt"}.`);
+    } else {
+      setRowMessage(channel.id, { ok: false, text: outcome.error });
+    }
+  };
+
+  const onTest = async (channel: ChannelView) => {
+    if (!startRow(channel.id, "test")) return;
+    const request = buildTestChannelRequest(channel.id);
+    const res = await operatorJsonFetch<any>(request.url, request.init);
+    if (!mounted.current) return;
+    endRow(channel.id);
+    setRowMessage(channel.id, readTestResult(res));
+  };
+
+  // ---- routes ----
+  const routesChanged = !!routes && !!routeDraft && CHANNEL_USES.some((u) => routes[u] !== routeDraft[u]);
+  const onSaveRoutes = async () => {
+    if (!routes || !routeDraft || routesBusy) return;
+    const request = buildRoutesRequest(routes, routeDraft);
+    if (!request) return;
+    setRoutesBusy(true);
+    setRoutesError(null);
+    const res = await operatorJsonFetch<any>(request.url, request.init);
+    if (!mounted.current) return;
+    setRoutesBusy(false);
+    const outcome = readRoutesResult(res);
+    if (outcome.ok === true) {
+      setRoutes(outcome.routes);
+      setRouteDraft(outcome.routes);
+      setNotice("Đã lưu nơi gửi cảnh báo.");
+    } else {
+      setRoutesError(outcome.error);
+    }
+  };
+
+  const list = channels ?? [];
+  const deletingUses = deleting ? channelUses(deleting, routes) : [];
+
+  return (
+    <section
+      aria-labelledby="notification-channels-title"
+      className="bg-white rounded-2xl border border-slate-200 p-5 shadow-xs space-y-5"
+      data-testid="notification-channels"
+    >
+      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 border-b border-slate-100 pb-3">
+        <div className="flex items-center gap-2">
+          <BellRing className="w-4 h-4 text-indigo-600" aria-hidden="true" />
+          <div>
+            <h3
+              id="notification-channels-title"
+              ref={headingRef}
+              tabIndex={-1}
+              className="text-sm font-bold text-slate-900 focus:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500 rounded"
+            >
+              Kênh thông báo
+            </h3>
+            <p className="text-[11px] text-slate-500">Nơi nhận cảnh báo người lạ và hiện diện. URL chỉ hiển thị dạng che.</p>
+          </div>
+        </div>
+        <button
+          type="button"
+          onClick={() => {
+            if (!loading) void load();
+          }}
+          aria-disabled={loading || undefined}
+          className={`${SECTION_BUTTON} border-slate-200 text-slate-600 hover:bg-slate-50`}
+        >
+          <RefreshCw className={`w-3.5 h-3.5 ${loading ? "animate-spin" : ""}`} aria-hidden="true" /> Làm mới
+          <span className="sr-only"> kênh thông báo</span>
+        </button>
+      </div>
+
+      <p role="status" aria-live="polite" className="sr-only">
+        {notice}
+      </p>
+
+      {loadError && (
+        <div role="alert" className="flex items-start gap-2 rounded-xl border border-rose-200 bg-rose-50 px-3 py-2 text-xs font-semibold text-rose-700">
+          <AlertTriangle className="w-4 h-4 shrink-0" aria-hidden="true" />
+          <span className="break-words">{loadError}</span>
+        </div>
+      )}
+      {channels === null && !loadError && <p className="text-xs text-slate-500">Đang tải kênh thông báo...</p>}
+
+      {channels !== null && (
+        <ul className="space-y-2" aria-label="Danh sách kênh">
+          {list.map((channel) => {
+            const builtIn = isBuiltInChannel(channel);
+            const busy = rowBusy[channel.id];
+            const message = rowMessages[channel.id];
+            const uses = channelUses(channel, routes);
+            const nameId = `channel-${channel.id}-name`;
+            return (
+              <li
+                key={channel.id}
+                aria-labelledby={nameId}
+                aria-busy={busy ? true : undefined}
+                className="rounded-xl border border-slate-200 bg-slate-50/60 p-3 text-xs space-y-2"
+              >
+                <div className="flex flex-wrap items-start justify-between gap-2">
+                  <div className="min-w-0 space-y-0.5">
+                    <p id={nameId} className="font-bold text-slate-900 break-words">
+                      {channel.name}
+                    </p>
+                    <p className="font-mono text-[11px] text-slate-600 break-all">
+                      <span className="sr-only">URL (đã che): </span>
+                      {maskedUrlText(channel)}
+                    </p>
+                    {builtIn && <p className="text-[11px] text-indigo-700">{BUILT_IN_NOTE}</p>}
+                  </div>
+                  <div className="flex flex-wrap items-center gap-1.5">
+                    {builtIn ? (
+                      <span
+                        className={`px-2 py-0.5 rounded-full border text-[11px] font-bold ${
+                          channel.enabled ? "bg-emerald-50 text-emerald-800 border-emerald-200" : "bg-slate-100 text-slate-600 border-slate-200"
+                        }`}
+                      >
+                        {channel.enabled ? "Đang bật" : "Đang tắt"}
+                      </span>
+                    ) : (
+                      <button
+                        type="button"
+                        role="switch"
+                        aria-checked={channel.enabled}
+                        aria-label={`Bật kênh ${channel.name}`}
+                        // Not `disabled`: that would drop keyboard focus to <body> mid-request.
+                        aria-disabled={busy ? true : undefined}
+                        onClick={() => void onToggle(channel)}
+                        className={`${SECTION_BUTTON} ${
+                          channel.enabled ? "bg-emerald-50 text-emerald-800 border-emerald-200" : "bg-white text-slate-600 border-slate-300"
+                        }`}
+                      >
+                        {busy === "toggle" ? "Đang lưu..." : channel.enabled ? "Bật" : "Tắt"}
+                      </button>
+                    )}
+                    <button
+                      type="button"
+                      aria-disabled={busy ? true : undefined}
+                      onClick={() => void onTest(channel)}
+                      className={`${SECTION_BUTTON} bg-white border-indigo-200 text-indigo-700 hover:bg-indigo-50`}
+                    >
+                      <Send className="w-3.5 h-3.5" aria-hidden="true" />
+                      {busy === "test" ? "Đang gửi..." : "Gửi thử"}
+                      <span className="sr-only"> tới {channel.name}</span>
+                    </button>
+                    {!builtIn && (
+                      <>
+                        <button
+                          type="button"
+                          onClick={() => openEdit(channel)}
+                          className={`${SECTION_BUTTON} bg-white border-slate-300 text-slate-700 hover:bg-slate-50`}
+                        >
+                          <Pencil className="w-3.5 h-3.5" aria-hidden="true" /> Sửa
+                          <span className="sr-only"> kênh {channel.name}</span>
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setDeleting(channel);
+                            setDeleteError(null);
+                          }}
+                          className={`${SECTION_BUTTON} bg-white border-rose-200 text-rose-700 hover:bg-rose-50`}
+                        >
+                          <Trash2 className="w-3.5 h-3.5" aria-hidden="true" /> Xóa
+                          <span className="sr-only"> kênh {channel.name}</span>
+                        </button>
+                      </>
+                    )}
+                  </div>
+                </div>
+                <div className="flex flex-wrap items-center gap-1.5">
+                  <span className="text-[11px] text-slate-500">Dùng cho:</span>
+                  {uses.length === 0 ? (
+                    <span className="text-[11px] text-slate-400">chưa dùng</span>
+                  ) : (
+                    uses.map((u) => (
+                      <span key={u} className="px-2 py-0.5 rounded-full border border-indigo-200 bg-indigo-50 text-indigo-700 text-[11px] font-semibold">
+                        {channelUseLabel(u)}
+                      </span>
+                    ))
+                  )}
+                </div>
+                {message && (
+                  <p
+                    role={message.ok ? "status" : "alert"}
+                    className={`flex items-start gap-1.5 text-[11px] font-semibold break-words ${message.ok ? "text-emerald-700" : "text-rose-700"}`}
+                  >
+                    {message.ok ? (
+                      <CheckCircle2 className="w-3.5 h-3.5 shrink-0" aria-hidden="true" />
+                    ) : (
+                      <XCircle className="w-3.5 h-3.5 shrink-0" aria-hidden="true" />
+                    )}
+                    <span>{message.text}</span>
+                  </p>
+                )}
+              </li>
+            );
+          })}
+          {list.length === 0 && <li className="text-xs text-slate-500">Chưa có kênh nào.</li>}
+        </ul>
+      )}
+
+      {/* ---- routing ---- */}
+      {routes && routeDraft && (
+        <fieldset className="rounded-xl border border-slate-200 p-3 space-y-3">
+          <legend className="px-1 text-xs font-bold text-slate-900">Gửi cảnh báo tới</legend>
+          <div className="grid gap-3 sm:grid-cols-3">
+            {CHANNEL_USES.map((use) => (
+              <label key={use} htmlFor={`route-${use}`} className="text-[11px] font-semibold text-slate-600">
+                {channelUseLabel(use)}
+                <select
+                  id={`route-${use}`}
+                  value={routeDraft[use]}
+                  onChange={(e) => {
+                    const value = e.target.value;
+                    setRouteDraft((prev) => (prev ? { ...prev, [use]: value } : prev));
+                    setRoutesError(null);
+                  }}
+                  className="mt-1 block w-full px-3 py-2 rounded-lg border border-slate-300 text-xs font-normal bg-white focus:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500"
+                >
+                  {routeOptions(list, routeDraft[use]).map((o) => (
+                    <option key={o.value} value={o.value}>
+                      {o.label}
+                    </option>
+                  ))}
+                </select>
+              </label>
+            ))}
+          </div>
+          {routesError && (
+            <p role="alert" className="text-[11px] font-semibold text-rose-700 break-words">
+              {routesError}
+            </p>
+          )}
+          <div className="flex items-center gap-2">
+            <button
+              type="button"
+              onClick={() => void onSaveRoutes()}
+              disabled={!routesChanged && !routesBusy}
+              aria-disabled={routesBusy || undefined}
+              className={`${SECTION_BUTTON} bg-indigo-600 border-indigo-600 text-white hover:bg-indigo-700 disabled:opacity-50`}
+            >
+              <Check className="w-3.5 h-3.5" aria-hidden="true" /> {routesBusy ? "Đang lưu..." : "Lưu nơi gửi"}
+            </button>
+            {routesChanged && !routesBusy && (
+              <button
+                type="button"
+                onClick={() => {
+                  setRouteDraft(routes);
+                  setRoutesError(null);
+                }}
+                className={`${SECTION_BUTTON} bg-white border-slate-300 text-slate-700 hover:bg-slate-50`}
+              >
+                Hủy thay đổi
+              </button>
+            )}
+          </div>
+        </fieldset>
+      )}
+
+      {/* ---- add ---- */}
+      <form
+        onSubmit={(e) => void onAdd(e)}
+        noValidate
+        aria-labelledby="channel-add-title"
+        className="rounded-xl border border-dashed border-slate-300 p-3 space-y-3"
+      >
+        <h4 id="channel-add-title" className="flex items-center gap-1.5 text-xs font-bold text-slate-900">
+          <Plus className="w-3.5 h-3.5 text-indigo-600" aria-hidden="true" /> Thêm kênh
+        </h4>
+        <div className="grid gap-3 sm:grid-cols-2">
+          <div>
+            <label htmlFor="channel-add-name" className="block text-[11px] font-semibold text-slate-700 mb-1">
+              Tên kênh
+            </label>
+            <input
+              id="channel-add-name"
+              type="text"
+              maxLength={CHANNEL_NAME_MAX}
+              value={addDraft.name}
+              onChange={(e) => setAddDraft((d) => ({ ...d, name: e.target.value }))}
+              aria-invalid={addErrors.name ? true : undefined}
+              aria-describedby={addErrors.name ? "channel-add-name-error" : undefined}
+              className={inputClass(!!addErrors.name)}
+            />
+            <FieldError id="channel-add-name-error" text={addErrors.name} />
+          </div>
+          <div>
+            <label htmlFor="channel-add-url" className="block text-[11px] font-semibold text-slate-700 mb-1">
+              URL webhook
+            </label>
+            <input
+              id="channel-add-url"
+              type="text"
+              inputMode="url"
+              autoComplete="off"
+              spellCheck={false}
+              placeholder="https://..."
+              value={addDraft.url}
+              onChange={(e) => setAddDraft((d) => ({ ...d, url: e.target.value }))}
+              aria-invalid={addErrors.url ? true : undefined}
+              aria-describedby={addErrors.url ? "channel-add-url-error" : undefined}
+              className={`${inputClass(!!addErrors.url)} font-mono`}
+            />
+            <FieldError id="channel-add-url-error" text={addErrors.url} />
+          </div>
+        </div>
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <label htmlFor="channel-add-enabled" className="flex items-center gap-2 text-xs text-slate-700 cursor-pointer">
+            <input
+              id="channel-add-enabled"
+              type="checkbox"
+              checked={addDraft.enabled}
+              onChange={(e) => setAddDraft((d) => ({ ...d, enabled: e.target.checked }))}
+              className="w-4 h-4 text-indigo-600 rounded focus-visible:ring-2 focus-visible:ring-indigo-500"
+            />
+            Bật kênh
+          </label>
+          <button
+            type="submit"
+            aria-disabled={adding || undefined}
+            className={`${SECTION_BUTTON} bg-indigo-600 border-indigo-600 text-white hover:bg-indigo-700`}
+          >
+            <Plus className="w-3.5 h-3.5" aria-hidden="true" /> {adding ? "Đang thêm..." : "Thêm kênh"}
+          </button>
+        </div>
+        {addError && (
+          <p role="alert" className="text-[11px] font-semibold text-rose-700 break-words">
+            {addError}
+          </p>
+        )}
+      </form>
+
+      {editing && (
+        <ModalDialog
+          id="channel-edit-dialog"
+          title={
+            <>
+              <Pencil className="w-4 h-4 text-indigo-600" aria-hidden="true" /> Sửa kênh
+            </>
+          }
+          busy={editBusy}
+          onClose={closeEdit}
+          footer={
+            <>
+              <button
+                type="button"
+                onClick={closeEdit}
+                disabled={editBusy}
+                className="px-3 py-1.5 text-xs font-semibold rounded-lg border border-slate-200 text-slate-700 hover:bg-slate-50 disabled:opacity-40 focus:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500"
+              >
+                Hủy
+              </button>
+              <button
+                type="submit"
+                form="channel-edit-form"
+                aria-disabled={editBusy || undefined}
+                className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold rounded-lg bg-indigo-600 text-white hover:bg-indigo-700 aria-disabled:opacity-60 focus:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500"
+              >
+                <Check className="w-3.5 h-3.5" aria-hidden="true" /> {editBusy ? "Đang lưu..." : "Lưu"}
+              </button>
+            </>
+          }
+        >
+          <form id="channel-edit-form" onSubmit={(e) => void onSaveEdit(e)} noValidate className="space-y-3 text-xs">
+            <div>
+              <label htmlFor="channel-edit-name" className="block text-[11px] font-semibold text-slate-700 mb-1">
+                Tên kênh
+              </label>
+              <input
+                id="channel-edit-name"
+                data-autofocus
+                type="text"
+                maxLength={CHANNEL_NAME_MAX}
+                value={editDraft.name}
+                onChange={(e) => setEditDraft((d) => ({ ...d, name: e.target.value }))}
+                aria-invalid={editErrors.name ? true : undefined}
+                aria-describedby={editErrors.name ? "channel-edit-name-error" : undefined}
+                className={inputClass(!!editErrors.name)}
+              />
+              <FieldError id="channel-edit-name-error" text={editErrors.name} />
+            </div>
+            <div>
+              <label htmlFor="channel-edit-url" className="block text-[11px] font-semibold text-slate-700 mb-1">
+                URL webhook mới
+              </label>
+              <p id="channel-edit-url-hint" className="mb-1 text-[11px] text-slate-500">
+                Hiện tại: <span className="font-mono break-all">{maskedUrlText(editing)}</span>. Để trống để giữ nguyên.
+              </p>
+              <input
+                id="channel-edit-url"
+                type="text"
+                inputMode="url"
+                autoComplete="off"
+                spellCheck={false}
+                placeholder="https://..."
+                value={editDraft.url}
+                onChange={(e) => setEditDraft((d) => ({ ...d, url: e.target.value }))}
+                aria-invalid={editErrors.url ? true : undefined}
+                aria-describedby={editErrors.url ? "channel-edit-url-hint channel-edit-url-error" : "channel-edit-url-hint"}
+                className={`${inputClass(!!editErrors.url)} font-mono`}
+              />
+              <FieldError id="channel-edit-url-error" text={editErrors.url} />
+            </div>
+            <label htmlFor="channel-edit-enabled" className="flex items-center gap-2 text-xs text-slate-700 cursor-pointer">
+              <input
+                id="channel-edit-enabled"
+                type="checkbox"
+                checked={editDraft.enabled}
+                onChange={(e) => setEditDraft((d) => ({ ...d, enabled: e.target.checked }))}
+                className="w-4 h-4 text-indigo-600 rounded focus-visible:ring-2 focus-visible:ring-indigo-500"
+              />
+              Bật kênh
+            </label>
+            {editError && (
+              <p role="alert" className="text-[11px] font-semibold text-rose-700 break-words">
+                {editError}
+              </p>
+            )}
+          </form>
+        </ModalDialog>
+      )}
+
+      {deleting && (
+        <ModalDialog
+          id="channel-delete-dialog"
+          role="alertdialog"
+          title={
+            <>
+              <Trash2 className="w-4 h-4 text-rose-600" aria-hidden="true" /> Xóa kênh {deleting.name}?
+            </>
+          }
+          description={
+            deletingUses.length > 0
+              ? `Kênh đang dùng cho: ${deletingUses.map(channelUseLabel).join(", ")}. Đổi nơi gửi trước khi xóa.`
+              : "Kênh sẽ bị xóa khỏi danh sách."
+          }
+          busy={deleteBusy}
+          onClose={() => {
+            if (!deleteBusy) setDeleting(null);
+          }}
+          footer={
+            <>
+              <button
+                type="button"
+                data-autofocus
+                onClick={() => setDeleting(null)}
+                disabled={deleteBusy}
+                className="px-3 py-1.5 text-xs font-semibold rounded-lg border border-slate-200 text-slate-700 hover:bg-slate-50 disabled:opacity-40 focus:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500"
+              >
+                Hủy
+              </button>
+              <button
+                type="button"
+                onClick={() => void onConfirmDelete()}
+                aria-disabled={deleteBusy || undefined}
+                className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold rounded-lg bg-rose-600 text-white hover:bg-rose-700 aria-disabled:opacity-60 focus:outline-none focus-visible:ring-2 focus-visible:ring-rose-500"
+              >
+                <Trash2 className="w-3.5 h-3.5" aria-hidden="true" /> {deleteBusy ? "Đang xóa..." : "Xóa"}
+              </button>
+            </>
+          }
+        >
+          {deleteError ? (
+            <p role="alert" className="text-[11px] font-semibold text-rose-700 break-words">
+              {deleteError}
+            </p>
+          ) : undefined}
+        </ModalDialog>
+      )}
+    </section>
   );
 };
