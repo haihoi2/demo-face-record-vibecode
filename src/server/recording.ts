@@ -177,6 +177,11 @@ export function playbackFfmpegArgs(url: string, durationSeconds: number): string
     "-vf", "scale=-2:720",
     "-c:v", "libx264", "-preset", "veryfast", "-tune", "zerolatency",
     "-profile:v", "main", "-pix_fmt", "yuv420p", "-crf", "26",
+    // A keyframe every second: the fragmented MP4 is cut at keyframes, and with
+    // x264's default (~250 frames, 17 s at 15 fps) the browser got the header at
+    // once but no playable picture until the clip had finished converting -
+    // 36 s for a 4K entry clip (2026-10-08). Now the first picture plays in ~3 s.
+    "-force_key_frames", "expr:gte(t,n_forced*1)",
     "-movflags", "frag_keyframe+empty_moov+default_base_moof",
     "-f", "mp4", "pipe:1",
   ];

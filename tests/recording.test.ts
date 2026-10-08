@@ -124,6 +124,12 @@ describe("playback window and URL", () => {
     assert.ok(args.join(" ").includes("frag_keyframe+empty_moov"));
     assert.equal(args[args.indexOf("-t") + 1], "15");
   });
+
+  it("cuts a keyframe every second so the browser can play before the clip has finished converting", () => {
+    const args = playbackFfmpegArgs("rtsp://x/y", 15);
+    assert.equal(args[args.indexOf("-force_key_frames") + 1], "expr:gte(t,n_forced*1)");
+    assert.ok(args.indexOf("-force_key_frames") < args.indexOf("-movflags"));
+  });
 });
 
 describe("errors never leak the NVR login", () => {
