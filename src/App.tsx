@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback, useReducer } from "react";
+import React, { useState, useEffect, useCallback, useReducer, useRef } from "react";
 import { Navbar, NavTabType, canSeeTab } from "./components/Navbar";
 import { FaceScanner } from "./components/FaceScanner";
 import { CameraDashboard } from "./components/CameraDashboard";
@@ -319,6 +319,18 @@ export default function App() {
 
   // After a sign-in (or a role change) the door list can be read again; signed
   // out, no door list is kept on screen.
+  // After a sign-in, reload what a signed-out first load could not read (employees, events, notifications):
+  // otherwise "Nhân Viên Đăng Ký" stayed 0 until a full page reload (2026-10-11).
+  const signedInActor = operatorSession?.actor || "";
+  const firstSessionLoad = useRef(true);
+  useEffect(() => {
+    if (firstSessionLoad.current) {
+      firstSessionLoad.current = false;
+      return;
+    }
+    if (signedInActor) void fetchData();
+  }, [signedInActor, fetchData]);
+
   useEffect(() => {
     if (operatorSession) {
       void fetchDoorLocks();

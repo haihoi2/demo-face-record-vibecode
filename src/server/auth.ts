@@ -109,6 +109,9 @@ const RULES: readonly Rule[] = [
   // Blur reports: labels on stranger faces (never delete anything). The report list is admin.
   { methods: ["POST", "DELETE"], pattern: /^\/api\/strangers\/faces\/[^/]+\/blur-report$/, role: "operator" },
   { methods: READ, pattern: /^\/api\/strangers\/blur-reports$/, role: "admin" },
+  // Quick blur report from the live activity list (operator); its button state.
+  { methods: ["POST", "DELETE"], pattern: /^\/api\/logs\/[^/]+\/blur-report$/, role: "operator" },
+  { methods: READ, pattern: /^\/api\/logs\/blur-state$/, role: "operator" },
   // Face sharpness S0: labelling round - operators rate, admins see the summary.
   { methods: READ, pattern: /^\/api\/strangers\/sharpness\/sample$/, role: "operator" },
   { methods: ["POST"], pattern: /^\/api\/strangers\/faces\/[^/]+\/rating$/, role: "operator" },

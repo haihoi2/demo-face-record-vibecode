@@ -4724,6 +4724,8 @@ interface RtspFrameGrab {
   blocked?: { code: string; reason: string; host?: string };
   /** Where the frame came from: the gate's always-open stream, or a fresh camera connection. */
   source?: "shared-stream" | "camera";
+  /** When the camera picture was taken (shared stream); the recording clip is centred on it. */
+  capturedAtMs?: number;
 }
 
 /**
@@ -5076,7 +5078,7 @@ function sharedStreamFrames(gate: Gate, streamId: string, url: string, frames: n
   for (let i = snaps.length - 2; i >= 0 && picked.length < frames; i--) {
     if (picked[picked.length - 1].capturedAtMs - snaps[i].capturedAtMs >= intervalMs) picked.push(snaps[i]);
   }
-  return picked.reverse().map((s) => ({ ok: true, jpeg: s.jpeg, durationMs: 0, exitCode: 0, errorLog: "", source: "shared-stream" as const }));
+  return picked.reverse().map((s) => ({ ok: true, jpeg: s.jpeg, durationMs: 0, exitCode: 0, errorLog: "", source: "shared-stream" as const, capturedAtMs: s.capturedAtMs }));
 }
 
 // =========================================================================
@@ -5192,6 +5194,11 @@ interface RecognitionOutcomeInput {
   annotateFaces?: Array<{ box2d: [number, number, number, number]; boxSource?: "detector" }>;
   scanType: "ENTRY" | "EXIT";
   trigger: RecognitionTrigger;
+  /**
+   * When the stored picture was taken (ISO). The event is written seconds
+   * later (11 s on 2026-10-11 under load), so the NVR clip is centred on this.
+   */
+  capturedAt?: string;
   /**
    * Which gate (id) the decision belongs to; the cooldowns are keyed on it and
    * its door is the one a grant opens. Absent (the API path without a gate) =
@@ -5655,6 +5662,7 @@ async function applyRecognitionOutcome(input: RecognitionOutcomeInput): Promise<
         employeeCode: emp.employeeCode,
         department: emp.department,
         photoSnapshot: snapshotForLog,
+        ...(input.capturedAt ? { capturedAt: input.capturedAt } : {}),
         confidence: faceMatch ? faceMatch.confidence : 95,
         livenessScore: faceMatch ? faceMatch.livenessScore : 98,
         lockAction: "Mở chốt tự động qua API (SmartLock Gateway)",
@@ -5753,6 +5761,7 @@ async function applyRecognitionOutcome(input: RecognitionOutcomeInput): Promise<
     gateId: gateKey,
     status: "DENIED",
     photoSnapshot: snapshotForLog,
+    ...(input.capturedAt ? { capturedAt: input.capturedAt } : {}),
     confidence: detectedFaces[0]?.confidence || 25,
     livenessScore: detectedFaces[0]?.livenessScore || 85,
     lockAction: "Khóa giữ nguyên trạng thái LOCKED",
@@ -6228,6 +6237,7 @@ async function performGateScan(input: GateScanRequest): Promise<GateScanResult> 
   let snapshotStreamLabel: string | undefined;
   let snapshotFaces: Array<DetectedFaceItem & { streamId: string; streamLabel: string }> = [];
   let snapshotObservation: FaceObservation | undefined;
+  let snapshotCapturedAtMs: number | undefined;
   let snapshotStrangerFaces: FaceObservation[] | undefined;
   let snapshotRecognisedFaces: RecognisedFace[] | undefined;
 
@@ -6258,6 +6268,7 @@ async function performGateScan(input: GateScanRequest): Promise<GateScanResult> 
     const jpeg = owner?.frameJpegs.get(chosen.frameIndex);
     if (jpeg) {
       snapshotJpeg = jpeg;
+      snapshotCapturedAtMs = owner?.grabs[chosen.frameIndex]?.capturedAtMs;
       snapshotStreamId = chosen.streamId;
       snapshotStreamLabel = chosen.streamLabel;
       snapshotFaces = allFaces.filter(
@@ -6279,6 +6290,7 @@ async function performGateScan(input: GateScanRequest): Promise<GateScanResult> 
     const entry = owner ? [...owner.frameJpegs.entries()][0] : undefined;
     if (owner && entry) {
       snapshotJpeg = entry[1];
+      snapshotCapturedAtMs = owner.grabs[entry[0]]?.capturedAtMs;
       snapshotStreamId = owner.stream.id;
       snapshotStreamLabel = owner.stream.label;
       snapshotFaces = owner.faces;
@@ -6302,6 +6314,7 @@ async function performGateScan(input: GateScanRequest): Promise<GateScanResult> 
     frameImage: snapshotJpeg ? `data:image/jpeg;base64,${snapshotJpeg.toString("base64")}` : undefined,
     annotateFaces: snapshotFaces,
     scanType: resolvedScanType,
+    ...(snapshotCapturedAtMs && Number.isFinite(snapshotCapturedAtMs) ? { capturedAt: new Date(snapshotCapturedAtMs).toISOString() } : {}),
     trigger: input?.trigger === "watcher" ? "watcher" : "manual",
     gate: gateParam,
     streamId: snapshotStreamId,
@@ -8991,7 +9004,12 @@ app.get("/api/logs/:id/recording", requireOperatorRole("viewer"), async (req, re
     res.status(404).json({ success: false, error: "Không tìm thấy lượt quét" });
     return;
   }
-  const win = recordingWindow(Date.parse(log.timestamp), Date.now());
+  // Centred on when the picture was taken; older events (no capture time) start further back to cover
+  // the delay between the picture and the saved event (11 s on 2026-10-11).
+  const capturedMs = typeof log.capturedAt === "string" ? Date.parse(log.capturedAt) : NaN;
+  const win = Number.isFinite(capturedMs)
+    ? recordingWindow(capturedMs, Date.now())
+    : recordingWindow(Date.parse(log.timestamp), Date.now(), { ...DEFAULT_RECORDING_WINDOW, beforeMs: 15_000 });
   const winFailure = recordingWindowFailure(win);
   if (winFailure) {
     if (winFailure.reason === "not-yet-recorded") {
@@ -9406,6 +9424,26 @@ app.get(["/api/strangers/clusters", "/api/strangers", "/api/strangers/"], requir
 // ---- Blur reports: operator labels for re-tuning the blur filter (src/server/blurReports.ts) ----
 const BLUR_REPORT_FACE_ID_RE = /^SF-[A-Za-z0-9-]{1,60}$/;
 
+/** One report row with the face's numbers at this moment (no image, no embedding). */
+function blurReportFor(face: StrangerFaceRecord, kind: BlurReportKind, actor: string, note?: string): BlurReportRecord {
+  const f = face as any;
+  return {
+    id: newBlurReportId(),
+    faceId: face.id,
+    logId: face.logId,
+    kind,
+    actor,
+    at: new Date().toISOString(),
+    featureNorm: typeof f.featureNorm === "number" ? f.featureNorm : null,
+    edgeEnergy: typeof face.edgeEnergy === "number" ? face.edgeEnergy : null,
+    quality: typeof face.quality === "number" ? face.quality : null,
+    detectorScore: typeof face.detectorScore === "number" ? face.detectorScore : null,
+    sizePx: typeof face.sizePx === "number" ? face.sizePx : null,
+    gateId: typeof f.gateId === "string" ? f.gateId : null,
+    ...(note ? { note: note.slice(0, 200) } : {}),
+  };
+}
+
 async function recordBlurReport(req: Request, res: Response, kind: BlurReportKind) {
   const faceId = String(req.params.faceId || "");
   if (!BLUR_REPORT_FACE_ID_RE.test(faceId)) {
@@ -9426,22 +9464,7 @@ async function recordBlurReport(req: Request, res: Response, kind: BlurReportKin
     res.status(409).json({ success: false, error: "Ảnh này không còn trong kho ảnh người lạ" });
     return;
   }
-  const f = face as any;
-  const report: BlurReportRecord = {
-    id: newBlurReportId(),
-    faceId,
-    logId: face.logId,
-    kind,
-    actor: operatorActor(req) || "unknown",
-    at: new Date().toISOString(),
-    featureNorm: typeof f.featureNorm === "number" ? f.featureNorm : null,
-    edgeEnergy: typeof face.edgeEnergy === "number" ? face.edgeEnergy : null,
-    quality: typeof face.quality === "number" ? face.quality : null,
-    detectorScore: typeof face.detectorScore === "number" ? face.detectorScore : null,
-    sizePx: typeof face.sizePx === "number" ? face.sizePx : null,
-    gateId: typeof f.gateId === "string" ? f.gateId : null,
-    ...(optionalTrimmedString(req.body?.note) ? { note: optionalTrimmedString(req.body?.note)!.slice(0, 200) } : {}),
-  };
+  const report = blurReportFor(face, kind, operatorActor(req) || "unknown", optionalTrimmedString(req.body?.note));
   if (!(await db.saveBlurReport(report))) {
     res.status(503).json({ success: false, error: "Chưa lưu được báo cáo ảnh mờ (kho dữ liệu chưa sẵn sàng); thử lại sau." });
     return;
@@ -9456,6 +9479,44 @@ async function recordBlurReport(req: Request, res: Response, kind: BlurReportKin
 
 app.post("/api/strangers/faces/:faceId/blur-report", requireOperatorRole("operator"), requireCsrf, (req, res) => void recordBlurReport(req, res, "blur"));
 app.delete("/api/strangers/faces/:faceId/blur-report", requireOperatorRole("operator"), requireCsrf, (req, res) => void recordBlurReport(req, res, "blur-withdrawn"));
+
+/**
+ * Quick blur report from the live activity list (2026-10-11): reports (or
+ * withdraws) every stranger face of one access event. Events stored before
+ * per-face records have no face to report (400).
+ */
+const LOG_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
+async function recordLogBlurReport(req: Request, res: Response, kind: "blur" | "blur-withdrawn") {
+  const logId = String(req.params.id || "");
+  if (!LOG_ID_RE.test(logId)) return res.status(400).json({ success: false, error: "Mã lượt quét không hợp lệ" });
+  const faces = (await db.getStrangerFacesByLogIds([logId])).filter((f) => !f.purgedAt && !f.employeeId);
+  if (!faces.length) {
+    return res.status(400).json({ success: false, code: "NO_FACE_RECORDS", error: "Lượt quét này không có ảnh khuôn mặt người lạ riêng để báo mờ." });
+  }
+  const actor = operatorActor(req) || "unknown";
+  for (const face of faces) {
+    if (!(await db.saveBlurReport(blurReportFor(face, kind, actor, "báo nhanh từ nhật ký vào ra")))) {
+      return res.status(503).json({ success: false, error: "Chưa lưu được báo cáo ảnh mờ (kho dữ liệu chưa sẵn sàng); thử lại sau." });
+    }
+  }
+  console.log(`[Strangers] ${actor} ${kind === "blur" ? "báo ảnh mờ" : "bỏ báo ảnh mờ"} lượt ${logId} (${faces.length} khuôn mặt)`);
+  res.json({ success: true, logId, faces: faces.length, blurReported: kind === "blur" });
+}
+app.post("/api/logs/:id/blur-report", requireOperatorRole("operator"), requireCsrf, (req, res) => void recordLogBlurReport(req, res, "blur"));
+app.delete("/api/logs/:id/blur-report", requireOperatorRole("operator"), requireCsrf, (req, res) => void recordLogBlurReport(req, res, "blur-withdrawn"));
+
+/** Which of these events have a blur-reported face now (for the live list's button state). */
+app.get("/api/logs/blur-state", requireOperatorRole("operator"), async (req, res) => {
+  const ids = String(req.query.ids || "").split(",").map((x) => x.trim()).filter((x) => LOG_ID_RE.test(x)).slice(0, 50);
+  if (!ids.length) return res.json({ success: true, reported: [], withFaces: [] });
+  const faces = (await db.getStrangerFacesByLogIds(ids)).filter((f) => !f.purgedAt && !f.employeeId);
+  const reportedFaces = await db.blurReportedFaceIds(faces.map((f) => f.id)).catch(() => new Set<string>());
+  res.json({
+    success: true,
+    reported: [...new Set(faces.filter((f) => reportedFaces.has(f.id)).map((f) => f.logId))],
+    withFaces: [...new Set(faces.map((f) => f.logId))],
+  });
+});
 
 app.get("/api/strangers/blur-reports", requireOperatorRole("admin"), async (req, res) => {
   try {

@@ -32,6 +32,7 @@ import {
   GitBranch,
   Gauge,
   Film,
+  Focus,
 } from "lucide-react";
 import {
   CameraStreamsConfig,
@@ -61,6 +62,7 @@ import {
 import { ProtectedImage } from "./ProtectedImage";
 import { FaceThumb } from "./FaceImage";
 import { hasRole, useOperatorSession } from "../utils/session";
+import { TodayStats, isEntryEvent, logBlurReportRequest, readTodayStats, todayStatsUrls } from "../utils/dashboardStats";
 import {
   PipelineRuntimeView,
   Tone,
@@ -433,6 +435,61 @@ export const CameraDashboard: React.FC<CameraDashboardProps> = ({
 }) => {
   // Manual door commands are admin-only; the server refuses them for anyone else.
   const canOperateDoor = hasRole(useOperatorSession(), "admin");
+  const operatorSession = useOperatorSession();
+  const canReportBlur = hasRole(operatorSession, "operator");
+
+  // "Thống Kê Kiểm Soát Hôm Nay": today's counts from the server, refreshed on new events and every minute.
+  const [todayStats, setTodayStats] = useState<TodayStats | null>(null);
+  const latestLogId = accessLogs[0]?.id || "";
+  useEffect(() => {
+    if (!operatorSession) return;
+    let cancelled = false;
+    const load = async () => {
+      const urls = todayStatsUrls();
+      const [g, d] = await Promise.all([operatorJsonFetch<any>(urls.granted), operatorJsonFetch<any>(urls.denied)]);
+      if (!cancelled && g.ok && d.ok) setTodayStats(readTodayStats(g.data, d.data));
+    };
+    const timer = setTimeout(() => void load(), latestLogId ? 1500 : 0);
+    const every = setInterval(() => void load(), 60_000);
+    return () => { cancelled = true; clearTimeout(timer); clearInterval(every); };
+  }, [operatorSession, latestLogId]);
+
+  // Quick blur report on denied rows of the live list (operator+).
+  const [blurState, setBlurState] = useState<{ reported: Set<string>; withFaces: Set<string> }>({ reported: new Set(), withFaces: new Set() });
+  const [blurBusy, setBlurBusy] = useState<string | null>(null);
+  const [blurNotice, setBlurNotice] = useState<{ kind: "success" | "error"; text: string } | null>(null);
+  const deniedIdsKey = accessLogs.slice(0, 6).filter((l) => l.status === "DENIED").map((l) => l.id).join(",");
+  useEffect(() => {
+    if (!canReportBlur || !deniedIdsKey) return;
+    let cancelled = false;
+    void operatorJsonFetch<any>(`/api/logs/blur-state?ids=${encodeURIComponent(deniedIdsKey)}`).then((r) => {
+      if (!cancelled && r.ok && r.data?.success) {
+        setBlurState({ reported: new Set(r.data.reported || []), withFaces: new Set(r.data.withFaces || []) });
+      }
+    });
+    return () => { cancelled = true; };
+  }, [canReportBlur, deniedIdsKey]);
+  const toggleLogBlur = async (logId: string) => {
+    if (blurBusy) return;
+    const report = !blurState.reported.has(logId);
+    setBlurBusy(logId);
+    setBlurNotice(null);
+    try {
+      const { url, init } = logBlurReportRequest(logId, report);
+      const r = await operatorJsonFetch<any>(url, init);
+      if (!r.ok || !r.data?.success) throw new Error(r.data?.error || `HTTP ${r.status}`);
+      setBlurState((prev) => {
+        const reported = new Set(prev.reported);
+        if (report) reported.add(logId); else reported.delete(logId);
+        return { ...prev, reported };
+      });
+      setBlurNotice({ kind: "success", text: report ? `Đã báo ảnh mờ (${r.data.faces} khuôn mặt) - dùng để tinh chỉnh bộ lọc, ảnh không bị xóa.` : "Đã bỏ báo ảnh mờ." });
+    } catch (err: any) {
+      setBlurNotice({ kind: "error", text: err?.message || "Lỗi máy chủ" });
+    } finally {
+      setBlurBusy(null);
+    }
+  };
   const [config, setConfig] = useState<CameraStreamsConfig>(DEFAULT_STREAMS_CONFIG);
   const [loadingConfig, setLoadingConfig] = useState<boolean>(true);
   const [currentTime, setCurrentTime] = useState<string>("");
@@ -2827,6 +2884,14 @@ export const CameraDashboard: React.FC<CameraDashboardProps> = ({
             </button>
           </div>
 
+          {blurNotice && (
+            <p
+              role={blurNotice.kind === "error" ? "alert" : "status"}
+              className={`mb-2 px-3 py-2 rounded-xl text-[11px] border ${blurNotice.kind === "error" ? "bg-rose-50 border-rose-200 text-rose-800" : "bg-emerald-50 border-emerald-200 text-emerald-800"}`}
+            >
+              {blurNotice.text}
+            </p>
+          )}
           {accessLogs.length === 0 ? (
             <div className="py-8 text-center text-xs text-slate-400">
               Chưa có lượt vào ra nào được ghi nhận. Các sự kiện nhận diện sẽ hiển thị tức thì tại đây.
@@ -2835,7 +2900,9 @@ export const CameraDashboard: React.FC<CameraDashboardProps> = ({
             <div className="divide-y divide-slate-100 max-h-80 overflow-y-auto pr-1">
               {accessLogs.slice(0, 6).map((log) => {
                 const isGranted = log.status === "GRANTED";
-                const isEntry = log.scanType === "ENTRY";
+                const isEntry = isEntryEvent(log);
+                const canBlurThis = canReportBlur && !isGranted && blurState.withFaces.has(log.id);
+                const blurReported = blurState.reported.has(log.id);
 
                 return (
                   <div key={log.id} className="py-3 flex items-center justify-between gap-3 text-xs">
@@ -2890,6 +2957,22 @@ export const CameraDashboard: React.FC<CameraDashboardProps> = ({
                       >
                         {isGranted ? "ĐÃ MỞ CỔNG" : "TỪ CHỐI"}
                       </span>
+                      {canBlurThis && (
+                        <button
+                          type="button"
+                          id={`btn-log-blur-${log.id}`}
+                          onClick={() => void toggleLogBlur(log.id)}
+                          disabled={blurBusy === log.id}
+                          aria-pressed={blurReported}
+                          title={blurReported ? "Bỏ báo ảnh mờ" : "Báo ảnh mờ: ảnh khuôn mặt của lượt này quá mờ (dùng để tinh chỉnh bộ lọc, không xóa ảnh)"}
+                          className={`ml-1.5 inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-bold border transition-colors disabled:opacity-50 ${
+                            blurReported ? "bg-amber-400 text-amber-950 border-amber-400" : "bg-white text-slate-600 border-slate-200 hover:bg-amber-50"
+                          }`}
+                        >
+                          <Focus className="w-3 h-3" aria-hidden="true" />
+                          {blurReported ? "Đã báo mờ" : "Báo mờ"}
+                        </button>
+                      )}
                       <p className="text-[10px] font-mono text-slate-400 mt-1">
                         {new Date(log.timestamp).toLocaleTimeString("vi-VN")}
                       </p>
@@ -2914,21 +2997,21 @@ export const CameraDashboard: React.FC<CameraDashboardProps> = ({
               <div className="p-3 rounded-xl bg-slate-50 border border-slate-100">
                 <span className="text-[11px] font-medium text-slate-500">Lượt Vào (Entry)</span>
                 <p className="text-xl font-black text-emerald-600 mt-0.5">
-                  {accessLogs.filter((l) => l.scanType === "ENTRY" && l.status === "GRANTED").length}
+                  {todayStats ? todayStats.entries : "–"}
                 </p>
               </div>
 
               <div className="p-3 rounded-xl bg-slate-50 border border-slate-100">
                 <span className="text-[11px] font-medium text-slate-500">Lượt Ra (Exit)</span>
                 <p className="text-xl font-black text-blue-600 mt-0.5">
-                  {accessLogs.filter((l) => l.scanType === "EXIT" && l.status === "GRANTED").length}
+                  {todayStats ? todayStats.exits : "–"}
                 </p>
               </div>
 
               <div className="p-3 rounded-xl bg-slate-50 border border-slate-100">
                 <span className="text-[11px] font-medium text-slate-500">Người Lạ / Cảnh Báo</span>
                 <p className="text-xl font-black text-amber-600 mt-0.5">
-                  {accessLogs.filter((l) => l.status === "DENIED" || !l.employeeId).length}
+                  {todayStats ? todayStats.denied : "–"}
                 </p>
               </div>
 
