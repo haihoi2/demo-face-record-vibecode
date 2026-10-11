@@ -1,5 +1,7 @@
 import express, { NextFunction, Request, RequestHandler, Response } from "express";
 import path from "path";
+import fs from "fs";
+import os from "os";
 import dns from "dns";
 import https from "https";
 import net from "net";
@@ -125,6 +127,7 @@ import type {
 import { runLocalFaceRecognition } from "./src/utils/localBiometrics";
 import { templateRejectReason } from "./src/utils/templateReject";
 import { describeEmployeeChanges, parseEmployeeEdit } from "./src/server/employeeEdit";
+import { SNAPSHOT_TAG_FONT, snapshotNameTag, snapshotTagFilter } from "./src/server/snapshotTag";
 import { countsAgainstTemplateCap, templateCapRefuses } from "./src/server/templateCap";
 import {
   clusterStrangerFaces,
@@ -5191,7 +5194,7 @@ interface RecognitionOutcomeInput {
    * green boxes would mark the wrong pixels. Defaults to `detectedFaces`
    * (correct for the single-frame /api/recognize-face path).
    */
-  annotateFaces?: Array<{ box2d: [number, number, number, number]; boxSource?: "detector" }>;
+  annotateFaces?: Array<{ box2d: [number, number, number, number]; boxSource?: "detector"; recognized?: boolean; employeeId?: string; employeeName?: string; employeeCode?: string }>;
   scanType: "ENTRY" | "EXIT";
   trigger: RecognitionTrigger;
   /**
@@ -5630,7 +5633,7 @@ async function applyRecognitionOutcome(input: RecognitionOutcomeInput): Promise<
   // Non-data-URL inputs (and the no-image case) pass straight through.
   const snapshotForLog = await annotateSnapshotWithBoxes(
     input.frameImage as string,
-    (input.annotateFaces as Array<{ box2d: [number, number, number, number]; boxSource?: "detector" }>) || detectedFaces
+    input.annotateFaces || detectedFaces
   );
   summary.snapshotStored = Boolean(snapshotForLog);
 
@@ -11007,11 +11010,16 @@ const SNAPSHOT_JPEG_QSCALE = envInt("SNAPSHOT_JPEG_QSCALE", 8, 2, 31);
 
 async function annotateSnapshotWithBoxes(
   imageDataUrl: string,
-  faces: Array<{ box2d: [number, number, number, number]; boxSource?: "detector" }>
+  faces: Array<{ box2d: [number, number, number, number]; boxSource?: "detector"; recognized?: boolean; employeeId?: string; employeeName?: string; employeeCode?: string }>
 ): Promise<string> {
   const drawable = faces.filter((f) => f.boxSource === "detector" && Array.isArray(f.box2d));
   const m = /^data:(image\/\w+);base64,(.+)$/s.exec(imageDataUrl || "");
   if (!m) return imageDataUrl;
+  // Name tags (2026-10-11): a recognised employee's box carries their name. The text goes through
+  // a temporary file (textfile=), so nothing in a name can change the filter graph.
+  const tagFont = fs.existsSync(SNAPSHOT_TAG_FONT) ? SNAPSHOT_TAG_FONT : null;
+  const tagDir = tagFont && drawable.some((f) => snapshotNameTag(f)) ? fs.mkdtempSync(path.join(os.tmpdir(), "snaptag-")) : null;
+  let tagIndex = 0;
 
   const clamp = (v: number) => Math.min(1000, Math.max(0, Number(v) || 0)) / 1000;
   const filters = drawable.map((f) => {
@@ -11028,8 +11036,15 @@ async function annotateSnapshotWithBoxes(
     const x = Math.min(1 - w, Math.max(0, cx - w / 2));
     const y = Math.min(1 - h, Math.max(0, cy - h / 2));
     // thickness ~1/120 of the width, never thinner than 5 px
-    return `drawbox=x=iw*${x.toFixed(4)}:y=ih*${y.toFixed(4)}:w=iw*${w.toFixed(4)}:h=ih*${h.toFixed(4)}:color=0x00FF00@1:t=max(5\\,iw/120)`;
+    const box = `drawbox=x=iw*${x.toFixed(4)}:y=ih*${y.toFixed(4)}:w=iw*${w.toFixed(4)}:h=ih*${h.toFixed(4)}:color=0x00FF00@1:t=max(5\\,iw/120)`;
+    const tag = tagDir ? snapshotNameTag(f) : null;
+    if (!tag || !tagDir) return box;
+    const file = path.join(tagDir, `t${tagIndex++}.txt`);
+    fs.writeFileSync(file, tag, "utf8");
+    // Above the box (below it when the box touches the top), white on green, ~1/45 of the height.
+    return `${box},${snapshotTagFilter(tagFont!, file, { x, y, h })}`;
   });
+  const cleanupTags = () => { if (tagDir) fs.rm(tagDir, { recursive: true, force: true }, () => {}); };
 
   return new Promise<string>((resolve) => {
     const input = Buffer.from(m[2], "base64");
@@ -11041,7 +11056,7 @@ async function annotateSnapshotWithBoxes(
     ]);
     const chunks: Buffer[] = [];
     let settled = false;
-    const done = (out: string) => { if (!settled) { settled = true; resolve(out); } };
+    const done = (out: string) => { if (!settled) { settled = true; cleanupTags(); resolve(out); } };
     const timer = setTimeout(() => { try { proc.kill("SIGKILL"); } catch {} done(imageDataUrl); }, 4000);
     proc.stdout.on("data", (c: Buffer) => chunks.push(c));
     proc.on("error", () => { clearTimeout(timer); done(imageDataUrl); });

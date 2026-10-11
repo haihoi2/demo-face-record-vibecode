@@ -67,6 +67,10 @@ ENV NODE_ENV=test
 # runner uses. The ONNX models are deliberately NOT copied here: the unit suite
 # must prove it stays green on a model-less image.
 COPY --from=ffmpeg /ffmpeg /usr/local/bin/ffmpeg
+# The employee name tag on stored snapshots (drawtext) needs a Vietnamese-capable font.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends fonts-dejavu-core \
+    && rm -rf /var/lib/apt/lists/*
 CMD ["npm", "test"]
 
 # ----------------- Production Stage -----------------
@@ -86,7 +90,7 @@ ENV PORT=3000
 # - tzdata: ensures correct timezone timestamps (e.g. Asia/Ho_Chi_Minh)
 # ffmpeg is copied from the pinned static image above, not installed from apt.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates tzdata \
+    && apt-get install -y --no-install-recommends ca-certificates tzdata fonts-dejavu-core \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=ffmpeg /ffmpeg /usr/local/bin/ffmpeg
 
