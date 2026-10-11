@@ -8,6 +8,8 @@ export interface EmployeeEditForm {
   position: string;
   /** New photo (data URL) or "" for no change. */
   photo: string;
+  /** Or a saved recognised-face photo of this employee ("face:SF-..."), "" for none. */
+  photoFrom?: string;
 }
 
 export function employeeEditPatch(
@@ -20,6 +22,7 @@ export function employeeEditPatch(
   if (form.department !== original.department) patch.department = form.department;
   if (form.position !== original.position) patch.position = form.position;
   if (form.photo) patch.photo = form.photo;
+  else if (form.photoFrom) patch.photoFrom = form.photoFrom;
   return patch;
 }
 

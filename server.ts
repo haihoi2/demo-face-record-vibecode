@@ -8046,14 +8046,26 @@ app.patch(["/api/employees/:id", "/api/employees/:id/"], requireOperatorRole("ad
     if ("error" in p) return res.status(400).json({ success: false, code: "UNKNOWN_POSITION", error: p.error, field: "position" });
     position = p.name;
   }
+  // A saved recognised-face photo of THIS employee: its bytes are copied in (the crop itself is purged by retention).
+  let savedPhoto: string | undefined;
+  if (edit.photoFrom) {
+    const faceId = edit.photoFrom.slice(5);
+    const [face] = await db.getStrangerFacesByIds([faceId]);
+    if (!face || face.employeeId !== before.id || face.purgedAt) {
+      return res.status(400).json({ success: false, code: "PHOTO_NOT_THIS_EMPLOYEE", error: "Ảnh đã chọn không phải ảnh nhận diện của nhân viên này (hoặc đã hết hạn lưu)", field: "photoFrom" });
+    }
+    const crop = await db.getStrangerFaceCrop(faceId);
+    if (!crop || !crop.length) return res.status(400).json({ success: false, error: "Ảnh đã chọn không còn dữ liệu", field: "photoFrom" });
+    savedPhoto = `data:image/jpeg;base64,${Buffer.from(crop).toString("base64")}`;
+  }
   const updated: EmployeeRecord = {
     ...before,
     name: edit.name ?? before.name,
     department,
     position,
-    ...(edit.photo ? { photoUrl: edit.photo } : {}),
+    ...(edit.photo ? { photoUrl: edit.photo } : savedPhoto ? { photoUrl: savedPhoto } : {}),
   };
-  const changes = describeEmployeeChanges(before, updated, Boolean(edit.photo));
+  const changes = describeEmployeeChanges(before, updated, edit.photo ? true : savedPhoto ? "chọn từ ảnh nhận diện đã lưu" : false);
   if (!changes.length) return res.json({ success: true, employee: updated, changes: [] });
   employees[idx] = updated;
   db.saveEmployee(updated);

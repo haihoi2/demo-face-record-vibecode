@@ -32,6 +32,7 @@ import { safeJsonFetch, compressImage } from "../utils/api";
 import { directionLabel, gateDisplayLabel, gatesOf } from "../utils/gates";
 import { ProtectedImage } from "./ProtectedImage";
 import { EmployeeEditDialog } from "./EmployeeEditDialog";
+import { employeeAvatarSrc, employeeInitials, employeeMatchesQuery } from "../utils/employeeAvatar";
 import { hasRole, useOperatorSession } from "../utils/session";
 import { orgChoice, orgOptions, orgPlaceholder, useOrgCatalog } from "../utils/orgCatalog";
 import {
@@ -186,6 +187,8 @@ export const EmployeeRegistration: React.FC<EmployeeRegistrationProps> = ({
   // Profile correction is admin-only (the server enforces it too).
   const isAdmin = hasRole(useOperatorSession(), "admin");
   const [editingEmployee, setEditingEmployee] = useState<Employee | null>(null);
+  // Quick name filter of the roster (2026-10-11).
+  const [employeeQuery, setEmployeeQuery] = useState("");
   const [name, setName] = useState<string>("");
   const [employeeCode, setEmployeeCode] = useState<string>("");
   const [department, setDepartment] = useState<string>("Phòng Kỹ Thuật AI");
@@ -664,6 +667,7 @@ export const EmployeeRegistration: React.FC<EmployeeRegistrationProps> = ({
 
   /** Employees shown in the list once the coverage filter is applied. */
   const visibleEmployees = employees.filter((emp) =>
+    employeeMatchesQuery(emp, employeeQuery) &&
     passesCoverageFilter(coverageFilter, coverageByEmployee[emp.id], activeStreams)
   );
   /** Employees whose coverage is not known yet (never claimed as a gap). */
@@ -1464,6 +1468,25 @@ export const EmployeeRegistration: React.FC<EmployeeRegistrationProps> = ({
           </span>
         </div>
 
+        {employees.length > 0 && (
+          <div className="mb-3 relative">
+            <label htmlFor="input-employee-search" className="sr-only">Tìm nhân viên</label>
+            <input
+              id="input-employee-search"
+              type="search"
+              value={employeeQuery}
+              onChange={(e) => setEmployeeQuery(e.target.value)}
+              placeholder="Tìm theo tên, mã, phòng ban hoặc chức vụ (không cần dấu)…"
+              className="w-full px-3 py-2 bg-slate-50 border border-slate-200 rounded-xl text-xs focus:outline-hidden focus:ring-2 focus:ring-indigo-500/30 focus:border-indigo-500 transition"
+            />
+            {employeeQuery && (
+              <p className="mt-1 text-[11px] text-slate-500" role="status" aria-live="polite">
+                {visibleEmployees.length}/{employees.length} nhân viên khớp “{employeeQuery.trim()}”
+              </p>
+            )}
+          </div>
+        )}
+
         {/* Coverage filter: which employees still lack a template on a camera (plan C2) */}
         {activeStreams.length > 0 && employees.length > 0 && (
           <div className="mb-4 flex flex-col sm:flex-row sm:items-center gap-2 sm:gap-3">
@@ -1502,6 +1525,12 @@ export const EmployeeRegistration: React.FC<EmployeeRegistrationProps> = ({
           </div>
         )}
 
+        {employeeQuery && !coverageFilter && visibleEmployees.length === 0 && (
+          <div className="p-3 rounded-xl bg-slate-50 border border-slate-200 text-[11px] text-slate-600 mb-4">
+            Không có nhân viên nào khớp “{employeeQuery.trim()}”.
+          </div>
+        )}
+
         {coverageFilter && visibleEmployees.length === 0 && (
           <div className="p-3 rounded-xl bg-slate-50 border border-slate-200 text-[11px] text-slate-600 mb-4">
             {coverageUnread > 0
@@ -1521,11 +1550,18 @@ export const EmployeeRegistration: React.FC<EmployeeRegistrationProps> = ({
               className="p-4 rounded-xl border border-slate-200 hover:border-indigo-300 transition-all bg-slate-50/50 hover:bg-white hover:shadow-sm group flex flex-col justify-between"
             >
               <div className="flex items-start gap-3.5">
-                <ProtectedImage
-                  src={emp.photoUrl}
-                  alt={emp.name}
-                  className="w-14 h-14 rounded-xl object-cover border border-slate-200 shadow-xs shrink-0"
-                />
+                {employeeAvatarSrc(emp as Employee & { hasPhoto?: boolean }) ? (
+                  <ProtectedImage
+                    src={employeeAvatarSrc(emp as Employee & { hasPhoto?: boolean })}
+                    alt={emp.name}
+                    loading="lazy"
+                    className="w-14 h-14 rounded-xl object-cover border border-slate-200 shadow-xs shrink-0"
+                  />
+                ) : (
+                  <span aria-hidden="true" className="w-14 h-14 rounded-xl border border-slate-200 bg-slate-200 text-slate-600 text-sm font-bold flex items-center justify-center shrink-0">
+                    {employeeInitials(emp.name)}
+                  </span>
+                )}
                 <div className="min-w-0 flex-1">
                   <div className="flex items-center justify-between">
                     <h4 className="font-bold text-sm text-slate-900 truncate">

@@ -41,6 +41,10 @@ describe("employee profile correction", () => {
     assert.equal(withPhoto.body.employee.hasPhoto, true);
     assert.ok("faceTemplateRejected" in withPhoto.body, "says whether a template was made");
 
+    const notMine = await patch(emp.id, { photoFrom: "face:SF-not-this-employee" });
+    assert.equal(notMine.status, 400);
+    assert.equal(notMine.body.code, "PHOTO_NOT_THIS_EMPLOYEE");
+
     const listed = (await listEmployees()).find((e) => e.id === emp.id);
     assert.equal(listed?.name, `Đúng Tên ${emp.employeeCode}`);
   });

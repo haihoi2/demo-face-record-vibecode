@@ -1,4 +1,4 @@
-import React, { useState } from "react";
+import React, { useEffect, useState } from "react";
 import { X, Upload, RefreshCw } from "lucide-react";
 import type { Employee } from "../types";
 import { compressImage, operatorJsonFetch } from "../utils/api";
@@ -25,6 +25,18 @@ export const EmployeeEditDialog: React.FC<{
   const [department, setDepartment] = useState(employee.department);
   const [position, setPosition] = useState(employee.position);
   const [photo, setPhoto] = useState("");
+  // Saved recognised-face photos of this employee (GET /api/employees/:id/face-samples), newest first.
+  const [samples, setSamples] = useState<Array<{ faceId: string; capturedAt: string }>>([]);
+  const [photoFrom, setPhotoFrom] = useState("");
+  useEffect(() => {
+    let cancelled = false;
+    void operatorJsonFetch<any>(`/api/employees/${encodeURIComponent(employee.id)}/face-samples`).then((r) => {
+      if (!cancelled && r.ok && Array.isArray(r.data?.samples)) {
+        setSamples(r.data.samples.filter((x: any) => typeof x?.faceId === "string"));
+      }
+    });
+    return () => { cancelled = true; };
+  }, [employee.id]);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -36,6 +48,7 @@ export const EmployeeEditDialog: React.FC<{
     if (!file) return;
     try {
       setPhoto(await compressImage(file, 640, 640, 0.82));
+      setPhotoFrom("");
       setError(null);
     } catch {
       setError("Không xử lý được ảnh này; hãy chọn ảnh khác.");
@@ -43,7 +56,7 @@ export const EmployeeEditDialog: React.FC<{
   };
 
   const save = async () => {
-    const form = { name, department, position, photo };
+    const form = { name, department, position, photo, photoFrom };
     const invalid = employeeEditError(form);
     if (invalid) return setError(invalid);
     const patch = employeeEditPatch(employee, form);
@@ -68,7 +81,8 @@ export const EmployeeEditDialog: React.FC<{
     }
   };
 
-  const currentPhoto = photo || employeeAvatarSrc(employee);
+  const faceUrl = (faceId: string) => `/api/strangers/faces/${encodeURIComponent(faceId)}/image`;
+  const currentPhoto = photo || (photoFrom ? faceUrl(photoFrom.slice(5)) : "") || employeeAvatarSrc(employee);
 
   return (
     <div className="fixed inset-0 z-[60] overflow-y-auto bg-slate-900/60 backdrop-blur-xs flex items-center justify-center p-3 sm:p-6">
@@ -96,6 +110,32 @@ export const EmployeeEditDialog: React.FC<{
           </label>
         </div>
         {photo && <p className="text-[11px] text-slate-500">Ảnh mới sẽ thành ảnh đăng ký và một mẫu nhận diện (chỉ một khuôn mặt, nhìn thẳng).</p>}
+
+        {samples.length > 0 && (
+          <div>
+            <p className="text-[11px] font-semibold text-slate-700 mb-1.5">Hoặc chọn từ ảnh nhận diện đã lưu (30 ngày gần nhất)</p>
+            <div className="grid grid-cols-6 gap-1.5" role="radiogroup" aria-label="Ảnh nhận diện đã lưu">
+              {samples.slice(0, 12).map((smp) => {
+                const id = `face:${smp.faceId}`;
+                const picked = photoFrom === id;
+                return (
+                  <button
+                    key={smp.faceId}
+                    type="button"
+                    role="radio"
+                    aria-checked={picked}
+                    onClick={() => { setPhotoFrom(picked ? "" : id); setPhoto(""); }}
+                    title={new Date(smp.capturedAt).toLocaleString("vi-VN")}
+                    className={`aspect-square rounded-lg overflow-hidden bg-slate-200 border-2 focus:outline-hidden focus-visible:ring-2 focus-visible:ring-indigo-500 ${picked ? "border-indigo-600" : "border-transparent hover:border-slate-300"}`}
+                  >
+                    <ProtectedImage src={faceUrl(smp.faceId)} alt="" loading="lazy" className="w-full h-full object-cover" />
+                  </button>
+                );
+              })}
+            </div>
+            {photoFrom && <p className="mt-1 text-[11px] text-slate-500">Ảnh đã chọn sẽ được sao chép làm ảnh đăng ký.</p>}
+          </div>
+        )}
 
         <div className="space-y-3">
           <label className="block text-xs font-semibold text-slate-700">

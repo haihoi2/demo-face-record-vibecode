@@ -12,9 +12,11 @@ export interface EmployeeEdit {
   position?: string;
   /** New registration photo: data:image/(jpeg|png|webp);base64 only. */
   photo?: string;
+  /** Or one of this employee's saved recognised-face photos: "face:SF-..." (copied, so retention cannot break it). */
+  photoFrom?: string;
 }
 
-const FIELDS = ["name", "department", "position", "photo"] as const;
+const FIELDS = ["name", "department", "position", "photo", "photoFrom"] as const;
 export const MAX_EDIT_PHOTO_CHARS = 3_000_000;
 
 export function parseEmployeeEdit(body: unknown): { ok: true; value: EmployeeEdit } | { ok: false; error: string; field?: string } {
@@ -41,6 +43,13 @@ export function parseEmployeeEdit(body: unknown): { ok: true; value: EmployeeEdi
     if (b.photo.length > MAX_EDIT_PHOTO_CHARS) return { ok: false, error: "Ảnh quá lớn (tối đa khoảng 2 MB)", field: "photo" };
     value.photo = b.photo;
   }
+  if (b.photoFrom !== undefined) {
+    if (typeof b.photoFrom !== "string" || !/^face:SF-[A-Za-z0-9-]{1,60}$/.test(b.photoFrom)) {
+      return { ok: false, error: "Ảnh đã lưu không hợp lệ", field: "photoFrom" };
+    }
+    if (value.photo) return { ok: false, error: "Chọn một: ảnh tải lên hoặc ảnh đã lưu", field: "photoFrom" };
+    value.photoFrom = b.photoFrom;
+  }
   if (Object.keys(value).length === 0) return { ok: false, error: "Không có thay đổi nào" };
   return { ok: true, value };
 }
@@ -49,12 +58,12 @@ export function parseEmployeeEdit(body: unknown): { ok: true; value: EmployeeEdi
 export function describeEmployeeChanges(
   before: { name: string; department: string; position: string },
   after: { name: string; department: string; position: string },
-  photoChanged: boolean,
+  photoChanged: boolean | string,
 ): string[] {
   const out: string[] = [];
   if (before.name !== after.name) out.push(`Họ tên: ${before.name} → ${after.name}`);
   if (before.department !== after.department) out.push(`Bộ phận: ${before.department} → ${after.department}`);
   if (before.position !== after.position) out.push(`Chức vụ: ${before.position} → ${after.position}`);
-  if (photoChanged) out.push("Ảnh đăng ký: ảnh mới");
+  if (photoChanged) out.push(typeof photoChanged === "string" ? `Ảnh đăng ký: ${photoChanged}` : "Ảnh đăng ký: ảnh mới");
   return out;
 }
