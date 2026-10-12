@@ -6006,14 +6006,18 @@ async function performGateScan(input: GateScanRequest): Promise<GateScanResult> 
           outcome.observed.length > 0 &&
           !recognizeObservations(capObservations(outcome.observed), currentGallery(), fusionThresholds).recognized
         ) {
-          for (const g of extraGrabs) {
-            const i = grabs.length;
-            grabs.push(g);
-            const observed = await observeFrame(g.jpeg!, target.id, target.label, i);
+          // The extra pictures are independent: look at them together (2026-10-12: 3 frames in
+          // ~2.6 s instead of ~3.0 s at 4 threads), keeping their order and frame numbers.
+          const base = grabs.length;
+          grabs.push(...extraGrabs);
+          const extraObserved = await Promise.all(
+            extraGrabs.map((g, k) => observeFrame(g.jpeg!, target.id, target.label, base + k))
+          );
+          extraObserved.forEach((observed, k) => {
             for (const o of observed) o.extra = true;
-            if (observed.length > 0) outcome.frameJpegs.set(i, g.jpeg!);
+            if (observed.length > 0) outcome.frameJpegs.set(base + k, extraGrabs[k].jpeg!);
             outcome.observed.push(...observed);
-          }
+          });
         }
         return outcome;
       }

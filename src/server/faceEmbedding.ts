@@ -855,7 +855,9 @@ async function createEngine(): Promise<Engine> {
     graphOptimizationLevel: "all",
     // Keep the gateway responsive: the worker pool already provides parallelism
     // across frames, so per-session thread fan-out only fights for the same CPU.
-    intraOpNumThreads: envNumberOrDefault("FACE_ORT_THREADS", 2),
+    // 4 since 2026-10-12: a 4K door-scan frame took 1.4 s at 2 threads, 1.05 s at 4 (measured under
+    // live load); the event was saved 3.8 s (median) / 8.9 s (p90) after its picture.
+    intraOpNumThreads: envNumberOrDefault("FACE_ORT_THREADS", 4),
     logSeverityLevel: ortLogSeverity() as 0 | 1 | 2 | 3 | 4,
   };
   const t0 = Date.now();
