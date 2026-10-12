@@ -23,7 +23,6 @@ import {
   FileText,
   Terminal,
   Trash2,
-  RotateCcw,
   UserX,
   Link2,
   Timer,
@@ -80,8 +79,17 @@ import {
 
 export { dispatchDirectWebhook };
 
-export const CANONICAL_ETON_WEBHOOK_URL =
-  "https://chat-room.eton.vn/hooks/6aa4dfb6928518a18ba27a13/mguNArZoWHY7AegnWFw7d7TwyfnoT4JZWpmwvxtLmfi7iGuY";
+/** Scheme and host only: a webhook URL's path is its secret and is never shown in full. */
+export function maskWebhookForDisplay(url: string | null | undefined): string {
+  try {
+    const u = new URL(String(url || ""));
+    const tail = (u.pathname + u.search).replace(/\/+$/, "");
+    return `${u.protocol}//${u.host}${tail.length > 8 ? `/…/${tail.slice(-4)}` : tail ? "/…" : ""}`;
+  } catch {
+    return url ? "(chưa đúng định dạng URL)" : "(chưa cấu hình)";
+  }
+}
+
 
 // ---- Stranger ("người lạ") alert defaults, per the WebhookConfig contract ----
 export const STRANGER_ALERT_DEFAULTS = {
@@ -321,32 +329,15 @@ export const WebhookIntegration: React.FC<WebhookIntegrationProps> = ({
     }
   };
 
-  // Restore canonical working webhook URL
-  const handleRestoreCanonicalUrl = async () => {
-    const updated = {
-      ...config,
-      url: CANONICAL_ETON_WEBHOOK_URL,
-    };
-    setConfig(updated);
-    saveStoredWebhookConfig(updated);
-    try {
-      await safeJsonFetch("/api/webhook/config", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(updated),
-      });
-      setSaveSuccess(true);
-      setTimeout(() => setSaveSuccess(false), 2500);
-    } catch {}
-  };
-
   // Handle saving config
   const handleSaveConfig = async () => {
     // Stranger-alert fields travel inside the SAME config object as the gate titles.
     let cleanConfig: WebhookConfig = withStrangerDefaults({ ...config });
     cleanConfig.appBaseUrl = (cleanConfig.appBaseUrl || "").trim().replace(/\/+$/, "");
+    // No built-in fallback address (2026-10-12: a real webhook token used to be hard-coded here).
     if (!cleanConfig.url || cleanConfig.url.includes("...") || cleanConfig.url.endsWith("/hooks/") || cleanConfig.url.endsWith("/hooks")) {
-      cleanConfig.url = CANONICAL_ETON_WEBHOOK_URL;
+      setSaveError("Cần đường dẫn webhook đầy đủ: dán lại đường dẫn lấy từ Eton Chat Room (Integrations → Incoming Webhook).");
+      return;
     }
     setConfig(cleanConfig);
 
@@ -678,7 +669,7 @@ export const WebhookIntegration: React.FC<WebhookIntegrationProps> = ({
             <span className="px-2 py-0.5 bg-indigo-600 text-white font-bold rounded text-[10px]">
               POST
             </span>
-            <span className="text-slate-300 truncate">{config.url}</span>
+            <span className="text-slate-300 truncate">{maskWebhookForDisplay(config.url)}</span>
           </div>
           <span className="text-indigo-300 text-[11px] shrink-0">
             Payload: JSON • Auto on Scan IN/OUT
@@ -902,14 +893,6 @@ export const WebhookIntegration: React.FC<WebhookIntegrationProps> = ({
                   <label className="block font-semibold text-slate-700">
                     Webhook URL (API chat-room.eton.vn):
                   </label>
-                  <button
-                    type="button"
-                    onClick={handleRestoreCanonicalUrl}
-                    className="text-[11px] text-indigo-600 hover:text-indigo-800 font-medium flex items-center gap-1 cursor-pointer transition"
-                  >
-                    <RotateCcw className="w-3 h-3" />
-                    Khôi phục URL chuẩn Eton
-                  </button>
                 </div>
                 <input
                   type="text"
@@ -930,13 +913,7 @@ export const WebhookIntegration: React.FC<WebhookIntegrationProps> = ({
                       <AlertTriangle className="w-4 h-4 shrink-0 text-rose-500" />
                       URL bị rút gọn dấu ba chấm (...) gây lỗi <strong>HTTP 404 Not Found</strong>!
                     </span>
-                    <button
-                      type="button"
-                      onClick={handleRestoreCanonicalUrl}
-                      className="px-2.5 py-1 rounded-lg bg-rose-600 text-white font-bold text-[11px] hover:bg-rose-700 cursor-pointer shrink-0 transition shadow-xs"
-                    >
-                      Sửa ngay (Khôi phục URL)
-                    </button>
+                    <span className="text-[11px] shrink-0">Dán lại đường dẫn đầy đủ từ Eton Chat Room.</span>
                   </div>
                 )}
               </div>
