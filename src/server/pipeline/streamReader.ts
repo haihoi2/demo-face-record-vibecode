@@ -32,6 +32,7 @@
  *   Note: like the legacy grab, the URL is visible in FFmpeg's argv to
  *   same-host processes that can read /proc (FFmpeg cannot take it from env).
  */
+import { dropOlderThan, pushWithinWindow } from "../timeWindow";
 import { EventEmitter } from "node:events";
 import { spawn as nodeSpawn } from "node:child_process";
 
@@ -579,7 +580,7 @@ class StreamReader extends EventEmitter implements FrameSource {
 
   private currentFps(now: number): number {
     const from = now - FPS_WINDOW_MS;
-    while (this.deliveries.length && this.deliveries[0] < from) this.deliveries.shift();
+    dropOlderThan(this.deliveries, from);
     if (!this.deliveries.length || this.streamingSinceMs == null) return 0;
     const window = Math.min(FPS_WINDOW_MS, Math.max(1, now - this.streamingSinceMs));
     return Math.round((this.deliveries.length * 1000 * 10) / window) / 10;
@@ -877,7 +878,7 @@ class StreamReader extends EventEmitter implements FrameSource {
     this.seq += 1;
     this.ring.push(frame);
     this.lastFrameAtMs = now;
-    this.deliveries.push(now);
+    pushWithinWindow(this.deliveries, now, FPS_WINDOW_MS);
     if (this.motionDetector) this.motionResults.set(frame, this.motionDetector.update(frame));
     if (this.status !== "streaming") {
       this.streamingSinceMs = now;

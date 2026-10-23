@@ -20,6 +20,7 @@
  * with back-off (stats: restarts); tracks are ended by the normal 2 s rule, no
  * outcome is invented. Never throws out of callbacks.
  */
+import { dropOlderThan, pushWithinWindow } from "../timeWindow";
 import fs from "node:fs";
 import path from "node:path";
 import { Worker } from "node:worker_threads";
@@ -316,7 +317,7 @@ export class PresenceHost {
 
   stats(): PresenceHostStats {
     const now = this.opts.now();
-    while (this.processedAt.length && now - this.processedAt[0] > FPS_WINDOW_MS) this.processedAt.shift();
+    dropOlderThan(this.processedAt, now - FPS_WINDOW_MS);
     const span = Math.min(FPS_WINDOW_MS, this.processedAt.length ? now - this.processedAt[0] : 0);
     const fps = this.processedAt.length > 1 && span > 0 ? Math.round(((this.processedAt.length - 1) / span) * 10000) / 10 : 0;
     const workers = {} as Record<PresenceModelId, PresenceWorkerStats>;
@@ -572,7 +573,8 @@ export class PresenceHost {
             this.s.detections[slot.id] += dets.length;
             if (slot.role === "primary") {
               this.s.framesProcessed += 1;
-              this.processedAt.push(this.opts.now());
+              // Bounded on every push: the list used to grow until the next stats() call (2026-10-23 hang).
+              pushWithinWindow(this.processedAt, this.opts.now(), FPS_WINDOW_MS);
               this.handle(this.core.primary(t, dets));
             } else {
               this.handle(this.core.secondary(t, dets));
