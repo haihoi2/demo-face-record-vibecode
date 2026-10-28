@@ -173,6 +173,7 @@ import type { FaceOutcome, PresenceEventDraft, PresenceEventRecord } from "./src
 
 import { PresenceHost } from "./src/server/presence/presenceHost";
 import {
+  StaticSpotTracker,
   PresenceAlertBatcher,
   PresenceAlertBatch,
   PresenceHealthState,
@@ -9731,6 +9732,8 @@ async function onPresenceDraft(gate: Gate, draft: PresenceEventDraft, hostCrop: 
     presenceAlerts.offer({
       id, gateId: gate, startedAt: record.startedAt, inViewMs: record.inViewMs, peakPersons: record.peakPersons,
       period: record.period, faceOutcome: record.faceOutcome,
+      ...(Array.isArray(record.bestBox) && record.bestBox.length === 4 ? { box: [...record.bestBox] as [number, number, number, number] } : {}),
+      ...(typeof record.bestScore === "number" ? { score: record.bestScore } : {}),
     }, Date.now(), presenceGateSettings(gate).values.alertHoldSeconds * 1000);
   }
   if (!ok) console.warn(`[Presence ${gateLogTag(gate)}] Không lưu được sự kiện hiện diện ${id}.`);
@@ -9748,6 +9751,10 @@ const presenceAlerts = new PresenceAlertBatcher({
   windowMs: PRESENCE_ALERT_WINDOW_SECONDS * 1000,
   holdMs: PRESENCE_ALERT_HOLD_MS,
   windowMsFor: (gateId) => presenceGateSettings(gateId as Gate).values.alertWindowSeconds * 1000,
+  // A spot that keeps producing separate events (a parked object read as a person) is not alerted (2026-10-28).
+  staticSpots: new StaticSpotTracker(),
+  onStaticSpot: (gateId, box) =>
+    console.warn(`[Presence ${gateLogTag(gateId as Gate)}] Vật đứng yên bị nhận nhầm là người tại [${box.map((v) => Math.round(v)).join(",")}]: ghi nhận nhưng không gửi cảnh báo cho vị trí này.`),
 });
 /** When each event was messaged, so later updates of the event keep it. */
 const presenceAlertedAt = new Map<string, string>();
@@ -9926,7 +9933,7 @@ app.get("/api/presence/status", requireOperatorRole("viewer"), (_req, res) => {
       worker: st?.worker ?? null,
       lastEventAt: st?.lastEventAt ?? null,
       ...(presenceModeFor(g.id) === "live"
-        ? { alerts: { windowSeconds: presenceGateSettings(g.id).values.alertWindowSeconds, health: presenceHealth.get(g.id) || "unknown" } }
+        ? { alerts: { windowSeconds: presenceGateSettings(g.id).values.alertWindowSeconds, health: presenceHealth.get(g.id) || "unknown", suppressedStatic: presenceAlerts.backlog().suppressedStatic } }
         : {}),
       ...(presenceModeFor(g.id) !== "off" && !gatePipelines.get(g.id)?.source
         ? { note: "Cần luồng của engine thời gian thực (chế độ shadow/live) cho cổng này" }

@@ -28,6 +28,10 @@ export interface PresenceAlertEvent {
   peakPersons: number;
   period: "working" | "after-hours";
   faceOutcome: "none" | "stranger" | "employee";
+  /** Best box [x1, y1, x2, y2] in source pixels, for the static-object rule. */
+  box?: [number, number, number, number];
+  /** Best detector score; only low-confidence detections can be a static object. */
+  score?: number;
 }
 
 export interface PresenceAlertBatch {
@@ -35,11 +39,78 @@ export interface PresenceAlertBatch {
   events: PresenceAlertEvent[];
 }
 
+/**
+ * Static objects (2026-10-28): a dark object on the stacked boxes in view of the
+ * entry camera was read as a person (score ~0.32) thousands of times a night -
+ * up to 6,300 events and 130 messages a night. A person walking through is ONE
+ * track; a flickering false detection is many short events on the SAME box.
+ * When `minHits` separate events overlap the same box (IoU >= `iou`) within
+ * `windowMs`, that spot is static and its events are not alerted (they are
+ * still recorded). A spot is forgotten after `windowMs` without a hit.
+ *
+ * Only LOW-confidence detections count (score < `maxScore`): the object scored
+ * ~0.32, while a night-shift worker repeatedly pushing cages at one spot scored
+ * ~0.67 - a real person is never silenced by this rule.
+ */
+export interface StaticSpotOptions { windowMs: number; minHits: number; iou: number; maxScore: number }
+export const DEFAULT_STATIC_SPOTS: StaticSpotOptions = { windowMs: 30 * 60_000, minHits: 6, iou: 0.7, maxScore: 0.45 };
+
+type Box = [number, number, number, number];
+function iou(a: Box, b: Box): number {
+  const ix = Math.max(0, Math.min(a[2], b[2]) - Math.max(a[0], b[0]));
+  const iy = Math.max(0, Math.min(a[3], b[3]) - Math.max(a[1], b[1]));
+  const inter = ix * iy;
+  const area = (r: Box) => Math.max(0, r[2] - r[0]) * Math.max(0, r[3] - r[1]);
+  const union = area(a) + area(b) - inter;
+  return union > 0 ? inter / union : 0;
+}
+
+export class StaticSpotTracker {
+  private readonly spots = new Map<string, Array<{ box: Box; hits: number[] }>>();
+  constructor(private readonly opts: StaticSpotOptions = DEFAULT_STATIC_SPOTS) {}
+
+  /** Whether a detection of this score can belong to a static object. */
+  counts(score: number | undefined): boolean {
+    return typeof score === "number" && score < this.opts.maxScore;
+  }
+
+  /** Records one new event's box; returns whether that spot is static now, and whether it just became so. */
+  hit(gateId: string, box: Box, nowMs: number): { isStatic: boolean; becameStatic: boolean } {
+    const list = (this.spots.get(gateId) || []).filter((sp) => {
+      sp.hits = sp.hits.filter((t) => nowMs - t <= this.opts.windowMs);
+      return sp.hits.length > 0;
+    });
+    let spot = list.find((sp) => iou(sp.box, box) >= this.opts.iou);
+    if (!spot) {
+      spot = { box, hits: [] };
+      list.push(spot);
+      if (list.length > 200) list.shift();
+    }
+    const before = spot.hits.length >= this.opts.minHits;
+    spot.hits.push(nowMs);
+    spot.box = box;
+    this.spots.set(gateId, list);
+    const isStatic = spot.hits.length >= this.opts.minHits;
+    return { isStatic, becameStatic: isStatic && !before };
+  }
+
+  /** Static spots per gate right now (for status and logs). */
+  staticSpots(gateId: string, nowMs: number): Box[] {
+    return (this.spots.get(gateId) || [])
+      .filter((sp) => sp.hits.filter((t) => nowMs - t <= this.opts.windowMs).length >= this.opts.minHits)
+      .map((sp) => [...sp.box] as Box);
+  }
+}
+
 export interface PresenceAlertOptions {
   windowMs: number;
   holdMs: number;
   /** Per-gate window (P3b settings); default `windowMs`. */
   windowMsFor?: (gateId: string) => number;
+  /** Static-object rule; omitted = off. */
+  staticSpots?: StaticSpotTracker;
+  /** Called when a spot first becomes static (for one log line). */
+  onStaticSpot?: (gateId: string, box: [number, number, number, number]) => void;
 }
 
 /** Whether an event messages the security group (see the module comment). */
@@ -53,6 +124,9 @@ export class PresenceAlertBatcher {
   private readonly queued = new Map<string, PresenceAlertEvent[]>();
   private readonly lastSentAt = new Map<string, number>();
   private readonly decided = new Set<string>();
+  /** Events on a static spot: recorded, never alerted. */
+  private readonly onStatic = new Set<string>();
+  private suppressedStatic = 0;
 
   constructor(private readonly opts: PresenceAlertOptions) {}
 
@@ -60,7 +134,15 @@ export class PresenceAlertBatcher {
   offer(e: PresenceAlertEvent, nowMs: number, holdMs: number = this.opts.holdMs): void {
     if (this.decided.has(e.id)) return;
     this.latest.set(e.id, { ...e });
-    if (!this.pending.has(e.id)) this.pending.set(e.id, nowMs + holdMs);
+    if (!this.pending.has(e.id)) {
+      this.pending.set(e.id, nowMs + holdMs);
+      // First sight of this event: one hit on its spot.
+      if (e.box && this.opts.staticSpots && this.opts.staticSpots.counts(e.score)) {
+        const r = this.opts.staticSpots.hit(e.gateId, e.box, nowMs);
+        if (r.isStatic) this.onStatic.add(e.id);
+        if (r.becameStatic) this.opts.onStaticSpot?.(e.gateId, e.box);
+      }
+    }
   }
 
   /** The messages to send now (at most one per gate). */
@@ -71,7 +153,12 @@ export class PresenceAlertBatcher {
       const e = this.latest.get(id);
       this.latest.delete(id);
       this.remember(id);
+      const isStatic = this.onStatic.delete(id);
       if (!e || !presenceAlertEligible(e)) continue;
+      if (isStatic) {
+        this.suppressedStatic += 1;
+        continue;
+      }
       const q = this.queued.get(e.gateId) || [];
       q.push(e);
       this.queued.set(e.gateId, q);
@@ -102,10 +189,10 @@ export class PresenceAlertBatcher {
   }
 
   /** Events waiting for a decision or for the next message (for status and tests). */
-  backlog(): { pending: number; queued: number } {
+  backlog(): { pending: number; queued: number; suppressedStatic: number } {
     let queued = 0;
     for (const q of this.queued.values()) queued += q.length;
-    return { pending: this.pending.size, queued };
+    return { pending: this.pending.size, queued, suppressedStatic: this.suppressedStatic };
   }
 
   private remember(id: string): void {
