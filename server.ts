@@ -222,6 +222,7 @@ import {
 } from "./src/server/faceFusion";
 import type { FaceGallery } from "./src/server/faceFusion";
 import { groupFaceTracks } from "./src/server/faceTracks";
+import { extractFacesOffThread, faceExtractPoolTelemetry, getFaceExtractPool, isFaceExtractError } from "./src/server/faceExtractPool";
 import { gateWatchPace } from "./src/server/gateWatchPace";
 
 dotenv.config();
@@ -2381,6 +2382,17 @@ const clearFaceGate = {
  * face looking away can neither be recognised nor tracked as a stranger. Never
  * throws: a bad frame yields an empty list.
  */
+/** Off-thread extraction failures, logged at most once a minute with a count (never the frame). */
+const offThreadFailureLog = { at: 0, count: 0 };
+function noteOffThreadFailure(code: string): void {
+  offThreadFailureLog.count += 1;
+  const now = Date.now();
+  if (now - offThreadFailureLog.at < 60_000) return;
+  console.warn(`[FaceEngine] Tách khuôn mặt ngoài luồng chính lỗi (${code}); ${offThreadFailureLog.count} khung bị bỏ qua từ lần báo trước.`);
+  offThreadFailureLog.at = now;
+  offThreadFailureLog.count = 0;
+}
+
 async function observeFrame(
   image: Buffer | string,
   streamId: string,
@@ -2388,9 +2400,29 @@ async function observeFrame(
   frameIndex: number
 ): Promise<EngineObservation[]> {
   try {
-    const rgb = await loadImage(image);
-    if (!rgb) return [];
-    const detected = await extractFaces(rgb);
+    // Off the main thread when the extraction pool runs (Taiga #507), so a scan
+    // no longer stalls HTTP/SSE; the same loadImage + extractFaces in a worker.
+    let width: number, height: number, detected: ExtractedFace[];
+    try {
+      const r = await extractFacesOffThread(image);
+      ({ width, height } = r);
+      detected = r.faces;
+    } catch (err) {
+      const code = isFaceExtractError(err) ? err.code : "engine_error";
+      if (code === "decode_failed" || code === "invalid_input") return []; // what loadImage() -> null gave
+      if (code !== "disabled" && code !== "not_ready") {
+        // Overloaded, timed out, crashed, config mismatch...: this frame gives no
+        // observations (fail closed, no unlock). Never back onto the main thread
+        // under load - that is the stall this pool removes.
+        noteOffThreadFailure(code);
+        return [];
+      }
+      // Pool off (FACE_EXTRACT_WORKERS=0) or still loading: the main-thread path.
+      const rgb = await loadImage(image);
+      if (!rgb) return [];
+      ({ width, height } = rgb);
+      detected = await extractFaces(rgb);
+    }
     const faces = detected.filter((f) => f.clear);
     clearFaceGate.clear += faces.length;
     for (const f of detected) {
@@ -2410,11 +2442,11 @@ async function observeFrame(
         edgeEnergy: f.edgeEnergy,
         featureNorm: f.featureNorm,
         box: [f.box[0], f.box[1], f.box[2], f.box[3]] as [number, number, number, number],
-        frameSize: [rgb.width, rgb.height] as [number, number],
+        frameSize: [width, height] as [number, number],
       },
       face: f,
-      width: rgb.width,
-      height: rgb.height,
+      width,
+      height,
       streamId,
       streamLabel,
       frameIndex,
@@ -2595,6 +2627,8 @@ function warmUpFaceEngine(): void {
           `[FaceEngine] ✅ Engine thực đã sẵn sàng (${info.detectorModel} + ${info.recognizerModel}, ${info.loadTimeMs}ms, tag=${faceModelTag()}), ` +
             `${db.getFaceTemplates().length} mẫu khuôn mặt trong thư viện.`
         );
+        // Door-scan extraction off the main thread (Taiga #507); FACE_EXTRACT_WORKERS=0 keeps it here.
+        getFaceExtractPool().start();
         return;
       }
       const info = getFaceEngineInfo();
@@ -2637,6 +2671,7 @@ app.get(["/api/face-engine/status", "/api/face-engine/status/", "/api/face-engin
     },
     thresholds: currentFusionThresholds(),
     clearFace: { limits: CLEAR_FACE_LIMITS, ...clearFaceGate },
+    faceExtract: faceExtractPoolTelemetry(),
     limits: {
       maxObservationsPerDecision: FACE_MAX_OBSERVATIONS,
       maxFramesPerStream: FACE_SCAN_MAX_FRAMES,
