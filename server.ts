@@ -221,6 +221,8 @@ import {
   pipelineFusionThresholds,
 } from "./src/server/faceFusion";
 import type { FaceGallery } from "./src/server/faceFusion";
+import { groupFaceTracks } from "./src/server/faceTracks";
+import { gateWatchPace } from "./src/server/gateWatchPace";
 
 dotenv.config();
 
@@ -2435,6 +2437,33 @@ function capObservations(all: EngineObservation[]): FaceObservation[] {
   const keep = new Set(ranked.slice(0, FACE_MAX_OBSERVATIONS));
   for (const o of all) o.fused = keep.has(o);
   return all.filter((o) => o.fused).map((o) => o.observation);
+}
+
+/**
+ * One fused decision over a group of observations (a whole scan, or one face
+ * track of it). `fusedObservations` are the group's observations kept by the
+ * cap. Extra "sharpest of several" pictures never add up to a grant: pictures a
+ * quarter second apart are not independent evidence. The grant must be backed
+ * by the scan's own picture(s), or by ONE extra picture on its own - exactly
+ * what a separate one-picture scan would have decided.
+ */
+function decideObservationGroup(
+  group: EngineObservation[],
+  fusedObservations: FaceObservation[],
+  gallery: FaceGallery,
+  thresholds: Partial<FusionThresholds>,
+): FusionDecision {
+  const fusion = recognizeObservations(fusedObservations, gallery, thresholds);
+  if (!fusion.recognized || !group.some((o) => o.extra)) return fusion;
+  const groups: EngineObservation[][] = [group.filter((o) => !o.extra)];
+  const extraKeys = [...new Set(group.filter((o) => o.extra).map((o) => `${o.streamId}\u0000${o.frameIndex}`))];
+  for (const key of extraKeys) groups.push(group.filter((o) => o.extra && `${o.streamId}\u0000${o.frameIndex}` === key));
+  const backed = groups.some((g) => {
+    if (g.length === 0) return false;
+    const d = recognizeObservations(g.map((o) => o.observation), gallery, thresholds);
+    return d.recognized && d.employeeId === fusion.employeeId;
+  });
+  return backed ? fusion : { ...fusion, recognized: false, employeeId: undefined, confidence: 0, basis: "rejected-weak" };
 }
 
 /**
@@ -6064,29 +6093,48 @@ async function performGateScan(input: GateScanRequest): Promise<GateScanResult> 
   // WINNING observation came from can be identified after the decision.
   let allObserved: EngineObservation[] = [];
   let allFaces: Array<DetectedFaceItem & { streamId: string; streamLabel: string }> = [];
+  let faceTracks = 0;
+  let recognisedTracks = 0;
   if (faceEngine === "onnx") {
     allObserved = outcomes.flatMap((o) => o.observed);
     const pooled = capObservations(allObserved); // marks the dropped ones `fused:false`
     observationsPooled = pooled.length;
-    fusion = recognizeObservations(pooled, currentGallery(), fusionThresholds);
-    // Extra "sharpest of several" pictures never add up to a grant: pictures a
-    // quarter second apart are not independent evidence. The grant must be
-    // backed by the scan's own picture(s), or by ONE extra picture on its own -
-    // exactly what a separate one-picture scan would have decided.
-    if (fusion.recognized && allObserved.some((o) => o.extra)) {
-      const gallery = currentGallery();
-      const groups: EngineObservation[][] = [allObserved.filter((o) => !o.extra)];
-      const extraKeys = [...new Set(allObserved.filter((o) => o.extra).map((o) => `${o.streamId}\u0000${o.frameIndex}`))];
-      for (const key of extraKeys) groups.push(allObserved.filter((o) => o.extra && `${o.streamId}\u0000${o.frameIndex}` === key));
-      const backed = groups.some((g) => {
-        if (g.length === 0) return false;
-        const d = recognizeObservations(g.map((o) => o.observation), gallery, fusionThresholds);
-        return d.recognized && d.employeeId === fusion.employeeId;
-      });
-      if (!backed) fusion = { ...fusion, recognized: false, employeeId: undefined, confidence: 0, basis: "rejected-weak" };
+    const gallery = currentGallery();
+    // One decision per FACE (Taiga #506): with two people at the gate their
+    // observations are grouped into face tracks and each track is decided on its
+    // own evidence; fused together, two employees side by side were refused as
+    // "ambiguous". A scan with one face per stream keeps the pooled decision, so
+    // several cameras still agree on one person exactly as before.
+    const trackOf = groupFaceTracks(allObserved.map((o) => ({ streamId: o.streamId, frameIndex: o.frameIndex, box: o.face.box })));
+    const tracksPerStream = new Map<string, Set<number>>();
+    allObserved.forEach((o, i) => {
+      const set = tracksPerStream.get(o.streamId) ?? new Set<number>();
+      set.add(trackOf[i]);
+      tracksPerStream.set(o.streamId, set);
+    });
+    faceTracks = new Set(trackOf).size;
+    if (![...tracksPerStream.values()].some((set) => set.size > 1)) {
+      fusion = decideObservationGroup(allObserved, pooled, gallery, fusionThresholds);
+      allFaces = facesFromDecision(allObserved, fusion, employees);
+      recognisedTracks = fusion.recognized ? 1 : 0;
+    } else {
+      // Per-observation matches do not depend on the grouping: the pooled
+      // decision supplies them (index-parallel to `pooled`) and the summary
+      // when nobody is recognised.
+      const pooledDecision = recognizeObservations(pooled, gallery, fusionThresholds);
+      allFaces = new Array(allObserved.length);
+      const accepted: FusionDecision[] = [];
+      for (const track of new Set(trackOf)) {
+        const idx = allObserved.map((_, i) => i).filter((i) => trackOf[i] === track);
+        const group = idx.map((i) => allObserved[i]);
+        const decision = decideObservationGroup(group, group.filter((o) => o.fused).map((o) => o.observation), gallery, fusionThresholds);
+        if (decision.recognized) accepted.push(decision);
+        facesFromDecision(group, decision, employees).forEach((f, k) => { allFaces[idx[k]] = f; });
+      }
+      recognisedTracks = accepted.length;
+      accepted.sort((a, b) => b.confidence - a.confidence);
+      fusion = accepted[0] ? { ...accepted[0], perObservation: pooledDecision.perObservation } : pooledDecision;
     }
-    // Built from the SAME ordered list that was fused, then split per stream.
-    allFaces = facesFromDecision(allObserved, fusion, employees);
     for (const o of outcomes) o.faces = allFaces.filter((f) => f.streamId === o.stream.id);
   }
 
@@ -6118,6 +6166,8 @@ async function performGateScan(input: GateScanRequest): Promise<GateScanResult> 
     observationCap: FACE_MAX_OBSERVATIONS,
     framesPerStream,
     frameIntervalMs: intervalMs,
+    faceTracks,
+    recognisedTracks,
     streamsPooled: new Set(outcomes.flatMap((o) => o.observed).map((o) => o.streamId)).size,
     galleryTemplates: faceEngine === "onnx" ? db.getFaceTemplates().length : 0,
     modelTag: faceModelTag(),
@@ -6448,6 +6498,14 @@ const GATE_WATCH_START_DELAY_MS = 500;
  * instead of spinning and picks the work up by itself once the cause clears.
  */
 const GATE_WATCH_IDLE_RECHECK_MS = 15_000;
+/**
+ * Lunch peak (Taiga #506): while the last scan of a gate saw a face (within
+ * GATE_WATCH_BUSY_HOLD_SECONDS), the next scan starts after GATE_WATCH_BUSY_GAP_MS
+ * instead of the configured gap; an empty gate keeps the configured gap.
+ * GATE_WATCH_BUSY_HOLD_SECONDS=0 turns this off.
+ */
+const GATE_WATCH_BUSY_GAP_MS = envInt("GATE_WATCH_BUSY_GAP_MS", 300, 0, 300_000);
+const GATE_WATCH_BUSY_HOLD_SECONDS = envInt("GATE_WATCH_BUSY_HOLD_SECONDS", 8, 0, 300);
 
 /** A configured gate id (N-gate wave; was "entry" | "exit"). */
 type GateWatchKey = string;
@@ -6478,6 +6536,10 @@ interface GateWatcherState {
   lastEmployeeName?: string;
   lastError?: string;
   nextRunAt?: string;
+  /** When a scan of this gate last saw a face (ms epoch), for the busy pace. */
+  lastFacesAtMs?: number;
+  /** Why the current gap was chosen. */
+  pace?: "busy" | "idle" | "backoff";
   /** Why an enabled watcher is idling instead of scanning (logged once per cause). */
   idleReason?: string;
   loggedIdleReason?: string;
@@ -6568,6 +6630,7 @@ function gateWatchRuntime(state: GateWatcherState): GateWatchRuntime & GateWatch
     consecutiveErrors: state.consecutiveErrors,
     totalRuns: state.totalRuns,
     nextRunAt: state.nextRunAt,
+    ...(state.pace ? { pace: state.pace } : {}),
     lastOutcome: state.lastOutcome,
     lastAccessLogId: state.lastOutcome?.logId,
     lastUnlocked: state.lastOutcome?.lockUnlocked,
@@ -6613,12 +6676,22 @@ function gateWatchBlockedReason(gateKey: GateWatchKey): string | null {
   return null;
 }
 
-/** Delay before the next run: the configured gap, doubled per consecutive error, capped at 60 s. */
+/**
+ * Delay before the next run: the configured gap, or the short busy gap while
+ * people are at the gate; doubled per consecutive error, capped at 60 s.
+ */
 function gateWatchDelayMs(state: GateWatcherState): number {
-  const base = state.intervalSeconds * 1000;
-  if (state.consecutiveErrors <= 0) return base;
-  const factor = Math.pow(2, Math.min(state.consecutiveErrors, 16));
-  return Math.min(GATE_WATCH_MAX_BACKOFF_MS, Math.round(base * factor));
+  const { delayMs, pace } = gateWatchPace({
+    intervalMs: state.intervalSeconds * 1000,
+    consecutiveErrors: state.consecutiveErrors,
+    lastFacesAtMs: state.lastFacesAtMs,
+    nowMs: Date.now(),
+    busyGapMs: GATE_WATCH_BUSY_GAP_MS,
+    busyHoldMs: GATE_WATCH_BUSY_HOLD_SECONDS * 1000,
+    maxBackoffMs: GATE_WATCH_MAX_BACKOFF_MS,
+  });
+  state.pace = pace;
+  return delayMs;
 }
 
 /** Arms the ONE timer of this watcher. Callers must not have another armed. */
@@ -6708,6 +6781,8 @@ async function runGateWatchTick(state: GateWatcherState, generation: number) {
   if (ok) {
     state.consecutiveErrors = 0;
     state.lastError = undefined;
+    // Real detector boxes only: the legacy path reports a placeholder face.
+    if (Array.isArray(body.detectedFaces) && body.detectedFaces.some((f: any) => f?.boxSource === "detector")) state.lastFacesAtMs = Date.now();
   } else {
     state.consecutiveErrors += 1;
     state.lastError = body.error || `HTTP ${result.status}`;
