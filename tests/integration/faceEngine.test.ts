@@ -123,7 +123,8 @@ describe("GET /api/face-engine/status", () => {
 
     // Engine info snapshot (never throws, never triggers a model load).
     assert.equal(typeof body.info, "object");
-    assert.equal(typeof (body.info as any).modelDir, "string");
+    // modelDir is a server path: kept out of the API since the 2026-11-03 security wave (S-04).
+    assert.equal((body.info as any).modelDir, undefined);
     assert.equal(typeof (body.info as any).embeddingDim, "number");
     assert.equal((body.info as any).ready, body.ready);
 

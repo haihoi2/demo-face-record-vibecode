@@ -10766,7 +10766,25 @@ async function pickedFromStrangerCluster(req: Request): Promise<
  * person). Append-only SPLIT adjudication: nothing is hidden or deleted, the
  * access history stays as it was, and /api/strangers/restore undoes it.
  */
+/**
+ * Serialises edits of one stranger group inside this process. Three identical
+ * remove-photos requests fired at once all passed pickedFromStrangerCluster
+ * before the first commit landed (PostgreSQL, 2026-11-03 security wave) and
+ * wrote three adjudications; queued per group, the second and third see the
+ * photos already gone and answer 409 like a replay.
+ */
+const clusterEditQueue = new Map<string, Promise<unknown>>();
+function withClusterEditLock<T>(clusterId: string, fn: () => Promise<T>): Promise<T> {
+  const prev = clusterEditQueue.get(clusterId) ?? Promise.resolve();
+  const run = prev.then(fn, fn);
+  const tail = run.then(() => undefined, () => undefined);
+  clusterEditQueue.set(clusterId, tail);
+  void tail.then(() => { if (clusterEditQueue.get(clusterId) === tail) clusterEditQueue.delete(clusterId); });
+  return run;
+}
+
 app.post("/api/strangers/clusters/:clusterId/split", requireOperatorRole("operator"), requireCsrf, async (req, res) => {
+  await withClusterEditLock(String(req.params.clusterId || ""), async () => {
   try {
     const picked = await pickedFromStrangerCluster(req);
     if ("error" in picked) {
@@ -10799,6 +10817,7 @@ app.post("/api/strangers/clusters/:clusterId/split", requireOperatorRole("operat
     console.error("[Strangers] Lỗi tách cụm ảnh người lạ:", err);
     res.status(500).json({ success: false, error: err?.message || "Lỗi tách cụm ảnh người lạ" });
   }
+  });
 });
 
 /**
@@ -10807,6 +10826,7 @@ app.post("/api/strangers/clusters/:clusterId/split", requireOperatorRole("operat
  * these photos: hidden from the panel, nothing deleted, restorable.
  */
 app.post("/api/strangers/clusters/:clusterId/remove-photos", requireOperatorRole("operator"), requireCsrf, async (req, res) => {
+  await withClusterEditLock(String(req.params.clusterId || ""), async () => {
   try {
     const picked = await pickedFromStrangerCluster(req);
     if ("error" in picked) {
@@ -10836,6 +10856,7 @@ app.post("/api/strangers/clusters/:clusterId/remove-photos", requireOperatorRole
     console.error("[Strangers] Lỗi bỏ ảnh khỏi cụm người lạ:", err);
     res.status(500).json({ success: false, error: err?.message || "Lỗi bỏ ảnh khỏi cụm" });
   }
+  });
 });
 
 /**
