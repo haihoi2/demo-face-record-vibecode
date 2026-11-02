@@ -198,7 +198,7 @@ export function playbackFailure(stderr: string): { status: number; code: string;
     return {
       status: 404,
       code: "RECORDING_NOT_FOUND",
-      error: "Đầu ghi không có đoạn ghi cho thời điểm này (có thể đã bị ghi đè — đầu ghi lưu khoảng 8 ngày).",
+      error: "Đầu ghi không có đoạn ghi cho thời điểm này (có thể đã bị ghi đè — đầu ghi lưu khoảng 1 tháng).",
     };
   }
   if (/401 Unauthorized|403 Forbidden/i.test(stderr)) {
