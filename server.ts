@@ -222,6 +222,7 @@ import {
 } from "./src/server/faceFusion";
 import type { FaceGallery } from "./src/server/faceFusion";
 import { groupFaceTracks } from "./src/server/faceTracks";
+import { bestOfExtrasAllowed } from "./src/server/bestOfBudget";
 import { extractFacesOffThread, faceExtractPoolTelemetry, getFaceExtractPool, isFaceExtractError } from "./src/server/faceExtractPool";
 import { gateWatchPace } from "./src/server/gateWatchPace";
 
@@ -2279,6 +2280,8 @@ function presenceDetectorSettings(gate: Gate): PresenceSettings {
  */
 const DOOR_SCAN_BEST_OF_EXTRA_FRAMES = envInt("DOOR_SCAN_BEST_OF_EXTRA_FRAMES", 2, 0, 4);
 const DOOR_SCAN_BEST_OF_SPACING_MS = envInt("DOOR_SCAN_BEST_OF_SPACING_MS", 250, 100, 1000);
+/** Scans that wanted extra pictures: all looked at, fewer (pool busy), none (no idle worker). */
+const bestOfStats = { full: 0, trimmed: 0, skipped: 0 };
 const FACE_SCAN_MAX_FRAME_INTERVAL_MS = 3000;
 
 /**
@@ -2672,6 +2675,7 @@ app.get(["/api/face-engine/status", "/api/face-engine/status/", "/api/face-engin
     thresholds: currentFusionThresholds(),
     clearFace: { limits: CLEAR_FACE_LIMITS, ...clearFaceGate },
     faceExtract: faceExtractPoolTelemetry(),
+    bestOf: { extraFrames: DOOR_SCAN_BEST_OF_EXTRA_FRAMES, ...bestOfStats },
     limits: {
       maxObservationsPerDecision: FACE_MAX_OBSERVATIONS,
       maxFramesPerStream: FACE_SCAN_MAX_FRAMES,
@@ -6071,16 +6075,24 @@ async function performGateScan(input: GateScanRequest): Promise<GateScanResult> 
           outcome.observed.length > 0 &&
           !recognizeObservations(capObservations(outcome.observed), currentGallery(), fusionThresholds).recognized
         ) {
+          // Only as many as there are idle extraction workers (Taiga #506): at the
+          // noon peak the other gate's frames are in the pool and these would
+          // queue behind them; the watcher rescans 0.3 s later anyway. Newest first.
+          const allowed = bestOfExtrasAllowed(extraGrabs.length, faceExtractPoolTelemetry());
+          const extras = extraGrabs.slice(0, allowed);
+          if (allowed === 0) bestOfStats.skipped += 1;
+          else if (allowed < extraGrabs.length) bestOfStats.trimmed += 1;
+          else bestOfStats.full += 1;
           // The extra pictures are independent: look at them together (2026-10-12: 3 frames in
           // ~2.6 s instead of ~3.0 s at 4 threads), keeping their order and frame numbers.
           const base = grabs.length;
-          grabs.push(...extraGrabs);
+          grabs.push(...extras);
           const extraObserved = await Promise.all(
-            extraGrabs.map((g, k) => observeFrame(g.jpeg!, target.id, target.label, base + k))
+            extras.map((g, k) => observeFrame(g.jpeg!, target.id, target.label, base + k))
           );
           extraObserved.forEach((observed, k) => {
             for (const o of observed) o.extra = true;
-            if (observed.length > 0) outcome.frameJpegs.set(base + k, extraGrabs[k].jpeg!);
+            if (observed.length > 0) outcome.frameJpegs.set(base + k, extras[k].jpeg!);
             outcome.observed.push(...observed);
           });
         }
