@@ -292,15 +292,18 @@ describe("the card in the source", () => {
   });
 
   it("is rendered on the engine tab and the deployment note mentions the per-gate switch", () => {
-    const engineTab = page.slice(page.indexOf('activeTabSection === "engine" && ('), page.indexOf("SECTION 2: GOOGLE AI"));
+    const engineTab = page.slice(page.indexOf('activeTabSection === "engine" && ('), page.indexOf("SECTION 3: LOCAL MODEL"));
     assert.match(engineTab, /<RealtimeEngineCard \/>/);
-    assert.match(engineTab, /Động cơ thời gian thực là luồng riêng, không thuộc ba chế độ này/);
+    assert.match(engineTab, /Động cơ thời gian thực là luồng riêng, không thuộc ba chế độ\s+cũ bên dưới/);
     assert.match(engineTab, /cho từng cổng/);
-    // The card sits outside the three selectable cards (each of which sets engineMode on click).
+    // The card sits outside the legacy engineMode cards, which now live in the collapsed
+    // legacy <details> after it (2026-11-02 truthful AI config page).
     const cardIndex = engineTab.indexOf("<RealtimeEngineCard />");
-    const lastSelectable = engineTab.lastIndexOf('engineMode: "HYBRID_AUTO"');
-    assert.ok(cardIndex > lastSelectable, "the fourth card comes after the three engineMode cards");
-    assert.doesNotMatch(engineTab.slice(cardIndex), /engineMode: "/, "nothing after the card sets engineMode");
+    const legacyIndex = engineTab.indexOf('<details id="ai-config-legacy"');
+    const firstSelectable = engineTab.indexOf('engineMode: "');
+    assert.ok(cardIndex < legacyIndex, "the real-time card comes before the legacy section");
+    assert.ok(firstSelectable > legacyIndex, "every engineMode write is inside the legacy section");
+    assert.doesNotMatch(engineTab.slice(0, legacyIndex), /engineMode: "/, "nothing before the legacy section sets engineMode");
   });
 
   it("never describes the gap between scans as a period or frequency", () => {

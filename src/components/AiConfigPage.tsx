@@ -6,9 +6,7 @@ import {
   CheckCircle2,
   Sliders,
   ShieldCheck,
-  Zap,
   RefreshCw,
-  Play,
   RotateCcw,
   Save,
   Check,
@@ -26,20 +24,29 @@ import {
 } from "lucide-react";
 import {
   AiRecognitionConfig,
-  RecognitionEngineMode,
-  BenchmarkResult,
   Employee,
   FusionThresholds,
 } from "../types";
 import { safeJsonFetch } from "../utils/api";
 import { soundEffects } from "../utils/audio";
-import {
-  getStoredAiConfig,
-  saveStoredAiConfig,
-  getStoredEmployees,
-} from "../utils/offlineEngine";
-import { runLocalFaceRecognition } from "../utils/localBiometrics";
+import { getStoredAiConfig, saveStoredAiConfig } from "../utils/offlineEngine";
 import { RealtimeEngineCard } from "./RealtimeEngineCard";
+import {
+  ARCHITECTURE_DISPLAY_ONLY_BADGE,
+  ARCHITECTURE_DISPLAY_ONLY_HINT,
+  BENCHMARK_RETIRED_TEXT,
+  BENCHMARK_RETIRED_TITLE,
+  ENGINE_SOURCE_SENTENCE,
+  LEGACY_EDIT_TOGGLE_LABEL,
+  LEGACY_SECTION_HINT,
+  LEGACY_SECTION_TITLE,
+  bestOfRows,
+  faceExtractRows,
+  faceExtractStateLabel,
+  legacyEngineModeLabel,
+  readBestOfTelemetry,
+  readFaceExtractTelemetry,
+} from "../utils/aiConfigTruth";
 
 interface AiConfigPageProps {
   employees: Employee[];
@@ -47,16 +54,20 @@ interface AiConfigPageProps {
 }
 
 /**
- * Which "Local Model SOTA" controls the backend actually honours today.
- * Audited against server.ts / src/server/faceFusion.ts / faceWorkerPool.ts:
- *  - modelArchitecture: only swaps a display string. The real detector/recognizer
- *    pair is decided by the ONNX models loaded server-side and is reported
+ * Which "Local Model" controls the backend actually honours today.
+ * Verified in server.ts / src/server/faceFusion.ts / src/server/faceWorker.ts:
+ *  - The door decision always uses the ONNX engine (SCRFD det_10g + ArcFace
+ *    w600k_r50) when FACE_ENGINE=onnx; the engine is chosen by server config
+ *    (FACE_ENGINE / FACE_RECOGNIZER_MODEL), never by this page.
+ *  - modelArchitecture: display-only. It only changes a display name over the demo
+ *    seed-based matcher (src/server/faceWorker.ts) in the legacy `recognizeFrame`
+ *    path, which runs only when the ONNX engine is not ready - and then the system
+ *    is fail-closed (no unlock). The real detector/recognizer pair is reported
  *    read-only by GET /api/face-engine/status.
  *  - similarityThreshold: REAL - it is the fusion `acceptSingle` operating point
- *    (one strong observation is enough to accept at or above this cosine).
- *  - livenessSensitivity: thresholds 92/85/75 are compared against a score hardcoded
- *    to 94-100, so the check can never fail. Still NOT wired to the ONNX pipeline.
- *  - autoContrast / antiSpoofing: stored in config and never read by any code path.
+ *    (server.ts currentFusionThresholds).
+ *  - livenessSensitivity / autoContrast / antiSpoofing / maxFaces: legacy-path only,
+ *    never read by the ONNX door flow.
  * Flip an entry to true only when the matching backend work actually lands.
  */
 const LOCAL_MODEL_SUPPORT = {
@@ -145,25 +156,21 @@ const countEnrolledEmployees = (byEmployee: Record<string, number> | number | un
   return null;
 };
 
-export const AiConfigPage: React.FC<AiConfigPageProps> = ({
-  employees,
-  onNavigateToScanner,
-}) => {
+// `employees` stays in the props contract for App.tsx; the demo benchmark that used it
+// is gone and the enrolled count now comes from the server status.
+export const AiConfigPage: React.FC<AiConfigPageProps> = ({ onNavigateToScanner }) => {
   const [config, setConfig] = useState<AiRecognitionConfig>(getStoredAiConfig());
   const [saving, setSaving] = useState<boolean>(false);
   const [saveSuccess, setSaveSuccess] = useState<boolean>(false);
-  const [benchmarking, setBenchmarking] = useState<boolean>(false);
-  const [benchmarkResult, setBenchmarkResult] = useState<BenchmarkResult | null>(null);
-  const [testSubject, setTestSubject] = useState<string>("FIRST_EMPLOYEE");
-  const [activeTabSection, setActiveTabSection] = useState<"engine" | "google" | "local" | "benchmark">("engine");
+  const [activeTabSection, setActiveTabSection] = useState<"engine" | "local" | "benchmark">("engine");
+  /** Legacy (non-door) settings are read-only until an operator opts in. */
+  const [legacyEditable, setLegacyEditable] = useState<boolean>(false);
 
   // Real face engine status (GET /api/face-engine/status). Never assumed present.
   const [engineStatus, setEngineStatus] = useState<FaceEngineStatus | null>(null);
   const [engineLoading, setEngineLoading] = useState<boolean>(true);
   const [engineError, setEngineError] = useState<string | null>(null);
   const [engineCheckedAt, setEngineCheckedAt] = useState<string | null>(null);
-
-  const effectiveEmployees = employees.length > 0 ? employees : getStoredEmployees();
 
   const fetchEngineStatus = useCallback(async (): Promise<void> => {
     setEngineLoading(true);
@@ -261,89 +268,6 @@ export const AiConfigPage: React.FC<AiConfigPageProps> = ({
     soundEffects.playClick();
   };
 
-  const runBenchmark = async () => {
-    setBenchmarking(true);
-    setBenchmarkResult(null);
-
-    const testEmp =
-      testSubject === "FIRST_EMPLOYEE"
-        ? effectiveEmployees[0]
-        : effectiveEmployees.find((e) => e.id === testSubject);
-
-    const samplePhoto = testEmp?.photoUrl || "";
-
-    try {
-      // Attempt server benchmark first
-      const serverRes = await safeJsonFetch<BenchmarkResult>("/api/config/ai/benchmark", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          imageBase64: samplePhoto,
-          clientEmployees: effectiveEmployees,
-          localModelArchitecture: config.localModel.modelArchitecture,
-          similarityThreshold: config.localModel.similarityThreshold,
-          livenessSensitivity: config.localModel.livenessSensitivity,
-          googleModel: config.googleAi.model,
-        }),
-      });
-
-      if (serverRes.ok && serverRes.data && serverRes.data.googleAiResult) {
-        setBenchmarkResult(serverRes.data);
-        soundEffects.playBeep();
-      } else {
-        // Run Client-Side Benchmark Simulation
-        const localStart = performance.now();
-        const localRes = runLocalFaceRecognition({
-          imageBase64: samplePhoto,
-          employees: effectiveEmployees,
-          modelArchitecture: config.localModel.modelArchitecture,
-          similarityThreshold: config.localModel.similarityThreshold,
-          livenessSensitivity: config.localModel.livenessSensitivity,
-          testEmployeeId: testEmp?.id,
-        });
-        const localDuration = Math.round(performance.now() - localStart) + 12;
-
-        const simulatedGoogleDuration = Math.round(210 + Math.random() * 60);
-
-        const result: BenchmarkResult = {
-          googleAiResult: {
-            model: config.googleAi.model,
-            latencyMs: simulatedGoogleDuration,
-            recognized: localRes.recognized,
-            facesCount: localRes.detectedFaces.length || 1,
-            detectedEmployees: localRes.bestMatch ? [localRes.bestMatch.name] : [],
-            confidence: Math.round((96.5 + Math.random() * 2.8) * 10) / 10,
-            livenessScore: 98.4,
-            message: `Xác thực qua ${config.googleAi.model} (Phân tích toàn cảnh đa mục tiêu)`,
-          },
-          localResult: {
-            model: localRes.modelName,
-            latencyMs: localDuration,
-            recognized: localRes.recognized,
-            facesCount: localRes.detectedFaces.length || 1,
-            detectedEmployees: localRes.bestMatch ? [localRes.bestMatch.name] : [],
-            confidence: localRes.overallConfidence,
-            livenessScore: localRes.overallLiveness,
-            cosineSimilarity: localRes.cosineSimilarity,
-            message: localRes.detectedFaces[0]?.message || "Xác thực vector Cosine",
-          },
-          speedDifference: `Local Model nhanh hơn xấp xỉ ${(simulatedGoogleDuration / Math.max(1, localDuration)).toFixed(1)}x so với Google Cloud AI (${localDuration}ms vs ${simulatedGoogleDuration}ms)`,
-          recommendation:
-            localRes.cosineSimilarity >= 0.72
-              ? "Cả hai mô hình đều xác thực chính xác. Nên dùng chế độ Hybrid Auto hoặc Local Model để mở cửa siêu tốc <40ms!"
-              : "Độ tin cậy cục bộ ở mức biên. Khuyến nghị bật chế độ Hybrid Auto để Google AI hỗ trợ phân tích sâu khi cần thiết.",
-        };
-
-        setBenchmarkResult(result);
-        soundEffects.playBeep();
-      }
-    } catch {
-      // Fallback
-    } finally {
-      setBenchmarking(false);
-    }
-  };
-
   // ---- Derived engine facts (all tolerant of a missing / partial payload) ----
   const rawEngineInfo = engineStatus?.info || {};
   /** The server names these detectorModel/recognizerModel/embeddingDim/loadTimeMs;
@@ -377,6 +301,9 @@ export const AiConfigPage: React.FC<AiConfigPageProps> = ({
     typeof templateTotalForTag === "number" && templateTotal !== null
       ? templateTotal - templateTotalForTag
       : 0;
+
+  const faceExtract = readFaceExtractTelemetry(engineStatus);
+  const bestOf = readBestOfTelemetry(engineStatus);
 
   const threshold = config.localModel.similarityThreshold;
   /** Honest reading of the slider against this site's measured cosine ranges. */
@@ -618,13 +545,13 @@ export const AiConfigPage: React.FC<AiConfigPageProps> = ({
               <h1 className="text-xl font-bold text-slate-900">
                 Cấu Hình Mô Hình Nhận Diện AI
               </h1>
-              <span className="px-2.5 py-0.5 text-xs font-semibold rounded-full bg-emerald-100 text-emerald-800 border border-emerald-200">
-                SOTA 2026
+              <span className="px-2.5 py-0.5 text-xs font-semibold rounded-full bg-slate-100 text-slate-700 border border-slate-200 font-mono">
+                ONNX
               </span>
             </div>
             <p className="text-sm text-slate-600">
-              Chọn giữa Google Cloud AI Vision (Gemini) và động cơ nhận diện cục bộ chạy trên máy chủ.
-              Tên mô hình thật đang nạp được báo trực tiếp từ máy chủ ở bảng bên dưới - không phải nhãn cố định trong giao diện.
+              Trang này cho biết động cơ nào đang thật sự quyết định cửa và cho phép chỉnh ngưỡng nhận diện.
+              Tên mô hình đang nạp được báo trực tiếp từ máy chủ ở bảng bên dưới - không phải nhãn cố định trong giao diện.
             </p>
           </div>
 
@@ -661,32 +588,26 @@ export const AiConfigPage: React.FC<AiConfigPageProps> = ({
           </div>
         </div>
 
-        {/* Quick Active Engine Status Strip */}
+        {/* Quick strip: what the SERVER says is running. Never derived from the stored engineMode. */}
         <div className="mt-5 pt-4 border-t border-slate-100 grid grid-cols-1 sm:grid-cols-3 gap-3">
           <div className="flex items-center gap-2 text-xs text-slate-600 bg-slate-50 px-3 py-2 rounded-lg border border-slate-100">
             <Activity className="w-4 h-4 text-indigo-600 shrink-0" />
             <div>
-              <span className="font-semibold text-slate-700">Động cơ đang chạy: </span>
-              <span className="text-indigo-600 font-bold">
-                {config.engineMode === "GOOGLE_GEMINI"
-                  ? "Google Cloud AI"
-                  : config.engineMode === "LOCAL_BIOMETRIC"
-                  ? "Local Edge Biometrics"
-                  : "Hybrid Auto (Kép)"}
+              <span className="font-semibold text-slate-700">Động cơ quyết định cửa: </span>
+              <span className={`font-bold font-mono ${engineOperational ? "text-emerald-700" : "text-rose-700"}`}>
+                {engineStatus ? engineStatus.engine || "không rõ" : engineLoading ? "đang đọc..." : "chưa đọc được"}
               </span>
             </div>
           </div>
 
           <div className="flex items-center gap-2 text-xs text-slate-600 bg-slate-50 px-3 py-2 rounded-lg border border-slate-100">
-            <Zap className="w-4 h-4 text-amber-500 shrink-0" />
-            <div>
-              <span className="font-semibold text-slate-700">Tốc độ phản hồi: </span>
-              <span className="text-slate-800 font-mono font-medium">
-                {config.engineMode === "LOCAL_BIOMETRIC"
-                  ? "< 40ms (Siêu tốc)"
-                  : config.engineMode === "GOOGLE_GEMINI"
-                  ? "~180-250ms (Đám mây)"
-                  : "30-50ms (Ưu tiên Local)"}
+            <Cpu className="w-4 h-4 text-emerald-600 shrink-0" />
+            <div className="min-w-0">
+              <span className="font-semibold text-slate-700">Mô hình: </span>
+              <span className="text-slate-800 font-mono font-medium break-all">
+                {engineInfo.detector || engineInfo.recognizer
+                  ? `${engineInfo.detector || "?"} + ${engineInfo.recognizer || "?"}`
+                  : "—"}
               </span>
             </div>
           </div>
@@ -694,23 +615,27 @@ export const AiConfigPage: React.FC<AiConfigPageProps> = ({
           <div className="flex items-center gap-2 text-xs text-slate-600 bg-slate-50 px-3 py-2 rounded-lg border border-slate-100">
             <ShieldCheck className="w-4 h-4 text-emerald-600 shrink-0" />
             <div>
-              <span className="font-semibold text-slate-700">Bảo mật dữ liệu: </span>
-              <span className="text-emerald-700 font-medium">
-                {config.engineMode === "LOCAL_BIOMETRIC"
-                  ? "100% On-Device (Không gửi ảnh)"
-                  : "Mã hóa TLS 1.3 End-to-End"}
+              <span className="font-semibold text-slate-700">Ngưỡng acceptSingle: </span>
+              <span className="text-slate-800 font-mono font-medium">
+                {serverAcceptSingle === null ? "—" : serverAcceptSingle.toFixed(2)}
               </span>
             </div>
           </div>
         </div>
+        <p id="ai-config-engine-source" className="mt-3 text-xs text-slate-600">
+          {ENGINE_SOURCE_SENTENCE}
+        </p>
       </div>
 
       {/* Real engine status - shown on every tab: it decides whether anything below matters */}
       {renderEngineStatusPanel()}
 
       {/* Navigation Sub-tabs */}
-      <div className="flex items-center gap-2 border-b border-slate-200 pb-2">
+      <div role="tablist" aria-label="Mục cấu hình AI" className="flex items-center gap-2 border-b border-slate-200 pb-2">
         <button
+          role="tab"
+          id="tab-ai-engine"
+          aria-selected={activeTabSection === "engine"}
           onClick={() => setActiveTabSection("engine")}
           className={`flex items-center gap-2 px-3.5 py-2 text-sm font-semibold rounded-lg transition-all ${
             activeTabSection === "engine"
@@ -719,22 +644,13 @@ export const AiConfigPage: React.FC<AiConfigPageProps> = ({
           }`}
         >
           <Layers className="w-4 h-4" />
-          <span>1. Chọn Chế Độ Động Cơ</span>
+          <span>1. Động Cơ</span>
         </button>
 
         <button
-          onClick={() => setActiveTabSection("google")}
-          className={`flex items-center gap-2 px-3.5 py-2 text-sm font-semibold rounded-lg transition-all ${
-            activeTabSection === "google"
-              ? "bg-indigo-600 text-white shadow-xs"
-              : "text-slate-600 hover:text-slate-900 hover:bg-slate-100"
-          }`}
-        >
-          <Sparkles className="w-4 h-4" />
-          <span>2. Tinh Chỉnh Google AI</span>
-        </button>
-
-        <button
+          role="tab"
+          id="tab-ai-local"
+          aria-selected={activeTabSection === "local"}
           onClick={() => setActiveTabSection("local")}
           className={`flex items-center gap-2 px-3.5 py-2 text-sm font-semibold rounded-lg transition-all ${
             activeTabSection === "local"
@@ -743,10 +659,13 @@ export const AiConfigPage: React.FC<AiConfigPageProps> = ({
           }`}
         >
           <Cpu className="w-4 h-4" />
-          <span>3. Tinh Chỉnh Local Model SOTA</span>
+          <span>2. Ngưỡng Nhận Diện</span>
         </button>
 
         <button
+          role="tab"
+          id="tab-ai-benchmark"
+          aria-selected={activeTabSection === "benchmark"}
           onClick={() => setActiveTabSection("benchmark")}
           className={`flex items-center gap-2 px-3.5 py-2 text-sm font-semibold rounded-lg transition-all ${
             activeTabSection === "benchmark"
@@ -755,188 +674,17 @@ export const AiConfigPage: React.FC<AiConfigPageProps> = ({
           }`}
         >
           <Award className="w-4 h-4" />
-          <span>4. Thử Nghiệm Benchmark Đối Soát</span>
+          <span>3. Số Liệu Động Cơ</span>
         </button>
       </div>
 
-      {/* SECTION 1: ENGINE SELECTION */}
+      {/* SECTION 1: ENGINE - real-time pipeline switch, then the legacy (non-door) settings collapsed */}
       {activeTabSection === "engine" && (
         <div className="space-y-6">
-          <div className="grid grid-cols-1 md:grid-cols-3 gap-5">
-            {/* Card 1: Google Gemini */}
-            <div
-              id="card-engine-google"
-              onClick={() => {
-                setConfig({ ...config, engineMode: "GOOGLE_GEMINI" });
-                soundEffects.playClick();
-              }}
-              className={`relative cursor-pointer rounded-2xl p-6 border-2 transition-all ${
-                config.engineMode === "GOOGLE_GEMINI"
-                  ? "border-indigo-600 bg-indigo-50/40 shadow-md ring-2 ring-indigo-500/20"
-                  : "border-slate-200 bg-white hover:border-slate-300 hover:shadow-xs"
-              }`}
-            >
-              <div className="flex items-start justify-between">
-                <div className="p-3 bg-indigo-100 text-indigo-700 rounded-xl">
-                  <Sparkles className="w-6 h-6" />
-                </div>
-                <span className="px-2 py-0.5 text-xs font-semibold rounded-full bg-indigo-100 text-indigo-700 border border-indigo-200">
-                  Google DeepMind
-                </span>
-              </div>
-
-              <div className="mt-4">
-                <h3 className="text-base font-bold text-slate-900 flex items-center gap-1.5">
-                  Google Cloud AI Vision
-                  {config.engineMode === "GOOGLE_GEMINI" && (
-                    <CheckCircle2 className="w-4 h-4 text-indigo-600 inline" />
-                  )}
-                </h3>
-                <p className="text-xs text-slate-500 mt-1">
-                  Mô hình Gemini Vision SOTA mới nhất (3.8 Flash & Pro)
-                </p>
-              </div>
-
-              <ul className="mt-4 space-y-2 text-xs text-slate-600">
-                <li className="flex items-center gap-1.5">
-                  <Check className="w-3.5 h-3.5 text-emerald-600 shrink-0" />
-                  <span>Nhận diện đa người cùng lúc toàn cảnh</span>
-                </li>
-                <li className="flex items-center gap-1.5">
-                  <Check className="w-3.5 h-3.5 text-emerald-600 shrink-0" />
-                  <span>Xử lý tốt góc nghiêng và phụ kiện che mặt</span>
-                </li>
-                <li className="flex items-center gap-1.5">
-                  <Check className="w-3.5 h-3.5 text-emerald-600 shrink-0" />
-                  <span>Tự động giải thích lý do từ chối chi tiết</span>
-                </li>
-              </ul>
-
-              <div className="mt-5 pt-4 border-t border-slate-100 flex items-center justify-between text-xs">
-                <span className="text-slate-500">Độ trễ xử lý:</span>
-                <span className="font-mono font-medium text-slate-800">~180 - 240ms</span>
-              </div>
-            </div>
-
-            {/* Card 2: Local SOTA Biometric Model */}
-            <div
-              id="card-engine-local"
-              onClick={() => {
-                setConfig({ ...config, engineMode: "LOCAL_BIOMETRIC" });
-                soundEffects.playClick();
-              }}
-              className={`relative cursor-pointer rounded-2xl p-6 border-2 transition-all ${
-                config.engineMode === "LOCAL_BIOMETRIC"
-                  ? "border-emerald-600 bg-emerald-50/40 shadow-md ring-2 ring-emerald-500/20"
-                  : "border-slate-200 bg-white hover:border-slate-300 hover:shadow-xs"
-              }`}
-            >
-              <div className="flex items-start justify-between">
-                <div className="p-3 bg-emerald-100 text-emerald-700 rounded-xl">
-                  <Cpu className="w-6 h-6" />
-                </div>
-                <span className="px-2 py-0.5 text-xs font-semibold rounded-full bg-emerald-100 text-emerald-700 border border-emerald-200">
-                  Edge Biometrics
-                </span>
-              </div>
-
-              <div className="mt-4">
-                <h3 className="text-base font-bold text-slate-900 flex items-center gap-1.5">
-                  Local Face Recognition SOTA
-                  {config.engineMode === "LOCAL_BIOMETRIC" && (
-                    <CheckCircle2 className="w-4 h-4 text-emerald-600 inline" />
-                  )}
-                </h3>
-                <p className="text-xs text-slate-500 mt-1">
-                  {engineStatus && (engineInfo.detector || engineInfo.recognizer)
-                    ? `${engineInfo.detector || "?"} + ${engineInfo.recognizer || "?"}${
-                        typeof engineInfo.dims === "number" ? ` (${engineInfo.dims}-D)` : ""
-                      }`
-                    : "Mô hình ONNX chạy trên máy chủ (xem bảng trạng thái động cơ)"}
-                </p>
-              </div>
-
-              <ul className="mt-4 space-y-2 text-xs text-slate-600">
-                <li className="flex items-center gap-1.5">
-                  <Check className="w-3.5 h-3.5 text-emerald-600 shrink-0" />
-                  <span>Siêu tốc độ mở cửa tức thì (<strong className="font-semibold text-emerald-700">&lt; 40ms</strong>)</span>
-                </li>
-                <li className="flex items-center gap-1.5">
-                  <Check className="w-3.5 h-3.5 text-emerald-600 shrink-0" />
-                  <span>Bảo mật 100%: Ảnh không gửi ra ngoài mạng</span>
-                </li>
-                <li className="flex items-center gap-1.5">
-                  <Check className="w-3.5 h-3.5 text-emerald-600 shrink-0" />
-                  <span>Hoạt động liên tục cả khi rớt mạng / offline</span>
-                </li>
-              </ul>
-
-              <div className="mt-5 pt-4 border-t border-slate-100 flex items-center justify-between text-xs">
-                <span className="text-slate-500">Độ trễ xử lý:</span>
-                <span className="font-mono font-medium text-emerald-700 font-bold">&lt; 35ms</span>
-              </div>
-            </div>
-
-            {/* Card 3: Hybrid Auto Pipeline */}
-            <div
-              id="card-engine-hybrid"
-              onClick={() => {
-                setConfig({ ...config, engineMode: "HYBRID_AUTO" });
-                soundEffects.playClick();
-              }}
-              className={`relative cursor-pointer rounded-2xl p-6 border-2 transition-all ${
-                config.engineMode === "HYBRID_AUTO"
-                  ? "border-violet-600 bg-violet-50/40 shadow-md ring-2 ring-violet-500/20"
-                  : "border-slate-200 bg-white hover:border-slate-300 hover:shadow-xs"
-              }`}
-            >
-              <div className="flex items-start justify-between">
-                <div className="p-3 bg-violet-100 text-violet-700 rounded-xl">
-                  <Layers className="w-6 h-6" />
-                </div>
-                <span className="px-2 py-0.5 text-xs font-semibold rounded-full bg-violet-100 text-violet-700 border border-violet-200">
-                  Khuyến nghị
-                </span>
-              </div>
-
-              <div className="mt-4">
-                <h3 className="text-base font-bold text-slate-900 flex items-center gap-1.5">
-                  Chế Độ Hybrid Thông Minh
-                  {config.engineMode === "HYBRID_AUTO" && (
-                    <CheckCircle2 className="w-4 h-4 text-violet-600 inline" />
-                  )}
-                </h3>
-                <p className="text-xs text-slate-500 mt-1">
-                  Kết hợp tối ưu: Local Fast-Path + Cloud Deep Vision
-                </p>
-              </div>
-
-              <ul className="mt-4 space-y-2 text-xs text-slate-600">
-                <li className="flex items-center gap-1.5">
-                  <Check className="w-3.5 h-3.5 text-violet-600 shrink-0" />
-                  <span>Xác thực nhân viên quen thuộc trong 30ms</span>
-                </li>
-                <li className="flex items-center gap-1.5">
-                  <Check className="w-3.5 h-3.5 text-violet-600 shrink-0" />
-                  <span>Tự động gọi Google AI khi gặp góc ánh sáng khó</span>
-                </li>
-                <li className="flex items-center gap-1.5">
-                  <Check className="w-3.5 h-3.5 text-violet-600 shrink-0" />
-                  <span>Tiết kiệm băng thông & chi phí gọi API đám mây</span>
-                </li>
-              </ul>
-
-              <div className="mt-5 pt-4 border-t border-slate-100 flex items-center justify-between text-xs">
-                <span className="text-slate-500">Độ trễ trung bình:</span>
-                <span className="font-mono font-medium text-violet-800">30ms - 200ms</span>
-              </div>
-            </div>
-          </div>
-
           {/*
-            Card 4: the real-time pipeline engine. A SEPARATE flow beside the
-            three modes above, switched per gate by an admin; it is not an
-            `engineMode` value and the card never writes that setting.
+            The real-time pipeline engine. A SEPARATE flow from the legacy
+            engineMode below, switched per gate by an admin; the card never
+            writes that setting.
           */}
           <RealtimeEngineCard />
 
@@ -944,173 +692,280 @@ export const AiConfigPage: React.FC<AiConfigPageProps> = ({
           <div className="bg-slate-50 p-4 rounded-xl border border-slate-200 flex items-start gap-3 text-xs text-slate-600">
             <Info className="w-4 h-4 text-indigo-600 shrink-0 mt-0.5" />
             <div>
-              <strong className="text-slate-800">Lưu ý triển khai:</strong> Ba chế độ động cơ ở trên đều tích hợp đầy đủ với hệ thống Điều khiển Cửa thông minh (Smart Lock) và Webhook thông báo thời gian thực đến phòng chat Eton; bạn có thể thay đổi chế độ bất kỳ lúc nào mà không làm gián đoạn vận hành cổng kiểm soát. Động cơ thời gian thực là luồng riêng, không thuộc ba chế độ này: Quản trị bật/tắt cho từng cổng ngay trong thẻ "Động cơ thời gian thực" (legacy / chạy thử / đang áp dụng), không qua nút Lưu của trang.
+              <strong className="text-slate-800">Lưu ý triển khai:</strong> Quyết định mở cửa luôn đi qua động cơ ONNX
+              (SCRFD + ArcFace) trên máy chủ khi <span className="font-mono">FACE_ENGINE=onnx</span>; nếu động cơ chưa
+              sẵn sàng, hệ thống đóng an toàn và không mở cửa. Động cơ thời gian thực là luồng riêng, không thuộc ba chế độ
+              cũ bên dưới: Quản trị bật/tắt cho từng cổng ngay trong thẻ "Động cơ thời gian thực" (legacy / chạy thử /
+              đang áp dụng), không qua nút Lưu của trang.
             </div>
           </div>
-        </div>
-      )}
 
-      {/* SECTION 2: GOOGLE AI FINE-TUNING */}
-      {activeTabSection === "google" && (
-        <div className="bg-white rounded-2xl p-6 border border-slate-200 shadow-xs space-y-6">
-          <div className="flex items-center justify-between">
-            <div className="flex items-center gap-2">
-              <Sparkles className="w-5 h-5 text-indigo-600" />
-              <h2 className="text-base font-bold text-slate-900">
-                Thông Số Kỹ Thuật Google AI Vision (Gemini)
-              </h2>
-            </div>
-            <span className="text-xs text-slate-500 font-mono">
-              SDK: @google/genai (Node.js Server-Side)
-            </span>
-          </div>
+          {/*
+            LEGACY SETTINGS. engineMode / googleAi / hybridSettings are read only by the
+            legacy `recognizeFrame` path, which runs only when the ONNX engine is not
+            ready - and then the system is fail-closed. Gemini never opens a door.
+            Collapsed and read-only by default; the config shape and POST are kept
+            because other code may still read them.
+          */}
+          <details id="ai-config-legacy" className="group bg-white rounded-2xl border border-slate-200 shadow-xs">
+            <summary className="cursor-pointer select-none list-none px-5 py-3.5 flex items-center justify-between gap-3 rounded-2xl focus:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500">
+              <span className="flex items-center gap-2 min-w-0">
+                <Lock className="w-4 h-4 text-slate-500 shrink-0" />
+                <span className="text-sm font-bold text-slate-800 truncate">{LEGACY_SECTION_TITLE}</span>
+                <span className="px-2 py-0.5 text-[10px] font-bold rounded-full bg-amber-100 text-amber-800 border border-amber-200 shrink-0">
+                  {NOT_IMPLEMENTED_BADGE} cho cửa
+                </span>
+              </span>
+              <span className="text-[11px] text-slate-500 shrink-0 flex items-center gap-1">
+                <span className="font-mono">{legacyEngineModeLabel(config.engineMode)}</span>
+                <ChevronRight className="w-4 h-4 transition-transform group-open:rotate-90" />
+              </span>
+            </summary>
 
-          {/* Model Selector Grid */}
-          <div className="space-y-2">
-            <label className="text-xs font-semibold text-slate-700 uppercase tracking-wider">
-              Phiên Bản Mô Hình Google AI
-            </label>
-            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-              {[
-                {
-                  id: "gemini-3.8-flash",
-                  title: "Gemini 3.8 Flash (Khuyến nghị SOTA)",
-                  desc: "Mô hình Flash thế hệ mới nhất 2026. Tối ưu phân tích đa khuôn mặt toàn cảnh với độ trễ thấp.",
-                  tag: "Mới nhất",
-                },
-                {
-                  id: "gemini-flash-latest",
-                  title: "Gemini Flash Latest (Tự động cập nhật)",
-                  desc: "Luôn trỏ về phiên bản Flash ổn định cao cấp nhất được triển khai trên hạ tầng Google.",
-                  tag: "Ổn định",
-                },
-                {
-                  id: "gemini-3.1-flash-lite",
-                  title: "Gemini 3.1 Flash Lite (Siêu nhẹ)",
-                  desc: "Thiết kế chuyên biệt cho tác vụ thị giác tần suất cao với mức tiêu thụ tài nguyên tối thiểu.",
-                  tag: "Tốc độ cao",
-                },
-                {
-                  id: "gemini-3.1-pro-preview",
-                  title: "Gemini 3.1 Pro (Phân tích sâu)",
-                  desc: "Xử lý ảnh khó, ngược sáng mạnh, chụp từ khoảng cách xa với độ chính xác cao nhất.",
-                  tag: "Độ chính xác cao",
-                },
-              ].map((m) => (
-                <div
-                  key={m.id}
-                  onClick={() =>
-                    setConfig({
-                      ...config,
-                      googleAi: { ...config.googleAi, model: m.id },
-                    })
-                  }
-                  className={`p-4 rounded-xl border cursor-pointer transition-all ${
-                    config.googleAi.model === m.id
-                      ? "border-indigo-600 bg-indigo-50/50 shadow-xs"
-                      : "border-slate-200 hover:border-slate-300"
-                  }`}
-                >
-                  <div className="flex items-center justify-between">
-                    <span className="font-bold text-xs text-slate-900">{m.title}</span>
-                    <span className="text-[10px] font-semibold px-2 py-0.5 rounded-full bg-slate-100 text-slate-700">
-                      {m.tag}
-                    </span>
+            <div className="px-5 pb-5 space-y-5 border-t border-slate-100 pt-4">
+              <div className="flex items-start gap-3 p-3 rounded-xl bg-amber-50 border border-amber-200">
+                <AlertTriangle className="w-4 h-4 text-amber-600 mt-0.5 shrink-0" />
+                <p className="text-[11px] text-amber-900 leading-relaxed">{LEGACY_SECTION_HINT}</p>
+              </div>
+
+              <label className="flex items-center gap-2 text-xs text-slate-700 cursor-pointer w-fit">
+                <input
+                  type="checkbox"
+                  id="chk-legacy-editable"
+                  checked={legacyEditable}
+                  onChange={(e) => setLegacyEditable(e.target.checked)}
+                  className="w-4 h-4 rounded text-amber-600 focus:ring-amber-500"
+                />
+                <span>{LEGACY_EDIT_TOGGLE_LABEL}</span>
+              </label>
+
+              {/* Legacy engine mode (read-only unless unlocked) */}
+              <div
+                role="radiogroup"
+                aria-label="Chế độ động cơ cũ"
+                aria-disabled={!legacyEditable}
+                className={`grid grid-cols-1 md:grid-cols-3 gap-4 ${legacyEditable ? "" : "opacity-70"}`}
+              >
+                {(
+                  [
+                    {
+                      id: "card-engine-google",
+                      mode: "GOOGLE_GEMINI",
+                      icon: <Sparkles className="w-5 h-5" />,
+                      iconClass: "bg-indigo-100 text-indigo-700",
+                      ring: "border-indigo-600 bg-indigo-50/40",
+                      title: "Google Gemini (luồng cũ)",
+                      desc: "Gọi Gemini Vision trong luồng cũ. Không bao giờ mở cửa.",
+                    },
+                    {
+                      id: "card-engine-local",
+                      mode: "LOCAL_BIOMETRIC",
+                      icon: <Cpu className="w-5 h-5" />,
+                      iconClass: "bg-emerald-100 text-emerald-700",
+                      ring: "border-emerald-600 bg-emerald-50/40",
+                      title: "Local demo (luồng cũ)",
+                      desc: "Bộ so khớp demo theo seed; không phải động cơ ONNX đang quyết định cửa.",
+                    },
+                    {
+                      id: "card-engine-hybrid",
+                      mode: "HYBRID_AUTO",
+                      icon: <Layers className="w-5 h-5" />,
+                      iconClass: "bg-violet-100 text-violet-700",
+                      ring: "border-violet-600 bg-violet-50/40",
+                      title: "Hybrid Auto (luồng cũ)",
+                      desc: "Local demo rồi Gemini khi không chắc; chỉ trong luồng cũ.",
+                    },
+                  ] as const
+                ).map((card) => {
+                  const selected = config.engineMode === card.mode;
+                  return (
+                    <button
+                      key={card.id}
+                      type="button"
+                      id={card.id}
+                      role="radio"
+                      aria-checked={selected}
+                      disabled={!legacyEditable}
+                      title={legacyEditable ? undefined : LEGACY_SECTION_HINT}
+                      onClick={() => {
+                        if (!legacyEditable) return;
+                        if (card.mode === "GOOGLE_GEMINI") setConfig({ ...config, engineMode: "GOOGLE_GEMINI" });
+                        else if (card.mode === "LOCAL_BIOMETRIC") setConfig({ ...config, engineMode: "LOCAL_BIOMETRIC" });
+                        else setConfig({ ...config, engineMode: "HYBRID_AUTO" });
+                        soundEffects.playClick();
+                      }}
+                      className={`text-left rounded-2xl p-4 border-2 transition-all disabled:cursor-not-allowed ${
+                        selected ? `${card.ring} shadow-xs` : "border-slate-200 bg-white"
+                      } ${legacyEditable ? "hover:border-slate-300" : ""}`}
+                    >
+                      <div className="flex items-start justify-between gap-2">
+                        <div className={`p-2 rounded-xl ${card.iconClass}`}>{card.icon}</div>
+                        {selected && <CheckCircle2 className="w-4 h-4 text-slate-700 shrink-0" />}
+                      </div>
+                      <div className="mt-3 text-sm font-bold text-slate-900">{card.title}</div>
+                      <p className="text-xs text-slate-500 mt-1">{card.desc}</p>
+                    </button>
+                  );
+                })}
+              </div>
+
+              {/* Legacy Google settings */}
+              <fieldset disabled={!legacyEditable} className="space-y-4 pt-4 border-t border-slate-100 disabled:opacity-70">
+                <legend className="text-xs font-bold text-slate-800 flex items-center gap-2">
+                  <Sparkles className="w-4 h-4 text-indigo-600" />
+                  Google AI Vision (Gemini) - luồng cũ
+                  <span className="text-[10px] font-semibold px-2 py-0.5 rounded-full bg-amber-100 text-amber-800">
+                    {NOT_IMPLEMENTED_BADGE} cho cửa
+                  </span>
+                </legend>
+
+                <div className="space-y-2">
+                  <span className="text-xs font-semibold text-slate-700 uppercase tracking-wider">
+                    Phiên bản mô hình Google AI
+                  </span>
+                  <div role="radiogroup" aria-label="Phiên bản mô hình Google AI" className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                    {[
+                      { id: "gemini-3.8-flash", title: "Gemini 3.8 Flash", desc: "Mô hình Flash, độ trễ thấp." },
+                      { id: "gemini-flash-latest", title: "Gemini Flash Latest", desc: "Trỏ về bản Flash ổn định mới nhất." },
+                      { id: "gemini-3.1-flash-lite", title: "Gemini 3.1 Flash Lite", desc: "Bản nhẹ, ít tài nguyên." },
+                      { id: "gemini-3.1-pro-preview", title: "Gemini 3.1 Pro", desc: "Bản phân tích sâu, chậm hơn." },
+                    ].map((m) => (
+                      <button
+                        key={m.id}
+                        type="button"
+                        role="radio"
+                        aria-checked={config.googleAi.model === m.id}
+                        onClick={() => setConfig({ ...config, googleAi: { ...config.googleAi, model: m.id } })}
+                        className={`text-left p-3 rounded-xl border transition-all disabled:cursor-not-allowed ${
+                          config.googleAi.model === m.id
+                            ? "border-indigo-600 bg-indigo-50/50 shadow-xs"
+                            : "border-slate-200 enabled:hover:border-slate-300"
+                        }`}
+                      >
+                        <span className="font-bold text-xs text-slate-900">{m.title}</span>
+                        <p className="text-xs text-slate-500 mt-1">{m.desc}</p>
+                      </button>
+                    ))}
                   </div>
-                  <p className="text-xs text-slate-500 mt-1">{m.desc}</p>
                 </div>
-              ))}
-            </div>
-          </div>
 
-          {/* Sliders and Toggles */}
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-6 pt-4 border-t border-slate-100">
-            {/* Min Confidence */}
-            <div className="space-y-2">
-              <div className="flex items-center justify-between text-xs">
-                <span className="font-semibold text-slate-700">
-                  Ngưỡng Tin Cậy Tối Thiểu (Min Confidence):
-                </span>
-                <span className="font-mono font-bold text-indigo-600">
-                  {config.googleAi.minConfidence}%
-                </span>
-              </div>
-              <input
-                type="range"
-                min="50"
-                max="95"
-                step="5"
-                value={config.googleAi.minConfidence}
-                onChange={(e) =>
-                  setConfig({
-                    ...config,
-                    googleAi: {
-                      ...config.googleAi,
-                      minConfidence: Number(e.target.value),
-                    },
-                  })
-                }
-                className="w-full accent-indigo-600"
-              />
-              <p className="text-[11px] text-slate-500">
-                Chỉ mở cửa tự động nếu độ khớp khuôn mặt từ Gemini đạt trên ngưỡng này.
-              </p>
-            </div>
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+                  <div className="space-y-2">
+                    <label htmlFor="rng-google-min-confidence" className="flex items-center justify-between text-xs">
+                      <span className="font-semibold text-slate-700">Ngưỡng tin cậy tối thiểu (Min Confidence):</span>
+                      <span className="font-mono font-bold text-indigo-600">{config.googleAi.minConfidence}%</span>
+                    </label>
+                    <input
+                      id="rng-google-min-confidence"
+                      type="range"
+                      min="50"
+                      max="95"
+                      step="5"
+                      value={config.googleAi.minConfidence}
+                      onChange={(e) =>
+                        setConfig({ ...config, googleAi: { ...config.googleAi, minConfidence: Number(e.target.value) } })
+                      }
+                      className="w-full accent-indigo-600"
+                    />
+                    <p className="text-[11px] text-slate-500">
+                      Chỉ dùng trong luồng cũ để lọc kết quả Gemini. Không có kết quả Gemini nào mở được cửa.
+                    </p>
+                  </div>
 
-            {/* Temperature */}
-            <div className="space-y-2">
-              <div className="flex items-center justify-between text-xs">
-                <span className="font-semibold text-slate-700">
-                  Nhiệt Độ Xử Lý (Temperature):
-                </span>
-                <span className="font-mono font-bold text-indigo-600">
-                  {config.googleAi.temperature.toFixed(2)}
-                </span>
-              </div>
-              <input
-                type="range"
-                min="0.0"
-                max="0.4"
-                step="0.05"
-                value={config.googleAi.temperature}
-                onChange={(e) =>
-                  setConfig({
-                    ...config,
-                    googleAi: {
-                      ...config.googleAi,
-                      temperature: Number(e.target.value),
-                    },
-                  })
-                }
-                className="w-full accent-indigo-600"
-              />
-              <p className="text-[11px] text-slate-500">
-                Nhiệt độ thấp (0.05 - 0.15) giúp kết quả nhận diện ổn định và định dạng JSON chuẩn xác nhất.
-              </p>
-            </div>
-          </div>
+                  <div className="space-y-2">
+                    <label htmlFor="rng-google-temperature" className="flex items-center justify-between text-xs">
+                      <span className="font-semibold text-slate-700">Temperature:</span>
+                      <span className="font-mono font-bold text-indigo-600">{config.googleAi.temperature.toFixed(2)}</span>
+                    </label>
+                    <input
+                      id="rng-google-temperature"
+                      type="range"
+                      min="0.0"
+                      max="0.4"
+                      step="0.05"
+                      value={config.googleAi.temperature}
+                      onChange={(e) =>
+                        setConfig({ ...config, googleAi: { ...config.googleAi, temperature: Number(e.target.value) } })
+                      }
+                      className="w-full accent-indigo-600"
+                    />
+                    <p className="text-[11px] text-slate-500">
+                      Nhiệt độ thấp (0.05 - 0.15) cho kết quả ổn định và JSON chuẩn hơn.
+                    </p>
+                  </div>
+                </div>
 
-          {/* Fallback Checkbox */}
-          <div className="flex items-center gap-3 p-3 bg-slate-50 rounded-xl border border-slate-200">
-            <input
-              type="checkbox"
-              id="chk-system-fallback"
-              checked={config.googleAi.useSystemFallback}
-              onChange={(e) =>
-                setConfig({
-                  ...config,
-                  googleAi: {
-                    ...config.googleAi,
-                    useSystemFallback: e.target.checked,
-                  },
-                })
-              }
-              className="w-4 h-4 rounded text-indigo-600 focus:ring-indigo-500"
-            />
-            <label htmlFor="chk-system-fallback" className="text-xs text-slate-700 cursor-pointer">
-              <strong className="font-semibold">Tự động chuyển tiếp Model khi mạng cao tải:</strong> Khi model chính gặp quá tải tức thời (HTTP 503/429), hệ thống tự động gọi phiên bản Flash Lite thay thế để đảm bảo cửa không bị kẹt.
-            </label>
-          </div>
+                <div className="flex items-center gap-3 p-3 bg-slate-50 rounded-xl border border-slate-200">
+                  <input
+                    type="checkbox"
+                    id="chk-system-fallback"
+                    checked={config.googleAi.useSystemFallback}
+                    onChange={(e) =>
+                      setConfig({ ...config, googleAi: { ...config.googleAi, useSystemFallback: e.target.checked } })
+                    }
+                    className="w-4 h-4 rounded text-indigo-600 focus:ring-indigo-500"
+                  />
+                  <label htmlFor="chk-system-fallback" className="text-xs text-slate-700">
+                    <strong className="font-semibold">Tự chuyển sang Flash Lite khi model chính quá tải (HTTP 503/429)</strong> -
+                    chỉ trong luồng cũ.
+                  </label>
+                </div>
+              </fieldset>
+
+              {/* Legacy hybrid settings */}
+              <fieldset disabled={!legacyEditable} className="space-y-3 pt-4 border-t border-slate-100 disabled:opacity-70">
+                <legend className="text-xs font-bold text-slate-800 flex items-center gap-2">
+                  <Layers className="w-4 h-4 text-violet-600" />
+                  Hybrid - luồng cũ
+                  <span className="text-[10px] font-semibold px-2 py-0.5 rounded-full bg-amber-100 text-amber-800">
+                    {NOT_IMPLEMENTED_BADGE} cho cửa
+                  </span>
+                </legend>
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+                  <div className="space-y-2">
+                    <label htmlFor="rng-hybrid-prefilter" className="flex items-center justify-between text-xs">
+                      <span className="font-semibold text-slate-700">Ngưỡng lọc trước bằng local demo:</span>
+                      <span className="font-mono font-bold text-violet-700">
+                        {config.hybridSettings.localPreFilterThreshold.toFixed(2)}
+                      </span>
+                    </label>
+                    <input
+                      id="rng-hybrid-prefilter"
+                      type="range"
+                      min="0.50"
+                      max="0.99"
+                      step="0.01"
+                      value={config.hybridSettings.localPreFilterThreshold}
+                      onChange={(e) =>
+                        setConfig({
+                          ...config,
+                          hybridSettings: { ...config.hybridSettings, localPreFilterThreshold: Number(e.target.value) },
+                        })
+                      }
+                      className="w-full accent-violet-600"
+                    />
+                  </div>
+                  <div className="flex items-center gap-3 p-3 bg-slate-50 rounded-xl border border-slate-200 self-end">
+                    <input
+                      type="checkbox"
+                      id="chk-hybrid-cloud-fallback"
+                      checked={config.hybridSettings.fallbackToCloudOnUnknown}
+                      onChange={(e) =>
+                        setConfig({
+                          ...config,
+                          hybridSettings: { ...config.hybridSettings, fallbackToCloudOnUnknown: e.target.checked },
+                        })
+                      }
+                      className="w-4 h-4 rounded text-violet-600 focus:ring-violet-500"
+                    />
+                    <label htmlFor="chk-hybrid-cloud-fallback" className="text-xs text-slate-700">
+                      Gọi Gemini khi local demo không nhận ra (chỉ luồng cũ)
+                    </label>
+                  </div>
+                </div>
+              </fieldset>
+            </div>
+          </details>
         </div>
       )}
 
@@ -1121,11 +976,11 @@ export const AiConfigPage: React.FC<AiConfigPageProps> = ({
             <div className="flex items-center gap-2">
               <Cpu className="w-5 h-5 text-emerald-600" />
               <h2 className="text-base font-bold text-slate-900">
-                Thông Số Kỹ Thuật Mô Hình Cục Bộ SOTA (Edge Biometrics)
+                Ngưỡng Nhận Diện Của Động Cơ ONNX
               </h2>
             </div>
             <span className="text-xs text-slate-500 font-mono">
-              In-Browser Wasm / Edge Node Execution
+              ONNX Runtime trên máy chủ
             </span>
           </div>
 
@@ -1145,15 +1000,24 @@ export const AiConfigPage: React.FC<AiConfigPageProps> = ({
           {/* Local Architecture Selection */}
           <div className="space-y-2">
             <label className="text-xs font-semibold text-slate-700 uppercase tracking-wider flex items-center gap-2">
-              Kiến Trúc Mô Hình Cục Bộ (Model Architecture)
+              Kiến Trúc Mô Hình (Model Architecture)
               <span className="normal-case tracking-normal text-[10px] font-semibold px-2 py-0.5 rounded-full bg-slate-200 text-slate-700">
                 Máy chủ quyết định
               </span>
+              {!LOCAL_MODEL_SUPPORT.modelArchitecture && (
+                <span
+                  className="normal-case tracking-normal text-[10px] font-semibold px-2 py-0.5 rounded-full bg-amber-100 text-amber-800"
+                  title={ARCHITECTURE_DISPLAY_ONLY_HINT}
+                >
+                  {ARCHITECTURE_DISPLAY_ONLY_BADGE}
+                </span>
+              )}
             </label>
             <p className="text-[11px] text-slate-500">
               Kiến trúc do máy chủ nạp lúc khởi động, không chọn được từ giao diện. Bảng dưới hiển
               thị đúng mô hình đang chạy theo báo cáo của máy chủ.
             </p>
+            <p className="text-[11px] text-amber-800">{ARCHITECTURE_DISPLAY_ONLY_HINT}</p>
             <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
               {[
                 {
@@ -1515,7 +1379,7 @@ export const AiConfigPage: React.FC<AiConfigPageProps> = ({
         </div>
       )}
 
-      {/* SECTION 4: BENCHMARK PLAYGROUND */}
+      {/* SECTION 4: LIVE ENGINE METRICS (replaces the retired demo benchmark) */}
       {activeTabSection === "benchmark" && (
         <div className="space-y-6">
           <div className="bg-white rounded-2xl p-6 border border-slate-200 shadow-xs space-y-5">
@@ -1523,161 +1387,127 @@ export const AiConfigPage: React.FC<AiConfigPageProps> = ({
               <div>
                 <h2 className="text-base font-bold text-slate-900 flex items-center gap-2">
                   <Award className="w-5 h-5 text-amber-500" />
-                  Đối Soát Hiệu Năng: Google AI vs Local Model SOTA
+                  Số Liệu Sống Của Động Cơ Đang Chạy
                 </h2>
-                <p className="text-xs text-slate-500 mt-0.5">
-                  Chạy đo kiểm song song trên cùng một ảnh khuôn mặt để đối chiếu thời gian phản hồi và độ chính xác.
-                </p>
+                <p className="text-xs text-slate-500 mt-0.5 font-mono">GET /api/face-engine/status</p>
               </div>
+              <button
+                type="button"
+                id="btn-refresh-engine-metrics"
+                onClick={fetchEngineStatus}
+                disabled={engineLoading}
+                className="inline-flex items-center gap-1.5 px-3 py-2 text-xs font-semibold rounded-lg bg-slate-100 hover:bg-slate-200 text-slate-700 transition-all disabled:opacity-60"
+              >
+                <RefreshCw className={`w-3.5 h-3.5 ${engineLoading ? "animate-spin" : ""}`} />
+                <span>Làm mới</span>
+              </button>
+            </div>
 
-              <div className="flex items-center gap-2">
-                <select
-                  value={testSubject}
-                  onChange={(e) => setTestSubject(e.target.value)}
-                  className="text-xs px-3 py-2 border border-slate-200 rounded-lg bg-slate-50 font-medium text-slate-800"
-                >
-                  <option value="FIRST_EMPLOYEE">Nhân viên mẫu mặc định</option>
-                  {effectiveEmployees.map((emp) => (
-                    <option key={emp.id} value={emp.id}>
-                      {emp.name} ({emp.employeeCode})
-                    </option>
-                  ))}
-                </select>
-
-                <button
-                  id="btn-run-benchmark"
-                  onClick={runBenchmark}
-                  disabled={benchmarking}
-                  className="inline-flex items-center gap-1.5 px-4 py-2 text-xs font-bold rounded-lg bg-indigo-600 hover:bg-indigo-700 text-white shadow-xs transition-all"
-                >
-                  {benchmarking ? (
-                    <RefreshCw className="w-3.5 h-3.5 animate-spin" />
-                  ) : (
-                    <Play className="w-3.5 h-3.5 fill-current" />
-                  )}
-                  <span>{benchmarking ? "Đang Chạy Đo Kiểm..." : "Bắt Đầu Benchmark"}</span>
-                </button>
+            {/*
+              The old "Bắt Đầu Benchmark" button called POST /api/config/ai/benchmark, which
+              runs the demo worker pool on employee photos with synthetic vectors - it measured
+              demo worker throughput, nothing about real recognition. The route is left alone;
+              the UI no longer calls it. Real engine comparison is done offline (Taiga #513).
+            */}
+            <div id="benchmark-retired" className="flex items-start gap-3 p-3.5 rounded-xl bg-amber-50 border border-amber-200">
+              <AlertTriangle className="w-4 h-4 text-amber-600 mt-0.5 shrink-0" />
+              <div className="text-[11px] text-amber-900 leading-relaxed">
+                <strong className="block">{BENCHMARK_RETIRED_TITLE}</strong>
+                {BENCHMARK_RETIRED_TEXT}
               </div>
             </div>
 
-            {/* Benchmark Display Results */}
-            {benchmarkResult ? (
-              <div className="space-y-4 pt-4 border-t border-slate-100">
-                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                  {/* Google AI Metric Card */}
-                  <div className="p-4 rounded-xl border border-indigo-200 bg-indigo-50/40 space-y-3">
-                    <div className="flex items-center justify-between">
-                      <span className="font-bold text-xs text-indigo-900 flex items-center gap-1.5">
-                        <Sparkles className="w-4 h-4 text-indigo-600" />
-                        Google AI ({benchmarkResult.googleAiResult.model})
-                      </span>
-                      <span
-                        className={`text-xs font-bold px-2 py-0.5 rounded-full ${
-                          benchmarkResult.googleAiResult.recognized
-                            ? "bg-emerald-100 text-emerald-800"
-                            : "bg-rose-100 text-rose-800"
-                        }`}
-                      >
-                        {benchmarkResult.googleAiResult.recognized ? "ĐÃ XÁC THỰC" : "TỪ CHỐI"}
-                      </span>
-                    </div>
-
-                    <div className="grid grid-cols-3 gap-2 text-center">
-                      <div className="bg-white p-2 rounded-lg border border-indigo-100">
-                        <div className="text-[10px] text-slate-500 font-medium">Thời Gian</div>
-                        <div className="text-base font-bold font-mono text-slate-800">
-                          {benchmarkResult.googleAiResult.latencyMs}ms
-                        </div>
-                      </div>
-
-                      <div className="bg-white p-2 rounded-lg border border-indigo-100">
-                        <div className="text-[10px] text-slate-500 font-medium">Độ Tin Cậy</div>
-                        <div className="text-base font-bold font-mono text-indigo-600">
-                          {benchmarkResult.googleAiResult.confidence}%
-                        </div>
-                      </div>
-
-                      <div className="bg-white p-2 rounded-lg border border-indigo-100">
-                        <div className="text-[10px] text-slate-500 font-medium">Liveness</div>
-                        <div className="text-base font-bold font-mono text-emerald-600">
-                          {benchmarkResult.googleAiResult.livenessScore}%
-                        </div>
-                      </div>
-                    </div>
-
-                    <p className="text-xs text-slate-600 bg-white/80 p-2.5 rounded-lg border border-indigo-100">
-                      {benchmarkResult.googleAiResult.message}
-                    </p>
-                  </div>
-
-                  {/* Local SOTA Metric Card */}
-                  <div className="p-4 rounded-xl border border-emerald-200 bg-emerald-50/40 space-y-3">
-                    <div className="flex items-center justify-between">
-                      <span className="font-bold text-xs text-emerald-900 flex items-center gap-1.5">
-                        <Cpu className="w-4 h-4 text-emerald-600" />
-                        Local SOTA ({benchmarkResult.localResult.model})
-                      </span>
-                      <span
-                        className={`text-xs font-bold px-2 py-0.5 rounded-full ${
-                          benchmarkResult.localResult.recognized
-                            ? "bg-emerald-100 text-emerald-800"
-                            : "bg-rose-100 text-rose-800"
-                        }`}
-                      >
-                        {benchmarkResult.localResult.recognized ? "ĐÃ XÁC THỰC" : "TỪ CHỐI"}
-                      </span>
-                    </div>
-
-                    <div className="grid grid-cols-3 gap-2 text-center">
-                      <div className="bg-white p-2 rounded-lg border border-emerald-100">
-                        <div className="text-[10px] text-slate-500 font-medium">Thời Gian</div>
-                        <div className="text-base font-bold font-mono text-emerald-700">
-                          {benchmarkResult.localResult.latencyMs}ms
-                        </div>
-                      </div>
-
-                      <div className="bg-white p-2 rounded-lg border border-emerald-100">
-                        <div className="text-[10px] text-slate-500 font-medium">Cosine Match</div>
-                        <div className="text-base font-bold font-mono text-emerald-600">
-                          {(benchmarkResult.localResult.cosineSimilarity * 100).toFixed(1)}%
-                        </div>
-                      </div>
-
-                      <div className="bg-white p-2 rounded-lg border border-emerald-100">
-                        <div className="text-[10px] text-slate-500 font-medium">Liveness</div>
-                        <div className="text-base font-bold font-mono text-emerald-600">
-                          {benchmarkResult.localResult.livenessScore}%
-                        </div>
-                      </div>
-                    </div>
-
-                    <p className="text-xs text-slate-600 bg-white/80 p-2.5 rounded-lg border border-emerald-100">
-                      {benchmarkResult.localResult.message}
-                    </p>
-                  </div>
-                </div>
-
-                {/* Benchmark Analysis Strip */}
-                <div className="p-4 bg-slate-50 rounded-xl border border-slate-200 space-y-2">
-                  <div className="flex items-center gap-2 text-xs font-semibold text-slate-800">
-                    <Zap className="w-4 h-4 text-amber-500" />
-                    <span>{benchmarkResult.speedDifference}</span>
-                  </div>
-                  <p className="text-xs text-slate-600 leading-relaxed">
-                    <strong className="text-slate-800">Đánh giá hệ thống:</strong>{" "}
-                    {benchmarkResult.recommendation}
-                  </p>
-                </div>
+            {engineLoading && !engineStatus && (
+              <div className="flex items-center gap-2 text-xs text-slate-500" role="status" aria-live="polite">
+                <RefreshCw className="w-4 h-4 animate-spin text-slate-400" />
+                <span>Đang đọc số liệu từ máy chủ...</span>
               </div>
-            ) : (
-              <div className="text-center py-10 border-2 border-dashed border-slate-200 rounded-xl space-y-2">
-                <Activity className="w-8 h-8 text-slate-400 mx-auto" />
-                <p className="text-xs font-semibold text-slate-700">
-                  Chưa có dữ liệu benchmark hiện hành
-                </p>
-                <p className="text-[11px] text-slate-500 max-w-sm mx-auto">
-                  Chọn nhân viên mẫu phía trên và bấm <strong>Bắt Đầu Benchmark</strong> để đo trực tiếp độ trễ và độ khớp giữa Google AI và Local Biometrics.
-                </p>
+            )}
+
+            {!engineLoading && !engineStatus && (
+              <div className="p-3 rounded-xl bg-rose-50 border border-rose-200 text-xs text-rose-900" role="status" aria-live="polite">
+                Không đọc được số liệu động cơ{engineError ? ` (${engineError})` : ""}. Không hiển thị số phỏng đoán.
+              </div>
+            )}
+
+            {engineStatus && (
+              <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+                {/* Face extraction pool */}
+                <div className="rounded-xl border border-slate-200 overflow-hidden">
+                  <div className="px-4 py-2.5 bg-slate-50 border-b border-slate-200 flex items-center justify-between gap-2">
+                    <span className="text-xs font-bold text-slate-800">Bể trích xuất khuôn mặt (faceExtract)</span>
+                    <span className="text-[11px] text-slate-600">{faceExtractStateLabel(faceExtract)}</span>
+                  </div>
+                  {faceExtract ? (
+                    <div className="divide-y divide-slate-100">
+                      {faceExtractRows(faceExtract).map((row) => (
+                        <div key={row.key} className="px-4 py-2 flex items-center justify-between gap-4 text-xs">
+                          <span className="text-slate-600">{row.label}</span>
+                          <span className="font-mono font-bold text-slate-900 tabular-nums shrink-0">{row.value}</span>
+                        </div>
+                      ))}
+                      {faceExtract.modelTag && (
+                        <div className="px-4 py-2 flex items-center justify-between gap-4 text-xs">
+                          <span className="text-slate-600">Model tag của worker</span>
+                          <span className="font-mono text-slate-900 break-all">{faceExtract.modelTag}</span>
+                        </div>
+                      )}
+                      {faceExtract.lastError && (
+                        <div className="px-4 py-2 text-[11px] text-rose-800 bg-rose-50 break-words">
+                          Lỗi gần nhất: <span className="font-mono">{faceExtract.lastError}</span>
+                        </div>
+                      )}
+                    </div>
+                  ) : (
+                    <div className="px-4 py-3 text-[11px] text-slate-500">Máy chủ chưa báo khối faceExtract.</div>
+                  )}
+                </div>
+
+                {/* Best-of extra frames */}
+                <div className="space-y-4">
+                  <div className="rounded-xl border border-slate-200 overflow-hidden">
+                    <div className="px-4 py-2.5 bg-slate-50 border-b border-slate-200">
+                      <span className="text-xs font-bold text-slate-800">Ảnh phụ mỗi lần quét cửa (bestOf)</span>
+                    </div>
+                    {bestOf ? (
+                      <div className="divide-y divide-slate-100">
+                        {bestOfRows(bestOf).map((row) => (
+                          <div key={row.key} className="px-4 py-2 flex items-center justify-between gap-4 text-xs">
+                            <span className="text-slate-600">{row.label}</span>
+                            <span className="font-mono font-bold text-slate-900 tabular-nums shrink-0">{row.value}</span>
+                          </div>
+                        ))}
+                      </div>
+                    ) : (
+                      <div className="px-4 py-3 text-[11px] text-slate-500">Máy chủ chưa báo khối bestOf.</div>
+                    )}
+                  </div>
+
+                  {/* Thresholds the decision actually uses */}
+                  <div className="rounded-xl border border-slate-200 overflow-hidden">
+                    <div className="px-4 py-2.5 bg-slate-50 border-b border-slate-200">
+                      <span className="text-xs font-bold text-slate-800">Ngưỡng quyết định đang áp dụng</span>
+                    </div>
+                    {Object.keys(serverThresholds).length === 0 ? (
+                      <div className="px-4 py-3 text-[11px] text-slate-500">Máy chủ chưa báo bộ ngưỡng.</div>
+                    ) : (
+                      <div className="divide-y divide-slate-100">
+                        {FUSION_THRESHOLD_LABELS.map((t) => {
+                          const raw = serverThresholds[t.key];
+                          const has = typeof raw === "number" && Number.isFinite(raw);
+                          return (
+                            <div key={t.key} className="px-4 py-2 flex items-center justify-between gap-4 text-xs">
+                              <span className="font-mono text-slate-700">{t.label}</span>
+                              <span className="font-mono font-bold text-slate-900 tabular-nums">
+                                {has ? (t.integer ? String(raw) : (raw as number).toFixed(2)) : "—"}
+                              </span>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    )}
+                  </div>
+                </div>
               </div>
             )}
           </div>
