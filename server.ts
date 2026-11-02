@@ -1058,6 +1058,16 @@ const recognitionPath = (pathName: string) => [
 const legacySensitivePath = (pathName: string) =>
   /^(?:\/(?:events|lock|status|employees?|logs|notifications|webhook|config))(?:\/|$)/.test(pathName);
 
+/** A request URL for the log: no login in the query (rtsp://user:pass@...), token-like params masked. */
+function redactedRequestUrl(url: string): string {
+  const base = "http://local";
+  try {
+    return redactRtsp(redactedUrl(base + url)).slice(base.length) || "/";
+  } catch {
+    return redactRtsp(String(url || "")).replace(/([?&][^=&]*(token|key|secret|password|auth)[^=&]*=)[^&]*/gi, "$1***");
+  }
+}
+
 function redactedUrl(value: string): string {
   try {
     const url = new URL(value);
@@ -1173,7 +1183,7 @@ app.use((req, _res, next) => {
     !req.url.includes("vite") &&
     !req.url.includes("hot-update")
   ) {
-    console.log(`[HTTP ${req.method}] ${req.url}`);
+    console.log(`[HTTP ${req.method}] ${redactedRequestUrl(req.url)}`);
   }
   next();
 });
@@ -2665,7 +2675,8 @@ app.get(["/api/face-engine/status", "/api/face-engine/status/", "/api/face-engin
     requestedEngine: FACE_ENGINE_SETTING,
     ready: isFaceEngineReady(),
     failClosed: engine === "unavailable",
-    info: getFaceEngineInfo(),
+    // modelDir is a server path: logs only, never the API (security wave S-04).
+    info: (({ modelDir: _modelDir, ...rest }) => rest)(getFaceEngineInfo() as any),
     templates: {
       total: templates.length,
       byEmployee,

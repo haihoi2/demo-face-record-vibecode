@@ -80,7 +80,6 @@ describe("face-engine status: redaction", () => {
 
   it(
     "info.modelDir reveals the server's model directory to viewers (finding S-04, low)",
-    { todo: "status today returns info.modelDir as an absolute path (e.g. /models); only the file names are needed" },
     async () => {
       const viewer = await authenticateAs(VIEWER_TOKEN);
       const { body } = await apiAs<any>(viewer, "/api/face-engine/status");

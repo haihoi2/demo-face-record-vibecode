@@ -106,7 +106,6 @@ describe("role separation with named accounts", () => {
 
   it(
     "GET /api/network/ip-info is as sensitive as its /api/system/ip-info alias (finding S-01)",
-    { todo: "today the /api/network/ alias falls to the viewer default, dials api.ipify.org + ifconfig.me and returns the gateway's public egress IP" },
     async () => {
       const res = await apiAs<any>(viewer.cookie, "/api/network/ip-info");
       assert.equal(res.status, 403, `viewer got ${res.status}`);

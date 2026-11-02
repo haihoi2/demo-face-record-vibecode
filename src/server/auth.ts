@@ -75,6 +75,8 @@ const RULES: readonly Rule[] = [
   // P3b: per-gate presence settings - operators read, admins change.
   { methods: READ, pattern: /^\/api\/presence\/settings$/, role: "operator" },
   { methods: ["PUT"], pattern: /^\/api\/presence\/settings\/[^/]+$/, role: "admin" },
+  // Reveals the gateway's public egress IP and dials two third parties: admin only (2026-11-03 security wave, S-01).
+  { methods: READ, pattern: /^\/api\/network\/ip-info$/, role: "admin" },
   { methods: READ, pattern: /^\/api\/system\//, role: "admin" },
 
   // --- any signed-in account may change its own password

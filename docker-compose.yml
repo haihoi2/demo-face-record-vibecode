@@ -66,6 +66,8 @@ services:
       # Recognition engine for door decisions. onnx = real models only, fail
       # closed when they do not load. Never leave the demo hash matcher in charge.
       - FACE_ENGINE=${FACE_ENGINE:-onnx}
+      # onnxruntime-node ships a telemetry uploader (mobile.events.data.microsoft.com); keep it off (2026-11-03 egress audit E2).
+      - ORT_DISABLE_TELEMETRY=${ORT_DISABLE_TELEMETRY:-1}
       - FACE_STRANGER_MIN_QUALITY=${FACE_STRANGER_MIN_QUALITY:-}
       # Face size floors in pixels: any face (default 60), stored strangers (default 60).
       - FACE_MIN_SIZE_PX=${FACE_MIN_SIZE_PX:-}

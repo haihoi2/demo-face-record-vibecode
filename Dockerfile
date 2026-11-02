@@ -60,6 +60,8 @@ RUN npm run build
 #   docker compose --profile test run --rm tests
 #   docker build --target tester -t smartface-tests . && docker run --rm smartface-tests
 FROM builder AS tester
+# onnxruntime-node bundles a telemetry uploader (OneCollector); never upload from a gate (2026-11-03 egress audit E2).
+ENV ORT_DISABLE_TELEMETRY=1
 ENV NODE_ENV=test
 # tests/faceEmbedding.test.ts exercises the real ffmpeg decode path (JPEG in ->
 # raw RGB out). Without the binary those cases self-skip, which would silently
@@ -75,6 +77,8 @@ CMD ["npm", "test"]
 
 # ----------------- Production Stage -----------------
 FROM node:22-bookworm-slim AS runner
+# onnxruntime-node bundles a telemetry uploader (OneCollector); never upload from a gate (2026-11-03 egress audit E2).
+ENV ORT_DISABLE_TELEMETRY=1
 
 ARG APP_UID=1000
 ARG APP_GID=1000
