@@ -82,7 +82,7 @@ export const RecordingPlayer: React.FC<RecordingPlayerProps> = ({ logId, title, 
             <div className="absolute inset-0 flex flex-col items-center justify-center gap-3 px-6 text-center text-slate-100 text-xs">
               <p className="font-bold text-sm">Không phát được đoạn ghi</p>
               <p className="text-slate-300 max-w-md">
-                Đầu ghi chỉ lưu khoảng 8 ngày; lượt quét vừa xảy ra cần vài giây để đầu ghi ghi xong; hoặc đang có nhiều người
+                Đầu ghi chỉ lưu khoảng 1 tháng; lượt quét vừa xảy ra cần vài giây để đầu ghi ghi xong; hoặc đang có nhiều người
                 xem cùng lúc.
               </p>
               <button
