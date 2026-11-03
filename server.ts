@@ -12276,12 +12276,14 @@ async function runCameraAdaptation(): Promise<number> {
     // a permanent template (live 2026-09-30 ran at 0.45 and adapted at 0.618).
     const adaptBase = Math.max(DEFAULT_FUSION_THRESHOLDS.acceptSingle, currentFusionThresholds().acceptSingle);
     const plan = planAdaptation(candidates, existing, adaptBase, DEFAULT_ADAPTATION_POLICY);
+    // Whole gallery (full records) for the cross-employee check; one build per run is enough.
+    const galleryForCheck = currentGallery();
     const touched = new Map<string, number>();
     for (const item of plan) {
       const o = item.observation;
       if (!employees.some((e) => e.id === o.employeeId)) continue;
       // Belt and braces under the adaptation margin: never learn a colleague's face (templateAudit.ts).
-      const cross = checkTemplateAgainstGallery(o.embedding, o.employeeId, buildGallery(existing, tag), { acceptSingle: adaptBase });
+      const cross = checkTemplateAgainstGallery(o.embedding, o.employeeId, galleryForCheck, { acceptSingle: adaptBase });
       if (cross.ok === false) {
         // Narrowed by `=== false` (no strictNullChecks here): the refusal variants only.
         const why = cross.reason === "matches-other-employee" ? `khớp nhân viên khác ${cross.otherEmployeeId} (cosine ${cross.otherCosine})` : cross.reason;
