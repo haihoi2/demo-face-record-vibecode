@@ -222,6 +222,7 @@ import {
 } from "./src/server/faceFusion";
 import type { FaceGallery } from "./src/server/faceFusion";
 import { groupFaceTracks } from "./src/server/faceTracks";
+import { auditTemplates, checkTemplateAgainstGallery } from "./src/server/templateAudit";
 import { bestOfExtrasAllowed } from "./src/server/bestOfBudget";
 import { extractFacesOffThread, faceExtractPoolTelemetry, getFaceExtractPool, isFaceExtractError } from "./src/server/faceExtractPool";
 import { gateWatchPace } from "./src/server/gateWatchPace";
@@ -8306,6 +8307,25 @@ async function prepareTemplateFromImage(
     if (best.quality < FACE_ENROLL_MIN_QUALITY) {
       return { rejected: "low-quality", quality: Math.round(best.quality * 1000) / 1000, detectedFaces: faces.length };
     }
+    // Never file somebody else's face under this employee (2026-11-03: three
+    // "merge" templates of one employee were a colleague's face, and the gate
+    // then attributed the colleague's passages to the wrong person). A face
+    // that matches ANOTHER employee at the door threshold, and more strongly
+    // than this employee's own templates, is refused; merely "closer to someone
+    // else" below the threshold is logged (templateAudit.ts).
+    const crossCheck = checkTemplateAgainstGallery(best.embedding, employeeId, currentGallery(), {
+      acceptSingle: Math.max(DEFAULT_FUSION_THRESHOLDS.acceptSingle, currentFusionThresholds().acceptSingle),
+    });
+    if (!crossCheck.ok) {
+      if (crossCheck.reason === "matches-other-employee") {
+        console.warn(`[FaceEngine] Từ chối mẫu cho ${employeeId} từ ${opts.sourceLogId || "ảnh"}: khớp nhân viên khác ${crossCheck.otherEmployeeId} (cosine ${crossCheck.otherCosine}) mạnh hơn chính chủ (${crossCheck.targetCosine})`);
+        return { rejected: "matches-other-employee", detectedFaces: faces.length };
+      }
+      return { rejected: "engine-error", detectedFaces: faces.length };
+    }
+    if (crossCheck.flag) {
+      console.warn(`[FaceEngine] Mẫu mới của ${employeeId} gần ${crossCheck.otherEmployeeId} (cosine ${crossCheck.otherCosine}) hơn chính chủ (${crossCheck.targetCosine}) - vẫn lưu, dưới ngưỡng cửa`);
+    }
     // Camera adaptation templates do not count (templateCap.ts). A full
     // employee still takes a better photo: the caller trims the worst one
     // after the commit (enforceTemplateCap).
@@ -8680,6 +8700,42 @@ app.delete(EMPLOYEE_TEMPLATE_ITEM_ROUTES, requireOperatorRole("operator"), requi
     removed: publicTemplate(found),
     remaining,
   });
+});
+
+/**
+ * GET /api/face-templates/audit (admin) - one pass over the whole gallery:
+ * templates that look more like ANOTHER employee than their own, so an
+ * operator can remove faces filed under the wrong person (owner 2026-11-03).
+ * Read-only; numbers, ids and names only - never embeddings (templateAudit.ts).
+ */
+app.get(["/api/face-templates/audit", "/api/face-templates/audit/"], requireOperatorRole("admin"), (_req, res) => {
+  try {
+    const acceptSingle = Math.max(DEFAULT_FUSION_THRESHOLDS.acceptSingle, currentFusionThresholds().acceptSingle);
+    const r = auditTemplates(db.getFaceTemplates(), { modelTag: faceModelTag(), acceptSingle });
+    const who = (id: string) => {
+      const e = employees.find((x) => x.id === id);
+      return { code: e?.employeeCode ?? "", name: e?.name ?? "" };
+    };
+    res.json({
+      success: true,
+      generatedAt: new Date().toISOString(),
+      modelTag: r.modelTag,
+      thresholds: { acceptSingle: r.acceptSingle },
+      templates: r.templates,
+      employees: r.employees,
+      skipped: r.skipped,
+      perEmployee: r.perEmployee,
+      suspects: r.suspects.map((s) => ({
+        ...s,
+        employeeCode: who(s.employeeId).code,
+        employeeName: who(s.employeeId).name,
+        otherEmployeeCode: who(s.otherEmployeeId).code,
+        otherEmployeeName: who(s.otherEmployeeId).name,
+      })),
+    });
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: err?.message || "Lỗi so lại mẫu khuôn mặt" });
+  }
 });
 
 app.delete(["/api/employees/:id", "/employees/:id"], (req, res) => {
@@ -12224,6 +12280,12 @@ async function runCameraAdaptation(): Promise<number> {
     for (const item of plan) {
       const o = item.observation;
       if (!employees.some((e) => e.id === o.employeeId)) continue;
+      // Belt and braces under the adaptation margin: never learn a colleague's face (templateAudit.ts).
+      const cross = checkTemplateAgainstGallery(o.embedding, o.employeeId, buildGallery(existing, tag), { acceptSingle: adaptBase });
+      if (!cross.ok) {
+        console.warn(`[Adaptation] Bỏ qua mẫu cho ${o.employeeId} (sự kiện ${o.logId}): ${cross.reason === "matches-other-employee" ? `khớp nhân viên khác ${cross.otherEmployeeId} (cosine ${cross.otherCosine})` : cross.reason}`);
+        continue;
+      }
       if (item.evictTemplateId) db.deleteFaceTemplate(item.evictTemplateId);
       db.saveFaceTemplate({
         id: `FT-${randomUUID()}`, employeeId: o.employeeId, embedding: Array.from(o.embedding), dims: o.embedding.length, modelTag: tag,

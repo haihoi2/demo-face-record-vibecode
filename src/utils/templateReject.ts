@@ -21,6 +21,8 @@ export function templateRejectReason(reason?: string | null): string {
       return "Người này đã đủ số mẫu tối đa và mẫu nào cũng rõ hơn ảnh này - không cần thêm.";
     case "duplicate":
       return "Ảnh này trùng với một mẫu đã có.";
+    case "matches-other-employee":
+      return "Khuôn mặt trong ảnh khớp một nhân viên KHÁC mạnh hơn người này - không lưu để tránh lẫn người.";
     case "no-face":
       return "Không thấy khuôn mặt trong ảnh - hãy chọn ảnh khác.";
     case "unsupported-image":
