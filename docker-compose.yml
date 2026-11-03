@@ -80,6 +80,9 @@ services:
       - SHADOW_RESULT_RETENTION_DAYS=${SHADOW_RESULT_RETENTION_DAYS:-}
       - PIPELINE_MIN_FACE_PX=${PIPELINE_MIN_FACE_PX:-}
       - FACE_TTA_FLIP=${FACE_TTA_FLIP:-}
+      # Door-scan detector tiling (#523): 1 = single pass (default), 2 = left/right tiles on frames >= 4x FACE_DETECT_SIZE.
+      - FACE_DETECT_TILES=${FACE_DETECT_TILES:-}
+      - FACE_DETECT_TILE_OVERLAP=${FACE_DETECT_TILE_OVERLAP:-}
       # Compression of the stored access-log photo (FFmpeg -q:v, 2-31; default 8).
       - SNAPSHOT_JPEG_QSCALE=${SNAPSHOT_JPEG_QSCALE:-}
       # NVR playback for access-history review (server-side only; see .env.example).
@@ -185,6 +188,9 @@ services:
     # và các Camera IP LAN nội bộ (ví dụ: 192.168.60.2)
     extra_hosts:
       - "host.docker.internal:host-gateway"
+      # Telemetry host of onnxruntime-node pinned to loopback inside the container: a second
+      # layer under ORT_DISABLE_TELEMETRY=1 (2026-11-03 egress audit E2; edge block = Taiga #526).
+      - "mobile.events.data.microsoft.com:127.0.0.1"
 
     # USB Webcam passthrough trên Linux (nếu dùng camera cắm cổng USB trực tiếp vào máy chủ):
     # devices:

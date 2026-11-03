@@ -10,7 +10,8 @@
  *        [--license r50="MIT code; weights non-commercial research (InsightFace)"] \
  *        [--ref r50] [--parent r50_int8=r50] [--threads 2] [--bench-threads 1,2,4] [--bench-iters 40] \
  *        [--exclude EMP-0001,...] [--max-crops N] [--out report.json] [--md report.md] \
- *        [--frames <dir> --detect-size 640,960,1280 [--detect-ref 1280] [--detector-dir /models]]
+ *        [--frames <dir> --detect-size 640,960,1280 [--detect-ref 1280] [--detector-dir /models]
+ *         [--tiles 2 --tile-size 640 --tile-overlap 0.1]]
  *
  * <crops-dir> is the output of scripts/perf/calib-crops.ts (rec_<n>.u8 =
  * 112x112x3 uint8 RGB aligned crops + index.json with labels; crops listed in
@@ -34,6 +35,13 @@
  * the directory of the reference model) runs at each --detect-size square
  * letterbox; faces found, recall / box IoU / landmark agreement with --detect-ref
  * (default the largest size), extra detections and ms per frame are reported.
+ * --tiles N adds a pass that splits each frame into N horizontal windows
+ * (--tile-overlap of the width shared), letterboxes each to --tile-size and
+ * merges the detections with NMS: "two 640 tiles" vs "one 1280 letterbox".
+ *
+ * Unlabelled DENIED crops (the live engine's near-threshold rejections) are
+ * reported separately: per model, how many would be accepted against the
+ * employee crops at its reproduced thresholds (never as genuine/impostor pairs).
  */
 
 import fs from "node:fs";
@@ -45,12 +53,16 @@ import { CLEAR_FACE_LIMITS, detectFaces, faceModelTagFor, getFaceEngine, getFace
 import {
   assertNoVectors,
   buildPairs,
+  cropRgb,
+  deniedCrossing,
   describePreprocess,
   detectorAgreement,
   dist,
   driftVsParent,
   faceSize,
+  isEmployee,
   l2,
+  mergeTileDetections,
   parseLicenseSpec,
   parseModelSpec,
   parseParentSpec,
@@ -58,13 +70,17 @@ import {
   preprocessMatchesBaseline,
   quantile,
   r3,
+  renderDeniedTable,
   renderDetectorTable,
   renderRecognizerTable,
   reproduceReference,
   resizeBilinearU8,
   scoreSets,
   summarize,
+  suspiciousIdentityPairs,
+  tilePlan,
   type CropEntry,
+  type DeniedCrossing,
   type DetectorRow,
   type ModelMetrics,
   type ModelSpec,
@@ -81,7 +97,7 @@ const cropsDir = positional[0];
 const optAll = (name: string) => args.flatMap((a, i) => (a === name && i + 1 < args.length ? [args[i + 1]] : []));
 const opt = (name: string, d?: string) => optAll(name)[0] ?? d;
 const usage = () => {
-  console.error("usage: engine-compare.ts <crops-dir> --model name=path.onnx[,input=..,mean=..,std=..,layout=..,rgb|bgr] [--model ...] [--license name=text] [--ref name] [--parent child=parent] [--threads N] [--bench-threads 1,2,4] [--bench-iters N] [--out report.json] [--md report.md] [--frames dir --detect-size 640,960,1280]");
+  console.error("usage: engine-compare.ts <crops-dir> --model name=path.onnx[,input=..,mean=..,std=..,layout=..,rgb|bgr] [--model ...] [--license name=text] [--ref name] [--parent child=parent] [--threads N] [--bench-threads 1,2,4] [--bench-iters N] [--out report.json] [--md report.md] [--frames dir --detect-size 640,960,1280 [--tiles 2 --tile-size 640 --tile-overlap 0.1]]");
   process.exit(2);
 };
 if (!cropsDir || optAll("--model").length === 0) usage();
@@ -132,6 +148,14 @@ const MD = opt("--md");
 const FRAMES = opt("--frames");
 const DETECT_SIZES = (opt("--detect-size", "640,960,1280") || "").split(",").map(Number).filter((n) => Number.isInteger(n) && n % 32 === 0 && n >= 160);
 const DETECT_REF = Number(opt("--detect-ref", String(Math.max(...DETECT_SIZES))));
+/** --tiles N: also run the detector on N horizontal tiles (each letterboxed to --tile-size, --tile-overlap of the width shared) and merge with NMS. */
+const TILES = Math.max(0, Number(opt("--tiles", "0")));
+const TILE_SIZE = Number(opt("--tile-size", "640"));
+const TILE_OVERLAP = Number(opt("--tile-overlap", "0.1"));
+if (TILES > 0 && (!Number.isInteger(TILES) || TILES > 8 || !Number.isInteger(TILE_SIZE) || TILE_SIZE % 32 !== 0 || !(TILE_OVERLAP >= 0 && TILE_OVERLAP < 0.5))) {
+  console.error("--tiles must be 1..8 with --tile-size a multiple of 32 and --tile-overlap in [0, 0.5)");
+  process.exit(2);
+}
 const DETECTOR_DIR = opt("--detector-dir", path.dirname(MODELS.find((m) => m.name === REF)!.file))!;
 const LEGACY = { acceptSingle: DEFAULT_FUSION_THRESHOLDS.acceptSingle, acceptFused: DEFAULT_FUSION_THRESHOLDS.acceptFused, minMargin: DEFAULT_FUSION_THRESHOLDS.minMargin };
 const CROP = 112;
@@ -223,6 +247,23 @@ async function detectorPass(frames: RgbImage[], size: number) {
   return { faces, ms, detector: info.detectorModel, loadMs: info.loadTimeMs };
 }
 
+/** The same detector on `tiles` horizontal windows of each frame, each letterboxed to `size`; merged with NMS (#523 tiling idea). */
+async function detectorTiledPass(frames: RgbImage[], size: number, tiles: number, overlap: number) {
+  const first = await detectorPass([], size); // configure the engine for `size`; no frames yet
+  const faces: FaceBox[][] = [];
+  const ms: number[] = [];
+  for (const img of frames) {
+    const t0 = process.hrtime.bigint();
+    const rects = tilePlan(img.width, img.height, tiles, overlap);
+    const perTile: FaceBox[][] = [];
+    for (const r of rects) perTile.push(await detectFaces(cropRgb(img, r), { inputShape: { width: size, height: size } }));
+    faces.push(mergeTileDetections(perTile, rects) as FaceBox[]);
+    ms.push(Number(process.hrtime.bigint() - t0) / 1e6);
+  }
+  ms.sort((a, b) => a - b);
+  return { faces, ms, detector: first.detector, loadMs: first.loadMs };
+}
+
 // ---------------------------------------------------------------- main
 
 async function main() {
@@ -299,6 +340,30 @@ async function main() {
     }
   }
 
+  // The unlabelled DENIED group (near-threshold rejections of the live engine): how many crops each model would
+  // accept against the employee crops at its own equivalent thresholds. Reported separately from the pair metrics.
+  const deniedN = entries.filter((e) => !e.identity && e.status === "DENIED").map((e) => e.n);
+  const galleryN = entries.filter((e) => isEmployee(e.identity)).map((e) => e.n);
+  const deniedRows: Array<{ name: string; d: DeniedCrossing }> = [];
+  if (deniedN.length && galleryN.length) {
+    for (const m of MODELS) {
+      const r = results.get(m.name)!;
+      const rp: Reproduction | null = report.models[m.name].matchReference;
+      const thresholds = {
+        single: rp ? rp.acceptSingle.recommended.threshold : LEGACY.acceptSingle,
+        fused: rp ? rp.acceptFused.recommended.threshold : LEGACY.acceptFused,
+        siteStrict: r.metrics.siteStrict.threshold,
+        far0: r.metrics.tarAtFar0.threshold,
+        legacy0_55: LEGACY.acceptSingle,
+      };
+      const d = deniedCrossing(r.emb, deniedN, galleryN, thresholds);
+      report.models[m.name].deniedGroup = { ...d, note: "unlabelled DENIED crops vs every employee-labelled crop (1-NN); 'single'/'fused' are this model's reproduced thresholds (the legacy values for the reference)" };
+      deniedRows.push({ name: m.name, d });
+    }
+  }
+  // Label-defect radar on the reference: identity pairs whose strict-impostor cosines reach today's acceptSingle.
+  report.suspiciousIdentityPairs = suspiciousIdentityPairs(ref.emb, pairs, entries, LEGACY.acceptSingle);
+
   if (!NO_BENCH) {
     const sample = entries.slice(0, 16).map((e) => readCrop(e.n));
     for (const m of MODELS) {
@@ -329,25 +394,34 @@ async function main() {
       console.log(`detector @${s}: faces ${p.faces.flat().length} (>=${minPx}px ${p.faces.flat().filter((f) => faceSize(f) >= minPx).length}), ms/frame p50 ${r3(quantile(p.ms, 0.5))}`);
     }
     const refPass = passes.get(DETECT_REF)!;
-    const rows: DetectorRow[] = sizes.map((s) => {
-      const p = passes.get(s)!;
-      return {
-        size: s,
-        facesAll: p.faces.flat().length,
-        facesAtLeastMin: p.faces.flat().filter((f) => faceSize(f) >= minPx).length,
-        msPerFrame: dist(p.ms, (v) => Math.round(v)),
-        vsRef: s === DETECT_REF ? null : detectorAgreement(refPass.faces, p.faces, minPx),
-      };
+    const rowOf = (key: string, p: Awaited<ReturnType<typeof detectorPass>>, size: number, label?: string): DetectorRow & { key: string } => ({
+      key,
+      size,
+      ...(label ? { label } : {}),
+      facesAll: p.faces.flat().length,
+      facesAtLeastMin: p.faces.flat().filter((f) => faceSize(f) >= minPx).length,
+      msPerFrame: dist(p.ms, (v) => Math.round(v)),
+      vsRef: p === refPass ? null : detectorAgreement(refPass.faces, p.faces, minPx),
     });
+    const rows = sizes.map((s) => rowOf(String(s), passes.get(s)!, s));
+    if (TILES > 0) {
+      const label = `${TILES}x${TILE_SIZE} tiles (${Math.round(TILE_OVERLAP * 100)}% overlap)`;
+      const tp = await detectorTiledPass(frames, TILE_SIZE, TILES, TILE_OVERLAP);
+      passes.set(-TILES, tp);
+      rows.push(rowOf(`tiles${TILES}x${TILE_SIZE}`, tp, TILE_SIZE, label));
+      console.log(`detector ${label}: faces ${tp.faces.flat().length} (>=${minPx}px ${tp.faces.flat().filter((f) => faceSize(f) >= minPx).length}), ms/frame p50 ${r3(quantile(tp.ms, 0.5))}`);
+    }
     report.detector = {
       detector: refPass.detector,
       detectorDir: path.basename(DETECTOR_DIR),
       frames: frames.length,
       frameSize: { width: frames[0].width, height: frames[0].height },
+      frameSizes: Object.fromEntries([...frames.reduce((m, f) => m.set(`${f.width}x${f.height}`, (m.get(`${f.width}x${f.height}`) ?? 0) + 1), new Map<string, number>())]),
       refSize: DETECT_REF,
       minFacePx: minPx,
       threads: THREADS,
-      sizes: Object.fromEntries(rows.map((r) => [String(r.size), { ...r, loadMs: passes.get(r.size)!.loadMs }])),
+      tiles: TILES > 0 ? { tiles: TILES, size: TILE_SIZE, overlap: TILE_OVERLAP } : null,
+      sizes: Object.fromEntries(rows.map(({ key, ...r }) => [key, { ...r, loadMs: (key.startsWith("tiles") ? passes.get(-TILES) : passes.get(r.size))!.loadMs }])),
     };
     detectorMd = renderDetectorTable(rows, DETECT_REF, minPx, THREADS);
   }
@@ -384,6 +458,10 @@ async function main() {
     if (r.tagCollidesWith.length) md.push(`- WARNING ${m.name}: template tag ${r.modelTagIfLoaded} collides with ${r.tagCollidesWith.join(", ")} (same file name) - embeddings would mix in a gallery.`);
     if (!r.loadableByCurrentEngine) md.push(`- NOTE ${m.name}: dim ${r.embeddingDim}, ${r.preprocess.text}: the current engine cannot load this contract (fail closed); engine + tag work needed before any switch.`);
   }
+  if (deniedRows.length) {
+    md.push("", `## Near-threshold DENIED group (${deniedRows[0].d.crops} unlabelled crops vs ${deniedRows[0].d.galleryCrops} employee crops, 1-NN)`, "", renderDeniedTable(deniedRows), "", "cross = denied crops whose best cosine against any employee crop reaches the threshold; 'single'/'fused' are the model's reproduced acceptSingle/acceptFused (legacy values for the reference), 'siteStrict' and 'far0' its own operating points, 'legacy0_55' today's acceptSingle applied to every model's cosines (only meaningful for the reference).");
+  }
+  if (report.suspiciousIdentityPairs.length) md.push("", `Label-defect radar (${REF}, strict-impostor pairs >= ${LEGACY.acceptSingle}): ${report.suspiciousIdentityPairs.map((s: { a: string; b: string; pairsAbove: number; max: number }) => `${s.a} vs ${s.b}: ${s.pairsAbove} pairs (max ${s.max})`).join("; ")}. Two employee ids this close are probably one person with two records or a repeated false accept - owner check, no image was viewed.`);
   if (detectorMd) md.push("", `## Detector input size (${report.detector.detector}, ${report.detector.frames} frames of ${report.detector.frameSize.width}x${report.detector.frameSize.height}, ref ${DETECT_REF})`, "", detectorMd);
   const mdText = md.join("\n");
   console.log("\n" + mdText);

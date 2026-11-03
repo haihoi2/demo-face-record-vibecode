@@ -215,6 +215,8 @@ export interface CropEntry {
   identity: string | null;
   gate: string;
   quality: number;
+  /** calib-crops.ts status; unlabelled "DENIED" crops form the near-threshold denied group. */
+  status?: "GRANTED" | "DENIED" | "CLIP";
 }
 export type PairKind = "genuine" | "genuineCrossGate" | "withinTrack" | "impostorStrict" | "impostorProbable";
 export interface Pair {
@@ -278,6 +280,7 @@ export function quantile(sorted: number[], q: number): number {
 }
 export const r3 = (v: number) => (Number.isFinite(v) ? Math.round(v * 1000) / 1000 : v);
 export const r4 = (v: number) => (Number.isFinite(v) ? Math.round(v * 10000) / 10000 : v);
+export const r6 = (v: number) => (Number.isFinite(v) ? Math.round(v * 1e6) / 1e6 : v);
 export function frac(sorted: number[], pred: (v: number) => boolean): number {
   if (sorted.length === 0) return NaN;
   let c = 0;
@@ -317,9 +320,10 @@ export function atThreshold(gen: number[], imp: number[], prob: number[], t: num
   return {
     threshold: r3(t),
     tar: r4(tar),
-    farStrict: r4(imp.length ? fa / imp.length : NaN),
+    // 6 decimals: a million strict pairs resolve FAR to 1e-6; 4 decimals would print 4e-5 as 0.
+    farStrict: r6(imp.length ? fa / imp.length : NaN),
     falseAcceptsStrict: fa,
-    farProbable: r4(frac(prob, (v) => v >= t)),
+    farProbable: r6(frac(prob, (v) => v >= t)),
     frr: r4(1 - tar),
     marginToImpostorP95: r3(t - quantile(imp, 0.95)),
   };
@@ -355,6 +359,8 @@ export interface ModelMetrics {
   /** FAR = 0 on strict impostors: threshold just above the worst impostor. */
   tarAtFar0: OperatingPoint;
   tarAtFar1e3: OperatingPoint;
+  /** FAR = 1e-4 on strict impostors (needs >= 10,000 strict pairs to admit one). */
+  tarAtFar1e4: OperatingPoint;
   /**
    * The site's rule: 0 strict false accepts AND the accept threshold at least
    * minMargin above the strict impostor p95; threshold rounded up to 0.01.
@@ -385,6 +391,7 @@ export function summarize(sets: ScoreSets, legacy: LegacyThresholds): ModelMetri
     dPrime: r3((mean(gen) - mean(imp)) / Math.sqrt((varr(gen) + varr(imp)) / 2)),
     tarAtFar0: atThreshold(gen, imp, prob, tFar0),
     tarAtFar1e3: atThreshold(gen, imp, prob, thresholdAtFar(imp, 1e-3)),
+    tarAtFar1e4: atThreshold(gen, imp, prob, thresholdAtFar(imp, 1e-4)),
     siteStrict: atThreshold(gen, imp, prob, tSite),
     legacySingle: atThreshold(gen, imp, prob, legacy.acceptSingle),
     legacyFused: atThreshold(gen, imp, prob, legacy.acceptFused),
@@ -411,7 +418,10 @@ export function reproduceReference(refName: string, ref: { metrics: ModelMetrics
   const prob = cand.sets.impostorProbable;
   const point = (refOp: OperatingPoint) => {
     const tTar = thresholdAtTar(gen, refOp.tar);
-    const tFar = thresholdAtFar(imp, refOp.farStrict);
+    // The reference's FAR from its false-accept COUNT, not the 4-decimal farStrict: with a million strict pairs
+    // a FAR of 4e-5 rounds to 0 and would turn "same FAR" into "zero false accepts" (a much stricter point).
+    const refFar = imp.length && Number.isFinite(refOp.falseAcceptsStrict) ? refOp.falseAcceptsStrict / imp.length : refOp.farStrict;
+    const tFar = thresholdAtFar(imp, refFar);
     return { sameTar: atThreshold(gen, imp, prob, tTar), sameFar: atThreshold(gen, imp, prob, tFar), recommended: atThreshold(gen, imp, prob, ceil2(Math.max(tTar, tFar))) };
   };
   const single = point(ref.metrics.legacySingle);
@@ -536,6 +546,90 @@ export function detectorAgreement(ref: DetFace[][], cand: DetFace[][], minPx: nu
   };
 }
 
+// ---------------------------------------------------------------- tiled detection (#523)
+
+// The tile helpers live in production code now (src/server/detectTiles.ts, used
+// by faceEmbedding.ts behind FACE_DETECT_TILES); re-exported so the harness and
+// its tests keep one implementation.
+export { cropRgb, mergeTileDetections, nmsFaces, tilePlan, type TileRect } from "../../src/server/detectTiles";
+
+// ---------------------------------------------------------------- the unlabelled DENIED group
+
+export interface DeniedCrossing {
+  /** Unlabelled DENIED crops scored (each against every employee-labelled crop). */
+  crops: number;
+  galleryCrops: number;
+  /** Per denied crop: its best cosine against any employee crop. */
+  bestCosine: Dist;
+  /** Denied crops whose best cosine reaches each named threshold (would be accepted as some employee). */
+  crossing: Record<string, { threshold: number; count: number; share: number }>;
+}
+
+/**
+ * How many of the unlabelled DENIED crops (near-threshold rejections of the
+ * live engine) a model would accept against this crop set's employee crops at
+ * each named threshold (its own reproduced acceptSingle / acceptFused, the site
+ * strict rule, today's legacy values). A 1-NN proxy for "best template match":
+ * the gallery here is every labelled crop, not the enrolled templates.
+ */
+export function deniedCrossing(emb: Map<number, Float32Array>, denied: number[], gallery: number[], thresholds: Record<string, number>): DeniedCrossing {
+  const best: number[] = [];
+  for (const d of denied) {
+    const v = emb.get(d);
+    if (!v) continue;
+    let m = -1;
+    for (const g of gallery) {
+      const u = emb.get(g);
+      if (u) m = Math.max(m, dot(v, u));
+    }
+    if (m > -1) best.push(m);
+  }
+  best.sort((a, b) => a - b);
+  const crossing: DeniedCrossing["crossing"] = {};
+  for (const [name, t] of Object.entries(thresholds)) {
+    if (!Number.isFinite(t)) continue;
+    const count = best.filter((v) => v >= t).length;
+    crossing[name] = { threshold: r3(t), count, share: r4(best.length ? count / best.length : NaN) };
+  }
+  return { crops: best.length, galleryCrops: gallery.filter((g) => emb.has(g)).length, bestCosine: dist(best), crossing };
+}
+
+export function renderDeniedTable(rows: Array<{ name: string; d: DeniedCrossing }>): string {
+  const names = rows.length ? Object.keys(rows[0].d.crossing) : [];
+  const head = `| model | denied crops | best cosine p50/p95/max | ${names.map((n) => `cross @${n} (thr)`).join(" | ")} |`;
+  const sep = `|${"---|".repeat(3 + names.length)}`;
+  const body = rows.map(({ name, d }) => `| ${cell(name)} | ${d.crops} | ${num(d.bestCosine.p50)} / ${num(d.bestCosine.p95)} / ${num(d.bestCosine.max)} | ${names.map((n) => (d.crossing[n] ? `${d.crossing[n].count} (${num(d.crossing[n].threshold)})` : "-")).join(" | ")} |`);
+  return [head, sep, ...body].join("\n");
+}
+
+/**
+ * Identity pairs whose strict-impostor cosines reach `t` (label defects such
+ * as one person under two employee ids, or a repeated false accept, show up
+ * here before anyone looks at an image). Aggregates only: counts per id pair.
+ */
+export function suspiciousIdentityPairs(emb: Map<number, Float32Array>, pairs: Pair[], entries: CropEntry[], t: number, top = 5): Array<{ a: string; b: string; pairsAbove: number; max: number }> {
+  const idOf = new Map(entries.map((e) => [e.n, e.identity ?? ""]));
+  const acc = new Map<string, { a: string; b: string; pairsAbove: number; max: number }>();
+  for (const p of pairs) {
+    if (p.kind !== "impostorStrict") continue;
+    const u = emb.get(p.a);
+    const v = emb.get(p.b);
+    if (!u || !v) continue;
+    const c = dot(u, v);
+    if (c < t) continue;
+    const [a, b] = [idOf.get(p.a)!, idOf.get(p.b)!].sort();
+    const k = `${a}\u0000${b}`;
+    const cur = acc.get(k) ?? { a, b, pairsAbove: 0, max: -1 };
+    cur.pairsAbove++;
+    cur.max = Math.max(cur.max, c);
+    acc.set(k, cur);
+  }
+  return [...acc.values()]
+    .map((x) => ({ ...x, max: r3(x.max) }))
+    .sort((x, y) => y.pairsAbove - x.pairsAbove || y.max - x.max || x.a.localeCompare(y.a))
+    .slice(0, top);
+}
+
 // ---------------------------------------------------------------- report guards and rendering
 
 /**
@@ -571,20 +665,24 @@ const num = (v: number | undefined | null) => (v === undefined || v === null || 
 const cell = (s: string) => s.replace(/\|/g, "\\|").replace(/\n/g, " ");
 
 export function renderRecognizerTable(rows: RecognizerRow[], threads: number[]): string {
-  const head = `| model | license | MB | dim | preprocess | genuine p5/p50/p95 | impostor strict p5/p50/p95 (max) | probable p95/max | TAR@FAR=0 (thr) | TAR@site strict (thr, margin) | TAR/FA @legacy 0.55 | acceptSingle reproducing ref (TAR, FA, margin) | acceptFused | drift p50/p95 | ms/face ${threads.map((t) => `${t}t`).join(" / ")} | good enough |`;
-  const sep = `|${"---|".repeat(16)}`;
+  const head = `| model | license | MB | dim | preprocess | genuine p5/p50/p95 | impostor strict p5/p50/p95 (max) | probable p95/max | d' | TAR@FAR=0 (thr) | TAR@FAR=1e-3 / 1e-4 (thr) | TAR@site strict (thr, margin) | TAR/FA @legacy 0.55 | acceptSingle reproducing ref (TAR, FA, margin) | acceptFused | drift p50/p95 | ms/face ${threads.map((t) => `${t}t`).join(" / ")} | good enough |`;
+  const sep = `|${"---|".repeat(18)}`;
   const body = rows.map((r) => {
     const m = r.metrics;
     const rp = r.reproduction;
     const lat = threads.map((t) => num(r.latencyMs[`threads${t}`])).join(" / ");
     const ge = rp ? `${rp.goodEnough.verdict ? "yes" : "no"}${r.identicalToRef ? " (identical to ref)" : ""}` : "(ref)";
-    return `| ${cell(r.name)} | ${cell(r.license)} | ${r.fileMB} | ${r.dim} | ${cell(r.preprocess)} | ${num(m.genuine.p5)} / ${num(m.genuine.p50)} / ${num(m.genuine.p95)} | ${num(m.impostorStrict.p5)} / ${num(m.impostorStrict.p50)} / ${num(m.impostorStrict.p95)} (${num(m.impostorStrict.max)}) | ${num(m.impostorProbable.p95)} / ${num(m.impostorProbable.max)} | ${pct(m.tarAtFar0.tar)} (${num(m.tarAtFar0.threshold)}) | ${pct(m.siteStrict.tar)} (${num(m.siteStrict.threshold)}, ${num(m.siteStrict.marginToImpostorP95)}) | ${pct(m.legacySingle.tar)} / ${m.legacySingle.falseAcceptsStrict} | ${rp ? `${num(rp.acceptSingle.recommended.threshold)} (${pct(rp.acceptSingle.recommended.tar)}, ${rp.acceptSingle.recommended.falseAcceptsStrict}, ${num(rp.acceptSingle.recommended.marginToImpostorP95)})` : "-"} | ${rp ? num(rp.acceptFused.recommended.threshold) : "-"} | ${r.drift ? `${num(r.drift.p50)} / ${num(r.drift.p95)}` : "-"} | ${lat} | ${ge} |`;
+    const far1e4 = m.tarAtFar1e4 ? ` / ${pct(m.tarAtFar1e4.tar)} (${num(m.tarAtFar1e4.threshold)})` : "";
+    return `| ${cell(r.name)} | ${cell(r.license)} | ${r.fileMB} | ${r.dim} | ${cell(r.preprocess)} | ${num(m.genuine.p5)} / ${num(m.genuine.p50)} / ${num(m.genuine.p95)} | ${num(m.impostorStrict.p5)} / ${num(m.impostorStrict.p50)} / ${num(m.impostorStrict.p95)} (${num(m.impostorStrict.max)}) | ${num(m.impostorProbable.p95)} / ${num(m.impostorProbable.max)} | ${num(m.dPrime)} | ${pct(m.tarAtFar0.tar)} (${num(m.tarAtFar0.threshold)}) | ${pct(m.tarAtFar1e3.tar)} (${num(m.tarAtFar1e3.threshold)})${far1e4} | ${pct(m.siteStrict.tar)} (${num(m.siteStrict.threshold)}, ${num(m.siteStrict.marginToImpostorP95)}) | ${pct(m.legacySingle.tar)} / ${m.legacySingle.falseAcceptsStrict} | ${rp ? `${num(rp.acceptSingle.recommended.threshold)} (${pct(rp.acceptSingle.recommended.tar)}, ${rp.acceptSingle.recommended.falseAcceptsStrict}, ${num(rp.acceptSingle.recommended.marginToImpostorP95)})` : "-"} | ${rp ? num(rp.acceptFused.recommended.threshold) : "-"} | ${r.drift ? `${num(r.drift.p50)} / ${num(r.drift.p95)}` : "-"} | ${lat} | ${ge} |`;
   });
   return [head, sep, ...body].join("\n");
 }
 
 export interface DetectorRow {
+  /** Letterbox side; for a tiled pass the per-tile side. */
   size: number;
+  /** Table label when the pass is not a plain square letterbox (e.g. "2x640 tiles, 10% overlap"). */
+  label?: string;
   facesAll: number;
   facesAtLeastMin: number;
   msPerFrame: Dist;
@@ -595,7 +693,7 @@ export function renderDetectorTable(rows: DetectorRow[], refSize: number, minPx:
   const sep = `|${"---|".repeat(8)}`;
   const body = rows.map((r) => {
     const v = r.vsRef;
-    return `| ${r.size} | ${r.facesAll} / ${r.facesAtLeastMin} | ${v ? `${v.found}/${v.refFaces} (${pct(v.recall, 0)})` : "(ref)"} | ${v ? v.extra : "-"} | ${v ? `${num(v.iou.p50)} / ${num(v.iou.min)}` : "-"} | ${v ? `${num(v.landmarkErrPct.p50)} / ${num(v.landmarkErrPct.p95)}` : "-"} | ${v ? (v.missedSizes.length ? v.missedSizes.join(",") : "none") : "-"} | ${num(r.msPerFrame.p50)} / ${num(r.msPerFrame.p95)} |`;
+    return `| ${cell(r.label ?? String(r.size))} | ${r.facesAll} / ${r.facesAtLeastMin} | ${v ? `${v.found}/${v.refFaces} (${pct(v.recall, 0)})` : "(ref)"} | ${v ? v.extra : "-"} | ${v ? `${num(v.iou.p50)} / ${num(v.iou.min)}` : "-"} | ${v ? `${num(v.landmarkErrPct.p50)} / ${num(v.landmarkErrPct.p95)}` : "-"} | ${v ? (v.missedSizes.length ? v.missedSizes.join(",") : "none") : "-"} | ${num(r.msPerFrame.p50)} / ${num(r.msPerFrame.p95)} |`;
   });
   return [head, sep, ...body].join("\n");
 }

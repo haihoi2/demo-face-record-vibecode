@@ -14,25 +14,32 @@ import {
   assertNoVectors,
   atThreshold,
   buildPairs,
+  cropRgb,
+  deniedCrossing,
   describePreprocess,
   detectorAgreement,
   dot,
   driftVsParent,
   l2,
   matchFaces,
+  mergeTileDetections,
+  nmsFaces,
   parseLicenseSpec,
   parseModelSpec,
   parseParentSpec,
   preprocessCrop,
   preprocessMatchesBaseline,
+  renderDeniedTable,
   renderDetectorTable,
   renderRecognizerTable,
   reproduceReference,
   resizeBilinearU8,
   scoreSets,
   summarize,
+  suspiciousIdentityPairs,
   thresholdAtFar,
   thresholdAtTar,
+  tilePlan,
   type CropEntry,
   type DetFace,
   type RgbU8,
@@ -240,6 +247,30 @@ test("reproduceReference: an identical model reproduces today's thresholds (with
   assert.equal(rb.goodEnough.tarAtFar0WithinTwoPoints, false);
 });
 
+test("reproduceReference: with a million strict pairs the reference's FAR comes from its false-accept count, not from the rounded farStrict (4e-5 must not become FAR 0)", () => {
+  // 1,000,000 impostors spread 0..0.5, plus 40 at 0.56-0.60 that today's 0.55 lets through (FAR 4e-5 -> r4 rounds to 0).
+  const imp: number[] = [];
+  for (let i = 0; i < 1_000_000; i++) imp.push((i / 1_000_000) * 0.5);
+  for (let i = 0; i < 40; i++) imp.push(0.56 + i * 0.001);
+  // 1 impostor far above: the FAR=0 threshold is 0.9 and must NOT be what "same FAR" reproduces.
+  imp.push(0.9);
+  imp.sort((a, b) => a - b);
+  const gen: number[] = [];
+  for (let i = 0; i < 1000; i++) gen.push(0.3 + (i / 1000) * 0.6);
+  const sets = { genuine: gen, genuineCrossGate: [], withinTrack: [], impostorStrict: imp, impostorProbable: [] };
+  const metrics = summarize(sets, LEGACY);
+  assert.equal(metrics.legacySingle.falseAcceptsStrict, 41);
+  assert.ok(metrics.legacySingle.farStrict > 0 && metrics.legacySingle.farStrict < 1e-4, `farStrict ${metrics.legacySingle.farStrict} keeps 6 decimals`);
+  assert.ok(metrics.tarAtFar1e4.threshold < metrics.tarAtFar0.threshold);
+  assert.ok(metrics.tarAtFar1e4.falseAcceptsStrict <= 100 && metrics.tarAtFar1e4.falseAcceptsStrict > 41, `FAR=1e-4 admits ${metrics.tarAtFar1e4.falseAcceptsStrict} of 1,000,041`);
+  assert.ok(metrics.tarAtFar1e3.falseAcceptsStrict <= 1000 && metrics.tarAtFar1e3.falseAcceptsStrict > metrics.tarAtFar1e4.falseAcceptsStrict);
+  const rp = reproduceReference("ref", { metrics }, { sets, metrics }, LEGACY);
+  // Same model, same data: the reproduced acceptSingle is today's 0.55 (rounded up to 0.01), not the FAR=0 point at 0.9.
+  assert.ok(Math.abs(rp.acceptSingle.sameFar.threshold - 0.55) < 0.011, `sameFar ${rp.acceptSingle.sameFar.threshold}`);
+  assert.ok(rp.acceptSingle.recommended.threshold <= 0.58, `recommended ${rp.acceptSingle.recommended.threshold}`);
+  assert.equal(rp.acceptSingle.recommended.falseAcceptsStrict > 0, true);
+});
+
 test("driftVsParent: identical embeddings drift 0; mismatched dims throw", () => {
   const a = new Map([[1, l2(new Float32Array([1, 2, 3]))], [2, l2(new Float32Array([3, 2, 1]))]]);
   const d = driftVsParent(a, a);
@@ -330,4 +361,97 @@ test("fixture: deterministic for a seed, 112x112x3, and the same identity's capt
   assert.equal(c1.data.length, 112 * 112 * 3);
   const f = (img: RgbU8) => l2(Float32Array.from(img.data, (v) => v - 128));
   assert.ok(dot(f(c1), f(c2)) > dot(f(c1), f(c3)));
+});
+
+// ---------------------------------------------------------------- tiled detection (#523)
+
+test("tilePlan: two horizontal halves share 10% of the width, cover the frame exactly, and degenerate to one tile", () => {
+  const t = tilePlan(3840, 2160, 2, 0.1);
+  assert.equal(t.length, 2);
+  assert.deepEqual(t[0], { x: 0, y: 0, w: 2112, h: 2160 });
+  assert.deepEqual(t[1], { x: 1728, y: 0, w: 2112, h: 2160 });
+  assert.equal(t[0].x + t[0].w - t[1].x, 384); // overlap = 10% of 3840
+  assert.equal(t[1].x + t[1].w, 3840);
+  assert.deepEqual(tilePlan(1920, 1080, 1), [{ x: 0, y: 0, w: 1920, h: 1080 }]);
+  const three = tilePlan(1920, 1080, 3, 0);
+  assert.deepEqual(three.map((r) => r.x), [0, 640, 1280]);
+  assert.ok(three.every((r) => r.w === 640 && r.h === 1080));
+  assert.throws(() => tilePlan(100, 100, 0));
+  assert.throws(() => tilePlan(100, 100, 2, 0.5));
+});
+
+test("cropRgb: pixel-exact window; refuses a rect outside the image", () => {
+  const img: RgbU8 = { width: 4, height: 2, data: Uint8Array.from({ length: 24 }, (_, i) => i) };
+  const c = cropRgb(img, { x: 1, y: 0, w: 2, h: 2 });
+  assert.equal(c.width, 2);
+  assert.equal(c.height, 2);
+  assert.deepEqual([...c.data], [3, 4, 5, 6, 7, 8, 15, 16, 17, 18, 19, 20]);
+  assert.throws(() => cropRgb(img, { x: 3, y: 0, w: 2, h: 2 }), /outside/);
+  assert.throws(() => cropRgb(img, { x: 0, y: 0, w: 0, h: 2 }), /outside/);
+});
+
+test("nmsFaces keeps the higher score of overlapping boxes; mergeTileDetections shifts tile detections to frame coordinates and dedups the overlap", () => {
+  const kept = nmsFaces([F(0, 0, 100, 0.8), F(5, 5, 100, 0.95), F(500, 500, 60, 0.7)], 0.4);
+  assert.deepEqual(kept.map((f) => f.score), [0.95, 0.7]);
+  const rects = tilePlan(1000, 500, 2, 0.2); // tiles at x=0 and x=400, each 600 wide
+  assert.deepEqual(rects.map((r) => r.x), [0, 400]);
+  // the same face sits in the overlap: at x=450 in the frame = 450 in tile 0 and 50 in tile 1
+  const merged = mergeTileDetections([[F(450, 100, 80, 0.9), F(10, 10, 70, 0.6)], [F(52, 101, 80, 0.93), F(500, 300, 90, 0.8)]], rects);
+  assert.equal(merged.length, 3);
+  const boxes = merged.map((f) => f.box.map(Math.round)).sort((a, b) => a[0] - b[0]);
+  assert.deepEqual(boxes, [[10, 10, 80, 80], [452, 101, 532, 181], [900, 300, 990, 390]]);
+  const seam = merged.find((f) => Math.round(f.box[0]) === 452)!;
+  assert.equal(seam.score, 0.93); // tile 1's higher-scored copy won
+  assert.deepEqual(seam.landmarks[0].map(Math.round), [452 + 24, 101 + 32]); // landmarks shifted with the box
+  assert.throws(() => mergeTileDetections([[]], rects), /tile results/);
+});
+
+// ---------------------------------------------------------------- denied group and label radar
+
+test("deniedCrossing: best cosine per denied crop against the employee crops; counts per named threshold; missing embeddings are skipped", () => {
+  const e = (...v: number[]) => l2(Float32Array.from(v));
+  const emb = new Map<number, Float32Array>([
+    [1, e(1, 0, 0)], // EMP-a
+    [2, e(0, 1, 0)], // EMP-b
+    [10, e(1, 0.2, 0)], // denied, close to EMP-a (cos ~0.98)
+    [11, e(0.3, 0.3, 1)], // denied, far from both (cos ~0.28)
+  ]);
+  const d = deniedCrossing(emb, [10, 11, 12], [1, 2, 3], { single: 0.55, fused: 0.45, lax: 0.2 });
+  assert.equal(d.crops, 2);
+  assert.equal(d.galleryCrops, 2);
+  assert.equal(d.bestCosine.n, 2);
+  assert.ok(d.bestCosine.max! > 0.97 && d.bestCosine.min! < 0.3);
+  assert.deepEqual(d.crossing.single, { threshold: 0.55, count: 1, share: 0.5 });
+  assert.deepEqual(d.crossing.fused, { threshold: 0.45, count: 1, share: 0.5 });
+  assert.deepEqual(d.crossing.lax, { threshold: 0.2, count: 2, share: 1 });
+  const md = renderDeniedTable([{ name: "r50", d }]);
+  assert.ok(md.split("\n")[0].startsWith("| model | denied crops | best cosine p50/p95/max | cross @single (thr) | cross @fused (thr) | cross @lax (thr) |"));
+  assert.ok(md.includes("| r50 | 2 |") && md.includes("| 1 (0.55) | 1 (0.45) | 2 (0.2) |"));
+  assertNoVectors(d);
+  const empty = deniedCrossing(emb, [], [1], { single: 0.55 });
+  assert.equal(empty.crops, 0);
+  assert.deepEqual(empty.crossing.single, { threshold: 0.55, count: 0, share: NaN });
+});
+
+test("suspiciousIdentityPairs: identity pairs whose strict-impostor cosines reach the threshold, counts only, sorted by count then max", () => {
+  const entries: CropEntry[] = [
+    { n: 1, source: "log", groupId: "g1", identity: "EMP-a", gate: "entry", quality: 1 },
+    { n: 2, source: "log", groupId: "g2", identity: "EMP-a", gate: "entry", quality: 1 },
+    { n: 3, source: "log", groupId: "g3", identity: "EMP-b", gate: "entry", quality: 1 },
+    { n: 4, source: "log", groupId: "g4", identity: "EMP-c", gate: "entry", quality: 1 },
+    { n: 5, source: "log", groupId: "g5", identity: null, gate: "entry", quality: 1, status: "DENIED" },
+  ];
+  const e = (...v: number[]) => l2(Float32Array.from(v));
+  const emb = new Map<number, Float32Array>([
+    [1, e(1, 0, 0)],
+    [2, e(1, 0.1, 0)],
+    [3, e(1, 0.3, 0)], // EMP-b looks like EMP-a (cos ~0.96)
+    [4, e(0, 0, 1)], // EMP-c orthogonal
+    [5, e(1, 0, 0)], // denied crop identical to EMP-a: not a strict pair, must not appear
+  ]);
+  const s = suspiciousIdentityPairs(emb, buildPairs(entries), entries, 0.55);
+  assert.deepEqual(s.map((x) => [x.a, x.b, x.pairsAbove]), [["EMP-a", "EMP-b", 2]]);
+  assert.ok(s[0].max > 0.95 && s[0].max <= 1);
+  assert.deepEqual(suspiciousIdentityPairs(emb, buildPairs(entries), entries, 0.999), []);
+  assertNoVectors(s);
 });

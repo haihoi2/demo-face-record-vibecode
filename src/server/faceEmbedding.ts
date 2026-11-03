@@ -23,6 +23,7 @@
  */
 
 import { envNumber } from "./env";
+import { cropRgb, mergeTileDetections, parseDetectTiles, shouldTileFrame, tilePlan } from "./detectTiles";
 import { spawn } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
@@ -130,6 +131,14 @@ export interface FaceEngineInfo {
   /** Horizontal-flip test-time augmentation of the recogniser (FACE_TTA_FLIP=1); default off. */
   ttaFlip: boolean;
   detectorInputSize: number;
+  /**
+   * FACE_DETECT_TILES (#523): 1 = one letterbox pass (default), 2 = left/right
+   * tiles for frames whose longest side is >= 4x detectorInputSize (small
+   * pictures keep the single pass). See src/server/detectTiles.ts.
+   */
+  detectTiles: number;
+  /** FACE_DETECT_TILE_OVERLAP: fraction of the frame width shared by neighbouring tiles (default 0.1). */
+  detectTileOverlap: number;
   /**
    * Spatial input dims of the LOADED detector graph: a number where the ONNX
    * graph fixes the axis (the static INT8 export is 640x640), "dynamic" where
@@ -340,6 +349,8 @@ function variantWarnings(): string[] {
     const v = (process.env[name] || "").trim().toLowerCase();
     if (v && v !== "fp32") out.push(`${name}: ignored, the recogniser runs fp32 only (INT8 failed the drift bar)`);
   }
+  const tiles = parseDetectTiles();
+  if (tiles.invalid) out.push(tiles.invalid);
   return out;
 }
 function detectThreshold(): number {
@@ -937,6 +948,8 @@ export function getFaceEngineInfo(): FaceEngineInfo {
     detectUpscale: detectUpscaleMode(),
     ttaFlip: ttaFlipEnabled(),
     detectorInputSize: detectorInputSize(),
+    detectTiles: parseDetectTiles().tiles,
+    detectTileOverlap: parseDetectTiles().overlap,
     detectorInputDims: engineRef ? engineRef.detectorInputDims : null,
     embeddingDim: EMBEDDING_DIM,
     detectThreshold: detectThreshold(),
@@ -1128,7 +1141,29 @@ export function resolveDetectShape(options?: DetectOptions): { width: number; he
   return { width: size, height: size };
 }
 
+/**
+ * Detector entry for an RGB frame. With an explicit `inputShape` (the real-time
+ * pipeline, offline tools) it is exactly one letterbox pass. Without one - the
+ * door-scan extractFaces() and the legacy detectFaces() callers - the
+ * FACE_DETECT_TILES flag applies (#523): a frame whose longest side is at least
+ * 4x the FACE_DETECT_SIZE square is cut into left/right tiles with
+ * FACE_DETECT_TILE_OVERLAP, each tile runs the SAME single pass at the same
+ * square, and the results are mapped back and merged at FACE_NMS_IOU
+ * (detectTiles.ts). FACE_DETECT_TILES=1 (default) is byte-identical to the
+ * single pass: the tiling code is never entered.
+ */
 async function detectOnRgb(engine: Engine, img: RgbImage, options?: DetectOptions): Promise<FaceBox[]> {
+  if (options?.inputShape) return detectSinglePass(engine, img, options);
+  const { tiles, overlap } = parseDetectTiles();
+  const side = detectorInputSize();
+  if (!shouldTileFrame(img.width, img.height, side, tiles)) return detectSinglePass(engine, img, options);
+  const rects = tilePlan(img.width, img.height, tiles, overlap);
+  const perTile: FaceBox[][] = [];
+  for (const r of rects) perTile.push(await detectSinglePass(engine, cropRgb(img, r), options));
+  return mergeTileDetections(perTile, rects, nmsIouThreshold());
+}
+
+async function detectSinglePass(engine: Engine, img: RgbImage, options?: DetectOptions): Promise<FaceBox[]> {
   const { width: inW, height: inH } = resolveDetectShape(options);
   // Fail closed on a graph that cannot take this shape: no run, no exception,
   // one log line per shape (the pipeline checks this before it starts as well).
