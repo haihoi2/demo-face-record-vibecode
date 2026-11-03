@@ -8316,14 +8316,14 @@ async function prepareTemplateFromImage(
     const crossCheck = checkTemplateAgainstGallery(best.embedding, employeeId, currentGallery(), {
       acceptSingle: Math.max(DEFAULT_FUSION_THRESHOLDS.acceptSingle, currentFusionThresholds().acceptSingle),
     });
-    if (!crossCheck.ok) {
+    if (crossCheck.ok === false) {
       if (crossCheck.reason === "matches-other-employee") {
         console.warn(`[FaceEngine] Từ chối mẫu cho ${employeeId} từ ${opts.sourceLogId || "ảnh"}: khớp nhân viên khác ${crossCheck.otherEmployeeId} (cosine ${crossCheck.otherCosine}) mạnh hơn chính chủ (${crossCheck.targetCosine})`);
         return { rejected: "matches-other-employee", detectedFaces: faces.length };
       }
       return { rejected: "engine-error", detectedFaces: faces.length };
     }
-    if (crossCheck.flag) {
+    if (crossCheck.ok === true && crossCheck.flag) {
       console.warn(`[FaceEngine] Mẫu mới của ${employeeId} gần ${crossCheck.otherEmployeeId} (cosine ${crossCheck.otherCosine}) hơn chính chủ (${crossCheck.targetCosine}) - vẫn lưu, dưới ngưỡng cửa`);
     }
     // Camera adaptation templates do not count (templateCap.ts). A full
@@ -12282,8 +12282,10 @@ async function runCameraAdaptation(): Promise<number> {
       if (!employees.some((e) => e.id === o.employeeId)) continue;
       // Belt and braces under the adaptation margin: never learn a colleague's face (templateAudit.ts).
       const cross = checkTemplateAgainstGallery(o.embedding, o.employeeId, buildGallery(existing, tag), { acceptSingle: adaptBase });
-      if (!cross.ok) {
-        console.warn(`[Adaptation] Bỏ qua mẫu cho ${o.employeeId} (sự kiện ${o.logId}): ${cross.reason === "matches-other-employee" ? `khớp nhân viên khác ${cross.otherEmployeeId} (cosine ${cross.otherCosine})` : cross.reason}`);
+      if (cross.ok === false) {
+        // Narrowed by `=== false` (no strictNullChecks here): the refusal variants only.
+        const why = cross.reason === "matches-other-employee" ? `khớp nhân viên khác ${cross.otherEmployeeId} (cosine ${cross.otherCosine})` : cross.reason;
+        console.warn(`[Adaptation] Bỏ qua mẫu cho ${o.employeeId} (sự kiện ${o.logId}): ${why}`);
         continue;
       }
       if (item.evictTemplateId) db.deleteFaceTemplate(item.evictTemplateId);
