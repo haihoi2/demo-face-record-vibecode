@@ -548,70 +548,10 @@ export function detectorAgreement(ref: DetFace[][], cand: DetFace[][], minPx: nu
 
 // ---------------------------------------------------------------- tiled detection (#523)
 
-export interface TileRect {
-  x: number;
-  y: number;
-  w: number;
-  h: number;
-}
-
-/**
- * Horizontal tiling of a frame into `tiles` side-by-side windows whose
- * neighbours overlap by `overlapFrac` of the frame width (a face on the seam is
- * whole in at least one tile when it is narrower than the overlap). Each tile
- * is then letterboxed to the detector's square on its own, so a 3840x2160 frame
- * split in two gives 2112x2160 tiles at ~1:1 and the detector sees the faces
- * roughly twice as large as on the full frame at the same input size.
- */
-export function tilePlan(width: number, height: number, tiles = 2, overlapFrac = 0.1): TileRect[] {
-  if (!Number.isInteger(tiles) || tiles < 1 || tiles > 8) throw new Error(`tilePlan: tiles must be 1..8, got ${tiles}`);
-  if (!(overlapFrac >= 0 && overlapFrac < 0.5)) throw new Error(`tilePlan: overlap must be in [0, 0.5), got ${overlapFrac}`);
-  if (tiles === 1) return [{ x: 0, y: 0, w: width, h: height }];
-  const overlap = Math.round(width * overlapFrac);
-  const w = Math.ceil((width + overlap * (tiles - 1)) / tiles);
-  const out: TileRect[] = [];
-  for (let i = 0; i < tiles; i++) {
-    const x = i === tiles - 1 ? width - w : i * (w - overlap);
-    out.push({ x: Math.max(0, x), y: 0, w: Math.min(w, width), h: height });
-  }
-  return out;
-}
-
-/** Pixel-exact window of an RGB HWC image. */
-export function cropRgb(img: RgbU8, r: TileRect): RgbU8 {
-  if (r.x < 0 || r.y < 0 || r.w < 1 || r.h < 1 || r.x + r.w > img.width || r.y + r.h > img.height) throw new Error(`cropRgb: ${JSON.stringify(r)} outside ${img.width}x${img.height}`);
-  const data = new Uint8Array(r.w * r.h * 3);
-  for (let y = 0; y < r.h; y++) data.set(img.data.subarray(((r.y + y) * img.width + r.x) * 3, ((r.y + y) * img.width + r.x + r.w) * 3), y * r.w * 3);
-  return { width: r.w, height: r.h, data };
-}
-
-/** Greedy NMS by score (same rule as faceEmbedding.ts nms: suppress IoU > threshold). */
-export function nmsFaces(faces: DetFace[], iouThreshold: number): DetFace[] {
-  const order = faces.map((_, i) => i).sort((i, j) => faces[j].score - faces[i].score || i - j);
-  const keep: DetFace[] = [];
-  const suppressed = new Uint8Array(faces.length);
-  for (const i of order) {
-    if (suppressed[i]) continue;
-    keep.push(faces[i]);
-    for (const j of order) if (j !== i && !suppressed[j] && iouBox(faces[i].box, faces[j].box) > iouThreshold) suppressed[j] = 1;
-  }
-  return keep;
-}
-
-/**
- * Detections of each tile (in tile coordinates) shifted back to frame
- * coordinates and merged with NMS, so a face in the overlap found by both
- * tiles counts once (the higher score wins, as in the engine's own NMS).
- */
-export function mergeTileDetections(perTile: DetFace[][], rects: TileRect[], iouThreshold = 0.4): DetFace[] {
-  if (perTile.length !== rects.length) throw new Error(`mergeTileDetections: ${perTile.length} tile results for ${rects.length} tiles`);
-  const all: DetFace[] = [];
-  perTile.forEach((faces, t) => {
-    const { x, y } = rects[t];
-    for (const f of faces) all.push({ box: [f.box[0] + x, f.box[1] + y, f.box[2] + x, f.box[3] + y], score: f.score, landmarks: f.landmarks.map(([px, py]) => [px + x, py + y] as const) });
-  });
-  return nmsFaces(all, iouThreshold);
-}
+// The tile helpers live in production code now (src/server/detectTiles.ts, used
+// by faceEmbedding.ts behind FACE_DETECT_TILES); re-exported so the harness and
+// its tests keep one implementation.
+export { cropRgb, mergeTileDetections, nmsFaces, tilePlan, type TileRect } from "../../src/server/detectTiles";
 
 // ---------------------------------------------------------------- the unlabelled DENIED group
 
