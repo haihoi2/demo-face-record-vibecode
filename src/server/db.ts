@@ -2386,7 +2386,8 @@ class SQLiteStorage implements StrangerFaceStore, ShadowResultStore, LoginEventS
               stmt.run(
                 r.id, r.timestamp, r.type, r.status,
                 r.employeeId || null, r.employeeName || null, r.employeeCode || null,
-                r.department || null, r.photoSnapshot, r.confidence,
+                // Mirror rows only, never the picture (see saveAccessLog).
+                r.department || null, null, r.confidence,
                 r.livenessScore ?? null, r.lockAction, r.doorName, r.reason || null,
                 r.faceEmbedding || null, r.faceEmbeddingDims || null,
                 r.faceEmbeddingModelTag || null, r.faceEmbeddingQuality ?? null,
@@ -4986,6 +4987,11 @@ class SQLiteStorage implements StrangerFaceStore, ShadowResultStore, LoginEventS
 
     if (this.isNativeSqlite && this.db) {
       try {
+        // With PostgreSQL authoritative, SQLite keeps the event rows (so a
+        // fallback still has the history) but NOT the picture: the ~0.9 MB
+        // snapshot was written twice and the mirror had grown to 14 GB of
+        // duplicates by 2026-11-03. Pictures are served from PostgreSQL.
+        const mirrorPhoto = this.pgPool && this.isPostgres ? null : log.photoSnapshot;
         const stmt = this.db.prepare(`
           INSERT OR IGNORE INTO access_logs (
             id, timestamp, type, status, employeeId, employeeName, employeeCode,
@@ -5003,7 +5009,7 @@ class SQLiteStorage implements StrangerFaceStore, ShadowResultStore, LoginEventS
           log.employeeName || null,
           log.employeeCode || null,
           log.department || null,
-          log.photoSnapshot,
+          mirrorPhoto,
           log.confidence,
           log.livenessScore ?? null,
           log.lockAction,
