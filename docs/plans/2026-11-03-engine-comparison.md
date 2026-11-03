@@ -378,3 +378,51 @@ export (each batch right after cropping), the crop directory, the frame director
 and `engine-compare.md` (aggregates only, `assertNoVectors` enforced), the harness log without pixel data, this
 section. Nothing was written to the database or the repository besides this document and the harness code. The
 OpenCV Zoo files stay in `/data/models/candidates/opencv_zoo/` (model weights, not biometric data).
+
+### 9.9 Implementation of the tile pass (#523, 2026-11-03, behind a flag, default OFF)
+
+Production code: `src/server/detectTiles.ts` (pure plan / crop / merge; the harness re-exports it from
+`scripts/perf/engineCompareLib.ts`), `faceEmbedding.ts#detectOnRgb` (the switch), `faceExtractProtocol.ts`
+(worker fingerprint). `server.ts` untouched.
+
+Env contract (both read lazily per call, both in the extraction-worker fingerprint, both passed through
+`docker-compose.yml`):
+
+| variable | values | default | effect |
+|---|---|---|---|
+| `FACE_DETECT_TILES` | `1` or `2` | `1` | `1` = today's single letterbox pass, byte-identical (the tile code is never entered). `2` = left/right tiles, each letterboxed to the `FACE_DETECT_SIZE` square on its own, detections mapped back to frame pixels and merged at `FACE_NMS_IOU`. Any other value = `1` plus a `variantWarning` in `/api/face-engine/status`. |
+| `FACE_DETECT_TILE_OVERLAP` | fraction in `[0, 0.5)` | `0.10` | share of the frame width the two tiles have in common (384 px on 4K). Outside the range = `0.10` plus a warning. |
+
+Rules:
+
+- Where: `extractFaces()` and `detectFaces()` WITHOUT an explicit `inputShape`, i.e. the door scan on the main
+  thread and in the extraction worker (same code, same env; a worker whose fingerprint differs is refused with
+  `config_mismatch` and recycled). The real-time pipeline passes its own `inputShape` and is not affected; ORT
+  thread settings are untouched (the tiles run sequentially on the one detector session).
+- When: only frames whose longest side is >= 4 x `FACE_DETECT_SIZE` (2560 px at 640). 4K entry frames tile;
+  1080p exit frames, uploads, enrolment pictures and crops keep the single pass (`shouldTileFrame`).
+- Seam: a detection whose box reaches a tile's inner edge counts as cut by the seam and is dropped when a
+  detection from the other tile covers > 50 % of it and is whole or better scored; the survivors go through the
+  engine's NMS. A face narrower than the overlap is therefore kept once from the tile that sees it whole; a face
+  wider than the overlap is kept once from the better-scored tile with its box clipped at that tile's edge
+  (tests/detectTiles.test.ts pins both cases, the seam-loss case and the mapping back).
+
+Measured in the tester image (`det_10g` FP32, `FACE_ORT_THREADS=2`, `--cpus 2.0`, host under other gates) on
+the 3840x2160 bench frame, `tests/detectTilesEquivalence.test.ts`:
+
+| | faces | best face box IoU vs tiles=1 | best face embedding cosine | best face size / score | ms per frame (median of 3) |
+|---|---|---|---|---|---|
+| `FACE_DETECT_TILES=1` | 1 | - | - | 117 px / 0.831 | 1007 |
+| `FACE_DETECT_TILES=2` | 2 | 0.938 | 0.965 | 110 px / 0.850 | 1928 |
+
+The extra face at tiles=2 is a 39 px detection at score 0.505 far from the seam (x 2426 of 3840, overlap is
+1728-2112), with no overlap with any other box: a genuine far-away face the full-frame pass missed, below the
+60 px floor so it stays `clear: false`. Worker == main thread at tiles=2 (`tests/faceExtractEquivalence.test.ts`
+with `FACE_DETECT_TILES=2`): 2 faces, embedding cosine 1.000, boxes within 0.5 px.
+
+Rollout note: enable on the ENTRY gateway first (`FACE_DETECT_TILES=2` in `.env`, rebuild/restart with owner
+approval; the EXIT camera is 1080p and stays on the single pass by the size rule anyway). Read the effect in
+`/api/face-engine/status` -> `info.detectTiles` (2) and `info.detectTileOverlap`, and in the door-scan frame
+times (about 2x per 4K frame; the scan gap must leave room for ~2 s at 2 threads under load, less at 4) and the
+share of `GRANTED` on far faces / `small` unclear reasons. Rollback: unset the variable (or `1`) and restart;
+no data, template or schema change is involved - the recogniser, model tag and templates are the same.
