@@ -188,6 +188,9 @@ services:
     # và các Camera IP LAN nội bộ (ví dụ: 192.168.60.2)
     extra_hosts:
       - "host.docker.internal:host-gateway"
+      # Telemetry host of onnxruntime-node pinned to loopback inside the container: a second
+      # layer under ORT_DISABLE_TELEMETRY=1 (2026-11-03 egress audit E2; edge block = Taiga #526).
+      - "mobile.events.data.microsoft.com:127.0.0.1"
 
     # USB Webcam passthrough trên Linux (nếu dùng camera cắm cổng USB trực tiếp vào máy chủ):
     # devices:
