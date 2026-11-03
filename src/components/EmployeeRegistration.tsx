@@ -32,6 +32,7 @@ import { safeJsonFetch, compressImage } from "../utils/api";
 import { directionLabel, gateDisplayLabel, gatesOf } from "../utils/gates";
 import { ProtectedImage } from "./ProtectedImage";
 import { EmployeeEditDialog } from "./EmployeeEditDialog";
+import { TemplateAuditPanel } from "./TemplateAuditPanel";
 import { employeeAvatarSrc, employeeInitials, employeeMatchesQuery } from "../utils/employeeAvatar";
 import { hasRole, useOperatorSession } from "../utils/session";
 import { orgChoice, orgOptions, orgPlaceholder, useOrgCatalog } from "../utils/orgCatalog";
@@ -1453,6 +1454,16 @@ export const EmployeeRegistration: React.FC<EmployeeRegistrationProps> = ({
           </>
         )}
       </div>
+
+      {/* Gallery audit (Taiga #508): templates closer to another employee than to their owner. Admin only. */}
+      {isAdmin && (
+        <TemplateAuditPanel
+          onDeleted={(employeeId) => {
+            if (employeeId === enrollEmployeeId) void fetchTemplates(employeeId);
+            reloadCoverage();
+          }}
+        />
+      )}
 
       {/* List of Registered Employees */}
       <div className="bg-white rounded-2xl border border-slate-200 p-6 shadow-xs">
