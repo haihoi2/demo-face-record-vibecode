@@ -5437,12 +5437,25 @@ class SQLiteStorage implements StrangerFaceStore, ShadowResultStore, LoginEventS
   }
 
   // ================= WEBHOOK CONFIG =================
+  /** Last configuration read successfully: what a transient read failure returns. */
+  private webhookConfigLastGood: WebhookConfigRecord | null = null;
+
+  /**
+   * Read-only. A getter must never write: on 2026-11-03 a transient
+   * "database is locked" during SQLite maintenance made this return the
+   * defaults (enabled=false, url="") and the "auto-heal" below, together with
+   * the callers' own heal step, PERSISTED those defaults to SQLite and
+   * PostgreSQL - the gate's webhook and presence alerts were silently off for
+   * 18 hours. Now: a read failure returns the last good configuration (or the
+   * defaults, unsaved); a malformed stored URL is reported as stored, never
+   * rewritten here.
+   */
   getWebhookConfig(defaultConfig: WebhookConfigRecord): WebhookConfigRecord {
     if (this.isNativeSqlite && this.db) {
       try {
         const row = this.db.prepare("SELECT * FROM webhook_config WHERE id = 'default'").get();
         if (row) {
-          let url = row.url;
+          const url = row.url;
           // Optional stranger-alert fields live in one JSON blob column; a row
           // written before they existed has NULL there and falls back to defaults.
           const stranger = parseStrangerWebhookConfig(row.strangerConfig);
@@ -5457,18 +5470,16 @@ class SQLiteStorage implements StrangerFaceStore, ShadowResultStore, LoginEventS
             },
             defaultConfig
           );
-          // Auto-heal truncated URL with ellipsis or incomplete hook path
-          if (!url || typeof url !== "string" || url.includes("...") || url.endsWith("/hooks/") || url.endsWith("/hooks")) {
-            url = defaultConfig.url;
-            merged.url = defaultConfig.url;
-            this.saveWebhookConfig(merged);
-          }
+          if (typeof url !== "string") merged.url = "";
+          this.webhookConfigLastGood = merged;
           return merged;
         }
-        this.saveWebhookConfig(withStrangerWebhookDefaults(defaultConfig, defaultConfig));
+        // No row yet: defaults, not persisted (the first explicit save creates the row).
         return withStrangerWebhookDefaults(defaultConfig, defaultConfig);
       } catch (err) {
-        console.error("[SQLite] Lỗi getWebhookConfig:", err);
+        console.error("[SQLite] Lỗi getWebhookConfig (giữ cấu hình đã đọc lần trước):", err);
+        if (this.webhookConfigLastGood) return this.webhookConfigLastGood;
+        return withStrangerWebhookDefaults(defaultConfig, defaultConfig);
       }
     }
     const stored = this.fallbackData.webhook_config;

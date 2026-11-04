@@ -2831,12 +2831,10 @@ async function sendEtonWebhook({
   /** Gate of the event. The title stays per direction; a gate beyond entry/exit is named in the text. */
   gateId?: string;
 }): Promise<WebhookLogRecord | null> {
-  // Always load latest config and auto-heal corrupted or truncated URL
+  // Latest stored configuration. Never "heal" by writing here: with no
+  // default URL any write from this path wipes the operator's configuration
+  // (it did, 2026-11-03). A missing or malformed URL simply means no send.
   webhookConfig = db.getWebhookConfig(DEFAULT_WEBHOOK_CONFIG);
-  if (!webhookConfig.url || webhookConfig.url.includes("...") || webhookConfig.url.endsWith("/hooks/") || webhookConfig.url.endsWith("/hooks")) {
-    webhookConfig.url = DEFAULT_WEBHOOK_CONFIG.url;
-    db.saveWebhookConfig(webhookConfig);
-  }
 
   if (!webhookConfig.enabled) return null;
 
@@ -3044,12 +3042,10 @@ async function sendStrangerWebhook({
   /** Used by POST /api/webhook/test-stranger so an operator test is never swallowed. */
   bypassCooldown?: boolean;
 }): Promise<WebhookLogRecord | null> {
-  // Always load latest config and auto-heal corrupted or truncated URL
+  // Latest stored configuration. Never "heal" by writing here: with no
+  // default URL any write from this path wipes the operator's configuration
+  // (it did, 2026-11-03). A missing or malformed URL simply means no send.
   webhookConfig = db.getWebhookConfig(DEFAULT_WEBHOOK_CONFIG);
-  if (!webhookConfig.url || webhookConfig.url.includes("...") || webhookConfig.url.endsWith("/hooks/") || webhookConfig.url.endsWith("/hooks")) {
-    webhookConfig.url = DEFAULT_WEBHOOK_CONFIG.url;
-    db.saveWebhookConfig(webhookConfig);
-  }
 
   // Opt-out is explicit `false`; an old config without the field stays enabled.
   if (webhookConfig.strangerAlertEnabled === false) return null;
