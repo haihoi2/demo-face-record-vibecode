@@ -38,6 +38,10 @@ export const OperatorSessionBar: React.FC = () => {
   const [pwDone, setPwDone] = useState(false);
   const firstField = useRef<HTMLInputElement | null>(null);
   // Resolves the promise handed to a 401 caller once the person signs in (or cancels).
+  // The dialog sits above every other overlay (z-[70]): panels such as the
+  // stranger modal are z-50 and are mounted later in App, so at the same
+  // z-index they painted over the login dialog - a deep link opened without a
+  // session showed "Đang phân tích…" forever (2026-11-04).
   const pending = useRef<((signedIn: boolean) => void) | null>(null);
 
   useEffect(() => {
@@ -149,7 +153,7 @@ export const OperatorSessionBar: React.FC = () => {
   return (
     <>
       {open && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/50 backdrop-blur-sm p-4">
+        <div className="fixed inset-0 z-[70] flex items-center justify-center bg-slate-900/50 backdrop-blur-sm p-4">
           <form
             onSubmit={submit}
             className="w-full max-w-sm rounded-2xl bg-white shadow-2xl border border-slate-200 p-5 space-y-4"
@@ -261,7 +265,7 @@ export const OperatorSessionBar: React.FC = () => {
       )}
 
       {pwOpen && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/50 backdrop-blur-sm p-4">
+        <div className="fixed inset-0 z-[70] flex items-center justify-center bg-slate-900/50 backdrop-blur-sm p-4">
           <form
             onSubmit={submitPassword}
             className="w-full max-w-sm rounded-2xl bg-white shadow-2xl border border-slate-200 p-5 space-y-3"
