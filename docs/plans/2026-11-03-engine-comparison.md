@@ -426,3 +426,72 @@ approval; the EXIT camera is 1080p and stays on the single pass by the size rule
 times (about 2x per 4K frame; the scan gap must leave room for ~2 s at 2 threads under load, less at 4) and the
 share of `GRANTED` on far faces / `small` unclear reasons. Rollback: unset the variable (or `1`) and restart;
 no data, template or schema change is involved - the recogniser, model tag and templates are the same.
+
+### 9.10 Adaptive tiling, `FACE_DETECT_TILES=auto` (#523 step 2, 2026-11-05, behind the same flag, default still `1`)
+
+Why: `FACE_DETECT_TILES=2` has been live on the 4K ENTRY camera since 2026-11-03 09:40. Three noon samples
+against the day before at one tile: denied 19 % / 4 % / 25 % (was 29 %; weekday baseline 35 %) - accuracy
+clearly better - but median grant delay 7.3 / 6.0 / 5.9 s (was 5.7; baseline 4.0), p90 up to 22 s on 04/11
+12:00; a 4K frame costs ~1.8 s instead of ~1.0 s and the extraction pool trims the best-of extras in ~40 % of
+peak scans. The tiles pay only when the single pass has nothing usable (far / small faces); a person close to
+the gate already gives the single pass a clear face and the second pass is wasted time.
+
+Production code: `src/server/detectTiles.ts` (ADAPTIVE MODE in the module header; `autoTileDecision`,
+`mergeSingleAndTiles`, parsing), `faceEmbedding.ts#detectOnRgb` (the switch and the per-process counters),
+`faceExtractProtocol.ts` (fingerprint). `server.ts` untouched: the counters ride on `getFaceEngineInfo()`.
+
+Env contract (read lazily per call, all in the extraction-worker fingerprint, passed through `docker-compose.yml`):
+
+| variable | values | default | effect |
+|---|---|---|---|
+| `FACE_DETECT_TILES` | `1`, `2` or `auto` | `1` | `1` and `2` exactly as in 9.9. `auto` = single letterbox pass first; the tile pass of `2` runs only when the single pass found no usable face (rule below). Any other value = `1` plus a `variantWarning`. |
+| `FACE_DETECT_TILES_MIN_FACE_PX` | integer `0..2000` | blank = `FACE_MIN_SIZE_PX` (60) | auto only: a single-pass face is usable when it is clear AND its box short side is >= this. Below the clear-face floor it changes nothing (the gate's floor still rules). Out of range = the default plus a warning. |
+
+Decision rule (`autoTileDecision`, pure, deterministic), applied after the size rule of 9.9 (frames below
+4 x `FACE_DETECT_SIZE` are never tiled, in any mode):
+
+1. the single pass found at least one face with `clear === true` (the same `clearFaceIssue` gate `extractFaces()`
+   reports: size floor, landmarks, roll, yaw, aspect) and box short side >= `FACE_DETECT_TILES_MIN_FACE_PX`
+   -> return the single-pass result unchanged. Byte-identical to `FACE_DETECT_TILES=1` (reason `clear`).
+2. otherwise - no face (`no_face`), faces but none passes the gate (`unclear`), clear faces all below the knob
+   (`small`) - run the two tiles and return the MERGE of single-pass + tile detections through the existing seam
+   rule and NMS (`mergeSingleAndTiles`): the full frame is one more "tile" whose rect is the whole frame, so its
+   boxes never count as cut by a seam; a tile sliver cut at the seam and covered > 50 % by a single-pass box is
+   dropped; duplicates settle by score, highest first, ties by input order with the single pass listed first. A
+   clear face found only by the tiles is added; an unclear single-pass box the tiles did not see is kept for the
+   unclear / stranger counters.
+
+Measured in the tester image (`det_10g` FP32, `FACE_ORT_THREADS=2`, `--cpus 2.0`, shared host under other
+load), `tests/detectTilesEquivalence.test.ts`, `extractFaces()` ms per frame = median of 3 (decode excluded,
+embedding included):
+
+| frame | faces at 1 / 2 / auto | auto decision | ms at `1` | ms at `2` | ms at `auto` |
+|---|---|---|---|---|---|
+| near: the 3840x2160 bench frame (117 px clear face) | 1 / 2 / 1 | `clear` x3 -> singleOnly 3, tiled 0 | 953 | 1870 | 1012 |
+| far A: bench frame x0.45 pasted in a 4K corner (49 px face) | 0 / 1 / 1 | `no_face` x3 -> tiled 3 | 614 | 1653 | 2151 |
+| far B: bench frame x0.55 in a 4K corner (58 px -> 63 px face) | 1 unclear / 1 clear / 1 clear | `unclear` x3 -> tiled 3 | 1187 | 1745 | 2338 |
+
+- near: `auto` == `1` byte for byte (boxes, landmarks, scores, embeddings, flags; `assert.deepEqual` on the full
+  `ExtractedFace[]`). The ~6 % difference in ms is noise on the shared host; auto runs exactly the same work.
+- far A: the single pass sees nothing; `auto` == `2` exactly (the merge has nothing from the single pass; IoU 1.0,
+  embedding cosine 1.000). Cost = single pass + tiles (~+30 % over `2`): this is the price of auto on frames
+  without a near face, the common idle case at the gate, which only matters when a scan is running anyway.
+- far B: the single pass finds the face at 58 px (`clear: false`, `small`); the tiles find it at 63 px, clear,
+  score 0.797 vs 0.636, and the merge keeps the tile box (NMS) - the face the gate can recognise, which `1`
+  would have refused as too small.
+- Worker == main thread at `auto` (`tests/faceExtractEquivalence.test.ts` with `FACE_DETECT_TILES=auto`): 1 face,
+  cosine 1.000; `auto` and the knob are in `extractFingerprint()`, so a worker started on other values is refused
+  (`config_mismatch`) and recycled.
+
+Expected effect at the gate: a near face costs one pass (today's 1.0 s), a far-only or empty frame costs ~2.2 s
+(one pass more than `2`). Whether the grant delay comes back towards the 5.7 s of one tile depends on how often
+the first scan of an approach already has a clear face; read it from the counters below after a day.
+
+Rollout note: set `FACE_DETECT_TILES=auto` on the ENTRY gateway (`.env`, rebuild/restart with owner approval; the
+EXIT camera is 1080p and never tiles). `/api/face-engine/status` -> `info.detectTiles` reads `"auto"`,
+`info.detectTilesMinFacePx` the floor in use, and `info.detectTilesAuto = { singleOnly, tiled }` counts the
+door-scan detections of the MAIN process since start: `singleOnly / (singleOnly + tiled)` is the share of scans
+that paid one pass. The counters are per process: with `FACE_EXTRACT_WORKERS` > 0 (default 2) the workers
+decide on their own and the main-process counters only count main-thread fallbacks; a worker-side total needs
+the pool to carry the counters in its result message (proposal for the integration owner, not done here).
+Rollback: `FACE_DETECT_TILES=2` or unset and restart; no data, template or schema change.
