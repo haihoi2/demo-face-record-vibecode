@@ -30,6 +30,7 @@ import { performance } from "node:perf_hooks";
 import {
   embedFace,
   extractFaces,
+  getAutoTileCounts,
   getFaceEngine,
   getFaceEngineInfo,
   loadImage,
@@ -78,8 +79,15 @@ async function handleExtract(id: number, image: ArrayBuffer | string): Promise<v
   try {
     const rgb = await loadImage(buf);
     if (!rgb) return fail(id, "decode_failed", "image could not be decoded (JPEG/PNG expected)", t0);
+    const tilesBefore = getAutoTileCounts();
     const faces = await extractFaces(rgb);
     if (engineErrors.length > 0) return fail(id, "engine_error", engineErrors[0], t0);
+    // One task at a time in this thread, so the counter delta is exactly this task's decisions.
+    const tilesAfter = getAutoTileCounts();
+    const tilesAuto =
+      getFaceEngineInfo().detectTilesAuto === null
+        ? undefined
+        : { singleOnly: tilesAfter.singleOnly - tilesBefore.singleOnly, tiled: tilesAfter.tiled - tilesBefore.tiled };
     const transfer: ArrayBuffer[] = [];
     for (const f of faces) {
       let e = f.embedding;
@@ -99,6 +107,7 @@ async function handleExtract(id: number, image: ArrayBuffer | string): Promise<v
       modelTag: getFaceEngineInfo().modelTag,
       faces,
       ms: Math.round(performance.now() - t0),
+      ...(tilesAuto ? { tilesAuto } : {}),
     };
     send(msg, transfer);
   } catch (err) {

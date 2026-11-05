@@ -22,6 +22,7 @@ import {
   shouldTileFrame,
   tileCountFor,
   tilePlan,
+  withWorkerTileCounts,
 } from "../src/server/detectTiles.ts";
 import { CLEAR_FACE_LIMITS, clearFaceIssue, facePose, getFaceEngineInfo, type FaceBox, type RgbImage } from "../src/server/faceEmbedding.ts";
 import { extractFingerprint, extractWorkerEnv } from "../src/server/faceExtractProtocol.ts";
@@ -369,4 +370,16 @@ test("auto merge precedence: tile-only faces are added, single-pass boxes the ti
   // with nothing from the single pass the merge is exactly the tiles=2 merge
   const perTile = [[frontal(100, 100, 80, 0.8)], [frontal(200, 300, 90, 0.7)]];
   assert.deepEqual(mergeSingleAndTiles([], perTile, rects, W, H, 0.4), mergeTileDetections(perTile, rects, 0.4));
+});
+
+test("withWorkerTileCounts: status view adds the workers' auto decisions to the main thread's (#523)", () => {
+  const main = { detectTiles: "auto" as const, detectTilesAuto: { singleOnly: 2, tiled: 1 } };
+  assert.deepEqual(withWorkerTileCounts(main, { detectTilesAuto: { singleOnly: 40, tiled: 9 } }).detectTilesAuto, { singleOnly: 42, tiled: 10 });
+  assert.deepEqual(withWorkerTileCounts(main, { detectTilesAuto: null }).detectTilesAuto, { singleOnly: 2, tiled: 1 }, "no worker result yet");
+  assert.deepEqual(withWorkerTileCounts(main, null).detectTilesAuto, { singleOnly: 2, tiled: 1 }, "no pool telemetry");
+  assert.equal(withWorkerTileCounts(main, {}).detectTiles, "auto", "other fields pass through");
+  assert.deepEqual(main.detectTilesAuto, { singleOnly: 2, tiled: 1 }, "input is not mutated");
+  // Outside auto mode the main thread reports null and stale pool sums are not surfaced.
+  const off = { detectTiles: 2 as const, detectTilesAuto: null };
+  assert.equal(withWorkerTileCounts(off, { detectTilesAuto: { singleOnly: 5, tiled: 5 } }).detectTilesAuto, null);
 });

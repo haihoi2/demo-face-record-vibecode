@@ -46,8 +46,10 @@ import {
   currentModelTag,
   extractFingerprint,
   extractWorkerEnv,
+  isAutoTileCounts,
   splitOrtThreads,
   wireFaceIssue,
+  type AutoTileCounts,
   type ExtractOk,
   type ExtractFailed,
   type FaceExtractErrorCode,
@@ -125,6 +127,13 @@ export interface FaceExtractPoolTelemetry {
   avgWorkerMs: number;
   /** Mean host-side ms (queue + messaging + work) over completed tasks. */
   avgTotalMs: number;
+  /**
+   * FACE_DETECT_TILES=auto decisions taken inside the workers, summed over
+   * completed tasks (#523); null until a worker reported one (not auto mode,
+   * or nothing completed yet). The main thread's own counters live in
+   * FaceEngineInfo.detectTilesAuto; the status route adds the two.
+   */
+  detectTilesAuto: AutoTileCounts | null;
   lastError: string | null;
 }
 
@@ -210,6 +219,7 @@ export class FaceExtractPool {
   private readyWaiters = new Set<() => void>();
 
   private completed = 0;
+  private tilesAuto: AutoTileCounts | null = null;
   private failed = 0;
   private failedByCode: Partial<Record<FaceExtractErrorCode, number>> = {};
   private restarts = 0;
@@ -340,6 +350,7 @@ export class FaceExtractPool {
       restarts: this.restarts,
       avgWorkerMs: this.completed ? Math.round((this.workerMsSum / this.completed) * 10) / 10 : 0,
       avgTotalMs: this.completed ? Math.round((this.totalMsSum / this.completed) * 10) / 10 : 0,
+      detectTilesAuto: this.tilesAuto ? { ...this.tilesAuto } : null,
       lastError: this.lastError,
     };
   }
@@ -456,6 +467,11 @@ export class FaceExtractPool {
     this.completed += 1;
     this.workerMsSum += workerMs;
     this.totalMsSum += totalMs;
+    if (msg.tilesAuto !== undefined && isAutoTileCounts(msg.tilesAuto)) {
+      if (!this.tilesAuto) this.tilesAuto = { singleOnly: 0, tiled: 0 };
+      this.tilesAuto.singleOnly += msg.tilesAuto.singleOnly;
+      this.tilesAuto.tiled += msg.tilesAuto.tiled;
+    }
     task.resolve({ width: msg.width, height: msg.height, faces: faces!, modelTag: msg.modelTag, workerMs, totalMs: Math.round(totalMs) });
   }
 

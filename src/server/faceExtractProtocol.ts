@@ -33,6 +33,7 @@
  */
 
 import { CLEAR_FACE_LIMITS, EMBEDDING_DIM, getFaceEngineInfo, type ExtractedFace } from "./faceEmbedding";
+import type { AutoTileCounts } from "./detectTiles";
 
 /** Why an off-thread extraction did not produce a result. The caller decides any fallback. */
 export type FaceExtractErrorCode =
@@ -188,6 +189,22 @@ export interface ExtractOk {
   faces: WireFace[];
   /** Worker-side wall time for decode + detect + embed. */
   ms: number;
+  /**
+   * FACE_DETECT_TILES=auto decisions taken for THIS task (#523): how many
+   * detections paid one pass and how many tiled. Omitted outside auto mode.
+   * The host sums them into FaceExtractPoolTelemetry.detectTilesAuto.
+   */
+  tilesAuto?: AutoTileCounts;
+}
+
+export type { AutoTileCounts } from "./detectTiles";
+
+/** Small non-negative integer counters only; anything else is ignored by the host (never trusted blindly). */
+export function isAutoTileCounts(v: unknown): v is AutoTileCounts {
+  if (!v || typeof v !== "object") return false;
+  const c = v as Partial<AutoTileCounts>;
+  const ok = (n: unknown) => Number.isInteger(n) && (n as number) >= 0 && (n as number) <= 64;
+  return ok(c.singleOnly) && ok(c.tiled);
 }
 
 export interface ExtractFailed {

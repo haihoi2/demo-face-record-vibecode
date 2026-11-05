@@ -22,7 +22,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { performance } from "node:perf_hooks";
 
-import { cosineSimilarity, extractFaces, getFaceEngine, loadImage, type ExtractedFace } from "../src/server/faceEmbedding.ts";
+import { cosineSimilarity, extractFaces, getAutoTileCounts, getFaceEngine, getFaceEngineInfo, loadImage, type ExtractedFace } from "../src/server/faceEmbedding.ts";
 import { FaceExtractPool, FaceExtractError } from "../src/server/faceExtractPool.ts";
 
 const MODEL_DIR = process.env.FACE_MODEL_DIR || "/app/models";
@@ -122,9 +122,22 @@ describe("off-thread extraction equivalence (models)", { skip: SKIP ?? false }, 
 
   test("fixture: same faces, boxes, fields and embeddings (cosine >= 0.9999); latency and event-loop stall", { skip: FIXTURE ? false : "no face fixture (set FACE_EXTRACT_FIXTURE)" }, async (t) => {
     const jpeg = fs.readFileSync(FIXTURE!);
+    const tilesBefore = getAutoTileCounts();
     const main = await mainThread(jpeg);
     assert.ok(main, "fixture decodes");
+    const tilesAfter = getAutoTileCounts();
+    const poolTilesBefore = pool.telemetry().detectTilesAuto;
     const off = await pool.extract(jpeg);
+    // #523: the worker's auto-tiling decision for this frame equals the main thread's.
+    if (getFaceEngineInfo().detectTilesAuto === null) {
+      assert.equal(pool.telemetry().detectTilesAuto, null, "no counters outside FACE_DETECT_TILES=auto");
+    } else {
+      const poolTiles = pool.telemetry().detectTilesAuto;
+      assert.ok(poolTiles, "auto mode: the worker reported its decision");
+      const workerDelta = { singleOnly: poolTiles.singleOnly - (poolTilesBefore?.singleOnly ?? 0), tiled: poolTiles.tiled - (poolTilesBefore?.tiled ?? 0) };
+      assert.deepEqual(workerDelta, { singleOnly: tilesAfter.singleOnly - tilesBefore.singleOnly, tiled: tilesAfter.tiled - tilesBefore.tiled });
+      assert.equal(workerDelta.singleOnly + workerDelta.tiled, 1, "one detection, one decision");
+    }
     assert.equal(off.width, main!.width);
     assert.equal(off.height, main!.height);
     assert.equal(off.faces.length, main!.faces.length, "same number of faces");

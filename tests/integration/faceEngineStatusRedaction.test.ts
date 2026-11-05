@@ -62,6 +62,11 @@ describe("face-engine status: redaction", () => {
     }
     assert.ok(fe.modelTag === null || /^[A-Za-z0-9_-]+$/.test(fe.modelTag), "modelTag is an identifier");
     assert.ok(fe.lastError === null || typeof fe.lastError === "string");
+    assert.ok(
+      fe.detectTilesAuto === null || (Number.isInteger(fe.detectTilesAuto.singleOnly) && Number.isInteger(fe.detectTilesAuto.tiled) && fe.detectTilesAuto.singleOnly >= 0 && fe.detectTilesAuto.tiled >= 0),
+      "detectTilesAuto is null or two counters",
+    );
+    assert.ok(body.info.detectTilesAuto === null || typeof body.info.detectTilesAuto.singleOnly === "number", "info.detectTilesAuto is null or counters");
     assert.equal(typeof fe.failedByCode, "object");
     for (const [code, n] of Object.entries(fe.failedByCode)) {
       assert.match(code, /^[a-z-]+$/, "failedByCode keys are error codes");

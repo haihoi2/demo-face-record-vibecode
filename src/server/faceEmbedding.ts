@@ -989,6 +989,11 @@ function tilesConfig() {
 /** Auto-mode decisions in this process since start (FaceEngineInfo.detectTilesAuto). */
 const autoTileCounts = { singleOnly: 0, tiled: 0 };
 
+/** Snapshot of the auto-mode counters of THIS process/thread (a worker reports its delta per task). */
+export function getAutoTileCounts(): { singleOnly: number; tiled: number } {
+  return { ...autoTileCounts };
+}
+
 /** Test seam: zero the auto-mode counters. */
 export function resetAutoTileCounts(): void {
   autoTileCounts.singleOnly = 0;

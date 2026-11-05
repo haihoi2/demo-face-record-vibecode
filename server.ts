@@ -225,6 +225,7 @@ import { groupFaceTracks } from "./src/server/faceTracks";
 import { auditTemplates, checkTemplateAgainstGallery } from "./src/server/templateAudit";
 import { bestOfExtrasAllowed } from "./src/server/bestOfBudget";
 import { extractFacesOffThread, faceExtractPoolTelemetry, getFaceExtractPool, isFaceExtractError } from "./src/server/faceExtractPool";
+import { withWorkerTileCounts } from "./src/server/detectTiles";
 import { gateWatchPace } from "./src/server/gateWatchPace";
 
 dotenv.config();
@@ -2677,7 +2678,8 @@ app.get(["/api/face-engine/status", "/api/face-engine/status/", "/api/face-engin
     ready: isFaceEngineReady(),
     failClosed: engine === "unavailable",
     // modelDir is a server path: logs only, never the API (security wave S-04).
-    info: (({ modelDir: _modelDir, ...rest }) => rest)(getFaceEngineInfo() as any),
+    // detectTilesAuto: main-thread decisions + the workers' (faceExtract.detectTilesAuto), #523.
+    info: (({ modelDir: _modelDir, ...rest }) => rest)(withWorkerTileCounts(getFaceEngineInfo(), faceExtractPoolTelemetry()) as any),
     templates: {
       total: templates.length,
       byEmployee,

@@ -490,8 +490,9 @@ the first scan of an approach already has a clear face; read it from the counter
 Rollout note: set `FACE_DETECT_TILES=auto` on the ENTRY gateway (`.env`, rebuild/restart with owner approval; the
 EXIT camera is 1080p and never tiles). `/api/face-engine/status` -> `info.detectTiles` reads `"auto"`,
 `info.detectTilesMinFacePx` the floor in use, and `info.detectTilesAuto = { singleOnly, tiled }` counts the
-door-scan detections of the MAIN process since start: `singleOnly / (singleOnly + tiled)` is the share of scans
-that paid one pass. The counters are per process: with `FACE_EXTRACT_WORKERS` > 0 (default 2) the workers
-decide on their own and the main-process counters only count main-thread fallbacks; a worker-side total needs
-the pool to carry the counters in its result message (proposal for the integration owner, not done here).
+door-scan detections since start, main thread AND extraction workers together: `singleOnly / (singleOnly + tiled)`
+is the share of scans that paid one pass. Each worker reports the decisions of a task in its result message
+(`ExtractOk.tilesAuto`, small non-negative integers or ignored); the pool sums them into
+`faceExtract.detectTilesAuto` (null until the first auto-mode result) and the status route adds that to the
+main thread's own counters (`withWorkerTileCounts`, `src/server/detectTiles.ts`). Outside auto mode both are null.
 Rollback: `FACE_DETECT_TILES=2` or unset and restart; no data, template or schema change.

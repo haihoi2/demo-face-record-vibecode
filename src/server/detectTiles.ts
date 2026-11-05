@@ -315,3 +315,33 @@ export function autoTileDecision<F extends TileFace>(single: readonly F[], isCle
 export function mergeSingleAndTiles<F extends TileFace>(single: F[], perTile: F[][], rects: TileRect[], frameW: number, frameH: number, iouThreshold = 0.4): F[] {
   return mergeTileDetections([single, ...perTile], [{ x: 0, y: 0, w: frameW, h: frameH }, ...rects], iouThreshold);
 }
+
+// ---------------------------------------------------------------------------
+// Auto-mode counters (#523): main thread + workers
+// ---------------------------------------------------------------------------
+
+/** How many auto-mode detections paid one pass (singleOnly) and how many tiled. */
+export interface AutoTileCounts {
+  singleOnly: number;
+  tiled: number;
+}
+
+/**
+ * Status view of the auto counters: the main thread's own decisions
+ * (FaceEngineInfo.detectTilesAuto) plus the workers' total that the extraction
+ * pool summed from its result messages. Outside auto mode the main thread
+ * reports null and the view stays null (stale pool sums from an earlier
+ * configuration are not surfaced). Pure; returns a new object.
+ */
+export function withWorkerTileCounts<T extends { detectTilesAuto: AutoTileCounts | null }>(
+  info: T,
+  pool: { detectTilesAuto?: AutoTileCounts | null } | null | undefined,
+): T {
+  if (!info.detectTilesAuto) return { ...info };
+  const w = pool?.detectTilesAuto;
+  if (!w) return { ...info, detectTilesAuto: { ...info.detectTilesAuto } };
+  return {
+    ...info,
+    detectTilesAuto: { singleOnly: info.detectTilesAuto.singleOnly + w.singleOnly, tiled: info.detectTilesAuto.tiled + w.tiled },
+  };
+}

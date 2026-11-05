@@ -544,3 +544,42 @@ describe("FaceExtractPool: real worker entry", () => {
     }
   });
 });
+
+describe("FaceExtractPool: auto-tiling counters from workers (#523)", () => {
+  const withTiles = (tilesAuto: unknown): Behaviour => (w, msg) =>
+    w.send({ type: "result", id: msg.id, ok: true, width: 640, height: 480, modelTag: TAG, faces: [], ms: 1, tilesAuto } as never);
+
+  test("null until a worker reports counters; then the per-task deltas are summed", async () => {
+    const h = harness();
+    await h.pool.whenReady(1000);
+    await h.pool.extract(JPEG());
+    assert.equal(h.pool.telemetry().detectTilesAuto, null, "a result without tilesAuto (not auto mode) leaves the sum null");
+    h.setBehaviour(withTiles({ singleOnly: 1, tiled: 0 }));
+    await h.pool.extract(JPEG());
+    await h.pool.extract(JPEG());
+    h.setBehaviour(withTiles({ singleOnly: 0, tiled: 1 }));
+    await h.pool.extract(JPEG());
+    const t = h.pool.telemetry();
+    assert.deepEqual(t.detectTilesAuto, { singleOnly: 2, tiled: 1 });
+    assert.equal(t.completed, 4, "the counters never fail a result");
+    t.detectTilesAuto!.tiled = 99;
+    assert.equal(h.pool.telemetry().detectTilesAuto!.tiled, 1, "telemetry returns a copy");
+    await h.pool.shutdown();
+  });
+
+  test("malformed counters are ignored, the result itself still succeeds", async () => {
+    const h = harness();
+    await h.pool.whenReady(1000);
+    for (const bad of [{ singleOnly: -1, tiled: 0 }, { singleOnly: 1.5, tiled: 0 }, { singleOnly: 1, tiled: 1e9 }, { singleOnly: "1", tiled: 0 }, "x", 7, [1, 0], { tiled: 1 }]) {
+      h.setBehaviour(withTiles(bad));
+      const r = await h.pool.extract(JPEG());
+      assert.deepEqual(r.faces, []);
+    }
+    assert.equal(h.pool.telemetry().detectTilesAuto, null);
+    assert.equal(h.pool.telemetry().completed, 8);
+    h.setBehaviour(withTiles({ singleOnly: 0, tiled: 1 }));
+    await h.pool.extract(JPEG());
+    assert.deepEqual(h.pool.telemetry().detectTilesAuto, { singleOnly: 0, tiled: 1 });
+    await h.pool.shutdown();
+  });
+});
