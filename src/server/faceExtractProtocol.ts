@@ -14,7 +14,8 @@
  *   read lazily per call     FACE_MODEL_DIR, FACE_DETECTOR_MODEL / FACE_DETECTOR_VARIANT,
  *                            FACE_RECOGNIZER_MODEL (=> model tag), FACE_DETECT_THRESHOLD,
  *                            FACE_NMS_IOU, FACE_DETECT_SIZE, FACE_DETECT_UPSCALE,
- *                            FACE_DETECT_TILES, FACE_DETECT_TILE_OVERLAP (#523),
+ *                            FACE_DETECT_TILES, FACE_DETECT_TILE_OVERLAP,
+ *                            FACE_DETECT_TILES_MIN_FACE_PX (#523),
  *                            FACE_TTA_FLIP, FFMPEG_PATH, FACE_FFMPEG_TIMEOUT_MS
  *   read once at engine load FACE_ORT_THREADS, FACE_ORT_LOG_LEVEL (and the model files above)
  *   read once at MODULE load CLEAR_FACE_LIMITS: FACE_MIN_SIZE_PX, FACE_CLEAR_MAX_YAW,
@@ -90,6 +91,7 @@ export function extractFingerprint(): string {
     detectUpscale: info.detectUpscale,
     detectTiles: info.detectTiles,
     detectTileOverlap: info.detectTileOverlap,
+    detectTilesMinFacePx: info.detectTilesMinFacePx,
     ttaFlip: info.ttaFlip,
     minFacePx: CLEAR_FACE_LIMITS.minFacePx,
     maxYaw: CLEAR_FACE_LIMITS.maxYaw,

@@ -7,18 +7,23 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import {
+  AUTO_TILES,
   DEFAULT_TILE_OVERLAP,
   MAX_DETECT_TILES,
   TILE_MIN_FRAME_FACTOR,
+  autoTileDecision,
+  boxShortSide,
   cropRgb,
   iouBox,
+  mergeSingleAndTiles,
   mergeTileDetections,
   nmsFaces,
   parseDetectTiles,
   shouldTileFrame,
+  tileCountFor,
   tilePlan,
 } from "../src/server/detectTiles.ts";
-import { getFaceEngineInfo, type FaceBox, type RgbImage } from "../src/server/faceEmbedding.ts";
+import { CLEAR_FACE_LIMITS, clearFaceIssue, facePose, getFaceEngineInfo, type FaceBox, type RgbImage } from "../src/server/faceEmbedding.ts";
 import { extractFingerprint, extractWorkerEnv } from "../src/server/faceExtractProtocol.ts";
 
 /** A square face box at (x, y) with landmarks at fixed offsets inside it. */
@@ -44,15 +49,26 @@ const withEnv = (vars: Record<string, string | undefined>, fn: () => void) => {
   }
 };
 
-test("parseDetectTiles: blank = 1 tile / 0.10 overlap; 2 accepted; anything else falls back per value and is reported", () => {
-  assert.deepEqual(parseDetectTiles({}), { tiles: 1, overlap: DEFAULT_TILE_OVERLAP });
-  assert.deepEqual(parseDetectTiles({ FACE_DETECT_TILES: " 2 ", FACE_DETECT_TILE_OVERLAP: "0.15" }), { tiles: 2, overlap: 0.15 });
-  assert.deepEqual(parseDetectTiles({ FACE_DETECT_TILES: "1", FACE_DETECT_TILE_OVERLAP: "0" }), { tiles: 1, overlap: 0 });
-  for (const bad of ["0", "3", "1.5", "two", "-1", String(MAX_DETECT_TILES + 1)]) {
+test("parseDetectTiles: blank = 1 tile / 0.10 overlap; 2 and auto accepted; anything else falls back per value and is reported", () => {
+  assert.deepEqual(parseDetectTiles({}), { tiles: 1, overlap: DEFAULT_TILE_OVERLAP, autoMinFacePx: 60 });
+  assert.deepEqual(parseDetectTiles({ FACE_DETECT_TILES: " 2 ", FACE_DETECT_TILE_OVERLAP: "0.15" }), { tiles: 2, overlap: 0.15, autoMinFacePx: 60 });
+  assert.deepEqual(parseDetectTiles({ FACE_DETECT_TILES: "1", FACE_DETECT_TILE_OVERLAP: "0" }), { tiles: 1, overlap: 0, autoMinFacePx: 60 });
+  assert.deepEqual(parseDetectTiles({ FACE_DETECT_TILES: " Auto " }, 48), { tiles: AUTO_TILES, overlap: DEFAULT_TILE_OVERLAP, autoMinFacePx: 48 });
+  assert.deepEqual(parseDetectTiles({ FACE_DETECT_TILES: "auto", FACE_DETECT_TILES_MIN_FACE_PX: "80" }), { tiles: "auto", overlap: DEFAULT_TILE_OVERLAP, autoMinFacePx: 80 });
+  for (const bad of ["0", "3", "1.5", "two", "-1", "automatic", String(MAX_DETECT_TILES + 1)]) {
     const r = parseDetectTiles({ FACE_DETECT_TILES: bad });
     assert.equal(r.tiles, 1, `FACE_DETECT_TILES=${bad}`);
-    assert.match(r.invalid ?? "", /FACE_DETECT_TILES/);
+    assert.match(r.invalid ?? "", /FACE_DETECT_TILES: expected 1\.\.2 or auto, using 1/);
   }
+  for (const bad of ["-1", "2001", "1.5", "x"]) {
+    const r = parseDetectTiles({ FACE_DETECT_TILES: "auto", FACE_DETECT_TILES_MIN_FACE_PX: bad }, 60);
+    assert.equal(r.tiles, "auto");
+    assert.equal(r.autoMinFacePx, 60, `FACE_DETECT_TILES_MIN_FACE_PX=${bad}`);
+    assert.match(r.invalid ?? "", /FACE_DETECT_TILES_MIN_FACE_PX: expected an integer in 0\.\.2000, using 60/);
+  }
+  assert.equal(tileCountFor(AUTO_TILES), 2);
+  assert.equal(tileCountFor(1), 1);
+  assert.equal(tileCountFor(2), 2);
   for (const bad of ["0.5", "1", "-0.1", "x"]) {
     const r = parseDetectTiles({ FACE_DETECT_TILES: "2", FACE_DETECT_TILE_OVERLAP: bad });
     assert.equal(r.tiles, 2);
@@ -73,6 +89,8 @@ test("shouldTileFrame: only frames >= 4x the detector side tile; 1080p, uploads 
   assert.equal(shouldTileFrame(640, 480, 640, 2), false);
   assert.equal(shouldTileFrame(112, 112, 640, 2), false);
   assert.equal(shouldTileFrame(3840, 2160, 640, 1), false);
+  assert.equal(shouldTileFrame(3840, 2160, 640, AUTO_TILES), true, "auto follows the size rule of tiles=2");
+  assert.equal(shouldTileFrame(1920, 1080, 640, AUTO_TILES), false, "1080p is never tiled, auto included");
   assert.equal(shouldTileFrame(3840, 2160, 1280, 2), false); // at 1280 the full frame is only 3x
   assert.equal(shouldTileFrame(3840, 2160, 0, 2), false);
 });
@@ -223,12 +241,132 @@ test("engine info and worker fingerprint carry the tile settings; an invalid val
     withEnv({ FACE_DETECT_TILES: "4" }, () => {
       const i = getFaceEngineInfo();
       assert.equal(i.detectTiles, 1);
-      assert.match(i.variantWarning ?? "", /FACE_DETECT_TILES: expected 1\.\.2, using 1/);
+      assert.match(i.variantWarning ?? "", /FACE_DETECT_TILES: expected 1\.\.2 or auto, using 1/);
       assert.equal(extractFingerprint(), base);
     });
-    // the worker env snapshot is a spread of the host env: the two values reach the worker as-is
-    const wenv = extractWorkerEnv(2, { FACE_DETECT_TILES: "2", FACE_DETECT_TILE_OVERLAP: "0.12" });
-    assert.equal(wenv.FACE_DETECT_TILES, "2");
+    // the worker env snapshot is a spread of the host env: the values reach the worker as-is
+    const wenv = extractWorkerEnv(2, { FACE_DETECT_TILES: "auto", FACE_DETECT_TILE_OVERLAP: "0.12", FACE_DETECT_TILES_MIN_FACE_PX: "70" });
+    assert.equal(wenv.FACE_DETECT_TILES, "auto");
     assert.equal(wenv.FACE_DETECT_TILE_OVERLAP, "0.12");
+    assert.equal(wenv.FACE_DETECT_TILES_MIN_FACE_PX, "70");
   });
+});
+
+test("auto mode in engine info and fingerprint: mode string and the min-face knob; counters only in auto; default knob = clear-face floor", () => {
+  withEnv({ FACE_DETECT_TILES: undefined, FACE_DETECT_TILE_OVERLAP: undefined, FACE_DETECT_TILES_MIN_FACE_PX: undefined }, () => {
+    const base = extractFingerprint();
+    const one = getFaceEngineInfo();
+    assert.equal(one.detectTilesAuto, null, "counters are not reported outside auto mode");
+    assert.equal(one.detectTilesMinFacePx, CLEAR_FACE_LIMITS.minFacePx);
+    assert.match(base, new RegExp(`"detectTilesMinFacePx":${CLEAR_FACE_LIMITS.minFacePx}`));
+    withEnv({ FACE_DETECT_TILES: "auto" }, () => {
+      const info = getFaceEngineInfo();
+      assert.equal(info.detectTiles, "auto");
+      assert.deepEqual(info.detectTilesAuto, { singleOnly: 0, tiled: 0 });
+      assert.ok(!/FACE_DETECT_TILES/.test(info.variantWarning ?? ""), "auto is a valid value");
+      const fp = extractFingerprint();
+      assert.notEqual(fp, base, "auto is a different engine configuration (config_mismatch for a stale worker)");
+      assert.match(fp, /"detectTiles":"auto"/);
+      withEnv({ FACE_DETECT_TILES_MIN_FACE_PX: "90" }, () => {
+        assert.equal(getFaceEngineInfo().detectTilesMinFacePx, 90);
+        assert.match(extractFingerprint(), /"detectTilesMinFacePx":90/);
+        assert.notEqual(extractFingerprint(), fp, "the knob is part of the fingerprint");
+      });
+      withEnv({ FACE_DETECT_TILES_MIN_FACE_PX: "5000" }, () => {
+        const i = getFaceEngineInfo();
+        assert.equal(i.detectTilesMinFacePx, CLEAR_FACE_LIMITS.minFacePx);
+        assert.match(i.variantWarning ?? "", /FACE_DETECT_TILES_MIN_FACE_PX/);
+        assert.equal(extractFingerprint(), fp, "an invalid knob is the default, never a third configuration");
+      });
+    });
+    // the knob without auto is accepted and fingerprinted but changes nothing at tiles=1/2
+    withEnv({ FACE_DETECT_TILES: "2", FACE_DETECT_TILES_MIN_FACE_PX: "80" }, () => {
+      const i = getFaceEngineInfo();
+      assert.equal(i.detectTiles, 2);
+      assert.equal(i.detectTilesAuto, null);
+      assert.equal(i.detectTilesMinFacePx, 80);
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// ADAPTIVE MODE decision and merge precedence (stubbed detector results)
+// ---------------------------------------------------------------------------
+
+/** The engine's gate on a bare detection: the same call extractFaces() uses for `clear`. */
+const isClear = (f: FaceBox) => clearFaceIssue(facePose(f.landmarks), CLEAR_FACE_LIMITS, boxShortSide(f.box)) === null;
+
+/** A frontal face at (x, y): the F() landmarks are frontal, so clearness is decided by size alone. */
+const frontal = (x: number, y: number, size: number, score = 0.9) => F(x, y, size, score);
+
+/** A face whose nose sits far outside the eye line: fails the yaw limit whatever its size. */
+function turned(x: number, y: number, size: number, score = 0.9): FaceBox {
+  const f = frontal(x, y, size, score);
+  const eyes = (f.landmarks[1][0] - f.landmarks[0][0]) * (CLEAR_FACE_LIMITS.maxYaw + 1);
+  return { ...f, landmarks: [f.landmarks[0], f.landmarks[1], [f.landmarks[2][0] + eyes, f.landmarks[2][1]], f.landmarks[3], f.landmarks[4]] };
+}
+
+test("auto decision: a clear face at or above the knob -> no tiling; no face / unclear-only / small-only -> tile, with the reason", () => {
+  const minPx = CLEAR_FACE_LIMITS.minFacePx; // 60 unless FACE_MIN_SIZE_PX is set
+  assert.equal(isClear(frontal(100, 100, minPx)), true);
+  assert.equal(isClear(frontal(100, 100, minPx - 1)), false, "below the clear-face floor is unclear (small)");
+  assert.equal(isClear(turned(100, 100, 200)), false, "a turned head is unclear (yaw)");
+
+  assert.deepEqual(autoTileDecision([frontal(100, 100, 120)], isClear, minPx), { tile: false, reason: "clear" });
+  assert.deepEqual(autoTileDecision([frontal(100, 100, minPx)], isClear, minPx), { tile: false, reason: "clear" }, "exactly the knob counts");
+  assert.deepEqual(autoTileDecision([turned(10, 10, 200), frontal(900, 100, 120)], isClear, minPx), { tile: false, reason: "clear" }, "one clear face is enough");
+  assert.deepEqual(autoTileDecision([], isClear, minPx), { tile: true, reason: "no_face" });
+  assert.deepEqual(autoTileDecision([turned(10, 10, 200), turned(500, 10, 150)], isClear, minPx), { tile: true, reason: "unclear" });
+  assert.deepEqual(autoTileDecision([frontal(10, 10, minPx - 10)], isClear, minPx), { tile: true, reason: "unclear" }, "below the floor the gate says small = unclear");
+  // the knob above the floor: a clear 70 px face is not usable at FACE_DETECT_TILES_MIN_FACE_PX=80
+  assert.deepEqual(autoTileDecision([frontal(10, 10, 70)], isClear, 80), { tile: true, reason: "small" });
+  assert.deepEqual(autoTileDecision([frontal(10, 10, 70), frontal(300, 10, 80)], isClear, 80), { tile: false, reason: "clear" });
+  // the knob below the floor changes nothing: the gate's floor still rules
+  assert.deepEqual(autoTileDecision([frontal(10, 10, minPx - 1)], isClear, 0), { tile: true, reason: "unclear" });
+  // deterministic: same input, same answer, input not mutated
+  const input = [turned(10, 10, 200)];
+  const snapshot = JSON.stringify(input);
+  assert.deepEqual(autoTileDecision(input, isClear, minPx), autoTileDecision(input, isClear, minPx));
+  assert.equal(JSON.stringify(input), snapshot);
+});
+
+test("auto merge precedence: tile-only faces are added, single-pass boxes the tiles missed are kept, duplicates settle by score, seam slivers lose to the full frame", () => {
+  const W = 3840, H = 2160;
+  const rects = tilePlan(W, H, 2, 0.1); // [0..2112], [1728..3840]
+  // single pass: an unclear far face at (3000, 500) 40 px that the tiles do not report, and a 100 px face at (500, 500) scored 0.7
+  const far = frontal(3000, 500, 40, 0.55);
+  const nearSingle = frontal(500, 500, 100, 0.7);
+  // tile 0 sees the near face again, slightly shifted, scored 0.85 (tile coordinates == frame coordinates for tile 0)
+  const nearTile = frontal(503, 498, 100, 0.85);
+  // tile 1 finds a clear 70 px face at frame x 2500 the single pass missed (tile x = 2500 - 1728)
+  const tileOnly = frontal(2500 - rects[1].x, 900, 70, 0.8);
+  const merged = mergeSingleAndTiles([far, nearSingle], [[nearTile], [tileOnly]], rects, W, H, 0.4);
+  assert.deepEqual(merged.map((f) => f.score), [0.85, 0.8, 0.55], "highest score first; the better-scored tile copy wins the duplicate");
+  assert.deepEqual(merged[0].box, nearTile.box);
+  assert.deepEqual(merged[1].box, [2500, 900, 2570, 970], "the tile-only face is mapped back to frame pixels");
+  assert.deepEqual(merged[2], far, "the single pass's unclear box survives for the unclear / stranger counters");
+
+  // a duplicate where the single pass scored higher keeps the single-pass box (tie-break irrelevant)
+  const m2 = mergeSingleAndTiles([frontal(500, 500, 100, 0.9)], [[frontal(503, 498, 100, 0.85)], []], rects, W, H, 0.4);
+  assert.equal(m2.length, 1);
+  assert.deepEqual(m2[0].box, [500, 500, 600, 600]);
+  // equal scores: the single pass is listed first and wins the tie
+  const m3 = mergeSingleAndTiles([frontal(500, 500, 100, 0.9)], [[frontal(503, 498, 100, 0.9)], []], rects, W, H, 0.4);
+  assert.deepEqual(m3.map((f) => f.box), [[500, 500, 600, 600]]);
+
+  // seam: a sliver clipped at tile 0's right edge (frame 2080..2112, scored 0.95) covered by a whole single-pass
+  // face (2080..2200, 0.6) is dropped although plain NMS would keep both; the full frame is never "cut"
+  const sliver = F(2080, 100, 120, 0.95, 32); // reaches x = 2112 = tile 0's inner edge
+  const whole = F(2080, 100, 120, 0.6);
+  assert.ok(iouBox(sliver.box, whole.box) < 0.4);
+  const m4 = mergeSingleAndTiles([whole], [[sliver], []], rects, W, H, 0.4);
+  assert.deepEqual(m4, [whole]);
+  // a single-pass box touching the frame edge is not a seam sliver and survives alongside a whole tile face elsewhere
+  const edge = F(0, 100, 120, 0.5, 30);
+  const m5 = mergeSingleAndTiles([edge], [[], [frontal(100, 100, 100, 0.9)]], rects, W, H, 0.4);
+  assert.deepEqual(m5.map((f) => f.score), [0.9, 0.5]);
+
+  // with nothing from the single pass the merge is exactly the tiles=2 merge
+  const perTile = [[frontal(100, 100, 80, 0.8)], [frontal(200, 300, 90, 0.7)]];
+  assert.deepEqual(mergeSingleAndTiles([], perTile, rects, W, H, 0.4), mergeTileDetections(perTile, rects, 0.4));
 });

@@ -30,6 +30,32 @@
  * whole, even when the clipped copy in the other tile scored higher and
  * overlaps it too little for plain NMS; a face wider than the overlap is kept
  * once from the better-scored tile with the box clipped at that tile's edge.
+ *
+ * ADAPTIVE MODE (FACE_DETECT_TILES=auto; autoTileDecision / mergeSingleAndTiles):
+ * live at tiles=2 the 4K entry camera denied fewer people (19-25 % vs 29 % at
+ * one tile) but a frame cost ~1.8 s instead of ~1.0 s and the median grant
+ * delay rose from 5.7 s to 6-7 s. The tiles only pay when the single pass has
+ * nothing usable (far / small faces); when a person is close the single pass
+ * already finds a clear face and the tile pass is wasted time. So in auto mode
+ * the engine runs the single letterbox pass FIRST and then, in this precedence:
+ *   1. the single pass found at least one face that passes the clear-face gate
+ *      (faceEmbedding.ts CLEAR_FACE_LIMITS, `clear === true`) AND whose box
+ *      short side is >= FACE_DETECT_TILES_MIN_FACE_PX (default = the gate's
+ *      FACE_MIN_SIZE_PX floor, 60) -> the single-pass result is returned
+ *      unchanged, byte-identical to FACE_DETECT_TILES=1 (reason "clear");
+ *   2. otherwise (no face: "no_face"; faces but none passes the gate:
+ *      "unclear"; clear faces but all below the knob: "small") the tile pass of
+ *      tiles=2 runs and the result is the MERGE of the single-pass detections
+ *      with the tile detections: the full frame enters mergeTileDetections as
+ *      one more "tile" whose rect is the whole frame, so its boxes never count
+ *      as cut by a seam; a tile box cut by the seam and covered > 50 % by a
+ *      single-pass box is dropped; everything else is settled by the engine's
+ *      NMS, highest score first, ties by input order with the single pass
+ *      listed first. A clear face found only by the tiles is therefore added,
+ *      and an unclear single-pass box the tiles did not see is kept for the
+ *      stranger / unclear counters.
+ * The size rule still applies first (a frame below 4x the detector side is
+ * never tiled, in any mode); tiles=1 and tiles=2 are untouched.
  */
 
 import type { RgbImage } from "./faceEmbedding";
@@ -57,33 +83,59 @@ export const MAX_DETECT_TILES = 2;
 /** Default FACE_DETECT_TILE_OVERLAP: neighbouring tiles share 10 % of the frame width. */
 export const DEFAULT_TILE_OVERLAP = 0.1;
 
+/** FACE_DETECT_TILES value of the ADAPTIVE MODE. */
+export const AUTO_TILES = "auto";
+
+/** Tiles the adaptive mode cuts when it does tile (the measured left/right split). */
+export const AUTO_TILE_COUNT = 2;
+
+/** Accepted range of FACE_DETECT_TILES_MIN_FACE_PX (same as FACE_MIN_SIZE_PX). */
+export const AUTO_MIN_FACE_PX_RANGE = { min: 0, max: 2000 };
+
+export type DetectTilesMode = number | typeof AUTO_TILES;
+
 /** How close (px) a box must come to a tile's inner edge to count as cut by the seam. */
 const SEAM_EPS = 2;
 
 export interface DetectTilesConfig {
-  /** 1 = single pass (today's behaviour), 2 = left/right halves. */
-  tiles: number;
+  /** 1 = single pass (today's behaviour), 2 = left/right halves, "auto" = ADAPTIVE MODE (module header). */
+  tiles: DetectTilesMode;
   /** Fraction of the frame width shared by neighbouring tiles, [0, 0.5). */
   overlap: number;
+  /**
+   * Auto mode only: a single-pass face is usable when it is clear AND its box
+   * short side is >= this (FACE_DETECT_TILES_MIN_FACE_PX; default = the
+   * clear-face floor passed to parseDetectTiles). Ignored at tiles 1 and 2.
+   */
+  autoMinFacePx: number;
   /** Set when a value was not accepted and the default was used instead (operator-facing). */
   invalid?: string;
 }
 
 /**
- * Parse FACE_DETECT_TILES / FACE_DETECT_TILE_OVERLAP from an env. Blank = the
- * defaults (1, 0.10). A value that is not an integer in 1..MAX_DETECT_TILES or an
- * overlap outside [0, 0.5) falls back to the default FOR THAT VALUE and is
- * reported in `invalid`, so a typo can never switch the door scan to an
- * unmeasured configuration silently.
+ * Parse FACE_DETECT_TILES / FACE_DETECT_TILE_OVERLAP / FACE_DETECT_TILES_MIN_FACE_PX
+ * from an env. Blank = the defaults (1, 0.10, `clearMinFacePx`). A value that is
+ * not an integer in 1..MAX_DETECT_TILES or "auto", an overlap outside [0, 0.5)
+ * or a min-face value outside AUTO_MIN_FACE_PX_RANGE falls back to the default
+ * FOR THAT VALUE and is reported in `invalid`, so a typo can never switch the
+ * door scan to an unmeasured configuration silently.
  */
-export function parseDetectTiles(env: NodeJS.ProcessEnv = process.env): DetectTilesConfig {
+export function parseDetectTiles(env: NodeJS.ProcessEnv = process.env, clearMinFacePx = 60): DetectTilesConfig {
   const issues: string[] = [];
-  let tiles = 1;
+  let tiles: DetectTilesMode = 1;
   const rawTiles = (env.FACE_DETECT_TILES ?? "").trim();
   if (rawTiles !== "") {
     const n = Number(rawTiles);
-    if (Number.isInteger(n) && n >= 1 && n <= MAX_DETECT_TILES) tiles = n;
-    else issues.push(`FACE_DETECT_TILES: expected 1..${MAX_DETECT_TILES}, using 1`);
+    if (rawTiles.toLowerCase() === AUTO_TILES) tiles = AUTO_TILES;
+    else if (Number.isInteger(n) && n >= 1 && n <= MAX_DETECT_TILES) tiles = n;
+    else issues.push(`FACE_DETECT_TILES: expected 1..${MAX_DETECT_TILES} or ${AUTO_TILES}, using 1`);
+  }
+  let autoMinFacePx = clearMinFacePx;
+  const rawMin = (env.FACE_DETECT_TILES_MIN_FACE_PX ?? "").trim();
+  if (rawMin !== "") {
+    const n = Number(rawMin);
+    if (Number.isInteger(n) && n >= AUTO_MIN_FACE_PX_RANGE.min && n <= AUTO_MIN_FACE_PX_RANGE.max) autoMinFacePx = n;
+    else issues.push(`FACE_DETECT_TILES_MIN_FACE_PX: expected an integer in ${AUTO_MIN_FACE_PX_RANGE.min}..${AUTO_MIN_FACE_PX_RANGE.max}, using ${clearMinFacePx}`);
   }
   let overlap = DEFAULT_TILE_OVERLAP;
   const rawOverlap = (env.FACE_DETECT_TILE_OVERLAP ?? "").trim();
@@ -92,12 +144,18 @@ export function parseDetectTiles(env: NodeJS.ProcessEnv = process.env): DetectTi
     if (Number.isFinite(f) && f >= 0 && f < 0.5) overlap = f;
     else issues.push(`FACE_DETECT_TILE_OVERLAP: expected a fraction in [0, 0.5), using ${DEFAULT_TILE_OVERLAP}`);
   }
-  return issues.length ? { tiles, overlap, invalid: issues.join("; ") } : { tiles, overlap };
+  return issues.length ? { tiles, overlap, autoMinFacePx, invalid: issues.join("; ") } : { tiles, overlap, autoMinFacePx };
+}
+
+/** Tiles the engine cuts for a mode: "auto" cuts like 2 when it tiles at all. */
+export function tileCountFor(mode: DetectTilesMode): number {
+  return mode === AUTO_TILES ? AUTO_TILE_COUNT : mode;
 }
 
 /** The size rule of the module header. `inputSide` is the detector square side (FACE_DETECT_SIZE). */
-export function shouldTileFrame(width: number, height: number, inputSide: number, tiles: number): boolean {
-  if (!(tiles > 1) || !(inputSide > 0)) return false;
+export function shouldTileFrame(width: number, height: number, inputSide: number, tiles: DetectTilesMode): boolean {
+  const n = tileCountFor(tiles);
+  if (!(n > 1) || !(inputSide > 0)) return false;
   return Math.max(width, height) >= TILE_MIN_FRAME_FACTOR * inputSide;
 }
 
@@ -212,4 +270,48 @@ export function mergeTileDetections<F extends TileFace>(perTile: F[][], rects: T
     if (!dropped) survivors.push(c.face);
   }
   return nmsFaces(survivors, iouThreshold);
+}
+
+// ---------------------------------------------------------------------------
+// ADAPTIVE MODE (module header)
+// ---------------------------------------------------------------------------
+
+/** Why auto mode did or did not tile after the single pass. */
+export type AutoTileReason = "clear" | "no_face" | "unclear" | "small";
+
+export interface AutoTileDecision {
+  /** true = run the tile pass and merge (mergeSingleAndTiles). */
+  tile: boolean;
+  reason: AutoTileReason;
+}
+
+/** Short side of a detection box in frame pixels (the same quantity as ExtractedFace.boxSize). */
+export function boxShortSide(box: readonly number[]): number {
+  return Math.min(box[2] - box[0], box[3] - box[1]);
+}
+
+/**
+ * Precedence rule of the ADAPTIVE MODE, pure and deterministic: depends only on
+ * the single-pass list, the gate and the knob. `isClear` is the clear-face gate
+ * (faceEmbedding clearFaceIssue(...) === null, size floor included).
+ */
+export function autoTileDecision<F extends TileFace>(single: readonly F[], isClear: (face: F) => boolean, minFacePx: number): AutoTileDecision {
+  if (single.length === 0) return { tile: true, reason: "no_face" };
+  let anyClear = false;
+  for (const f of single) {
+    if (!isClear(f)) continue;
+    anyClear = true;
+    if (boxShortSide(f.box) >= minFacePx) return { tile: false, reason: "clear" };
+  }
+  return { tile: true, reason: anyClear ? "small" : "unclear" };
+}
+
+/**
+ * Merge of the single-pass detections (frame coordinates) with the tile
+ * detections (tile coordinates): the full frame is one more "tile" whose rect
+ * is the whole frame (never cut by a seam), listed first; then the seam rule
+ * and the engine's NMS of mergeTileDetections decide.
+ */
+export function mergeSingleAndTiles<F extends TileFace>(single: F[], perTile: F[][], rects: TileRect[], frameW: number, frameH: number, iouThreshold = 0.4): F[] {
+  return mergeTileDetections([single, ...perTile], [{ x: 0, y: 0, w: frameW, h: frameH }, ...rects], iouThreshold);
 }

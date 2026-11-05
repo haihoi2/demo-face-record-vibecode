@@ -8,6 +8,11 @@
  *  - FACE_DETECT_TILES=2 leaves small pictures on the single pass (identical
  *    output) and, on a frame >= 4x the detector side, finds the single pass's
  *    best face with IoU >= 0.9; both paths' ms per frame are reported.
+ *  - FACE_DETECT_TILES=auto equals tiles=1 exactly when the single pass finds a
+ *    clear face (the fixture, a near face), and on a far-only frame (the fixture
+ *    downscaled into a corner of a 3840x2160 canvas; FAR_SCALE, default 0.45)
+ *    it tiles and finds every tiles=2 face; ms per frame for 1 / 2 / auto on
+ *    both frames are reported, with the singleOnly / tiled counters.
  *
  * The face frame comes from FACE_EXTRACT_FIXTURE (a JPEG path mounted
  * read-only; real frames are biometric data and are never committed). Without
@@ -26,7 +31,7 @@ import path from "node:path";
 import { performance } from "node:perf_hooks";
 
 import { iouBox, shouldTileFrame, tilePlan } from "../src/server/detectTiles.ts";
-import { cosineSimilarity, detectFaces, extractFaces, getFaceEngine, getFaceEngineInfo, loadImage, type ExtractedFace, type FaceBox, type RgbImage } from "../src/server/faceEmbedding.ts";
+import { CLEAR_FACE_LIMITS, cosineSimilarity, detectFaces, extractFaces, getFaceEngine, getFaceEngineInfo, loadImage, resetAutoTileCounts, type ExtractedFace, type FaceBox, type RgbImage } from "../src/server/faceEmbedding.ts";
 
 const MODEL_DIR = process.env.FACE_MODEL_DIR || "/app/models";
 const MODELS =
@@ -64,7 +69,38 @@ function synthetic(width: number, height: number): RgbImage {
   return { width, height, data };
 }
 
+/**
+ * `src` box-filter downscaled by `scale` and pasted at (ox, oy) on a flat grey
+ * canvas: a far, small version of the fixture's face with no other face in the
+ * frame. Pixel-deterministic.
+ */
+function farFrame(src: RgbImage, scale: number, canvasW: number, canvasH: number, ox = 0, oy = 0): RgbImage {
+  const w = Math.floor(src.width * scale), h = Math.floor(src.height * scale);
+  if (ox + w > canvasW || oy + h > canvasH) throw new Error("farFrame: scaled picture does not fit the canvas");
+  const data = new Uint8Array(canvasW * canvasH * 3).fill(110);
+  for (let y = 0; y < h; y++) {
+    const sy0 = Math.floor(y / scale), sy1 = Math.max(sy0 + 1, Math.floor((y + 1) / scale));
+    for (let x = 0; x < w; x++) {
+      const sx0 = Math.floor(x / scale), sx1 = Math.max(sx0 + 1, Math.floor((x + 1) / scale));
+      let r = 0, g = 0, b = 0, n = 0;
+      for (let sy = sy0; sy < sy1 && sy < src.height; sy++) {
+        for (let sx = sx0; sx < sx1 && sx < src.width; sx++) {
+          const i = (sy * src.width + sx) * 3;
+          r += src.data[i]; g += src.data[i + 1]; b += src.data[i + 2]; n++;
+        }
+      }
+      const o = ((oy + y) * canvasW + ox + x) * 3;
+      data[o] = r / n; data[o + 1] = g / n; data[o + 2] = b / n;
+    }
+  }
+  return { width: canvasW, height: canvasH, data };
+}
+
 const geometry = (f: FaceBox) => ({ box: f.box, score: f.score, landmarks: f.landmarks });
+const usable = (f: ExtractedFace) => f.clear && f.boxSize >= getFaceEngineInfo().detectTilesMinFacePx;
+const r3 = (v: number) => Math.round(v * 1000) / 1000;
+/** Max IoU of each face in `a` against any face in `b`. */
+const matchIou = (a: ExtractedFace[], b: ExtractedFace[]) => a.map((x) => r3(Math.max(0, ...b.map((y) => iouBox(x.box, y.box)))));
 const median = (xs: number[]) => [...xs].sort((a, b) => a - b)[Math.floor(xs.length / 2)];
 
 async function timed<T>(fn: () => Promise<T>, runs: number): Promise<{ value: T; medianMs: number }> {
@@ -180,5 +216,95 @@ describe("FACE_DETECT_TILES on the engine (models)", { skip: SKIP ?? false }, ()
     } else {
       assert.deepEqual(two.value.map(geometry), single.map(geometry), "small fixture: tiles=2 stays on the single pass");
     }
+  });
+
+  // ---------------------------------------------------------------------------
+  // FACE_DETECT_TILES=auto (ADAPTIVE MODE)
+  // ---------------------------------------------------------------------------
+
+  test("auto on a small picture (640x480) is the single pass, identical output, no counter moves", async () => {
+    const img = synthetic(640, 480);
+    setTiles("1");
+    const one = await detectFaces(img);
+    setTiles("auto");
+    resetAutoTileCounts();
+    assert.deepEqual(await detectFaces(img), one);
+    assert.deepEqual(getFaceEngineInfo().detectTilesAuto, { singleOnly: 0, tiled: 0 }, "below the size rule the auto path is never entered");
+  });
+
+  test("auto on a 4K frame without a face tiles (no_face) and equals tiles=2 exactly; counter tiled=1", async () => {
+    const img = synthetic(2560, 1440);
+    setTiles("1");
+    const single = await detectFaces(img);
+    setTiles("2");
+    const two = await detectFaces(img);
+    setTiles("auto");
+    resetAutoTileCounts();
+    const auto = await detectFaces(img);
+    assert.deepEqual(getFaceEngineInfo().detectTilesAuto, { singleOnly: 0, tiled: 1 });
+    if (single.length === 0) assert.deepEqual(auto, two, "nothing from the single pass: the merge is the tiles=2 result");
+    else for (const f of two) assert.ok(auto.some((a) => iouBox(a.box, f.box) >= 0.9), "every tiles=2 face is in the auto result");
+  });
+
+  test("fixture (near face): auto == tiles=1 byte for byte when the single pass finds a clear face; ms per frame 1 / 2 / auto", { skip: FIXTURE ? false : "no face fixture (set FACE_EXTRACT_FIXTURE)" }, async (t) => {
+    const rgb = await loadImage(fs.readFileSync(FIXTURE!));
+    assert.ok(rgb);
+    assert.ok(shouldTileFrame(rgb!.width, rgb!.height, getFaceEngineInfo().detectorInputSize, "auto"), "the fixture must be a tileable (>= 2560 px) frame");
+    setTiles("1");
+    const one = await timed(() => extractFaces(rgb!), 3);
+    assert.ok(one.value.some(usable), "the near fixture must contain a clear face at or above FACE_DETECT_TILES_MIN_FACE_PX");
+    setTiles("2");
+    const two = await timed(() => extractFaces(rgb!), 3);
+    setTiles("auto");
+    resetAutoTileCounts();
+    const auto = await timed(() => extractFaces(rgb!), 3);
+    assert.deepEqual(getFaceEngineInfo().detectTilesAuto, { singleOnly: 3, tiled: 0 }, "a clear near face never triggers the tile pass");
+    assert.deepEqual(auto.value, one.value, "auto is byte-identical to tiles=1 (boxes, landmarks, scores, embeddings, flags)");
+    const summary = {
+      frame: `${rgb!.width}x${rgb!.height}`,
+      faces: { tiles1: one.value.length, tiles2: two.value.length, auto: auto.value.length },
+      bestFace: { boxPx: Math.round(one.value[0].boxSize), score: r3(one.value[0].score), clear: one.value[0].clear },
+      minFacePx: getFaceEngineInfo().detectTilesMinFacePx,
+      msPerFrame: { tiles1: one.medianMs, tiles2: two.medianMs, auto: auto.medianMs },
+      ortThreads: process.env.FACE_ORT_THREADS || "4",
+    };
+    t.diagnostic(`auto-near ${JSON.stringify(summary)}`);
+    console.log(`[detectTilesEquivalence] auto-near ${JSON.stringify(summary)}`);
+  });
+
+  test("far-only frame (fixture downscaled into a 4K corner): tiles=1 has nothing usable, auto tiles and finds every tiles=2 face; ms per frame 1 / 2 / auto", { skip: FIXTURE ? false : "no face fixture (set FACE_EXTRACT_FIXTURE)" }, async (t) => {
+    const src = await loadImage(fs.readFileSync(FIXTURE!));
+    assert.ok(src);
+    const scale = Number(process.env.FAR_SCALE || "0.45");
+    const far = farFrame(src!, scale, 3840, 2160);
+    setTiles("1");
+    const one = await timed(() => extractFaces(far), 3);
+    assert.equal(one.value.some(usable), false, `the far frame must leave the single pass without a usable face (FAR_SCALE=${scale}; faces ${JSON.stringify(one.value.map((f) => [Math.round(f.boxSize), f.clear, f.unclearReason ?? null]))})`);
+    setTiles("2");
+    const two = await timed(() => extractFaces(far), 3);
+    assert.ok(two.value.length > 0, `tiles=2 must find the far face (FAR_SCALE=${scale})`);
+    setTiles("auto");
+    resetAutoTileCounts();
+    const auto = await timed(() => extractFaces(far), 3);
+    assert.deepEqual(getFaceEngineInfo().detectTilesAuto, { singleOnly: 0, tiled: 3 }, "nothing usable in the single pass: every call tiles");
+    const twoInAuto = matchIou(two.value, auto.value);
+    for (const v of twoInAuto) assert.ok(v >= 0.9, `every tiles=2 face is in the auto result (IoU ${twoInAuto})`);
+    if (one.value.length === 0) assert.deepEqual(auto.value.map(geometry), two.value.map(geometry), "an empty single pass: auto is exactly the tiles=2 merge");
+    else for (const f of one.value) assert.ok(matchIou([f], auto.value)[0] >= 0.5 || auto.value.some((a) => a.score >= f.score), "a single-pass box is kept unless a better-scored duplicate replaced it");
+    const summary = {
+      frame: `${far.width}x${far.height}`,
+      farScale: scale,
+      faces: {
+        tiles1: one.value.map((f) => ({ boxPx: Math.round(f.boxSize), score: r3(f.score), clear: f.clear, reason: f.unclearReason ?? null })),
+        tiles2: two.value.map((f) => ({ boxPx: Math.round(f.boxSize), score: r3(f.score), clear: f.clear, reason: f.unclearReason ?? null })),
+        auto: auto.value.map((f) => ({ boxPx: Math.round(f.boxSize), score: r3(f.score), clear: f.clear, reason: f.unclearReason ?? null })),
+      },
+      tiles2InAutoIou: twoInAuto,
+      bestCosineTiles2VsAuto: two.value.length && auto.value.length ? r3(cosineSimilarity(two.value[0].embedding, auto.value[0].embedding)) : null,
+      msPerFrame: { tiles1: one.medianMs, tiles2: two.medianMs, auto: auto.medianMs },
+      ortThreads: process.env.FACE_ORT_THREADS || "4",
+    };
+    t.diagnostic(`auto-far ${JSON.stringify(summary)}`);
+    console.log(`[detectTilesEquivalence] auto-far ${JSON.stringify(summary)}`);
   });
 });

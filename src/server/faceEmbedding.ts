@@ -23,7 +23,7 @@
  */
 
 import { envNumber } from "./env";
-import { cropRgb, mergeTileDetections, parseDetectTiles, shouldTileFrame, tilePlan } from "./detectTiles";
+import { AUTO_TILES, autoTileDecision, cropRgb, mergeSingleAndTiles, mergeTileDetections, parseDetectTiles, shouldTileFrame, tileCountFor, tilePlan, type DetectTilesMode } from "./detectTiles";
 import { spawn } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
@@ -134,11 +134,23 @@ export interface FaceEngineInfo {
   /**
    * FACE_DETECT_TILES (#523): 1 = one letterbox pass (default), 2 = left/right
    * tiles for frames whose longest side is >= 4x detectorInputSize (small
-   * pictures keep the single pass). See src/server/detectTiles.ts.
+   * pictures keep the single pass), "auto" = single pass first, tiles only when
+   * it finds no usable face. See src/server/detectTiles.ts.
    */
-  detectTiles: number;
+  detectTiles: DetectTilesMode;
   /** FACE_DETECT_TILE_OVERLAP: fraction of the frame width shared by neighbouring tiles (default 0.1). */
   detectTileOverlap: number;
+  /**
+   * FACE_DETECT_TILES_MIN_FACE_PX (auto mode): a single-pass face is usable when it is clear
+   * and its box short side is >= this. Default = CLEAR_FACE_LIMITS.minFacePx.
+   */
+  detectTilesMinFacePx: number;
+  /**
+   * Auto mode only (null otherwise): how many door-scan detections in THIS
+   * process stopped after the single pass vs ran the tile pass since start.
+   * Per process: with FACE_EXTRACT_WORKERS > 0 the workers keep their own.
+   */
+  detectTilesAuto: { singleOnly: number; tiled: number } | null;
   /**
    * Spatial input dims of the LOADED detector graph: a number where the ONNX
    * graph fixes the axis (the static INT8 export is 640x640), "dynamic" where
@@ -349,7 +361,7 @@ function variantWarnings(): string[] {
     const v = (process.env[name] || "").trim().toLowerCase();
     if (v && v !== "fp32") out.push(`${name}: ignored, the recogniser runs fp32 only (INT8 failed the drift bar)`);
   }
-  const tiles = parseDetectTiles();
+  const tiles = tilesConfig();
   if (tiles.invalid) out.push(tiles.invalid);
   return out;
 }
@@ -948,8 +960,10 @@ export function getFaceEngineInfo(): FaceEngineInfo {
     detectUpscale: detectUpscaleMode(),
     ttaFlip: ttaFlipEnabled(),
     detectorInputSize: detectorInputSize(),
-    detectTiles: parseDetectTiles().tiles,
-    detectTileOverlap: parseDetectTiles().overlap,
+    detectTiles: tilesConfig().tiles,
+    detectTileOverlap: tilesConfig().overlap,
+    detectTilesMinFacePx: tilesConfig().autoMinFacePx,
+    detectTilesAuto: tilesConfig().tiles === AUTO_TILES ? { ...autoTileCounts } : null,
     detectorInputDims: engineRef ? engineRef.detectorInputDims : null,
     embeddingDim: EMBEDDING_DIM,
     detectThreshold: detectThreshold(),
@@ -965,6 +979,20 @@ export function resetFaceEngine(): void {
   engineRef = null;
   engineLoading = false;
   engineError = null;
+}
+
+/** FACE_DETECT_TILES* as the engine applies them (the auto floor defaults to the clear-face floor). */
+function tilesConfig() {
+  return parseDetectTiles(process.env, CLEAR_FACE_LIMITS.minFacePx);
+}
+
+/** Auto-mode decisions in this process since start (FaceEngineInfo.detectTilesAuto). */
+const autoTileCounts = { singleOnly: 0, tiled: 0 };
+
+/** Test seam: zero the auto-mode counters. */
+export function resetAutoTileCounts(): void {
+  autoTileCounts.singleOnly = 0;
+  autoTileCounts.tiled = 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -1150,17 +1178,38 @@ export function resolveDetectShape(options?: DetectOptions): { width: number; he
  * FACE_DETECT_TILE_OVERLAP, each tile runs the SAME single pass at the same
  * square, and the results are mapped back and merged at FACE_NMS_IOU
  * (detectTiles.ts). FACE_DETECT_TILES=1 (default) is byte-identical to the
- * single pass: the tiling code is never entered.
+ * single pass: the tiling code is never entered. FACE_DETECT_TILES=auto runs
+ * the single pass first and tiles only when it found no clear face of at least
+ * FACE_DETECT_TILES_MIN_FACE_PX (detectTiles.ts ADAPTIVE MODE: the same gate
+ * extractFaces() applies, so "clear" here is the `clear` flag of the result).
  */
 async function detectOnRgb(engine: Engine, img: RgbImage, options?: DetectOptions): Promise<FaceBox[]> {
   if (options?.inputShape) return detectSinglePass(engine, img, options);
-  const { tiles, overlap } = parseDetectTiles();
+  const { tiles, overlap, autoMinFacePx } = tilesConfig();
   const side = detectorInputSize();
   if (!shouldTileFrame(img.width, img.height, side, tiles)) return detectSinglePass(engine, img, options);
-  const rects = tilePlan(img.width, img.height, tiles, overlap);
+  const rects = tilePlan(img.width, img.height, tileCountFor(tiles), overlap);
+  if (tiles === AUTO_TILES) {
+    const single = await detectSinglePass(engine, img, options);
+    const decision = autoTileDecision(single, isClearDetection, autoMinFacePx);
+    if (!decision.tile) {
+      autoTileCounts.singleOnly += 1;
+      return single;
+    }
+    autoTileCounts.tiled += 1;
+    const perTile: FaceBox[][] = [];
+    for (const r of rects) perTile.push(await detectSinglePass(engine, cropRgb(img, r), options));
+    return mergeSingleAndTiles(single, perTile, rects, img.width, img.height, nmsIouThreshold());
+  }
   const perTile: FaceBox[][] = [];
   for (const r of rects) perTile.push(await detectSinglePass(engine, cropRgb(img, r), options));
   return mergeTileDetections(perTile, rects, nmsIouThreshold());
+}
+
+/** The clear-face gate on a bare detection: exactly what extractFaces() reports as `clear`. */
+function isClearDetection(f: FaceBox): boolean {
+  const boxSize = Math.min(f.box[2] - f.box[0], f.box[3] - f.box[1]);
+  return clearFaceIssue(facePose(f.landmarks), CLEAR_FACE_LIMITS, boxSize) === null;
 }
 
 async function detectSinglePass(engine: Engine, img: RgbImage, options?: DetectOptions): Promise<FaceBox[]> {
