@@ -183,6 +183,7 @@ import {
   presenceHealthTransition,
 } from "./src/server/presence/alerts";
 import { presenceSettingsFromEnv, type PresenceSettings } from "./src/server/presence/presenceConfig";
+import { chatTextPayload, type StructuredChatMessage } from "./src/server/chatText";
 import {
   applyPresenceGatePatch,
   effectivePresenceGateSettings,
@@ -1409,9 +1410,13 @@ export interface WebhookLogRecord {
   timestamp: string;
   url: string;
   method: string;
+  /**
+   * The body as posted. Since 2026-11-25 every message is text only
+   * (chatTextPayload); `attachments` exists only on records logged before that.
+   */
   payload: {
     text: string;
-    attachments: Array<{
+    attachments?: Array<{
       title: string;
       [key: string]: any;
     }>;
@@ -2865,18 +2870,11 @@ async function sendEtonWebhook({
       ? `${userName} (${employeeCode}) - ${formattedTime}`
       : `${userName} - ${formattedTime}`) + gateSuffix;
 
-  // [[GATE]]: title in attachments
+  // [[GATE]] title leads the same line: one copyable text message, no attachment.
   const gateTitle =
     scanType === "ENTRY" ? webhookConfig.gateInTitle : webhookConfig.gateOutTitle;
 
-  const payload = {
-    text: userText,
-    attachments: [
-      {
-        title: gateTitle,
-      },
-    ],
-  };
+  const payload = chatTextPayload({ text: userText, attachments: [{ title: gateTitle }] });
 
   const logEntry: WebhookLogRecord = {
     id: "WH-" + Date.now() + "-" + Math.floor(Math.random() * 1000),
@@ -3124,9 +3122,9 @@ async function sendStrangerWebhook({
   const strangerTitle =
     webhookConfig.strangerTitle || DEFAULT_WEBHOOK_CONFIG.strangerTitle;
 
-  // Mattermost / Eton compatible body. The markdown link in `text` and the
-  // attachment `title_link` point at the same URL so either renderer gives the
-  // operator a click target. Both are omitted when no base URL is known.
+  // Mattermost / Eton compatible body, text only (chatTextPayload): title and
+  // alert line, the detail lines, then the markdown link as the click target.
+  // The link is omitted when no base URL is known.
   const textLines = [`🚨 Phát hiện người lạ tại ${door} - ${formattedTime}`];
   if (link) textLines.push(`[${linkLabel}](${link})`);
 
@@ -3141,16 +3139,10 @@ async function sendStrangerWebhook({
   }
   detailLines.push("Cửa giữ trạng thái KHÓA. Không có quyền ra vào nào được cấp.");
 
-  const attachment: { title: string; title_link?: string; text?: string } = {
-    title: strangerTitle,
-  };
-  if (link) attachment.title_link = link;
-  attachment.text = detailLines.join("\n");
-
-  const payload = {
+  const payload = chatTextPayload({
     text: textLines.join("\n"),
-    attachments: [attachment],
-  };
+    attachments: [{ title: strangerTitle, text: detailLines.join("\n") }],
+  });
 
   const logEntry: WebhookLogRecord = {
     id: "WH-" + Date.now() + "-" + Math.floor(Math.random() * 1000),
@@ -10007,9 +9999,10 @@ function currentRouteTarget(route: AlertRoute) {
  */
 async function postToChannel(
   target: { id: string; name: string; url: string; builtIn: boolean },
-  payload: WebhookLogRecord["payload"],
+  message: StructuredChatMessage,
   meta: { scanType: "ENTRY" | "EXIT"; userName: string },
 ): Promise<WebhookLogRecord> {
+  const payload = chatTextPayload(message);
   const logEntry: WebhookLogRecord = {
     id: "WH-" + Date.now() + "-" + Math.floor(Math.random() * 1000),
     timestamp: new Date().toISOString(),
@@ -10050,7 +10043,7 @@ async function postToChannel(
 }
 
 /** A presence message (alert or detector health) to the channel its alert type is routed to. */
-async function sendPresenceWebhook(gate: string, payload: WebhookLogRecord["payload"], route: AlertRoute = "presence"): Promise<boolean> {
+async function sendPresenceWebhook(gate: string, payload: StructuredChatMessage, route: AlertRoute = "presence"): Promise<boolean> {
   const target = currentRouteTarget(route);
   if (!target) {
     console.warn(`[Presence ${gateLogTag(gate)}] Kênh nhận ${route === "presence" ? "cảnh báo hiện diện" : "thông báo tình trạng"} đang tắt: không gửi.`);
@@ -10320,8 +10313,7 @@ app.post("/api/notification-channels/:id/test", requireOperatorRole("admin"), re
   const actor = operatorActor(req) || "admin";
   const at = new Date().toLocaleString("vi-VN", { timeZone: "Asia/Ho_Chi_Minh", hour12: false });
   const log = await postToChannel(target, {
-    text: `🔔 Tin thử từ SmartFace Gate Watch - kênh "${target.name}" (${at})`,
-    attachments: [{ title: "Tin thử", text: `Gửi bởi ${actor}. Kênh này nhận được tin là đã cấu hình đúng.` }],
+    text: `🔔 Tin thử từ SmartFace Gate Watch - kênh "${target.name}" (${at})\nGửi bởi ${actor}. Kênh này nhận được tin là đã cấu hình đúng.`,
   }, { scanType: "ENTRY", userName: "Tin thử" });
   console.log(`[Channels] ${actor} gửi thử kênh "${target.name}": ${log.success ? "thành công" : "thất bại"}`);
   res.json({ success: log.success, ...(log.statusCode ? { statusCode: log.statusCode } : {}), ...(log.success ? {} : { error: log.error || `HTTP ${log.statusCode}` }) });

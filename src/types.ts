@@ -261,9 +261,10 @@ export interface WebhookLog {
   timestamp: string;
   url: string;
   method: string;
+  /** Text only since 2026-11-25; `attachments` exists only on older records. */
   payload: {
     text: string;
-    attachments: Array<{
+    attachments?: Array<{
       title: string;
       [key: string]: any;
     }>;

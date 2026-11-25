@@ -488,17 +488,13 @@ pm2 start smartface-gateway # hoặc: docker compose start smartface-app
 
 Hệ thống hỗ trợ gửi thông báo điểm danh tự động vào kênh Chat Room của Eton:
 * **Địa chỉ**: `https://chat-room.eton.vn/hooks/YOUR_WEBHOOK_TOKEN` (lấy trong Eton Chat Room; không ghi token thật vào mã nguồn)
-* **Định dạng Payload chuẩn Eton**:
+* **Định dạng Payload** (chỉ có `text`, không dùng `attachments`, để tin nhắn copy được trên điện thoại; từ 25/11/2026):
 ```json
 {
-  "text": "Nguyễn Hoàng Minh (NV-1082) - 16:30:00 12/09/2026",
-  "attachments": [
-    {
-      "title": "[[CỔNG VÀO]]"
-    }
-  ]
+  "text": "[[CỔNG VÀO]] Nguyễn Hoàng Minh (NV-1082) - 16:30:00 12/09/2026"
 }
 ```
+  Cảnh báo người lạ và cảnh báo hiện diện cũng là một tin `text` nhiều dòng: dòng đầu là tiêu đề và nội dung chính, các dòng chi tiết, dòng cuối là liên kết.
 * **Chế độ phát trực tiếp từ trình duyệt (Direct Browser Delivery)**: Bỏ qua hạn chế CORS để các máy quét đặt trong mạng VPN/Intranet nội bộ của Eton có thể phát lệnh thông suốt.
 
 ---

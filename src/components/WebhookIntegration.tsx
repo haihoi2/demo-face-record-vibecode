@@ -385,14 +385,8 @@ export const WebhookIntegration: React.FC<WebhookIntegrationProps> = ({
     const gateTitle =
       type === "ENTRY" ? config.gateInTitle : config.gateOutTitle;
 
-    return {
-      text: userText,
-      attachments: [
-        {
-          title: gateTitle,
-        },
-      ],
-    };
+    // Text only, as the server sends it: the gate title leads the same line.
+    return { text: `${gateTitle} ${userText}`.trim() };
   };
 
   // Test Webhook from Server
@@ -607,14 +601,11 @@ export const WebhookIntegration: React.FC<WebhookIntegrationProps> = ({
 
   // Generate real-time live preview payload
   const currentPreviewPayload = {
-    text: config.includeEmployeeCode && testCode
-      ? `${testUser} (${testCode}) - ${new Date().toLocaleString("vi-VN", { hour12: false })}`
-      : `${testUser} - ${new Date().toLocaleString("vi-VN", { hour12: false })}`,
-    attachments: [
-      {
-        title: testScanType === "ENTRY" ? config.gateInTitle : config.gateOutTitle,
-      },
-    ],
+    text: `${testScanType === "ENTRY" ? config.gateInTitle : config.gateOutTitle} ${
+      config.includeEmployeeCode && testCode
+        ? `${testUser} (${testCode}) - ${new Date().toLocaleString("vi-VN", { hour12: false })}`
+        : `${testUser} - ${new Date().toLocaleString("vi-VN", { hour12: false })}`
+    }`.trim(),
   };
 
   const copyPayloadJson = () => {
@@ -1526,12 +1517,14 @@ Trân trọng cảm ơn!`;
                     <div className="truncate">
                       <span className="text-slate-400">text:</span> &quot;
                       <span className="text-emerald-300">{log.payload.text}</span>&quot;
-                      &nbsp;|&nbsp;
-                      <span className="text-slate-400">title:</span> &quot;
-                      <span className="text-indigo-300">
-                        {log.payload.attachments?.[0]?.title}
-                      </span>
-                      &quot;
+                      {log.payload.attachments?.[0]?.title && (
+                        <>
+                          &nbsp;|&nbsp;
+                          <span className="text-slate-400">title:</span> &quot;
+                          <span className="text-indigo-300">{log.payload.attachments[0].title}</span>
+                          &quot;
+                        </>
+                      )}
                     </div>
 
                     {log.error && (

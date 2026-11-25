@@ -6,7 +6,8 @@
  *   - GET/POST /api/webhook/config round-trips the new stranger fields and a
  *     partial POST never drops them,
  *   - POST /api/webhook/test-stranger builds a clickable `#strangers/<logId>`
- *     link (markdown in `text` AND `title_link` on the attachment),
+ *     markdown link in `text`; the body is text only, never an attachment
+ *     (an attachment cannot be copied in the phone chat client, 2026-11-25),
  *   - the base URL resolution order: appBaseUrl > APP_URL > X-Forwarded-* > Host,
  *   - strangerAlertEnabled:false sends nothing,
  *   - the cooldown throttles real alerts while the test endpoint bypasses it,
@@ -41,17 +42,11 @@ import { api, noFaceJpegDataUrl, postJson, recognize } from "./helpers";
 const SINK_URL = "https://stranger-webhook-sink.invalid/hooks-itest/stranger-webhook-sink";
 const STRANGER_USER_NAME = "Người lạ";
 
-interface WebhookAttachment {
-  title: string;
-  title_link?: string;
-  text?: string;
-}
-
 interface WebhookLog {
   id: string;
   url: string;
   method: string;
-  payload: { text: string; attachments: WebhookAttachment[] };
+  payload: { text: string; attachments?: unknown };
   success: boolean;
   scanType: "ENTRY" | "EXIT";
   userName: string;
@@ -219,7 +214,7 @@ describe("stranger alert webhook", () => {
     );
   });
 
-  it("the payload carries a markdown link and an attachment title_link", async () => {
+  it("the payload is one copyable text: title, alert line, details, markdown link; no attachment", async () => {
     const config = await getConfig();
     const res = await sendTestStranger({ logId: "LOG-ITEST-LINK", scanType: "EXIT" });
     assert.equal(res.status, 200);
@@ -227,9 +222,10 @@ describe("stranger alert webhook", () => {
     assert.ok(log, `no webhook log returned: ${res.text.slice(0, 300)}`);
 
     const posted = await payloadOf(log!.id);
-    const { text, attachments } = posted.payload;
+    const { text } = posted.payload;
 
-    // Mattermost/Eton shape: { text, attachments: [{ title, title_link, text }] }
+    // Text only. An attachment renders as a card the phone client cannot copy.
+    assert.deepEqual(Object.keys(posted.payload), ["text"], "the chat body must be { text } and nothing else");
     assert.ok(text.includes("#strangers/"), `text has no deep link: ${text}`);
     assert.ok(
       text.includes(`[${config.strangerLinkLabel}](`),
@@ -237,12 +233,15 @@ describe("stranger alert webhook", () => {
     );
     assert.ok(text.includes("Phát hiện người lạ"), `text is not the stranger alert: ${text}`);
 
-    assert.equal(attachments.length, 1);
-    const attachment = attachments[0];
-    assert.equal(attachment.title, config.strangerTitle);
-    assert.ok(attachment.title_link, "attachment has no title_link");
-    assert.ok(attachment.title_link!.includes("#strangers/LOG-ITEST-LINK"));
-    assert.ok(text.includes(attachment.title_link!), "text link and title_link disagree");
+    const lines = text.split("\n");
+    assert.ok(lines[0].startsWith(`${config.strangerTitle} `), `the title must lead the first line: ${lines[0]}`);
+    assert.ok(lines[0].includes("Phát hiện người lạ"), `first line is not the alert: ${lines[0]}`);
+    assert.ok(lines.includes("Mã nhật ký: LOG-ITEST-LINK"), `the log id line is missing: ${text}`);
+    assert.ok(
+      lines.includes("Cửa giữ trạng thái KHÓA. Không có quyền ra vào nào được cấp."),
+      `the door-stays-locked line is missing: ${text}`
+    );
+    assert.ok(lines[lines.length - 1].includes("#strangers/LOG-ITEST-LINK"), `the link must be the last line: ${text}`);
 
     // The log's own scan type is reused, and the user is the stranger label.
     assert.equal(posted.scanType, "EXIT");
@@ -253,6 +252,22 @@ describe("stranger alert webhook", () => {
     assert.ok(!serialized.includes("base64"), "payload leaked image bytes");
     assert.ok(!serialized.includes("data:image"), "payload leaked an image data url");
     assert.ok(serialized.length < 4000, `payload unexpectedly large: ${serialized.length} bytes`);
+  });
+
+  // Owner request 2026-11-25: the recognised-employee message used to carry the
+  // gate title as an attachment, which the phone chat client cannot copy.
+  it("the recognised-employee message is one text line led by the gate title, no attachment", async () => {
+    const config = await getConfig();
+    const res = await postJson("/api/webhook/test", { testScanType: "EXIT", customUser: "Itest Person", customCode: "NV-ITEST" });
+    assert.equal(res.status, 200, res.text.slice(0, 300));
+    const posted = await payloadOf(res.body.log.id);
+    assert.deepEqual(Object.keys(posted.payload), ["text"], "the chat body must be { text } and nothing else");
+    assert.ok(!posted.payload.text.includes("\n"), `expected a single line: ${posted.payload.text}`);
+    assert.ok(
+      posted.payload.text.startsWith(`${config.gateOutTitle} Itest Person`),
+      `the gate title must lead the line: ${posted.payload.text}`
+    );
+    assert.equal(posted.scanType, "EXIT");
   });
 
   it("falls back to X-Forwarded-Proto / X-Forwarded-Host when appBaseUrl is empty", async () => {
@@ -270,9 +285,8 @@ describe("stranger alert webhook", () => {
 
     const posted = await payloadOf(res.body!.log!.id);
     assert.ok(
-      posted.payload.attachments[0].title_link ===
-        "https://stg-gate-watch.vota.vn/#strangers/LOG-ITEST-FWD",
-      `title_link ignored the forwarded headers: ${posted.payload.attachments[0].title_link}`
+      posted.payload.text.includes("(https://stg-gate-watch.vota.vn/#strangers/LOG-ITEST-FWD)"),
+      `the link ignored the forwarded headers: ${posted.payload.text}`
     );
   });
 
@@ -318,10 +332,11 @@ describe("stranger alert webhook", () => {
       posted!.payload.text.includes(`#strangers/${accessLogId}`),
       `deep link does not target the access log: ${posted!.payload.text}`
     );
-    assert.equal(
-      posted!.payload.attachments[0].title_link,
-      `https://stg-gate-watch.vota.vn/#strangers/${accessLogId}`
+    assert.ok(
+      posted!.payload.text.includes(`(https://stg-gate-watch.vota.vn/#strangers/${accessLogId})`),
+      `deep link is not on the configured base url: ${posted!.payload.text}`
     );
+    assert.equal(posted!.payload.attachments, undefined, "the real alert must be text only");
   });
 
   it("sends nothing when strangerAlertEnabled is false", async () => {
