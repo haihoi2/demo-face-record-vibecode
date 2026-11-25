@@ -17,7 +17,7 @@ import { Worker } from "node:worker_threads";
 import type { Frame, FrameSource, Gate, SourceState } from "../src/server/pipeline/contracts";
 import { DEFAULT_FUSION_THRESHOLDS, FaceGallery } from "../src/server/faceFusion";
 import type { DecisionContext, TrackDecisionResult } from "../src/server/pipeline/trackDecision";
-import { GatePipeline, pipelineWorkerEnv, resolvePipelineWorkerEntry, type PipelineWorkerLike } from "../src/server/pipeline/gatePipeline";
+import { GatePipeline, pipelineMinFacePxForGate, pipelineWorkerEnv, resolvePipelineWorkerEntry, type PipelineWorkerLike } from "../src/server/pipeline/gatePipeline";
 import { PipelineCore, type PipelineEngine } from "../src/server/pipeline/pipelineCore";
 import type { WorkerToHost } from "../src/server/pipeline/pipelineProtocol";
 import type { FaceBox } from "../src/server/faceEmbedding";
@@ -341,6 +341,35 @@ describe("pipelineWorkerEnv: PIPELINE_MIN_FACE_PX (pipeline-only face-size floor
     for (const bad of ["10", "4000", "40.5", "abc", ""]) {
       assert.equal(pipelineWorkerEnv({ FACE_MIN_SIZE_PX: "60", PIPELINE_MIN_FACE_PX: bad } as NodeJS.ProcessEnv).FACE_MIN_SIZE_PX, "60", bad);
     }
+  });
+});
+
+describe("pipelineWorkerEnv: PIPELINE_MIN_FACE_PX_BY_GATE (per-gate floor)", () => {
+  it("the named gate gets its own floor; other gates keep PIPELINE_MIN_FACE_PX", () => {
+    const env = { FACE_MIN_SIZE_PX: "60", PIPELINE_MIN_FACE_PX: "40", PIPELINE_MIN_FACE_PX_BY_GATE: "exit:60" };
+    assert.equal(pipelineWorkerEnv(env, "exit").FACE_MIN_SIZE_PX, "60");
+    assert.equal(pipelineWorkerEnv(env, "entry").FACE_MIN_SIZE_PX, "40");
+    assert.equal(pipelineWorkerEnv(env).FACE_MIN_SIZE_PX, "40", "no gate: the global pipeline floor");
+    assert.equal(env.FACE_MIN_SIZE_PX, "60", "the door engine's floor is not touched");
+  });
+
+  it("several gates, spaces, and a gate with no global floor", () => {
+    const env = { FACE_MIN_SIZE_PX: "60", PIPELINE_MIN_FACE_PX_BY_GATE: " exit : 72 , side-door:48" };
+    assert.equal(pipelineWorkerEnv(env, "exit").FACE_MIN_SIZE_PX, "72");
+    assert.equal(pipelineWorkerEnv(env, "side-door").FACE_MIN_SIZE_PX, "48");
+    assert.equal(pipelineWorkerEnv(env, "entry").FACE_MIN_SIZE_PX, "60", "unnamed gate inherits the door engine's floor");
+  });
+
+  it("a malformed or out-of-range pair is ignored, never widening the floor by accident", () => {
+    const base = { FACE_MIN_SIZE_PX: "60", PIPELINE_MIN_FACE_PX: "40" };
+    for (const bad of ["exit:10", "exit:9999", "exit:abc", "exit=60", "exit:60px", "EXIT:60", "exit:", ":60", "exit:60:70", "exit:-60", "exit:6e1"]) {
+      assert.equal(pipelineWorkerEnv({ ...base, PIPELINE_MIN_FACE_PX_BY_GATE: bad }, "exit").FACE_MIN_SIZE_PX, "40", bad);
+      assert.equal(pipelineMinFacePxForGate(bad, "exit"), null, bad);
+    }
+    assert.equal(pipelineMinFacePxForGate("exit:10,exit:60", "exit"), "60", "a bad pair does not hide a good one");
+    assert.equal(pipelineMinFacePxForGate("exit:60,exit:80", "exit"), "80", "the last valid pair wins");
+    assert.equal(pipelineMinFacePxForGate("exit-2:60", "exit"), null, "a gate id is matched whole");
+    assert.equal(pipelineMinFacePxForGate(undefined, "exit"), null);
   });
 });
 

@@ -162,13 +162,19 @@ export function resolvePipelineWorkerEntry(): string {
  *                                                       that tag or the worker fails closed)
  *   PIPELINE_DETECTOR_MODEL   -> FACE_DETECTOR_MODEL    (a detector FILE in FACE_MODEL_DIR, e.g. a dynamic-
  *                                                       shape INT8 export; the embedding tag is unaffected)
+ *   PIPELINE_MIN_FACE_PX      -> FACE_MIN_SIZE_PX       (24-2000 source px; every gate's worker)
+ *   PIPELINE_MIN_FACE_PX_BY_GATE -> FACE_MIN_SIZE_PX    (`<gate id>:<px>` pairs, comma separated, e.g.
+ *                                                       `exit:60`; wins over PIPELINE_MIN_FACE_PX for the
+ *                                                       named gate only - the exit camera's 40-60 px faces
+ *                                                       give embeddings too weak to be evidence, the entry
+ *                                                       strip needs 40. A malformed pair is ignored.)
  *   PIPELINE_DETECT_INPUT     (read by the worker itself, see detectInput.ts) additionally sets
  *                             FACE_ORT_LOG_LEVEL=3 for `auto` / `<W>x<H>` plans unless FACE_ORT_LOG_LEVEL
  *                             is set: det_10g's output metadata is baked for 640x640 and ORT would warn
  *                             nine times per frame at any other shape (logging only).
  * Invalid values are ignored (the FACE_* value stays).
  */
-export function pipelineWorkerEnv(env: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+export function pipelineWorkerEnv(env: NodeJS.ProcessEnv = process.env, gate?: Gate): NodeJS.ProcessEnv {
   const out: NodeJS.ProcessEnv = { ...env };
   const int = (name: string, min: number, max: number, step = 1): string | null => {
     const raw = String(env[name] ?? "").trim();
@@ -181,7 +187,7 @@ export function pipelineWorkerEnv(env: NodeJS.ProcessEnv = process.env): NodeJS.
   // evidence in the worker; the door engine on the main thread keeps
   // FACE_MIN_SIZE_PX. Unset = the worker inherits the door engine's floor.
   // Entry diagnostic 2026-09-29: most faces in the 4K entry strip are < 60 px.
-  const minFace = int("PIPELINE_MIN_FACE_PX", 24, 2000);
+  const minFace = (gate !== undefined ? pipelineMinFacePxForGate(env.PIPELINE_MIN_FACE_PX_BY_GATE, gate) : null) ?? int("PIPELINE_MIN_FACE_PX", 24, 2000);
   if (minFace) out.FACE_MIN_SIZE_PX = minFace;
   const variant = String(env.PIPELINE_DETECTOR_VARIANT ?? "").trim().toLowerCase();
   if (variant === "fp32" || variant === "int8") out.FACE_DETECTOR_VARIANT = variant;
@@ -200,13 +206,30 @@ export function pipelineWorkerEnv(env: NodeJS.ProcessEnv = process.env): NodeJS.
   return out;
 }
 
+/**
+ * The floor PIPELINE_MIN_FACE_PX_BY_GATE names for `gate`, or null. Format:
+ * `<gate id>:<px>` pairs separated by commas (`exit:60,side-door:48`); px is an
+ * integer 24-2000 like PIPELINE_MIN_FACE_PX. A malformed pair is skipped; when a
+ * gate appears twice the last valid pair wins.
+ */
+export function pipelineMinFacePxForGate(raw: unknown, gate: Gate): string | null {
+  let found: string | null = null;
+  for (const part of String(raw ?? "").split(",")) {
+    const m = /^\s*([a-z][a-z0-9-]{1,31})\s*:\s*(\d{1,4})\s*$/.exec(part);
+    if (!m || m[1] !== gate) continue;
+    const n = Number(m[2]);
+    if (n >= 24 && n <= 2000) found = String(n);
+  }
+  return found;
+}
+
 /** Thread name of a gate's worker: `pipeline-<gate id>` (pipeline-entry, pipeline-exit, pipeline-side-door). */
 export function pipelineWorkerName(gate: Gate): string {
   return `pipeline-${assertGateId(gate, "pipeline worker name")}`;
 }
 
 function createDefaultWorker(gate: Gate): PipelineWorkerLike {
-  return new Worker(resolvePipelineWorkerEntry(), { name: pipelineWorkerName(gate), env: pipelineWorkerEnv() }) as unknown as PipelineWorkerLike;
+  return new Worker(resolvePipelineWorkerEntry(), { name: pipelineWorkerName(gate), env: pipelineWorkerEnv(process.env, gate) }) as unknown as PipelineWorkerLike;
 }
 
 /** The frame and the buffer to transfer: its own backing store, or a copy when that is shared/pooled. */
