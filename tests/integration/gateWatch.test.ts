@@ -20,7 +20,9 @@
 import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
 
-import { api, postJson, unreachableRtsp } from "./helpers";
+import net from "node:net";
+
+import { api, postJson, unreachableRtsp, UNREACHABLE_HOST } from "./helpers";
 
 interface WatchConfig {
   enabled: boolean;
@@ -373,6 +375,84 @@ describe("Backend gate watch (server-side auto-scan)", () => {
       assert.equal(after.totalRuns, before.totalRuns, "a stopped watcher must not run again");
       assert.equal(after.running, false);
       assert.equal(after.nextRunAt, undefined);
+    });
+
+    // Regression, live 2026-11-25: the exit gap was changed while a scan was in
+    // flight. The restart's first tick (500 ms later) found `running` and gave
+    // up, the stale scan did not reschedule, and the enabled watcher stopped
+    // scanning for 2 min 24 s without any error.
+    it("a reconfigure during an in-flight scan does not stop the watcher", async () => {
+      await waitForQuietCameraConfig(original);
+      // A "camera" that accepts the connection and says nothing for 1.5 s, so a
+      // scan is reliably still in flight when the watcher is reconfigured.
+      // (With ITEST_UNREACHABLE_HOST set elsewhere the connect just waits for
+      // FFmpeg's socket timeout instead: also slow, which is all that matters.)
+      const sockets = new Set<net.Socket>();
+      const stall = net.createServer((socket) => {
+        sockets.add(socket);
+        socket.on("error", () => {});
+        socket.on("close", () => sockets.delete(socket));
+        setTimeout(() => socket.destroy(), 1_500);
+      });
+      await new Promise<void>((resolve) => stall.listen(0, "0.0.0.0", () => resolve()));
+      const port = (stall.address() as net.AddressInfo).port;
+      const slowStream = { ...UNREACHABLE_STREAM, id: "exit-watch-race-itest", rtspUrl: `rtsp://${UNREACHABLE_HOST}:${port}/stall` };
+
+      let reconfiguredAt = 0;
+      let sawRunning = false;
+      const after: WatchRuntime[] = [];
+      try {
+        const swapped = await postJson("/api/camera-streams/config", { exitGate: { streams: [slowStream] } });
+        assert.equal(swapped.status, 200, swapped.text.slice(0, 200));
+        const enabled = await postWatch("exit", { enabled: true, intervalSeconds: 1, frames: 1 });
+        assert.equal(enabled.status, 200, enabled.text.slice(0, 200));
+
+        const deadline = Date.now() + 6_000;
+        while (Date.now() < deadline) {
+          if ((await getWatcher("EXIT")).running) {
+            sawRunning = true;
+            break;
+          }
+          await sleep(50);
+        }
+        assert.ok(sawRunning, "the slow scan was never seen in flight; the test cannot exercise the race");
+
+        // Change the gap while that scan is in flight: stop-then-start.
+        reconfiguredAt = Date.now();
+        const changed = await postWatch("exit", { intervalSeconds: 2 });
+        assert.equal(changed.status, 200, changed.text.slice(0, 200));
+        assert.equal(changed.body.watcher.enabled, true);
+        assert.equal(changed.body.watcher.intervalSeconds, 2);
+
+        // The stale scan ends within ~1.5-3.5 s. A live watcher then starts a
+        // NEW scan; the bug left it enabled with no timer, forever.
+        while (Date.now() - reconfiguredAt < 9_000) {
+          const w = await getWatcher("EXIT");
+          after.push(w);
+          if (w.lastRunAt && Date.parse(w.lastRunAt) > reconfiguredAt) break;
+          await sleep(200);
+        }
+      } finally {
+        await postWatch("exit", { enabled: false });
+        const restored = await postJson("/api/camera-streams/config", { exitGate: { streams: original.exitGate.streams } });
+        for (const socket of sockets) socket.destroy();
+        await new Promise<void>((resolve) => stall.close(() => resolve()));
+        assert.equal(restored.status, 200, restored.text.slice(0, 200));
+      }
+
+      const last = after[after.length - 1];
+      assert.ok(last, "no watcher sample after the reconfigure");
+      assert.equal(last.enabled, true, "the reconfigured watcher must stay enabled");
+      assert.ok(
+        last.lastRunAt && Date.parse(last.lastRunAt) > reconfiguredAt,
+        `no scan started after the reconfigure: the watcher is enabled but dead (totalRuns ${last.totalRuns}, ` +
+          `running ${last.running}, nextRunAt ${last.nextRunAt}, lastRunAt ${last.lastRunAt})`
+      );
+      // Never two scans at once, also across the restart.
+      const counts = after.map((w) => w.totalRuns);
+      for (let i = 1; i < counts.length; i++) {
+        assert.ok(counts[i] - counts[i - 1] <= 1, `totalRuns jumped between two polls: ${counts.join(",")}`);
+      }
     });
   });
 });

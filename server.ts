@@ -6550,6 +6550,11 @@ const GATE_WATCH_MAX_BACKOFF_MS = 60_000;
 /** First run after a start/reconfigure, so a POST answer already carries nextRunAt. */
 const GATE_WATCH_START_DELAY_MS = 500;
 /**
+ * Re-check gap of a tick that found the previous generation's scan still in
+ * flight (a reconfigure during a scan). Scans never overlap; the tick waits.
+ */
+const GATE_WATCH_BUSY_RETRY_MS = 250;
+/**
  * Re-check cadence while a watcher is enabled but has nothing to scan (gate
  * off, no enabled RTSP stream, engine unavailable + fail-closed). It idles
  * instead of spinning and picks the work up by itself once the cause clears.
@@ -6787,7 +6792,16 @@ function watchEmployeeSummary(employee: any) {
 }
 
 async function runGateWatchTick(state: GateWatcherState, generation: number) {
-  if (state.running) return; // unreachable via the chain; a cheap last line of defence
+  if (state.running) {
+    // Reached when the watcher was reconfigured (stop-then-start) while a scan
+    // of the previous generation was still in flight: the restart's first tick
+    // fires here before that scan has returned. That scan will NOT reschedule
+    // (its generation is stale), so dropping this tick would leave an enabled
+    // watcher with no timer - it stops scanning silently (seen live 2026-11-25,
+    // exit gate, 2 min 24 s). Scans still never overlap: wait and try again.
+    if (state.generation === generation && state.enabled) scheduleGateWatch(state, GATE_WATCH_BUSY_RETRY_MS);
+    return;
+  }
   const blocked = gateWatchBlockedReason(state.gateKey);
   if (blocked) {
     state.idleReason = blocked;
@@ -6930,7 +6944,9 @@ function stopGateWatcher(state: GateWatcherState) {
 
 /**
  * Applies the persisted watch config of one gate to its watcher. Restarting is
- * always stop-then-start, so no timer and no in-flight scan survives a change.
+ * always stop-then-start: the old timer is cleared and an in-flight scan of the
+ * old generation finishes without rescheduling; the new generation's first
+ * tick waits for it (runGateWatchTick) instead of overlapping it.
  */
 function applyGateWatchConfig(
   gateKey: GateWatchKey,
