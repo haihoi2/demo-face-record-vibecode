@@ -450,6 +450,15 @@ export interface GateWatchRuntime {
       openTracks: number;
       /** Detector input geometry in use (PIPELINE_DETECT_INPUT -> resolved shape). */
       detectInput?: string;
+      /** Track and embedding totals since the gate worker started (diagnostics; reset by a worker restart). */
+      tracks?: {
+        ended: number;
+        unconfirmed: number;
+        merged: number;
+        embeddingsUnconfirmed: number;
+        conflicts: number;
+        reseeds: number;
+      };
     };
     contextReason?: string;
     lastError?: string;

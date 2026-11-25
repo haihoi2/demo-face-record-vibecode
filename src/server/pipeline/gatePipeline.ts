@@ -35,10 +35,12 @@ import type { Frame, FrameSource, Gate, SourceState } from "./contracts";
 import { assertGateId } from "./gateId";
 import type { DecisionContext, TrackDecisionResult } from "./trackDecision";
 import type { PipelineWorkerLike } from "./pipelineCore";
+import type { TrackCounters } from "./tracker";
 import {
   contextFingerprint,
   errText,
   fromWireResult,
+  readTrackCounters,
   type HostToWorker,
   type WorkerStats,
   type WorkerToHost,
@@ -79,6 +81,8 @@ export interface PipelineStats {
     /** Detector input geometry in use (PIPELINE_DETECT_INPUT -> resolved shape). */
     detectInput?: string;
     openTracks: number;
+    /** Track and embedding totals since the worker started (reset by a worker restart). */
+    tracks?: TrackCounters;
   };
 }
 
@@ -365,6 +369,7 @@ export class GatePipeline {
 
   stats(): PipelineStats {
     const w = this.workerStats;
+    const tracks = readTrackCounters(w?.tracks);
     let contextOk = false;
     let contextReason: string | undefined;
     if (!this.context) {
@@ -402,6 +407,7 @@ export class GatePipeline {
         ...(w?.modelTag ? { modelTag: w.modelTag } : {}),
         ...(w?.detectInput ? { detectInput: w.detectInput } : {}),
         openTracks: w?.openTracks ?? 0,
+        ...(tracks ? { tracks } : {}),
       },
     };
   }

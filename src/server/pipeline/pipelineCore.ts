@@ -16,7 +16,7 @@ import type { Frame, Gate } from "./contracts";
 import { isGateId, trackIdPrefix } from "./gateId";
 import type { FaceBox, RgbImage } from "../faceEmbedding";
 import { GateTrackSession, type DecisionContext, type TrackDecisionResult } from "./trackDecision";
-import type { TrackerInput } from "./tracker";
+import { newTrackCounters, type TrackerInput } from "./tracker";
 import {
   errText,
   toWireResult,
@@ -72,6 +72,8 @@ export class PipelineCore {
   private chain: Promise<void> = Promise.resolve();
   private readonly now: () => number;
   private readonly s = { detections: 0, embeddings: 0, errors: 0, lastError: undefined as string | undefined };
+  /** Shared by every session of this worker, so a model change does not reset the totals. */
+  private readonly trackCounters = newTrackCounters();
 
   constructor(private readonly opts: PipelineCoreOptions) {
     this.now = opts.now || Date.now;
@@ -137,6 +139,7 @@ export class PipelineCore {
       contextOk: this.contextOk,
       ...(this.contextReason ? { contextReason: this.contextReason } : {}),
       openTracks: this.session ? this.session.tracker.snapshot().length : 0,
+      tracks: { ...this.trackCounters },
     };
   }
 
@@ -233,6 +236,7 @@ export class PipelineCore {
         clock: this.now,
         // "E"/"X" for the legacy gates "entry"/"exit", derived from the id otherwise.
         idPrefix: trackIdPrefix(this.gate),
+        counters: this.trackCounters,
       });
       this.sessionTag = tag;
       const st = this.session.contextStatus();

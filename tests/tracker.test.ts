@@ -9,8 +9,12 @@ import assert from "node:assert/strict";
 import type { FaceDetection, Frame, Gate } from "../src/server/pipeline/contracts";
 import { trackIdPrefix } from "../src/server/pipeline/gateId";
 import {
+  countTrackEnds,
+  countTrackerStep,
   DEFAULT_TRACKER_CONFIG,
   FaceTracker,
+  newTrackCounters,
+  TrackEnd,
   TrackerConfig,
   TrackerInput,
   TrackerStep,
@@ -818,5 +822,41 @@ describe("tracker: determinism and privacy", () => {
     step(tr, frame(0), [{ d: det(900, 500, 80), person: PERSON_A }]);
     const text = JSON.stringify(tr.snapshot());
     assert.ok(!/ref|embedding"/.test(text), text);
+  });
+});
+
+describe("tracker: track counters (worker diagnostics)", () => {
+  const end = (over: Partial<TrackEnd>): TrackEnd => ({
+    trackId: "X-1", gate: "exit", reason: "timeout", confirmed: true, firstSeenAtMs: T0, lastSeenAtMs: T0, endedAtMs: T0,
+    hits: 3, usableFrames: 3, embeddingsUsed: 2, conflicts: 0, evidenceFrames: 2, ...over,
+  });
+
+  it("separates confirmed, unconfirmed and merged ends, and counts the embeddings an unconfirmed track cost", () => {
+    const c = newTrackCounters();
+    countTrackEnds(c, [
+      end({}),
+      end({ trackId: "X-2", confirmed: false, embeddingsUsed: 2, conflicts: 1, evidenceFrames: 1 }),
+      end({ trackId: "X-3", confirmed: false, embeddingsUsed: 0, evidenceFrames: 0 }),
+      end({ trackId: "X-4", confirmed: false, reason: "merged", mergedInto: "X-1", embeddingsUsed: 1, evidenceFrames: 0 }),
+    ]);
+    assert.deepEqual(c, { ended: 4, unconfirmed: 2, merged: 1, embeddingsUnconfirmed: 3, conflicts: 0, reseeds: 0 });
+  });
+
+  it("a real run: a one-frame face that got an embedding is counted as unconfirmed with 1 embedding spent", () => {
+    const tr = tracker();
+    const c = newTrackCounters();
+    countTrackerStep(c, step(tr, frame(0), [{ d: det(900, 500, 80), person: PERSON_A }]).st);
+    assert.deepEqual(c, newTrackCounters(), "nothing ended yet");
+    countTrackerStep(c, step(tr, frame(1), []).st);
+    assert.deepEqual(c, newTrackCounters(), "missed one frame, still inside tentativeMaxMissMs");
+    countTrackEnds(c, tr.tick(T0 + 501));
+    assert.deepEqual(c, { ended: 1, unconfirmed: 1, merged: 0, embeddingsUnconfirmed: 1, conflicts: 0, reseeds: 0 });
+  });
+
+  it("counts conflict and reseed statuses from the step's updates", () => {
+    const c = newTrackCounters();
+    const u = (embeddingStatus: string) => ({ embeddingStatus }) as TrackerStep["updates"][number];
+    countTrackerStep(c, { updates: [u("conflict"), u("reseed"), u("evidence"), u("none"), u("conflict")], ended: [] } as unknown as TrackerStep);
+    assert.deepEqual(c, { ended: 0, unconfirmed: 0, merged: 0, embeddingsUnconfirmed: 0, conflicts: 2, reseeds: 1 });
   });
 });

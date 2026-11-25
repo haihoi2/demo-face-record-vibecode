@@ -241,6 +241,21 @@ describe("GatePipeline host: decision context", () => {
     assert.equal(st.contextOk, true);
     assert.equal(st.worker.engineReady, true);
     assert.equal(st.worker.modelTag, TAG);
+    assert.equal(st.worker.tracks, undefined, "a worker that sends no track counters: none reported");
+    await pipeline.stop();
+  });
+
+  it("passes the worker's track counters on only when every field is a non-negative integer", async () => {
+    const { pipeline, w } = setup();
+    pipeline.start();
+    const base = { detections: 0, embeddings: 0, errors: 0, engineReady: true, modelTag: TAG, contextOk: true, openTracks: 0 };
+    const good = { ended: 9, unconfirmed: 4, merged: 1, embeddingsUnconfirmed: 5, conflicts: 2, reseeds: 1 };
+    w().reply({ type: "stats", stats: { ...base, tracks: { ...good, extra: "x" } as any } });
+    assert.deepEqual(pipeline.stats().worker.tracks, good, "unknown fields are not carried over");
+    for (const bad of [{ ...good, ended: -1 }, { ...good, merged: 1.5 }, { ...good, conflicts: "2" }, { ended: 1 }, "x", null, { ...good, reseeds: Number.NaN }]) {
+      w().reply({ type: "stats", stats: { ...base, tracks: bad as any } });
+      assert.equal(pipeline.stats().worker.tracks, undefined, JSON.stringify(bad));
+    }
     await pipeline.stop();
   });
 

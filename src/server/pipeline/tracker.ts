@@ -290,6 +290,51 @@ export interface TrackerStep {
   rejected: Array<{ index: number; reason: DetectionRejectReason }>;
 }
 
+/**
+ * Running totals of what the tracker did with its tracks and embeddings.
+ * Diagnostics only (worker stats); never an input to a decision.
+ */
+export interface TrackCounters {
+  /** Tracks ended, any reason. */
+  ended: number;
+  /** Ended without ever being confirmed (detector flicker, a face seen once). Merged tracks are not counted here. */
+  unconfirmed: number;
+  /** Young tracks folded into an established track of the same person (reason "merged"). */
+  merged: number;
+  /** Embeddings run for tracks that then ended unconfirmed: inference spent, no outcome. */
+  embeddingsUnconfirmed: number;
+  /** Embeddings kept out of the evidence because they did not look like the track's person. */
+  conflicts: number;
+  /** Times a clearly better face restarted a track's weak reference. */
+  reseeds: number;
+}
+
+export function newTrackCounters(): TrackCounters {
+  return { ended: 0, unconfirmed: 0, merged: 0, embeddingsUnconfirmed: 0, conflicts: 0, reseeds: 0 };
+}
+
+/** Add the ended tracks to the totals. */
+export function countTrackEnds(c: TrackCounters, ends: readonly TrackEnd[]): void {
+  for (const e of ends || []) {
+    c.ended += 1;
+    if (e.reason === "merged") c.merged += 1;
+    else if (!e.confirmed) {
+      c.unconfirmed += 1;
+      // Conflicts are not charged to the budget, but each one was an embedding run.
+      c.embeddingsUnconfirmed += e.embeddingsUsed + e.conflicts;
+    }
+  }
+}
+
+/** Add one tracker step (its embedding statuses and its ended tracks) to the totals. */
+export function countTrackerStep(c: TrackCounters, step: TrackerStep): void {
+  for (const u of step.updates || []) {
+    if (u.embeddingStatus === "conflict") c.conflicts += 1;
+    else if (u.embeddingStatus === "reseed") c.reseeds += 1;
+  }
+  countTrackEnds(c, step.ended);
+}
+
 export interface TrackSnapshot {
   trackId: string;
   state: TrackState;

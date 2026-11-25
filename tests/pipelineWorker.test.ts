@@ -330,6 +330,31 @@ describe("PipelineCore", () => {
   });
 });
 
+describe("PipelineCore: track counters in the worker stats", () => {
+  const statsOf = (msgs: WorkerToHost[]) => msgs.flatMap((m) => (m.type === "stats" ? [m.stats] : []));
+
+  it("a decided employee's track is counted as ended, not as unconfirmed", async () => {
+    const { core, msgs, send } = coreSetup();
+    core.handle({ type: "context", version: 1, context: ctx() });
+    await send(6);
+    core.handle({ type: "stop" });
+    await until(() => msgs.some((m) => m.type === "stopped"), 1000, "stopped");
+    const last = statsOf(msgs).at(-1);
+    assert.deepEqual(last?.tracks, { ended: 1, unconfirmed: 0, merged: 0, embeddingsUnconfirmed: 0, conflicts: 0, reseeds: 0 });
+  });
+
+  it("a face seen in one frame only costs an embedding and is counted as unconfirmed", async () => {
+    const { core, msgs, send } = coreSetup();
+    core.handle({ type: "context", version: 1, context: ctx() });
+    await send(1);
+    core.handle({ type: "stop" });
+    await until(() => msgs.some((m) => m.type === "stopped"), 1000, "stopped");
+    assert.equal(resultsOf(msgs).length, 0, "no outcome for a tentative track");
+    const last = statsOf(msgs).at(-1);
+    assert.deepEqual(last?.tracks, { ended: 1, unconfirmed: 1, merged: 0, embeddingsUnconfirmed: 1, conflicts: 0, reseeds: 0 });
+  });
+});
+
 describe("pipelineWorkerEnv: PIPELINE_MIN_FACE_PX (pipeline-only face-size floor)", () => {
   it("sets the worker's floor only when given, leaving the door engine's untouched", () => {
     const base = { FACE_MIN_SIZE_PX: "60" } as NodeJS.ProcessEnv;

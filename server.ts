@@ -7339,6 +7339,7 @@ function pipelineRuntime(gate: Gate): Pick<GateWatchRuntime, "pipelineState" | "
         engineReady: st.worker.engineReady,
         openTracks: st.worker.openTracks,
         ...(st.worker.detectInput ? { detectInput: st.worker.detectInput } : {}),
+        ...(st.worker.tracks ? { tracks: st.worker.tracks } : {}),
       },
       ...(st.contextReason ? { contextReason: st.contextReason } : {}),
       ...(st.lastError ? { lastError: redactRtsp(st.lastError) } : {}),

@@ -39,7 +39,11 @@ import { FaceGallery, fuseDecision, matchObservations } from "../faceFusion";
 import type { BestFrame, Frame, FusionEvidence, Gate, ShadowResult, TrackOutcome } from "./contracts";
 import { assertGateId } from "./gateId";
 import {
+  countTrackEnds,
+  countTrackerStep,
   FaceTracker,
+  newTrackCounters,
+  TrackCounters,
   TrackEnd,
   TrackedFace,
   TrackerConfig,
@@ -509,6 +513,8 @@ export interface GateTrackSessionOptions {
   decisionConfig?: Partial<DecisionConfig>;
   clock?: () => number;
   idPrefix?: string;
+  /** Totals to add to (diagnostics). Pass one object to keep counting across sessions; default = a fresh one. */
+  counters?: TrackCounters;
 }
 
 /**
@@ -520,8 +526,11 @@ export interface GateTrackSessionOptions {
 export class GateTrackSession {
   readonly tracker: FaceTracker;
   readonly decider: TrackDecider;
+  /** What the tracker did with its tracks and embeddings so far (diagnostics only). */
+  readonly counters: TrackCounters;
 
   constructor(opts: GateTrackSessionOptions) {
+    this.counters = opts.counters ?? newTrackCounters();
     this.tracker = new FaceTracker({ gate: opts.gate, modelTag: opts.modelTag, config: opts.trackerConfig, clock: opts.clock, idPrefix: opts.idPrefix });
     this.decider = new TrackDecider({ gate: opts.gate, context: opts.context, config: opts.decisionConfig, clock: opts.clock });
   }
@@ -532,17 +541,18 @@ export class GateTrackSession {
 
   process(frame: Frame, inputs: readonly TrackerInput[]): { step: TrackerStep; results: TrackDecisionResult[] } {
     const step = this.tracker.update(frame, inputs);
+    countTrackerStep(this.counters, step);
     const results = this.decider.ingest(step);
     this.closeDecided(results);
     return { step, results };
   }
 
   tick(nowMs?: number): TrackDecisionResult[] {
-    return this.decider.ingestEnds(this.tracker.tick(nowMs));
+    return this.decider.ingestEnds(this.counted(this.tracker.tick(nowMs)));
   }
 
   close(nowMs?: number): TrackDecisionResult[] {
-    return this.decider.ingestEnds(this.tracker.endAll("shutdown", nowMs));
+    return this.decider.ingestEnds(this.counted(this.tracker.endAll("shutdown", nowMs)));
   }
 
   setContext(context: DecisionContext): ContextStatus {
@@ -557,6 +567,11 @@ export class GateTrackSession {
       return { ...st, ok: false, reason: "tracker model tag differs from the gallery's" };
     }
     return st;
+  }
+
+  private counted(ends: TrackEnd[]): TrackEnd[] {
+    countTrackEnds(this.counters, ends);
+    return ends;
   }
 
   private closeDecided(results: TrackDecisionResult[]): void {

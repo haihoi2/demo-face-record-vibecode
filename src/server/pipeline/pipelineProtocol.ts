@@ -22,6 +22,7 @@
  */
 import type { BestFrame, Frame, Gate, TrackOutcome } from "./contracts";
 import type { DecisionContext, TrackDecisionResult } from "./trackDecision";
+import type { TrackCounters } from "./tracker";
 
 /** A Frame without its pixels (what travels back with a decision). */
 export type FrameMeta = Omit<Frame, "rgb">;
@@ -57,6 +58,27 @@ export interface WorkerStats {
   contextOk: boolean;
   contextReason?: string;
   openTracks: number;
+  /** What the tracker did with its tracks and embeddings since the worker started (diagnostics). */
+  tracks?: TrackCounters;
+}
+
+const TRACK_COUNTER_KEYS = ["ended", "unconfirmed", "merged", "embeddingsUnconfirmed", "conflicts", "reseeds"] as const;
+
+/**
+ * The worker's track counters as the host accepts them: every field a
+ * non-negative safe integer, nothing else carried over. Anything else = undefined
+ * (the host never passes a worker's stats object on unchecked).
+ */
+export function readTrackCounters(v: unknown): TrackCounters | undefined {
+  if (!v || typeof v !== "object") return undefined;
+  const r = v as Record<string, unknown>;
+  const out = {} as TrackCounters;
+  for (const k of TRACK_COUNTER_KEYS) {
+    const n = r[k];
+    if (typeof n !== "number" || !Number.isSafeInteger(n) || n < 0) return undefined;
+    out[k] = n;
+  }
+  return out;
 }
 
 // ---- host -> worker ----------------------------------------------------------
