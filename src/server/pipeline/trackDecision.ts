@@ -303,6 +303,9 @@ export class TrackDecider {
       if (u.usable && (!st.best || u.quality > st.best.quality)) {
         st.best = { frame: u.frame, detection: u.detection, quality: u.quality };
       }
+      // The tracker replaced the track's reference with this clearly better face: the earlier
+      // evidence was judged against a reference that no longer stands, so it goes too.
+      if (u.embedding && u.usable && u.embeddingStatus === "reseed") st.evidence = [];
       if (u.embedding && u.usable && this.addEvidence(st, u, step.modelTag)) st.dirty = true;
       if (confirmedNow.has(u.trackId)) st.dirty = true;
       if (st.confirmed && st.dirty) {
@@ -445,8 +448,9 @@ export class TrackDecider {
       this.tracks.delete(end.trackId);
       return null;
     }
-    if (!end.confirmed || !st || !st.confirmed) {
-      // Detector flicker / never confirmed: nothing to report, drop what was held.
+    if (end.reason === "merged" || !end.confirmed || !st || !st.confirmed) {
+      // Detector flicker / never confirmed, or the same person continuing under an
+      // established track ("merged"): nothing to report, drop what was held.
       this.tracks.delete(end.trackId);
       return null;
     }

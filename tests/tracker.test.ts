@@ -121,7 +121,7 @@ describe("tracker: single walker", () => {
     assert.deepEqual(c.asked, [false], "same quality: no third embedding");
   });
 
-  it("respects the embedding budget: at most 5 per track, however long and however much better", () => {
+  it("respects the embedding budget: at most maxEmbeddingsPerTrack (8) per track, however long and however much better", () => {
     const tr = tracker();
     let asked = 0;
     let id = "";
@@ -132,8 +132,9 @@ describe("tracker: single walker", () => {
       id ||= r.st.updates[0].trackId;
       assert.equal(r.st.updates[0].trackId, id);
     }
-    assert.equal(asked, DEFAULT_TRACKER_CONFIG.maxEmbeddingsPerTrack);
-    assert.equal(tr.snapshot()[0].embeddingsUsed, 5);
+    assert.equal(DEFAULT_TRACKER_CONFIG.maxEmbeddingsPerTrack, 8);
+    assert.equal(asked, 8);
+    assert.equal(tr.snapshot()[0].embeddingsUsed, 8);
     // A caller that embeds anyway gets "over-budget" and no evidence.
     const extra = tr.update(frame(60), [inp(det(900, 660, 124), 1, emb(PERSON_A, 9))]);
     assert.equal(extra.updates[0].embeddingStatus, "over-budget");
@@ -230,9 +231,9 @@ describe("tracker: several people", () => {
     assert.equal(tr.snapshot().length, 2);
   });
 
-  it("an ambiguous overlap asks for tie-break embeddings and the embedding decides", () => {
+  it("an ambiguous overlap asks for tie-break embeddings and the embedding decides (2 embeddings per frame)", () => {
     const build = () => {
-      const tr = tracker();
+      const tr = tracker({ maxEmbeddingsPerFrame: 2 });
       for (let i = 0; i < 4; i++) {
         step(tr, frame(i), [
           { d: det(500, 500, 90), person: PERSON_A, seed: 10 + i },
@@ -259,6 +260,25 @@ describe("tracker: several people", () => {
     assert.ok(st.updates.every((u) => u.embeddingStatus === "evidence"));
   });
 
+  it("one tie-break embedding (the default per-frame cap) is enough to keep both identities", () => {
+    const tr = tracker();
+    for (let i = 0; i < 4; i++) {
+      step(tr, frame(i), [
+        { d: det(500, 500, 90), person: PERSON_A, seed: 10 + i },
+        { d: det(560, 500, 90), person: PERSON_B, seed: 20 + i },
+      ]);
+    }
+    const [idA, idB] = tr.snapshot().map((s) => s.trackId);
+    assert.deepEqual(tr.snapshot().map((s) => s.embeddingsUsed), [2, 2]);
+    const faces = [det(525, 500, 90), det(535, 500, 90)];
+    const plan = tr.plan(frame(4), faces.map((d) => inp(d)));
+    assert.deepEqual(plan.requests.map((r) => r.reason), ["tiebreak"]);
+    assert.deepEqual(plan.needsEmbedding, [true, false]);
+    const st = tr.update(frame(4), [inp(faces[0], 0.6, emb(PERSON_B, 77)), inp(faces[1])]);
+    assert.equal(idOf(st, 0), idB);
+    assert.equal(idOf(st, 1), idA);
+  });
+
   it("a different person in the same box is split off, not merged into the track", () => {
     const tr = tracker();
     for (let i = 0; i < 3; i++) step(tr, frame(i), [{ d: det(900, 600, 80), person: PERSON_A }]);
@@ -274,10 +294,265 @@ describe("tracker: several people", () => {
     for (let i = 0; i < 2; i++) step(tr, frame(i), [{ d: det(900, 600, 80), person: PERSON_A }]);
     const idA = tr.snapshot()[0].trackId;
     const doubtful = Float32Array.from(mix(PERSON_A, 0.36, 999));
-    const st = tr.update(frame(2), [inp(det(900, 600, 80), 0.9, doubtful)]);
+    // Same capture quality as the evidence: the reference is not the weaker side.
+    const st = tr.update(frame(2), [inp(det(900, 600, 80), 0.6, doubtful)]);
     assert.equal(idOf(st, 0), idA);
     assert.equal(st.updates[0].embeddingStatus, "conflict");
     assert.equal(st.updates[0].embedding, undefined);
+  });
+});
+
+// Regression tests for the exit-gate evidence starvation (Taiga #523, 25/11/2026): a person walking
+// out close to the camera got a new track on every frame and the embeddings went to faces that
+// never became evidence.
+describe("tracker: fast near-field walker (motion stage)", () => {
+  // 600 ms between frames (detect + one embedding on a loaded host); the face moves 1.6 box widths per frame.
+  const GAP = 600;
+  const walk = (i: number) => det(900, 300 + 160 * i, 100 + 8 * i);
+
+  it("non-overlapping boxes of one walking person stay one track", () => {
+    const tr = tracker();
+    const ids = new Set<string>();
+    for (let i = 0; i < 5; i++) {
+      const r = step(tr, frame(i, T0 + i * GAP), [{ d: walk(i), person: PERSON_A }]);
+      assert.equal(r.st.updates.length, 1);
+      ids.add(r.st.updates[0].trackId);
+    }
+    assert.equal(ids.size, 1);
+    const s = tr.snapshot();
+    assert.equal(s.length, 1);
+    assert.equal(s[0].state, "confirmed");
+    assert.ok(s[0].embeddingsUsed >= 2, "the one track collects the evidence");
+  });
+
+  it("without the motion stage the same walk is a new track on every frame (the reported failure)", () => {
+    const tr = tracker({ motionMaxSpeed: 0 });
+    const ids = new Set<string>();
+    for (let i = 0; i < 5; i++) ids.add(tr.update(frame(i, T0 + i * GAP), [inp(walk(i))]).updates[0].trackId);
+    assert.equal(ids.size, 5);
+  });
+
+  it("a face too far for the speed bound, or of a very different size, is a new track", () => {
+    const far = tracker();
+    const a = far.update(frame(0), [inp(det(300, 300, 80))]);
+    // 125 ms later, 10 box widths away: no person moves that fast.
+    const b = far.update(frame(1), [inp(det(1100, 300, 80))]);
+    assert.notEqual(idOf(b, 0), idOf(a, 0));
+
+    const size = tracker();
+    const c = size.update(frame(0), [inp(det(300, 300, 60))]);
+    const d = size.update(frame(1, T0 + GAP), [inp(det(420, 300, 130))]);
+    assert.notEqual(idOf(d, 0), idOf(c, 0));
+  });
+
+  it("two tracks about equally near one face are not paired by motion; the plan asks for a tie-break", () => {
+    const tr = tracker();
+    for (let i = 0; i < 4; i++) {
+      step(tr, frame(i), [
+        { d: det(580, 500, 80), person: PERSON_A, seed: 10 + i },
+        { d: det(820, 500, 80), person: PERSON_B, seed: 20 + i },
+      ]);
+    }
+    const [idA, idB] = tr.snapshot().map((s) => s.trackId);
+    // One face exactly between them (1.5 box widths from each), no overlap with either.
+    const t = T0 + 3 * DT + 400;
+    const mid = det(700, 500, 80);
+    const plan = tr.plan(frame(4, t), [inp(mid)]);
+    assert.deepEqual(plan.requests.map((r) => r.reason), ["tiebreak"]);
+    const blind = tr.update(frame(4, t), [inp(mid)]);
+    assert.equal(blind.updates[0].newTrack, true, "no embedding: neither track is extended");
+    assert.ok(![idA, idB].includes(blind.updates[0].trackId));
+  });
+
+  it("a decided track is not extended by motion alone", () => {
+    const build = () => {
+      const tr = tracker();
+      for (let i = 0; i < 2; i++) step(tr, frame(i), [{ d: det(600, 500, 80), person: PERSON_A }]);
+      return tr;
+    };
+    const t = T0 + DT + 400;
+    const open = build();
+    const idOpen = open.snapshot()[0].trackId;
+    assert.equal(idOf(open.update(frame(2, t), [inp(det(700, 500, 80))]), 0), idOpen, "undecided: same person by motion");
+
+    const closed = build();
+    const idClosed = closed.snapshot()[0].trackId;
+    closed.closeEvidence(idClosed);
+    const st = closed.update(frame(2, t), [inp(det(700, 500, 80))]);
+    assert.notEqual(idOf(st, 0), idClosed);
+    assert.equal(st.updates[0].newTrack, true);
+  });
+});
+
+describe("tracker: tentative tracks and slow frames", () => {
+  it("a new track survives a slow frame (800 ms) when no frame was offered in between", () => {
+    const tr = tracker();
+    const a = tr.update(frame(0), [inp(det(700, 500, 80))]);
+    const b = tr.update(frame(1, T0 + 800), [inp(det(705, 505, 82))]);
+    assert.equal(idOf(b, 0), idOf(a, 0));
+    assert.equal(b.updates[0].state, "confirmed");
+    assert.deepEqual(b.ended, []);
+  });
+
+  it("a new track that was offered a frame and missed it still ends after 500 ms", () => {
+    const tr = tracker();
+    const a = tr.update(frame(0), [inp(det(700, 500, 80))]);
+    tr.update(frame(1, T0 + 300), []);
+    const b = tr.update(frame(2, T0 + 800), [inp(det(705, 505, 82))]);
+    assert.notEqual(idOf(b, 0), idOf(a, 0));
+    assert.equal(b.ended.length, 1);
+    assert.equal(b.ended[0].confirmed, false);
+  });
+
+  it("refuses a grace shorter than the miss limit", () => {
+    assert.throws(() => tracker({ tentativeMaxMissMs: 800, tentativeGraceMs: 500 }));
+  });
+});
+
+describe("tracker: embedding policy under one embedding per frame", () => {
+  it("asks for one embedding per frame by default and lets two people take turns", () => {
+    assert.equal(DEFAULT_TRACKER_CONFIG.maxEmbeddingsPerFrame, 1);
+    const tr = tracker();
+    const asked: boolean[][] = [];
+    for (let i = 0; i < 5; i++) {
+      asked.push(step(tr, frame(i), [
+        { d: det(500, 500, 80), person: PERSON_A },
+        { d: det(1300, 500, 80), person: PERSON_B },
+      ]).asked);
+    }
+    assert.deepEqual(asked, [[true, false], [false, true], [true, false], [false, true], [false, false]]);
+    assert.deepEqual(tr.snapshot().map((s) => s.embeddingsUsed), [2, 2]);
+  });
+
+  it("a face that would start a new track never takes the embedding from a track short of evidence", () => {
+    const tr = tracker();
+    step(tr, frame(0), [{ d: det(500, 500, 80), person: PERSON_A }]);
+    const r = step(tr, frame(1), [
+      { d: det(1300, 500, 120), q: 0.95, person: PERSON_B },
+      { d: det(500, 500, 80), person: PERSON_A },
+    ]);
+    assert.deepEqual(r.asked, [false, true]);
+  });
+
+  it("refresh: keeps sampling an undecided track every 500 ms once the selection score stops growing", () => {
+    const tr = tracker();
+    const reasons: Array<string | undefined> = [];
+    for (let i = 0; i < 10; i++) {
+      const plain = [inp(det(900, 600, 80), 0.6)];
+      const plan = tr.plan(frame(i), plain);
+      reasons.push(plan.requests[0]?.reason);
+      tr.update(frame(i), plan.needsEmbedding[0] ? [inp(det(900, 600, 80), 0.6, emb(PERSON_A, i))] : plain);
+    }
+    // Embedded at 0 and 125 ms; the next one 500 ms after the last (625 ms), then 500 ms later again (1125 ms).
+    assert.deepEqual(reasons, ["new", "evidence", undefined, undefined, undefined, "refresh", undefined, undefined, undefined, "refresh"]);
+
+    const off = tracker({ refreshAfterMs: 0 });
+    let asked = 0;
+    for (let i = 0; i < 10; i++) if (step(off, frame(i), [{ d: det(900, 600, 80), person: PERSON_A }]).asked[0]) asked += 1;
+    assert.equal(asked, 2);
+  });
+
+  it("refresh skips a face clearly worse than the best evidence", () => {
+    const tr = tracker();
+    for (let i = 0; i < 2; i++) step(tr, frame(i), [{ d: det(900, 600, 80), q: 0.6, person: PERSON_A }]);
+    const t = T0 + DT + 600;
+    assert.deepEqual(tr.plan(frame(2, t), [inp(det(900, 600, 80), 0.4)]).needsEmbedding, [false]);
+    assert.deepEqual(tr.plan(frame(2, t), [inp(det(900, 600, 80), 0.5)]).needsEmbedding, [true]);
+  });
+
+  it("a conflict does not use the evidence budget and is bounded on its own", () => {
+    const tr = tracker();
+    for (let i = 0; i < 2; i++) step(tr, frame(i), [{ d: det(900, 600, 80), person: PERSON_A }]);
+    let conflicts = 0;
+    for (let k = 1; k <= 6; k++) {
+      const f = frame(1 + k, T0 + DT + k * 500);
+      const plain = [inp(det(900, 600, 80), 0.6)];
+      const plan = tr.plan(f, plain);
+      if (!plan.needsEmbedding[0]) {
+        tr.update(f, plain);
+        continue;
+      }
+      const st = tr.update(f, [inp(det(900, 600, 80), 0.6, Float32Array.from(mix(PERSON_A, 0.36, 900 + k)))]);
+      assert.equal(st.updates[0].embeddingStatus, "conflict");
+      conflicts += 1;
+    }
+    assert.equal(conflicts, DEFAULT_TRACKER_CONFIG.maxConflictsPerTrack);
+    const s = tr.snapshot()[0];
+    assert.equal(s.embeddingsUsed, 2);
+    assert.equal(s.conflicts, 3);
+  });
+
+  it("reseed: a clearly better face that conflicts with a weak reference restarts the reference", () => {
+    const tr = tracker();
+    // Reference built from two far, low-quality faces.
+    for (let i = 0; i < 2; i++) step(tr, frame(i), [{ d: det(900, 600, 62), q: 0.3, person: PERSON_A }]);
+    const id = tr.snapshot()[0].trackId;
+    const near = mix(PERSON_A, 0.36, 999);
+    const st = tr.update(frame(2), [inp(det(900, 610, 90), 0.8, Float32Array.from(near))]);
+    assert.equal(idOf(st, 0), id);
+    assert.equal(st.updates[0].embeddingStatus, "reseed");
+    assert.ok(st.updates[0].embedding, "the better face is evidence");
+    assert.equal(tr.snapshot()[0].embeddingsUsed, 3);
+    assert.equal(tr.snapshot()[0].conflicts, 0);
+    // The next near face agrees with the new reference; a face like the old reference is now the doubtful one.
+    const agree = tr.update(frame(3), [inp(det(900, 620, 92), 0.8, Float32Array.from(mix(near, 0.9, 5)))]);
+    assert.equal(agree.updates[0].embeddingStatus, "evidence");
+    const old = tr.update(frame(4), [inp(det(900, 630, 92), 0.8, emb(PERSON_A, 6))]);
+    assert.equal(old.updates[0].embeddingStatus, "conflict");
+  });
+
+  it("reseed never applies to a clearly different person (cut by the identity guard)", () => {
+    const tr = tracker();
+    for (let i = 0; i < 2; i++) step(tr, frame(i), [{ d: det(900, 600, 62), q: 0.3, person: PERSON_A }]);
+    const id = tr.snapshot()[0].trackId;
+    const st = tr.update(frame(2), [inp(det(900, 610, 90), 0.9, emb(PERSON_C, 7))]);
+    assert.notEqual(idOf(st, 0), id);
+    assert.equal(st.updates[0].newTrack, true);
+  });
+});
+
+describe("tracker: merge by identity", () => {
+  const decidedThenYoung = () => {
+    const tr = tracker();
+    for (let i = 0; i < 2; i++) step(tr, frame(i), [{ d: det(600, 500, 80), person: PERSON_A }]);
+    const idA = tr.snapshot()[0].trackId;
+    tr.closeEvidence(idA);
+    // The decided person moves on without box overlap: a young track starts, not yet embedded.
+    const t = T0 + DT + 400;
+    const young = tr.update(frame(2, t), [inp(det(720, 500, 80))]);
+    assert.equal(young.updates[0].newTrack, true);
+    return { tr, idA, idYoung: young.updates[0].trackId, t };
+  };
+
+  it("the young track's first embedding matches the decided track: the face goes back, the young track ends as merged", () => {
+    const { tr, idA, idYoung, t } = decidedThenYoung();
+    const st = tr.update(frame(3, t + DT), [inp(det(725, 505, 80), 0.6, emb(PERSON_A, 50))]);
+    assert.equal(st.updates.length, 1);
+    assert.equal(st.updates[0].trackId, idA);
+    assert.equal(st.updates[0].embeddingStatus, "closed");
+    assert.equal(st.updates[0].embedding, undefined);
+    assert.deepEqual(st.ended.map((e) => [e.trackId, e.reason, e.mergedInto]), [[idYoung, "merged", idA]]);
+    assert.deepEqual(tr.snapshot().map((s) => s.trackId), [idA]);
+  });
+
+  it("another person's embedding stays with the young track", () => {
+    const { tr, idYoung, t } = decidedThenYoung();
+    const st = tr.update(frame(3, t + DT), [inp(det(725, 505, 80), 0.6, emb(PERSON_B, 51))]);
+    assert.equal(st.updates[0].trackId, idYoung);
+    assert.equal(st.updates[0].embeddingStatus, "evidence");
+    assert.deepEqual(st.ended, []);
+    assert.equal(tr.snapshot().length, 2);
+  });
+
+  it("does not merge into a track that has its own face in the frame", () => {
+    const { tr, idA, idYoung, t } = decidedThenYoung();
+    const st = tr.update(frame(3, t + DT), [
+      inp(det(725, 505, 80), 0.6, emb(PERSON_A, 52)),
+      inp(det(600, 500, 80)),
+    ]);
+    assert.equal(idOf(st, 0), idYoung);
+    assert.equal(idOf(st, 1), idA);
+    assert.deepEqual(st.ended, []);
   });
 });
 
@@ -333,13 +608,23 @@ describe("tracker: occlusion, flicker, lifecycle", () => {
   });
 
   it("a single-frame false detection ends unconfirmed (no outcome owed)", () => {
+    // Offered a frame without the face: gone after tentativeMaxMissMs (500 ms).
     const tr = tracker();
     tr.update(frame(0), [inp(det(700, 500, 80))]);
+    assert.deepEqual(tr.update(frame(1), []).ended, []);
     assert.deepEqual(tr.tick(T0 + 500), []);
     const ended = tr.tick(T0 + 501);
     assert.equal(ended.length, 1);
     assert.equal(ended[0].confirmed, false);
     assert.equal(tr.snapshot().length, 0);
+
+    // No frame offered at all (stalled loop): nothing was missed yet, it waits tentativeGraceMs (1200 ms).
+    const idle = tracker();
+    idle.update(frame(0), [inp(det(700, 500, 80))]);
+    assert.deepEqual(idle.tick(T0 + 1200), []);
+    const late = idle.tick(T0 + 1201);
+    assert.equal(late.length, 1);
+    assert.equal(late[0].confirmed, false);
   });
 
   it("lost after 1 s, ended after 2 s without a match (timeouts, via tick)", () => {

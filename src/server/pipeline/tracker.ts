@@ -20,6 +20,17 @@
  *    alive through detector flicker but never start or confirm one.
  *    Greedy by score, deterministic tie-breaks (track creation order, then
  *    detection index); with a few faces greedy equals Hungarian in practice.
+ *  - Motion stage (third): a face walking past close to the camera moves about
+ *    a box width per frame, so consecutive boxes do not overlap and IoU alone
+ *    starts a new track on every frame. High-score detections still unmatched
+ *    are paired with still unmatched, recently seen, undecided tracks by centre
+ *    distance to the predicted position, inside a speed-bounded reach
+ *    (`motionMaxSpeed` box widths per second for a track without a velocity
+ *    estimate, `motionSlack` around the prediction otherwise) and a similar
+ *    box size. Only an unambiguous mutual nearest pair is taken; anything else
+ *    is left to the embedding (tie-break request, re-attach by embedding).
+ *    A decided track (evidence closed) is never extended by motion alone, so
+ *    another person cannot be absorbed into an outcome already given.
  *  - Ambiguity (people crossing/overlapping): a detection whose best two
  *    candidate tracks (or a track whose best two candidate detections) are
  *    within `ambiguityMargin` IoU is ambiguous. If the caller supplied an
@@ -33,7 +44,10 @@
  *  - Lifecycle: tentative -> confirmed after `confirmHits` hits; a tentative
  *    track that misses `tentativeMaxMissMs` is dropped silently (flicker, not a
  *    person); confirmed -> lost after `lostAfterMs` without a match; ended after
- *    `endAfterMs`. Lost tracks can still be matched (occlusion).
+ *    `endAfterMs`. Lost tracks can still be matched (occlusion). A tentative
+ *    track that has not been OFFERED a frame since its last hit (the loop was
+ *    busy, e.g. embedding) has not missed anything: it is kept up to
+ *    `tentativeGraceMs`, so a slow frame cannot kill every new track.
  *
  * Evidence rules: only `usable` faces (detector said clear, >= minFacePx on the
  * source picture, score >= minUsableScore) may carry an embedding into the
@@ -45,6 +59,27 @@
  * needed to resolve an ambiguous association. Never more than
  * `maxEmbeddingsPerTrack` per track, never more than `maxEmbeddingsPerFrame` per
  * frame, never for a track whose evidence has been closed (already decided).
+ * Within a frame the order is: tie-breaks, then tracks still short of evidence
+ * (fewest evidence frames first, so two people take turns), then clearly better
+ * faces and refreshes, and last a face that would start a new track.
+ *  - One embedding per frame by default: ArcFace runs in the same thread as
+ *    the detector, so every embedding delays the next frame by its full cost.
+ *  - "refresh": an undecided track keeps sampling, at most once per
+ *    `refreshAfterMs`, faces about as good as its best one. The selection
+ *    score saturates for large faces, so "clearly better" alone stops asking
+ *    exactly when a walking person is closest.
+ *  - "new": a face that would start a new track comes last, so it never takes
+ *    the frame's embedding from an existing track. When it had to wait, the
+ *    young track's first embedding is compared with established tracks nearby
+ *    that lost their box: on a match the face goes back to that track and the
+ *    young one ends as "merged" with no outcome, so a person who was already
+ *    decided is not decided a second time under a new id.
+ *  - A "conflict" embedding is not evidence and does not use the track's
+ *    evidence budget; it has its own small bound (`maxConflictsPerTrack`).
+ *  - "reseed": a conflicting face that is clearly better than everything the
+ *    reference was built from replaces the reference (a first embedding taken
+ *    from a small far face is a poor reference for the same person close up).
+ *    The earlier, weaker evidence is dropped by the decision layer as well.
  *
  * Quality here is CAPTURE quality (size x sharpness, from faceQuality) weighted
  * by frontality for frame selection. It is not presentation-attack detection
@@ -63,20 +98,24 @@ import { STRANGER_SAME_PERSON_COSINE } from "../strangers";
 
 export type Box = [number, number, number, number];
 export type TrackState = "tentative" | "confirmed" | "lost";
-export type EmbeddingReason = "new" | "evidence" | "better" | "tiebreak";
+export type EmbeddingReason = "new" | "evidence" | "better" | "refresh" | "tiebreak";
 /**
  * What happened to an embedding the caller supplied:
  *  none         no embedding given
  *  evidence     accepted as evidence for the track (TrackUpdate.embedding set)
- *  conflict     looks like another person than the track so far; not evidence
+ *  reseed       doubtful against the reference but clearly better than the faces it was built from:
+ *               evidence, and the reference (and the decider's evidence) restart from this face
+ *  conflict     doubtful against the track so far (between split and same cosine); not evidence,
+ *               not charged to the evidence budget
  *  closed       the track is already decided; used for association only
  *  over-budget  the track already used its embedding budget; not evidence
  *  unusable     the face is not clear / too small; not evidence
  *  invalid      wrong model tag, wrong length, non-finite or zero vector
  */
-export type EmbeddingStatus = "none" | "evidence" | "conflict" | "closed" | "over-budget" | "unusable" | "invalid";
+export type EmbeddingStatus = "none" | "evidence" | "reseed" | "conflict" | "closed" | "over-budget" | "unusable" | "invalid";
 export type DetectionRejectReason = "invalid-detection" | "below-floor" | "overload" | "track-limit";
-export type TrackEndReason = "timeout" | "reset" | "shutdown";
+/** "merged": a young track without evidence turned out, at its first embedding, to be an established track nearby. */
+export type TrackEndReason = "timeout" | "reset" | "shutdown" | "merged";
 export type FrameRejectReason = "invalid-frame" | "wrong-gate" | "stale-frame";
 
 export interface TrackerConfig {
@@ -96,6 +135,8 @@ export interface TrackerConfig {
   ambiguityMargin: number;
   confirmHits: number;
   tentativeMaxMissMs: number;
+  /** A tentative track not offered any frame since its last hit is kept this long (>= tentativeMaxMissMs). */
+  tentativeGraceMs: number;
   lostAfterMs: number;
   endAfterMs: number;
   maxExtrapolateMs: number;
@@ -108,9 +149,26 @@ export interface TrackerConfig {
   splitCosine: number;
   /** Re-attach by embedding only within this many box widths of the track. */
   reidMaxCenterDist: number;
+  /**
+   * Motion stage: farthest a face may travel, in box widths per second, to still
+   * join a track that has no velocity estimate yet. 0 turns the stage off.
+   */
+  motionMaxSpeed: number;
+  /** Motion stage: allowed error around the predicted position, in box widths per second. */
+  motionSlack: number;
+  /** Motion stage: reach at zero elapsed time, in box widths. */
+  motionBase: number;
+  /** Motion stage: largest box-width ratio between track and detection. */
+  motionMaxSizeRatio: number;
   maxEmbeddingsPerTrack: number;
+  /** Embeddings that looked like another person ("conflict") a track may spend before it stops asking. */
+  maxConflictsPerTrack: number;
   /** Embed the first N usable frames of a track regardless of quality gain. */
   minEvidenceFrames: number;
+  /** An undecided track asks again after this long without an embedding (0 = never). */
+  refreshAfterMs: number;
+  /** ... for a face whose selection score is at least this share of the best embedded one. */
+  refreshMinRatio: number;
   /** Relative selection-score gain that makes a face "clearly better" (0.1 = +10%). */
   betterGain: number;
   maxEmbeddingsPerFrame: number;
@@ -131,6 +189,7 @@ export const DEFAULT_TRACKER_CONFIG: Readonly<TrackerConfig> = Object.freeze({
   ambiguityMargin: 0.15,
   confirmHits: 2,
   tentativeMaxMissMs: 500,
+  tentativeGraceMs: 1200,
   lostAfterMs: 1000,
   endAfterMs: 2000,
   maxExtrapolateMs: 500,
@@ -139,10 +198,17 @@ export const DEFAULT_TRACKER_CONFIG: Readonly<TrackerConfig> = Object.freeze({
   sameCosine: STRANGER_SAME_PERSON_COSINE,
   splitCosine: 0.25,
   reidMaxCenterDist: 3,
-  maxEmbeddingsPerTrack: 5,
+  motionMaxSpeed: 8,
+  motionSlack: 3,
+  motionBase: 0.5,
+  motionMaxSizeRatio: 1.6,
+  maxEmbeddingsPerTrack: 8,
+  maxConflictsPerTrack: 3,
   minEvidenceFrames: 2,
   betterGain: 0.1,
-  maxEmbeddingsPerFrame: 4,
+  refreshAfterMs: 500,
+  refreshMinRatio: 0.8,
+  maxEmbeddingsPerFrame: 1,
   maxDetectionsPerFrame: 24,
   maxTracks: 16,
   minFacePx: CLEAR_FACE_LIMITS.minFacePx,
@@ -191,6 +257,8 @@ export interface TrackEnd {
   trackId: string;
   gate: Gate;
   reason: TrackEndReason;
+  /** Reason "merged" only: the established track that continues instead. No outcome is owed for this one. */
+  mergedInto?: string;
   /** False for tentative tracks (detector flicker): no outcome is owed. */
   confirmed: boolean;
   firstSeenAtMs: number;
@@ -198,7 +266,12 @@ export interface TrackEnd {
   endedAtMs: number;
   hits: number;
   usableFrames: number;
+  /** Embeddings spent on the track's evidence budget (evidence + association checks after the decision). */
   embeddingsUsed: number;
+  /** Embeddings that looked like another person and were kept out of the evidence. */
+  conflicts: number;
+  /** Embeddings accepted as evidence. */
+  evidenceFrames: number;
 }
 
 export interface TrackerStep {
@@ -227,6 +300,7 @@ export interface TrackSnapshot {
   hits: number;
   usableFrames: number;
   embeddingsUsed: number;
+  conflicts: number;
   evidenceFrames: number;
   evidenceClosed: boolean;
 }
@@ -260,6 +334,9 @@ interface Track {
   hits: number;
   usableFrames: number;
   embeddingsUsed: number;
+  conflicts: number;
+  /** Capture time of the last frame whose embedding was used for this track (-Infinity: none yet). */
+  lastEmbeddingAtMs: number;
   evidenceFrames: number;
   bestEvidenceSelect: number;
   refSum: Float64Array | null;
@@ -295,6 +372,8 @@ function validateConfig(c: TrackerConfig): void {
   if (!(c.lowScore <= c.highScore && c.highScore <= 1)) throw new RangeError("tracker config: lowScore <= highScore <= 1");
   if (!(c.lostAfterMs <= c.endAfterMs)) throw new RangeError("tracker config: lostAfterMs <= endAfterMs");
   if (!(c.splitCosine <= c.sameCosine)) throw new RangeError("tracker config: splitCosine <= sameCosine");
+  if (!(c.tentativeMaxMissMs <= c.tentativeGraceMs)) throw new RangeError("tracker config: tentativeMaxMissMs <= tentativeGraceMs");
+  if (!(c.motionMaxSizeRatio >= 1)) throw new RangeError("tracker config: motionMaxSizeRatio >= 1");
   for (const k of ["confirmHits", "maxEmbeddingsPerTrack", "maxEmbeddingsPerFrame", "maxDetectionsPerFrame", "maxTracks", "embeddingDims", "minEvidenceFrames"] as const) {
     if (!Number.isInteger(c[k]) || c[k] < 1) throw new RangeError(`tracker config ${k} must be a positive integer`);
   }
@@ -375,6 +454,7 @@ export class FaceTracker {
       hits: tr.hits,
       usableFrames: tr.usableFrames,
       embeddingsUsed: tr.embeddingsUsed,
+      conflicts: tr.conflicts,
       evidenceFrames: tr.evidenceFrames,
       evidenceClosed: tr.evidenceClosed,
     }));
@@ -401,13 +481,13 @@ export class FaceTracker {
     const live = reset ? [] : this.tracks.filter((tr) => !this.wouldEnd(tr, t));
     const { dets } = this.sanitize(list, false);
     const preds = live.map((tr) => toBox(this.predict(tr, t)));
-    const assoc = this.associate(live, preds, dets, false);
+    const assoc = this.associate(live, preds, dets, false, t);
     const byDet = new Map<number, number>();
     for (const [ti, di] of assoc.pairs) byDet.set(di, ti);
 
     const c = this.config;
     const hasRoomForNew = live.length < c.maxTracks || live.some((tr) => tr.state !== "tentative" && tr.ref);
-    const candidates: Array<EmbeddingRequest & { prio: number; select: number }> = [];
+    const candidates: Array<EmbeddingRequest & { prio: number; select: number; have: number }> = [];
     dets.forEach((d, di) => {
       if (!d.usable) return;
       const amb = assoc.ambiguous.get(di);
@@ -415,26 +495,33 @@ export class FaceTracker {
         const cands = [...amb].map((ti) => live[ti]);
         if (cands.some((tr) => tr.ref) && cands.every((tr) => tr.embeddingsUsed < c.maxEmbeddingsPerTrack)) {
           const ti = byDet.get(di);
-          candidates.push({ index: d.index, trackId: ti === undefined ? null : live[ti].id, reason: "tiebreak", prio: 0, select: d.select });
+          candidates.push({ index: d.index, trackId: ti === undefined ? null : live[ti].id, reason: "tiebreak", prio: 0, select: d.select, have: 0 });
           return;
         }
       }
       const ti = byDet.get(di);
       if (ti === undefined) {
+        // Last in the frame: never takes the embedding from an existing track.
         if (d.score >= c.newTrackScore && hasRoomForNew) {
-          candidates.push({ index: d.index, trackId: null, reason: "new", prio: 1, select: d.select });
+          candidates.push({ index: d.index, trackId: null, reason: "new", prio: 3, select: d.select, have: 0 });
         }
         return;
       }
       const tr = live[ti];
-      if (tr.evidenceClosed || tr.embeddingsUsed >= c.maxEmbeddingsPerTrack) return;
+      if (tr.evidenceClosed || tr.embeddingsUsed >= c.maxEmbeddingsPerTrack || tr.conflicts >= c.maxConflictsPerTrack) return;
       if (tr.evidenceFrames < c.minEvidenceFrames) {
-        candidates.push({ index: d.index, trackId: tr.id, reason: "evidence", prio: 1, select: d.select });
+        candidates.push({ index: d.index, trackId: tr.id, reason: "evidence", prio: 1, select: d.select, have: tr.evidenceFrames });
       } else if (d.select >= tr.bestEvidenceSelect * (1 + c.betterGain) && d.select > 0) {
-        candidates.push({ index: d.index, trackId: tr.id, reason: "better", prio: 2, select: d.select });
+        candidates.push({ index: d.index, trackId: tr.id, reason: "better", prio: 2, select: d.select, have: tr.evidenceFrames });
+      } else if (
+        c.refreshAfterMs > 0 && d.select > 0 && t - tr.lastEmbeddingAtMs >= c.refreshAfterMs &&
+        d.select >= tr.bestEvidenceSelect * c.refreshMinRatio
+      ) {
+        candidates.push({ index: d.index, trackId: tr.id, reason: "refresh", prio: 2, select: d.select, have: tr.evidenceFrames });
       }
     });
-    candidates.sort((a, b) => a.prio - b.prio || b.select - a.select || a.index - b.index);
+    // Same priority: the track with the least evidence first, so people take turns under a small per-frame cap.
+    candidates.sort((a, b) => a.prio - b.prio || a.have - b.have || b.select - a.select || a.index - b.index);
     const requests = candidates.slice(0, c.maxEmbeddingsPerFrame).map(({ index, trackId, reason }) => ({ index, trackId, reason }));
     requests.sort((a, b) => a.index - b.index);
     for (const r of requests) needsEmbedding[r.index] = true;
@@ -475,7 +562,7 @@ export class FaceTracker {
     const c = this.config;
     const live = this.tracks;
     const preds = live.map((tr) => toBox(this.predict(tr, t)));
-    const assoc = this.associate(live, preds, dets, true);
+    const assoc = this.associate(live, preds, dets, true, t);
 
     // Identity guard: cut pairs whose embedding is clearly another person.
     const identity = new Map<number, number>(); // det index -> cosine vs its track
@@ -490,6 +577,32 @@ export class FaceTracker {
       }
       pairs.push([ti, di]);
     }
+    // Merge by identity: the first embedding of a track that has no evidence yet. If it matches an
+    // established track nearby that has no face in this frame, that track continues and the young one ends.
+    const merged = new Map<number, number>(); // young track index -> established track index
+    {
+      const taken = new Set(pairs.map((p) => p[0]));
+      for (const pair of pairs) {
+        const young = live[pair[0]];
+        const d = dets[pair[1]];
+        if (young.ref || young.evidenceClosed || !d.embedding || !d.usable) continue;
+        let best = -1;
+        let bestCos = c.sameCosine;
+        live.forEach((tr, ti) => {
+          if (taken.has(ti) || !tr.ref || !this.reidInReach(tr, preds[ti], d)) return;
+          const cos = dot(d.embedding!, tr.ref);
+          if (cos >= bestCos && (best < 0 || cos > bestCos)) {
+            best = ti;
+            bestCos = cos;
+          }
+        });
+        if (best < 0) continue;
+        merged.set(pair[0], best);
+        taken.add(best);
+        pair[0] = best;
+        identity.set(pair[1], bestCos);
+      }
+    }
     const matchedT = new Set(pairs.map((p) => p[0]));
     const matchedD = new Set(pairs.map((p) => p[1]));
 
@@ -499,11 +612,7 @@ export class FaceTracker {
       let best = -1;
       let bestCos = c.sameCosine;
       live.forEach((tr, ti) => {
-        if (matchedT.has(ti) || tr.state === "tentative" || !tr.ref) return;
-        const p = preds[ti];
-        const reach = c.reidMaxCenterDist * Math.max(p[2] - p[0], d.box[2] - d.box[0]);
-        const dist = Math.hypot((p[0] + p[2]) / 2 - (d.box[0] + d.box[2]) / 2, (p[1] + p[3]) / 2 - (d.box[1] + d.box[3]) / 2);
-        if (dist > reach) return;
+        if (matchedT.has(ti) || !tr.ref || !this.reidInReach(tr, preds[ti], d)) return;
         const cos = dot(d.embedding!, tr.ref);
         if (cos >= bestCos && (best < 0 || cos > bestCos)) {
           best = ti;
@@ -529,6 +638,10 @@ export class FaceTracker {
     live.forEach((tr, ti) => {
       if (!matchedT.has(ti)) tr.missed = true;
     });
+    if (merged.size > 0) {
+      for (const [yi, oi] of merged) step.ended.push({ ...this.endRecord(live[yi], "merged", t), mergedInto: live[oi].id });
+      this.tracks = live.filter((_, ti) => !merged.has(ti));
+    }
 
     dets.forEach((d, di) => {
       if (matchedD.has(di) || d.score < c.newTrackScore) return;
@@ -573,7 +686,11 @@ export class FaceTracker {
 
   private wouldEnd(tr: Track, t: number): boolean {
     const since = t - tr.lastSeenAtMs;
-    if (tr.state === "tentative") return since > this.config.tentativeMaxMissMs;
+    if (tr.state === "tentative") {
+      if (since <= this.config.tentativeMaxMissMs) return false;
+      // Not offered a frame since its last hit (the loop was busy): nothing was missed yet.
+      return tr.missed || since > this.config.tentativeGraceMs;
+    }
     return since >= this.config.endAfterMs;
   }
 
@@ -607,6 +724,8 @@ export class FaceTracker {
       hits: tr.hits,
       usableFrames: tr.usableFrames,
       embeddingsUsed: tr.embeddingsUsed,
+      conflicts: tr.conflicts,
+      evidenceFrames: tr.evidenceFrames,
     };
   }
 
@@ -659,7 +778,7 @@ export class FaceTracker {
     return [tr.x[0] + tr.v[0] * dt, tr.x[1] + tr.v[1] * dt, tr.x[2] + tr.v[2] * dt, tr.x[3] + tr.v[3] * dt];
   }
 
-  private associate(tracks: Track[], preds: Box[], dets: Det[], useEmbeddings: boolean): Association {
+  private associate(tracks: Track[], preds: Box[], dets: Det[], useEmbeddings: boolean, t: number): Association {
     const c = this.config;
     const pairs: Array<[number, number]> = [];
     const ambiguous = new Map<number, Set<number>>();
@@ -725,7 +844,62 @@ export class FaceTracker {
       dets.map((_, i) => i).filter((i) => dets[i].score < c.highScore),
       c.iouLow,
     );
+    this.associateByMotion(tracks, preds, dets, t, takenT, takenD, pairs, ambiguous);
     return { pairs, ambiguous };
+  }
+
+  /**
+   * Third stage (see the header): unmatched high-score detections against
+   * unmatched, recently seen, undecided tracks by centre distance to the
+   * predicted position. Takes only pairs that are each other's nearest
+   * candidate by a clear margin; contested detections are marked ambiguous so
+   * plan() asks for an embedding and update() can re-attach by identity.
+   */
+  private associateByMotion(
+    tracks: Track[], preds: Box[], dets: Det[], t: number,
+    takenT: Set<number>, takenD: Set<number>, pairs: Array<[number, number]>, ambiguous: Map<number, Set<number>>,
+  ): void {
+    const c = this.config;
+    if (!(c.motionMaxSpeed > 0)) return;
+    const cands: Array<{ ti: number; di: number; cost: number }> = [];
+    tracks.forEach((tr, ti) => {
+      if (takenT.has(ti) || tr.evidenceClosed) return;
+      const since = t - tr.lastSeenAtMs;
+      if (since < 0 || since >= c.lostAfterMs) return;
+      const p = preds[ti];
+      const pw = p[2] - p[0];
+      // A velocity estimate exists from the second hit on; before that only the speed bound applies.
+      const speed = tr.hits >= 2 ? c.motionSlack : c.motionMaxSpeed;
+      const reach = c.motionBase + (speed * Math.min(since, c.maxExtrapolateMs)) / 1000;
+      dets.forEach((d, di) => {
+        if (takenD.has(di) || d.score < c.highScore) return;
+        const dw = d.box[2] - d.box[0];
+        if (Math.max(pw, dw) > c.motionMaxSizeRatio * Math.min(pw, dw)) return;
+        const w = (pw + dw) / 2;
+        const dist = Math.hypot((p[0] + p[2]) / 2 - (d.box[0] + d.box[2]) / 2, (p[1] + p[3]) / 2 - (d.box[1] + d.box[3]) / 2) / w;
+        if (dist <= reach) cands.push({ ti, di, cost: dist });
+      });
+    });
+    if (cands.length === 0) return;
+    cands.sort((a, b) => a.cost - b.cost || tracks[a.ti].order - tracks[b.ti].order || a.di - b.di);
+    // Clear margin over the runner-up, in box widths: half as far again plus a quarter width.
+    const clear = (best: number, second: number | undefined) => second === undefined || second >= best * 1.5 + 0.25;
+    for (const x of cands) {
+      if (takenT.has(x.ti) || takenD.has(x.di)) continue;
+      const forDet = cands.filter((y) => y.di === x.di && !takenT.has(y.ti));
+      const forTrack = cands.filter((y) => y.ti === x.ti && !takenD.has(y.di));
+      if (forDet[0] !== x || forTrack[0] !== x) continue;
+      if (!clear(x.cost, forDet[1]?.cost)) {
+        const s = ambiguous.get(x.di) ?? new Set<number>();
+        for (const y of forDet) if (!clear(x.cost, y.cost) || y === x) s.add(y.ti);
+        ambiguous.set(x.di, s);
+        continue;
+      }
+      if (!clear(x.cost, forTrack[1]?.cost)) continue;
+      takenT.add(x.ti);
+      takenD.add(x.di);
+      pairs.push([x.ti, x.di]);
+    }
   }
 
   private observe(tr: Track, d: Det, t: number): void {
@@ -775,6 +949,8 @@ export class FaceTracker {
       hits: 1,
       usableFrames: 0,
       embeddingsUsed: 0,
+      conflicts: 0,
+      lastEmbeddingAtMs: -Infinity,
       evidenceFrames: 0,
       bestEvidenceSelect: 0,
       refSum: null,
@@ -790,6 +966,14 @@ export class FaceTracker {
     return tr;
   }
 
+  /** True when `d` may be re-attached to `tr` by embedding: an established track with evidence, close enough. */
+  private reidInReach(tr: Track, p: Box, d: Det): boolean {
+    if (tr.state === "tentative" || !tr.ref) return false;
+    const reach = this.config.reidMaxCenterDist * Math.max(p[2] - p[0], d.box[2] - d.box[0]);
+    const dist = Math.hypot((p[0] + p[2]) / 2 - (d.box[0] + d.box[2]) / 2, (p[1] + p[3]) / 2 - (d.box[1] + d.box[3]) / 2);
+    return dist <= reach;
+  }
+
   /** Decide what the supplied embedding (if any) means for the track, and build the update. */
   private face(frame: Frame, tr: Track, d: Det, isNew: boolean, identityCosine: number | undefined): TrackedFace {
     const c = this.config;
@@ -800,12 +984,34 @@ export class FaceTracker {
       if (!d.usable) status = "unusable";
       else if (tr.embeddingsUsed >= c.maxEmbeddingsPerTrack) status = "over-budget";
       else {
-        tr.embeddingsUsed += 1;
         const cos = tr.ref ? dot(d.embedding, tr.ref) : undefined;
         if (identityCosine === undefined && cos !== undefined) identityCosine = cos;
-        if (tr.evidenceClosed) status = "closed";
-        else if (cos !== undefined && cos < c.sameCosine) status = "conflict";
-        else {
+        tr.lastEmbeddingAtMs = frame.capturedAtMs;
+        if (tr.evidenceClosed) {
+          tr.embeddingsUsed += 1;
+          status = "closed";
+        } else if (cos !== undefined && cos < c.sameCosine && d.select > 0 && d.select >= tr.bestEvidenceSelect * (1 + c.betterGain)) {
+          // Doubtful against the reference, but clearly better than every face the reference was
+          // built from: the reference is the weak side. Start over from this face. (A face that is
+          // clearly another person never gets here: update() cuts it below splitCosine.)
+          tr.embeddingsUsed += 1;
+          status = "reseed";
+          evidence = d.embedding;
+          const w = Math.max(0.05, d.quality);
+          const sum = new Float64Array(d.embedding.length);
+          for (let i = 0; i < sum.length; i++) sum[i] = w * d.embedding[i];
+          tr.refSum = sum;
+          tr.ref = normalizedCopy(sum, sum.length);
+          tr.evidenceFrames = 1;
+          tr.bestEvidenceSelect = d.select;
+          tr.conflicts = 0;
+        } else if (cos !== undefined && cos < c.sameCosine) {
+          // Not evidence, and not charged to the evidence budget: a doubtful frame must not
+          // use up the embeddings the track still needs. Bounded by maxConflictsPerTrack in plan().
+          tr.conflicts += 1;
+          status = "conflict";
+        } else {
+          tr.embeddingsUsed += 1;
           status = "evidence";
           evidence = d.embedding;
           const w = Math.max(0.05, d.quality);

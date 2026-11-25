@@ -497,10 +497,87 @@ describe("trackDecision: fail closed", () => {
     assert.deepEqual(decider.ingest(stepOf([updates[0]])), []);
     assert.deepEqual(decider.ingest(stepOf([updates[1]])), [], "fusion alone would accept E1 here");
     const end = decider.ingestEnds([{
-      trackId: "M-1", gate: "exit", reason: "timeout", confirmed: true, firstSeenAtMs: T0, lastSeenAtMs: T0, endedAtMs: T0 + 2000, hits: 3, usableFrames: 3, embeddingsUsed: 3,
+      trackId: "M-1", gate: "exit", reason: "timeout", confirmed: true, firstSeenAtMs: T0, lastSeenAtMs: T0, endedAtMs: T0 + 2000, hits: 3, usableFrames: 3, embeddingsUsed: 3, conflicts: 0, evidenceFrames: 3,
     }]);
     assert.equal(end.length, 1);
     assert.notEqual(end[0].outcome.kind, "employee");
+  });
+});
+
+// Regression tests for the exit-gate evidence starvation (Taiga #523, 25/11/2026).
+describe("trackDecision: reseed and merged tracks", () => {
+  const stepOf = (u: TrackedFace[], seq = 0): TrackerStep => ({
+    gate: "exit", modelTag: TAG, frameSeq: seq, atMs: T0 + seq * DT, accepted: true, updates: u, confirmed: [], ended: [], rejected: [],
+  });
+  const face = (i: number, embedding: Float32Array | undefined, quality: number, status: TrackedFace["embeddingStatus"], trackId = "R-1"): TrackedFace => ({
+    trackId, frame: frame(i), detection: det(900, 500, 80), quality, ...(embedding ? { embedding } : {}),
+    detectionIndex: 0, state: "confirmed", usable: true, selectScore: quality, newTrack: i === 0, embeddingStatus: status,
+  });
+  // Two far faces whose embeddings lean weakly towards another employee (as small faces do), then two near faces of E1 at cosine 0.5.
+  const junk = (seed: number) => Float32Array.from(orthTo(mix(E2, 0.4, seed), [E1]));
+  const session = mix(E1, 0.5, 71);
+  const near = (seed: number) => Float32Array.from(mix(session, 0.98, seed));
+  const run = (thirdStatus: TrackedFace["embeddingStatus"]) => {
+    const decider = new TrackDecider({ gate: "exit", context: ctx(), clock: () => T0 });
+    const out: TrackDecisionResult[] = [];
+    out.push(...decider.ingest(stepOf([face(0, junk(1), 0.5, "evidence")], 0)));
+    out.push(...decider.ingest(stepOf([face(1, junk(2), 0.5, "evidence")], 1)));
+    const before = decider.pending()[0]?.evidenceFrames;
+    out.push(...decider.ingest(stepOf([face(2, near(3), 0.8, thirdStatus)], 2)));
+    const after = decider.pending()[0]?.evidenceFrames;
+    out.push(...decider.ingest(stepOf([face(3, near(4), 0.8, "evidence")], 3)));
+    return { out, before, after };
+  };
+
+  it("a reseed drops the evidence collected before it, and the track is decided on the new evidence", () => {
+    const r = run("reseed");
+    assert.equal(r.before, 2);
+    assert.equal(r.after, 1, "only the reseed face is left");
+    assert.equal(r.out.length, 1);
+    const o = r.out[0].outcome;
+    assert.equal(o.kind, "employee");
+    assert.equal(r.out[0].basis, "multi-agree");
+    assert.equal(o.kind === "employee" && o.employeeId, "E1");
+    assert.equal(o.kind === "employee" && o.fused.framesUsed, 2, "decided on the two near faces only");
+  });
+
+  it("without the reseed status the early evidence stays in the decision (characterisation)", () => {
+    const r = run("evidence");
+    assert.equal(r.after, 3);
+    assert.equal(r.out.length, 1);
+    const o = r.out[0].outcome;
+    assert.equal(o.kind === "employee" && o.fused.framesUsed, 4);
+  });
+
+  it("a track that ends as merged owes no outcome, a timed-out one does", () => {
+    const build = () => {
+      const decider = new TrackDecider({ gate: "exit", context: ctx(), clock: () => T0 });
+      decider.ingest(stepOf([face(0, undefined, 0.6, "none", "Y-2")], 0));
+      decider.ingest(stepOf([face(1, undefined, 0.6, "none", "Y-2")], 1));
+      return decider;
+    };
+    const end = { trackId: "Y-2", gate: "exit" as Gate, confirmed: true, firstSeenAtMs: T0, lastSeenAtMs: T0 + DT, endedAtMs: T0 + 2 * DT, hits: 2, usableFrames: 2, embeddingsUsed: 0, conflicts: 0, evidenceFrames: 0 };
+    const timedOut = build().ingestEnds([{ ...end, reason: "timeout" }]);
+    assert.equal(timedOut.length, 1);
+    assert.equal(timedOut[0].outcome.kind, "insufficient");
+
+    const merged = build();
+    assert.deepEqual(merged.ingestEnds([{ ...end, reason: "merged", mergedInto: "R-1" }]), []);
+    assert.deepEqual(merged.pending(), []);
+  });
+
+  it("a decided employee who moves on without box overlap is not decided a second time", () => {
+    const h = new Harness();
+    const walk = passage(E1, 0.85, 30);
+    h.frame(0, [{ d: det(600, 500, 90), who: walk }]);
+    h.frame(1, [{ d: det(600, 500, 90), who: walk }]);
+    assert.equal(h.results.length, 1);
+    assert.equal(h.results[0].outcome.kind, "employee");
+    // 400 ms later the face is 1.5 box widths away: no overlap, and a decided track is not extended by motion.
+    let t = T0 + DT + 400;
+    for (let i = 2; i < 8; i++, t += DT) h.frame(i, [{ d: det(735 + 4 * i, 500, 90), who: walk }], t);
+    h.tick(t + 5000);
+    assert.equal(h.results.length, 1, "one outcome for one person");
   });
 });
 
