@@ -80,6 +80,9 @@ services:
       - SHADOW_RESULT_RETENTION_DAYS=${SHADOW_RESULT_RETENTION_DAYS:-}
       - PIPELINE_MIN_FACE_PX=${PIPELINE_MIN_FACE_PX:-}
       - PIPELINE_MIN_FACE_PX_BY_GATE=${PIPELINE_MIN_FACE_PX_BY_GATE:-}
+      # Gates whose real-time pipeline posts the employee chat message (#523 step 3); message only.
+      - PIPELINE_NOTIFY_GATES=${PIPELINE_NOTIFY_GATES:-}
+      - PIPELINE_NOTIFY_DEDUPE_SECONDS=${PIPELINE_NOTIFY_DEDUPE_SECONDS:-}
       - FACE_TTA_FLIP=${FACE_TTA_FLIP:-}
       # Door-scan detector tiling (#523): 1 = single pass (default), 2 = left/right tiles on frames >= 4x FACE_DETECT_SIZE.
       - FACE_DETECT_TILES=${FACE_DETECT_TILES:-}

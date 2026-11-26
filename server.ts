@@ -184,6 +184,7 @@ import {
 } from "./src/server/presence/alerts";
 import { presenceSettingsFromEnv, type PresenceSettings } from "./src/server/presence/presenceConfig";
 import { chatTextPayload, type StructuredChatMessage } from "./src/server/chatText";
+import { GateNoticeDedupe, notifyDedupeSeconds, parseNotifyGates } from "./src/server/pipelineNotify";
 import {
   applyPresenceGatePatch,
   effectivePresenceGateSettings,
@@ -5759,14 +5760,20 @@ async function applyRecognitionOutcome(input: RecognitionOutcomeInput): Promise<
         employee: emp,
       });
 
-      sendEtonWebhook({
-        userName: emp.name,
-        employeeCode: emp.employeeCode,
-        scanType: actionType,
-        gateId: gateKey,
-      }).catch((webhookErr) => {
-        console.warn("[Webhook] Background dispatch warning:", webhookErr);
-      });
+      // A notify gate's pipeline may already have announced this passage.
+      const notice = pipelineNotifyActive(gateKey) ? gateNotices.claim(gateKey, emp.id, "door-scan", Date.now()) : { send: true };
+      if (notice.send) {
+        sendEtonWebhook({
+          userName: emp.name,
+          employeeCode: emp.employeeCode,
+          scanType: actionType,
+          gateId: gateKey,
+        }).catch((webhookErr) => {
+          console.warn("[Webhook] Background dispatch warning:", webhookErr);
+        });
+      } else {
+        console.log(`[Webhook] ${gateLogTag(gateKey)}: bỏ tin trùng cho ${emp.employeeCode || emp.id}, luồng ${notice.duplicateOf?.source} đã gửi ${Math.round((notice.duplicateOf?.agoMs ?? 0) / 1000)}s trước.`);
+      }
     }
     result.log = result.logs[0];
     summary.logId = result.logs[0]?.id;
@@ -7007,6 +7014,8 @@ function syncGateWatchers() {
 // `shadow` runs next to the legacy watcher on its own always-open stream and
 // reports what it WOULD decide - SSE `pipeline_shadow_result` plus one log line
 // - and never unlocks, never writes an access log, never stores an image.
+// A gate in PIPELINE_NOTIFY_GATES additionally posts the employee chat
+// message from the pipeline (still no unlock, no access log, no image).
 // `live` is not in this build (effectivePipelineMode downgrades it to legacy).
 //
 // Inference runs in one worker thread per gate (src/server/pipeline/
@@ -7020,6 +7029,51 @@ const PIPELINE_PROBE_RETRY_MS = 30_000;
 /** One pipeline stats line per gate this often (0 = off); counters only, no ids. */
 const PIPELINE_STATS_LOG_MS = envInt("PIPELINE_STATS_LOG_MS", 60_000, 0, 3_600_000);
 const PIPELINE_ERROR_LOG_MS = 10_000;
+
+/**
+ * Gates whose real-time pipeline posts the employee chat message
+ * (src/server/pipelineNotify.ts): message only, never a door command or an
+ * access-log row. While such a gate's pipeline runs, its door scan and its
+ * pipeline share one claim per employee per PIPELINE_NOTIFY_DEDUPE_SECONDS,
+ * so a passage produces one message whichever path sees it first.
+ */
+const PIPELINE_NOTIFY = parseNotifyGates(process.env.PIPELINE_NOTIFY_GATES);
+const PIPELINE_NOTIFY_DEDUPE_MS = notifyDedupeSeconds(process.env.PIPELINE_NOTIFY_DEDUPE_SECONDS) * 1000;
+const gateNotices = new GateNoticeDedupe(PIPELINE_NOTIFY_DEDUPE_MS);
+if (PIPELINE_NOTIFY.gates.size || PIPELINE_NOTIFY.ignored.length) {
+  console.log(
+    `[Pipeline] Gửi tin nhắn từ luồng thời gian thực: ${[...PIPELINE_NOTIFY.gates].join(", ") || "không cổng nào"}` +
+      `, chống trùng ${PIPELINE_NOTIFY_DEDUPE_MS / 1000}s` +
+      (PIPELINE_NOTIFY.ignored.length ? `; bỏ qua giá trị không phải mã cổng: ${PIPELINE_NOTIFY.ignored.join(", ")}` : "") +
+      "."
+  );
+}
+
+/** True while `gate` is in PIPELINE_NOTIFY_GATES AND its real-time pipeline is running. */
+function pipelineNotifyActive(gate: Gate): boolean {
+  return PIPELINE_NOTIFY.gates.has(gate) && Boolean(gatePipelines.get(gate)?.pipeline);
+}
+
+/**
+ * The pipeline recognised an employee on a notify gate: post the same chat
+ * message the door scan posts, unless this passage was already announced.
+ * Message only - no unlock, no access-log row, no image. Never throws.
+ */
+function notifyFromPipeline(gate: Gate, employeeId: string): "sent" | "duplicate" | "skipped" {
+  const emp = employees.find((e) => e.id === employeeId);
+  const gateRecord = cameraStreamsConfig.gates.find((g) => g.id === gate);
+  if (!emp || !gateRecord) return "skipped";
+  // Same clock as the door scan's claim (a frame time could sit ahead of it and slip past the window).
+  const claim = gateNotices.claim(gate, emp.id, "pipeline", Date.now());
+  if (!claim.send) return "duplicate";
+  sendEtonWebhook({
+    userName: emp.name,
+    employeeCode: emp.employeeCode,
+    scanType: gateRecord.direction === "EXIT" ? "EXIT" : "ENTRY",
+    gateId: gate,
+  }).catch((err) => console.warn(`[Pipeline ${gateLogTag(gate)}] Không gửi được tin nhắn:`, err?.message || err));
+  return "sent";
+}
 
 /** Pipeline error lines, at most one per gate per PIPELINE_ERROR_LOG_MS (the rest are counted). */
 const pipelineErrorLog = new Map<Gate, { at: number; suppressed: number }>();
@@ -7221,12 +7275,18 @@ function logPipelineStats(gate: Gate, pipeline: GatePipeline) {
 
 /** Shadow: report only. Ids, timings and bases - never images or embeddings. */
 function reportPipelineResult(gate: Gate, r: TrackDecisionResult) {
+  // Notify gates: the employee chat message goes out first (it is the point of the mode).
+  const notify =
+    r.outcome.kind === "employee" && pipelineNotifyActive(gate)
+      ? notifyFromPipeline(gate, r.outcome.employeeId)
+      : undefined;
   const payload = {
     ...r.shadow,
     basis: r.basis,
     ...(r.fusionBasis ? { fusionBasis: r.fusionBasis } : {}),
     ...(r.meanCheckRefused ? { meanCheckRefused: true } : {}),
     mode: pipelineModeFor(gate).mode,
+    ...(notify ? { notify } : {}),
   };
   broadcastSSE("pipeline_shadow_result", payload);
   console.log(`[Pipeline ${gateLogTag(gate)}] shadow ${JSON.stringify(payload)}`);
