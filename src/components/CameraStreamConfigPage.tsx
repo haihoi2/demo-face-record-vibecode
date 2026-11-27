@@ -39,6 +39,7 @@ import {
   Save,
   Crop,
   DoorOpen,
+  BookOpen,
 } from "lucide-react";
 import {
   CameraStreamsConfig,
@@ -78,6 +79,7 @@ import {
   suggestGateId,
   updateGateInConfig,
   validateGateDraft,
+  ADD_GATE_GUIDE_PATH,
   type GateDirection,
   type GateDraft,
   type GateMutationOutcome,
@@ -2227,6 +2229,19 @@ export const CameraStreamConfigPage: React.FC = () => {
               Thêm cổng
             </button>
           )}
+          {isAdmin && (
+            <a
+              id="link-add-gate-guide"
+              href={ADD_GATE_GUIDE_PATH}
+              target="_blank"
+              rel="noopener"
+              title="Hướng dẫn từng bước: thêm cổng, gắn camera, vẽ vùng cổng, bật quét cửa (mở tab mới)"
+              className="inline-flex items-center gap-1.5 px-3 py-2.5 rounded-xl text-sm font-semibold border border-slate-200 text-indigo-700 bg-white hover:bg-indigo-50"
+            >
+              <BookOpen className="w-4 h-4" />
+              Hướng dẫn
+            </a>
+          )}
         </div>
 
         <div role="status" aria-live="polite" className="empty:hidden px-6 pt-4">
@@ -2944,7 +2959,14 @@ export const CameraStreamConfigPage: React.FC = () => {
               <Plus className="w-4 h-4 text-indigo-600" /> Thêm cổng
             </>
           }
-          description="Cổng mới bắt đầu chưa có luồng camera; thêm luồng ở tab của cổng sau khi tạo. Mã cổng không đổi được về sau và không dùng lại cho cổng khác."
+          description={
+            <>
+              Cổng mới bắt đầu chưa có luồng camera; thêm luồng ở tab của cổng sau khi tạo. Mã cổng không đổi được về sau và không dùng lại cho cổng khác.{" "}
+              <a href={ADD_GATE_GUIDE_PATH} target="_blank" rel="noopener" className="font-semibold text-indigo-700 underline">
+                Xem hướng dẫn từng bước
+              </a>
+            </>
+          }
           busy={gateBusy}
           onClose={() => setAddGateOpen(false)}
           footer={

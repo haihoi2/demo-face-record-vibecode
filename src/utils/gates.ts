@@ -198,6 +198,9 @@ export function updateGateInConfig(
 // PUT/DELETE /api/gates/:gateId. The UI renders what the server answers.
 // ---------------------------------------------------------------------------
 
+/** The admin's step-by-step guide for adding a gate, served from public/huong-dan/. */
+export const ADD_GATE_GUIDE_PATH = "/huong-dan/them-cong.html";
+
 export interface GateDraft {
   id: string;
   label: string;

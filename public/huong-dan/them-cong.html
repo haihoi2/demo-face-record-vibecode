@@ -3,17 +3,16 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex">
 <title>Thêm cổng Gate Watch</title>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Be+Vietnam+Pro:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap">
 <style>
 :root{
   --ground:#f6f7fb; --paper:#ffffff; --ink:#1b2135; --muted:#5b6380; --line:#dfe3ee;
   --accent:#4f46e5; --accent-soft:#eceafd; --accent-ink:#3730a3;
   --warn:#b45309; --warn-soft:#fff6e6; --ok:#047857; --ok-soft:#e9f8f1; --bad:#be123c; --bad-soft:#fdeef2;
   --chip:#eef0f7; --chip-ink:#2a3150;
-  --sans:"Be Vietnam Pro",system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
-  --mono:"JetBrains Mono",ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+  --sans:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+  --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
 }
 @media (prefers-color-scheme: dark){
   :root:not([data-theme="light"]){
@@ -70,6 +69,8 @@ tr:last-child td{border-bottom:0}
 td:first-child{font-weight:500}
 .two{display:grid;grid-template-columns:1fr 1fr;gap:12px}
 @media (max-width:640px){.two{grid-template-columns:1fr}h1{font-size:28px}.step{grid-template-columns:1fr}.step::before{margin-bottom:-4px}}
+.back{font-size:14px;font-weight:600;text-decoration:none;align-self:flex-start}
+.back:hover{text-decoration:underline}
 footer{color:var(--muted);font-size:13px;border-top:1px solid var(--line);padding-top:16px}
 a{color:var(--accent-ink)}
 a:focus-visible,button:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
@@ -79,6 +80,7 @@ a:focus-visible,button:focus-visible{outline:2px solid var(--accent);outline-off
 <main class="wrap">
 
 <header>
+  <a class="back" href="/">Về trang Gate Watch</a>
   <span class="eyebrow">SmartFace Gate Watch · Hướng dẫn cho admin</span>
   <h1>Thêm một cổng mới có camera nhận diện</h1>
   <p class="lead">Làm theo các bước dưới đây để thêm cổng, gắn camera, vẽ vùng cổng và bật quét cửa. Mọi bước đều làm trên giao diện, không cần sửa máy chủ, trừ hai trường hợp được ghi rõ.</p>
