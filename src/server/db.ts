@@ -95,7 +95,18 @@ export interface AccessLogRecord {
    * by gateIdForLegacyRow() ("entry" / "exit") without rewriting the row.
    */
   gateId?: string;
+  /**
+   * Who wrote the event. Absent (NULL) = the door scan, as every older row.
+   * "pipeline" = the real-time pipeline on a notify gate saw an employee the
+   * door scan did not record: attendance only, the door was NOT opened and
+   * no picture is stored (#523).
+   */
+  source?: AccessLogSource;
 }
+
+export type AccessLogSource = "pipeline";
+/** The stored source when known, else NULL (a door-scan row). */
+export const storableAccessLogSource = (v: unknown): AccessLogSource | null => (v === "pipeline" ? "pipeline" : null);
 
 /** Same limits as the PostgreSQL columns (VARCHAR 64 / 16), enforced here for SQLite and JSON too. */
 const TRACK_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$/;
@@ -756,8 +767,10 @@ function rowToAccessLog(r: any): AccessLogRecord {
     // Derived for rows written before gate ids existed; left out when the
     // query loaded neither the column nor the direction (id + image lookups).
     gateId: "gateId" in r || "type" in r ? gateIdForLegacyRow(r) : undefined,
+    source: storableAccessLogSource(r.source) ?? undefined,
   } as AccessLogRecord;
   if (out.gateId === undefined) delete out.gateId;
+  if (out.source === undefined) delete out.source;
   return out;
 }
 
@@ -2347,8 +2360,8 @@ class SQLiteStorage implements StrangerFaceStore, ShadowResultStore, LoginEventS
               id, timestamp, type, status, "employeeId", "employeeName", "employeeCode",
               department, "photoSnapshot", confidence, "livenessScore", "lockAction", "doorName", reason,
               "faceEmbedding", "faceEmbeddingDims", "faceEmbeddingModelTag", "faceEmbeddingQuality",
-              "capturedAt", "trackId", "recordingChannel", "gateId"
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22)
+              "capturedAt", "trackId", "recordingChannel", "gateId", "source"
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23)
             ON CONFLICT (id) DO NOTHING
           `, [
             log.id, log.timestamp, log.type, log.status,
@@ -2360,6 +2373,7 @@ class SQLiteStorage implements StrangerFaceStore, ShadowResultStore, LoginEventS
             ...accessLogTraceParams(log),
             // The stored value only: a legacy row stays NULL in PostgreSQL too.
             storableGateId(log.storedGateId),
+            storableAccessLogSource((log as { source?: unknown }).source),
           ]);
         }
         console.log(`[PostgreSQL] Đã khởi tạo và đồng bộ ${existingLogs.length} bản ghi truy cập vào PostgreSQL!`);
@@ -2368,7 +2382,7 @@ class SQLiteStorage implements StrangerFaceStore, ShadowResultStore, LoginEventS
           SELECT id, timestamp, type, status, "employeeId", "employeeName", "employeeCode",
                  department, "photoSnapshot", confidence, "livenessScore", "lockAction", "doorName", reason,
                  "faceEmbedding", "faceEmbeddingDims", "faceEmbeddingModelTag", "faceEmbeddingQuality",
-                 "capturedAt", "trackId", "recordingChannel", "gateId"
+                 "capturedAt", "trackId", "recordingChannel", "gateId", "source"
           FROM access_logs ORDER BY timestamp DESC LIMIT 100
         `);
         for (const r of pgLogs.rows) {
@@ -2379,8 +2393,8 @@ class SQLiteStorage implements StrangerFaceStore, ShadowResultStore, LoginEventS
                   id, timestamp, type, status, employeeId, employeeName, employeeCode,
                   department, photoSnapshot, confidence, livenessScore, lockAction, doorName, reason,
                   faceEmbedding, faceEmbeddingDims, faceEmbeddingModelTag, faceEmbeddingQuality,
-                  capturedAt, trackId, recordingChannel, gateId
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                  capturedAt, trackId, recordingChannel, gateId, source
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(id) DO NOTHING
               `);
               stmt.run(
@@ -2391,7 +2405,8 @@ class SQLiteStorage implements StrangerFaceStore, ShadowResultStore, LoginEventS
                 r.livenessScore ?? null, r.lockAction, r.doorName, r.reason || null,
                 r.faceEmbedding || null, r.faceEmbeddingDims || null,
                 r.faceEmbeddingModelTag || null, r.faceEmbeddingQuality ?? null,
-                r.capturedAt ?? null, r.trackId ?? null, r.recordingChannel ?? null, storableGateId(r.gateId)
+                r.capturedAt ?? null, r.trackId ?? null, r.recordingChannel ?? null, storableGateId(r.gateId),
+                storableAccessLogSource(r.source)
               );
             } catch {}
           }
@@ -2591,7 +2606,8 @@ class SQLiteStorage implements StrangerFaceStore, ShadowResultStore, LoginEventS
           "capturedAt" VARCHAR(64),
           "trackId" VARCHAR(64),
           "recordingChannel" VARCHAR(16),
-          "gateId" VARCHAR(32)
+          "gateId" VARCHAR(32),
+          "source" VARCHAR(16)
         );
 
         CREATE TABLE IF NOT EXISTS smart_lock_state (
@@ -2758,6 +2774,11 @@ class SQLiteStorage implements StrangerFaceStore, ShadowResultStore, LoginEventS
         -- the NULL legacy branch) in history order. Rollback: DROP INDEX, DROP COLUMN.
         ALTER TABLE access_logs ADD COLUMN IF NOT EXISTS "gateId" VARCHAR(32);
         CREATE INDEX IF NOT EXISTS idx_access_logs_gate_ts ON access_logs ("gateId", "timestamp" DESC, id DESC);
+        -- Event source (2026-11-27, #523): NULL = door scan (every older row,
+        -- no backfill), 'pipeline' = attendance-only row from the real-time
+        -- pipeline (no unlock, no picture). Additive, nullable, catalog-only.
+        -- Rollback: DROP COLUMN "source" (older code never reads it).
+        ALTER TABLE access_logs ADD COLUMN IF NOT EXISTS "source" VARCHAR(16);
         -- Per-face stranger records (2026-09-29): the faces an adjudication
         -- covers. A constant default makes the NOT NULL column catalog-only
         -- (no rewrite); old rows read '[]' and old code never names it.
@@ -2886,7 +2907,8 @@ class SQLiteStorage implements StrangerFaceStore, ShadowResultStore, LoginEventS
         capturedAt TEXT,
         trackId TEXT,
         recordingChannel TEXT,
-        gateId TEXT
+        gateId TEXT,
+        source TEXT
       );
       CREATE INDEX IF NOT EXISTS idx_access_logs_ts_id ON access_logs (timestamp DESC, id DESC);
 
@@ -3047,6 +3069,7 @@ class SQLiteStorage implements StrangerFaceStore, ShadowResultStore, LoginEventS
       "ALTER TABLE access_logs ADD COLUMN trackId TEXT",
       "ALTER TABLE access_logs ADD COLUMN recordingChannel TEXT",
       "ALTER TABLE access_logs ADD COLUMN gateId TEXT",
+      "ALTER TABLE access_logs ADD COLUMN source TEXT",
       "ALTER TABLE stranger_resolutions ADD COLUMN faceIds TEXT NOT NULL DEFAULT '[]'",
       "ALTER TABLE stranger_resolution_events ADD COLUMN faceIds TEXT NOT NULL DEFAULT '[]'",
     ]) {
@@ -3407,7 +3430,7 @@ class SQLiteStorage implements StrangerFaceStore, ShadowResultStore, LoginEventS
         this.pgPool.query(
           `SELECT id, timestamp, type, status, "employeeId", "employeeName", "employeeCode", department,
                   confidence, "livenessScore", "lockAction", "doorName", reason,
-                  "capturedAt", "trackId", "recordingChannel", "gateId",
+                  "capturedAt", "trackId", "recordingChannel", "gateId", "source",
                   CASE WHEN "photoSnapshot" IS NOT NULL AND "photoSnapshot" <> '' THEN 1 ELSE 0 END AS "hasImage"
              FROM access_logs ORDER BY timestamp DESC, id DESC LIMIT $1 OFFSET $2`,
           [limit, offset],
@@ -3419,7 +3442,7 @@ class SQLiteStorage implements StrangerFaceStore, ShadowResultStore, LoginEventS
     if (this.isNativeSqlite && this.db) {
       const rows = this.db.prepare(`SELECT id, timestamp, type, status, employeeId, employeeName, employeeCode,
         department, confidence, livenessScore, lockAction, doorName, reason,
-        capturedAt, trackId, recordingChannel, gateId,
+        capturedAt, trackId, recordingChannel, gateId, source,
         CASE WHEN photoSnapshot IS NOT NULL AND photoSnapshot <> '' THEN 1 ELSE 0 END AS hasImage
         FROM access_logs ORDER BY timestamp DESC, id DESC LIMIT ? OFFSET ?`).all(limit, offset) as any[];
       const count = this.db.prepare("SELECT count(*) AS total FROM access_logs").get() as any;
@@ -3493,7 +3516,7 @@ class SQLiteStorage implements StrangerFaceStore, ShadowResultStore, LoginEventS
         this.pgPool.query(
           `SELECT id, timestamp, type, status, "employeeId", "employeeName", "employeeCode", department,
                   confidence, "livenessScore", "lockAction", "doorName", reason,
-                  "capturedAt", "trackId", "recordingChannel", "gateId",
+                  "capturedAt", "trackId", "recordingChannel", "gateId", "source",
                   CASE WHEN "photoSnapshot" IS NOT NULL AND "photoSnapshot" <> '' THEN 1 ELSE 0 END AS "hasImage"
              FROM access_logs ${where.length ? "WHERE " + where.join(" AND ") : ""}
             ORDER BY timestamp DESC, id DESC LIMIT $${params.length}`,
@@ -3514,7 +3537,7 @@ class SQLiteStorage implements StrangerFaceStore, ShadowResultStore, LoginEventS
       }
       const rows = this.db.prepare(`SELECT id, timestamp, type, status, employeeId, employeeName, employeeCode,
         department, confidence, livenessScore, lockAction, doorName, reason,
-        capturedAt, trackId, recordingChannel, gateId,
+        capturedAt, trackId, recordingChannel, gateId, source,
         CASE WHEN photoSnapshot IS NOT NULL AND photoSnapshot <> '' THEN 1 ELSE 0 END AS hasImage
         FROM access_logs ${where.length ? "WHERE " + where.join(" AND ") : ""}
         ORDER BY timestamp DESC, id DESC LIMIT ?`).all(...(params as any[]), n + 1) as any[];
@@ -3614,7 +3637,7 @@ class SQLiteStorage implements StrangerFaceStore, ShadowResultStore, LoginEventS
     if (this.pgPool && this.isPostgres) {
       await this.settleAccessLogWrites(id);
       const result = await this.pgPool.query(
-        `SELECT id, timestamp, type, status, "capturedAt", "trackId", "recordingChannel", "gateId"
+        `SELECT id, timestamp, type, status, "capturedAt", "trackId", "recordingChannel", "gateId", "source"
            FROM access_logs WHERE id = $1`,
         [id],
       );
@@ -3622,7 +3645,7 @@ class SQLiteStorage implements StrangerFaceStore, ShadowResultStore, LoginEventS
     }
     if (this.isNativeSqlite && this.db) {
       const row = this.db.prepare(
-        "SELECT id, timestamp, type, status, capturedAt, trackId, recordingChannel, gateId FROM access_logs WHERE id = ?",
+        "SELECT id, timestamp, type, status, capturedAt, trackId, recordingChannel, gateId, source FROM access_logs WHERE id = ?",
       ).get(id) as any;
       return row ? meta(row) : undefined;
     }
@@ -3674,7 +3697,7 @@ class SQLiteStorage implements StrangerFaceStore, ShadowResultStore, LoginEventS
                   CASE WHEN "photoSnapshot" IS NOT NULL AND "photoSnapshot" <> '' THEN 'stored' ELSE '' END AS "photoSnapshot",
                   confidence, "livenessScore", "lockAction", "doorName", reason,
                   "faceEmbedding", "faceEmbeddingDims", "faceEmbeddingModelTag", "faceEmbeddingQuality",
-                  "capturedAt", "trackId", "recordingChannel", "gateId"
+                  "capturedAt", "trackId", "recordingChannel", "gateId", "source"
              FROM access_logs
             WHERE "photoSnapshot" IS NOT NULL AND "photoSnapshot" <> ''
               AND (status = 'DENIED' OR "employeeId" IS NULL OR "employeeName" = 'Không xác định')${cursorWhere}
@@ -3693,7 +3716,7 @@ class SQLiteStorage implements StrangerFaceStore, ShadowResultStore, LoginEventS
                 CASE WHEN photoSnapshot IS NOT NULL AND photoSnapshot <> '' THEN 'stored' ELSE '' END AS photoSnapshot,
                 confidence, livenessScore, lockAction, doorName, reason,
                 faceEmbedding, faceEmbeddingDims, faceEmbeddingModelTag, faceEmbeddingQuality,
-                capturedAt, trackId, recordingChannel, gateId FROM access_logs
+                capturedAt, trackId, recordingChannel, gateId, source FROM access_logs
           WHERE photoSnapshot IS NOT NULL AND photoSnapshot <> ''
             AND (status = 'DENIED' OR employeeId IS NULL OR employeeName = 'Không xác định')${cursorWhere}
             AND NOT EXISTS (SELECT 1 FROM stranger_faces sf WHERE sf.logId = access_logs.id)
@@ -4952,7 +4975,7 @@ class SQLiteStorage implements StrangerFaceStore, ShadowResultStore, LoginEventS
     if (rejected.length) {
       console.warn(`[AccessLog] ${String(log.id).slice(0, 64)}: bỏ giá trị không hợp lệ (${rejected.join(", ")}), bản ghi vẫn được lưu.`);
     }
-    const traceParams = [trace.capturedAt ?? null, trace.trackId ?? null, trace.recordingChannel ?? null, gateId];
+    const traceParams = [trace.capturedAt ?? null, trace.trackId ?? null, trace.recordingChannel ?? null, gateId, storableAccessLogSource(log.source)];
     let authoritative: Promise<boolean> | null = null;
     if (this.pgPool && this.isPostgres) {
       const pool = this.pgPool;
@@ -4961,8 +4984,8 @@ class SQLiteStorage implements StrangerFaceStore, ShadowResultStore, LoginEventS
           id, timestamp, type, status, "employeeId", "employeeName", "employeeCode",
           department, "photoSnapshot", confidence, "livenessScore", "lockAction", "doorName", reason,
           "faceEmbedding", "faceEmbeddingDims", "faceEmbeddingModelTag", "faceEmbeddingQuality",
-          "capturedAt", "trackId", "recordingChannel", "gateId"
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22)
+          "capturedAt", "trackId", "recordingChannel", "gateId", "source"
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23)
         ON CONFLICT (id) DO NOTHING
       `, [
         log.id, log.timestamp, log.type, log.status,
@@ -4997,8 +5020,8 @@ class SQLiteStorage implements StrangerFaceStore, ShadowResultStore, LoginEventS
             id, timestamp, type, status, employeeId, employeeName, employeeCode,
             department, photoSnapshot, confidence, livenessScore, lockAction, doorName, reason,
             faceEmbedding, faceEmbeddingDims, faceEmbeddingModelTag, faceEmbeddingQuality,
-            capturedAt, trackId, recordingChannel, gateId
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            capturedAt, trackId, recordingChannel, gateId, source
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         `);
         stmt.run(
           log.id,
@@ -5034,7 +5057,9 @@ class SQLiteStorage implements StrangerFaceStore, ShadowResultStore, LoginEventS
         trackId: trace.trackId,
         recordingChannel: trace.recordingChannel,
         gateId: gateId ?? undefined,
+        source: storableAccessLogSource(log.source) ?? undefined,
       };
+      if (!stored.source) delete stored.source;
       this.fallbackData.access_logs.unshift(stored);
       this.prependFallbackStrangerCandidate(stored);
       try {

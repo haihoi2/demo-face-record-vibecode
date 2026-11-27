@@ -337,8 +337,8 @@ describe("SQLite: access-log trace migration and persistence", () => {
     const inspect = new DatabaseSync(dbFile);
     try {
       const cols = (inspect.prepare("PRAGMA table_info(access_logs)").all() as Array<{ name: string }>).map((c) => c.name);
-      // The trace columns, then the N-gate wave's gateId (appended after them by its own migration).
-      assert.deepEqual(cols.slice(-4), ["capturedAt", "trackId", "recordingChannel", "gateId"]);
+      // The trace columns, then the N-gate wave's gateId and the event source (#523), each appended by its own migration.
+      assert.deepEqual(cols.slice(-5), ["capturedAt", "trackId", "recordingChannel", "gateId", "source"]);
       const legacy = inspect.prepare("SELECT photoSnapshot, reason, faceEmbeddingModelTag FROM access_logs WHERE id = 'LOG-LEGACY-1'").get();
       assert.deepEqual({ ...legacy }, { photoSnapshot: "data:image/jpeg;base64,/9j/legacy", reason: "legacy stranger", faceEmbeddingModelTag: "arcface_legacy" });
       assert.equal((inspect.prepare("SELECT count(*) AS n FROM access_logs WHERE id = 'LOG-DUP'").get() as any).n, 1);

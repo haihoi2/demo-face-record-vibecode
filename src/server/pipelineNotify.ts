@@ -81,3 +81,52 @@ export class GateNoticeDedupe {
     return this.last.size;
   }
 }
+
+// ---------------------------------------------------------------------------
+// Attendance rows for passages only the pipeline saw (#523, owner choice A)
+// ---------------------------------------------------------------------------
+
+/** The fields of an access-log row the duplicate check reads. */
+export interface GrantRowLike {
+  id: string;
+  timestamp: string;
+  /** When the passage was seen; a pipeline row is written one pairing window after it. */
+  capturedAt?: string;
+  status: string;
+  employeeId?: string;
+}
+
+/**
+ * Id of the newest GRANTED row (door scan or pipeline) of `employeeId` at
+ * `gate` whose passage (capturedAt, else its write time) is at or after
+ * `sinceMs`, else null. Comparing passage times keeps one row per message:
+ * the message window runs from the decision, not from the delayed write. `logs` is newest first (the
+ * server's in-memory recent log); the scan stops at the first older row and
+ * after `scanLimit` rows. `gateOf` resolves a row's gate (legacy rows have none).
+ */
+export function recentGrantRowId<T extends GrantRowLike>(
+  logs: readonly T[],
+  gate: string,
+  employeeId: string,
+  sinceMs: number,
+  gateOf: (log: T) => string,
+  scanLimit = 500
+): string | null {
+  for (let i = 0; i < logs.length && i < scanLimit; i++) {
+    const log = logs[i];
+    const written = Date.parse(log.timestamp);
+    // capturedAt <= timestamp, so a row written before the window cannot match: stop there.
+    if (Number.isFinite(written) && written < sinceMs) break;
+    const seen = log.capturedAt ? Date.parse(log.capturedAt) : written;
+    if (Number.isFinite(seen) && seen < sinceMs) continue;
+    if (log.status === "GRANTED" && log.employeeId === employeeId && gateOf(log) === gate) return log.id;
+  }
+  return null;
+}
+
+/** Match percentage shown on an access-log row, the door scan's scale: (cosine - 0.35) / 0.65, 0..100. */
+export function pipelineConfidencePct(fusedCosine: unknown): number {
+  const c = Number(fusedCosine);
+  if (fusedCosine === null || fusedCosine === undefined || !Number.isFinite(c)) return 0;
+  return Math.round(Math.max(0, Math.min(1, (c - 0.35) / 0.65)) * 100);
+}

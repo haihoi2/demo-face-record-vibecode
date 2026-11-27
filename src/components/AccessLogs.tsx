@@ -481,7 +481,7 @@ export const AccessLogs: React.FC<AccessLogsProps> = ({
                       {/* Photo Thumbnail */}
                       <td className="py-3 px-4">
                         <FaceThumb
-                          src={log.photoSnapshot}
+                          src={log.hasImage === false ? null : log.photoSnapshot}
                           alt={`Ảnh lượt quét ${log.employeeName || "người lạ"} lúc ${formattedTime}`}
                           caption={`${gateName} · ${formattedTime} ${formattedDate}`}
                           className="w-12 h-12 rounded-lg"

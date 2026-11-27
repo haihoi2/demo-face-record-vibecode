@@ -41,6 +41,8 @@ export interface AccessLog {
   recordingChannel?: string;
   /** Gate id (N-gate wave). Older events have none: "entry" for type ENTRY, "exit" for EXIT. */
   gateId?: string;
+  /** Absent = door scan. "pipeline" = attendance-only event from the real-time pipeline: the door was not opened, no image. */
+  source?: 'pipeline';
   /** Set when this event's employee record was later merged into another (the name above stays historical). */
   mergedInto?: { id: string; name: string; employeeCode: string };
 }

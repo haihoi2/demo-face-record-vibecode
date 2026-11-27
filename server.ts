@@ -184,7 +184,7 @@ import {
 } from "./src/server/presence/alerts";
 import { presenceSettingsFromEnv, type PresenceSettings } from "./src/server/presence/presenceConfig";
 import { chatTextPayload, type StructuredChatMessage } from "./src/server/chatText";
-import { GateNoticeDedupe, notifyDedupeSeconds, parseNotifyGates } from "./src/server/pipelineNotify";
+import { GateNoticeDedupe, notifyDedupeSeconds, parseNotifyGates, pipelineConfidencePct, recentGrantRowId } from "./src/server/pipelineNotify";
 import {
   applyPresenceGatePatch,
   effectivePresenceGateSettings,
@@ -1128,7 +1128,11 @@ function sanitizePublicJson(value: any): any {
       employeeId: value.employeeId, employeeName: value.employeeName, employeeCode: value.employeeCode,
       department: value.department, confidence: value.confidence, livenessScore: value.livenessScore,
       lockAction: value.lockAction, doorName: value.doorName, reason: value.reason,
-      photoSnapshot: imageUrl, imageUrl, hasImage: Boolean(value.photoSnapshot),
+      // A row already shaped by publicAccessLog carries its real hasImage (its
+      // photoSnapshot is the image URL by then, always truthy).
+      photoSnapshot: imageUrl, imageUrl, hasImage: typeof value.hasImage === "boolean" ? value.hasImage : Boolean(value.photoSnapshot),
+      // Attendance-only rows of a notify gate's pipeline (#523); door-scan rows have no source.
+      ...(value.source === "pipeline" ? { source: "pipeline" } : {}),
     };
   }
   if (typeof value.id === "string" && value.employeeCode && value.accessLevel) {
@@ -1259,6 +1263,11 @@ export interface AccessLogRecord {
   reason?: string;
   /** Gate id (N-gate wave); older rows have none - read them with gateIdForLegacyRow(). */
   gateId?: string;
+  /** Absent = door scan. "pipeline" = attendance-only row from a notify gate's real-time pipeline (no unlock, no picture). */
+  source?: "pipeline";
+  /** Trace fields stored by db.ts (capture time of the decided frame, tracker id). */
+  capturedAt?: string;
+  trackId?: string;
   faceEmbedding?: number[];
   faceEmbeddingDims?: number;
   faceEmbeddingModelTag?: string;
@@ -7015,7 +7024,9 @@ function syncGateWatchers() {
 // reports what it WOULD decide - SSE `pipeline_shadow_result` plus one log line
 // - and never unlocks, never writes an access log, never stores an image.
 // A gate in PIPELINE_NOTIFY_GATES additionally posts the employee chat
-// message from the pipeline (still no unlock, no access log, no image).
+// message from the pipeline and, when the door scan wrote no grant for that
+// person, an attendance-only access log row (source "pipeline": never an
+// unlock, never an image).
 // `live` is not in this build (effectivePipelineMode downgrades it to legacy).
 //
 // Inference runs in one worker thread per gate (src/server/pipeline/
@@ -7294,7 +7305,9 @@ function reportPipelineResult(gate: Gate, r: TrackDecisionResult) {
   // same passage can arrive AFTER the shadow decision: wait one window, then
   // pair and store. Never blocks the pipeline; never throws.
   setTimeout(() => {
-    persistShadowResult(gate, r).catch((err: any) => console.warn("[Pipeline] Không lưu được kết quả shadow:", err?.message || err));
+    persistShadowResult(gate, r)
+      .then((legacy) => (notify === "sent" ? recordPipelinePassage(gate, r, legacy) : undefined))
+      .catch((err: any) => console.warn("[Pipeline] Không lưu được kết quả shadow:", err?.message || err));
   }, SHADOW_MATCH_WINDOW_MS).unref();
 }
 
@@ -7314,6 +7327,7 @@ function nearestLegacyEvent(gate: Gate, atMs: number, employeeId?: string): { id
     const t = new Date(log.timestamp).getTime();
     if (t < atMs - reach) break;
     if (gateIdForLegacyRow(log) !== gate || (log.status !== "GRANTED" && log.status !== "DENIED")) continue;
+    if (log.source === "pipeline") continue; // the pipeline's own attendance row is not a door-engine event
     const delta = Math.abs(t - atMs);
     if (employeeId && log.status === "GRANTED" && log.employeeId === employeeId && delta <= reach && delta < sameDelta) {
       sameEmployee = log; sameDelta = delta;
@@ -7326,7 +7340,7 @@ function nearestLegacyEvent(gate: Gate, atMs: number, employeeId?: string): { id
 
 const round3 = (v: unknown) => (typeof v === "number" && Number.isFinite(v) ? Math.round(v * 1000) / 1000 : undefined);
 
-async function persistShadowResult(gate: Gate, r: TrackDecisionResult): Promise<void> {
+async function persistShadowResult(gate: Gate, r: TrackDecisionResult): Promise<ReturnType<typeof nearestLegacyEvent>> {
   const sh = r.shadow;
   const o = r.outcome;
   const fused = o.kind === "employee" ? (o.fused as Record<string, unknown>) : undefined;
@@ -7366,6 +7380,57 @@ async function persistShadowResult(gate: Gate, r: TrackDecisionResult): Promise<
   if (record.agreement === "identity-mismatch") {
     console.warn(`[Pipeline ${gateLogTag(gate)}] shadow nhận ${record.employeeId} nhưng cửa đã mở cho ${record.legacyEmployeeId} (${record.legacyLogId}) - cần kiểm tra.`);
   }
+  return legacy;
+}
+
+/**
+ * Notify gates: the attendance row for a passage only the pipeline saw.
+ * Runs one SHADOW_MATCH_WINDOW_MS after the decision, and only for a decision
+ * whose chat message the pipeline itself sent (so nobody was announced in the
+ * dedupe window before it). Skipped when a grant row for the same person at
+ * this gate exists from one dedupe window before the decision until now: that
+ * row is the passage's record. Never unlocks, never stores or broadcasts an
+ * image, never feeds the door's cooldowns.
+ */
+async function recordPipelinePassage(gate: Gate, r: TrackDecisionResult, legacy: ReturnType<typeof nearestLegacyEvent>): Promise<void> {
+  if (r.outcome.kind !== "employee") return;
+  const employeeId = r.outcome.employeeId;
+  const sh = r.shadow;
+  const emp = employees.find((e) => e.id === employeeId);
+  const gateRecord = cameraStreamsConfig.gates.find((g) => g.id === gate);
+  if (!emp || !gateRecord) return;
+  const existing =
+    legacy && legacy.status === "GRANTED" && legacy.employeeId === employeeId
+      ? legacy.id
+      : recentGrantRowId(accessLogs, gate, employeeId, sh.decidedAtMs - PIPELINE_NOTIFY_DEDUPE_MS, gateIdForLegacyRow);
+  if (existing) {
+    console.log(`[Pipeline ${gateLogTag(gate)}] Không ghi lượt cho ${emp.employeeCode || emp.id}: đã có bản ghi ${existing}.`);
+    return;
+  }
+  const pct = pipelineConfidencePct((r.outcome.fused as Record<string, unknown> | undefined)?.fusedCosine);
+  const log: AccessLogRecord = {
+    id: "LOG-" + Date.now() + "-" + Math.floor(Math.random() * 1000),
+    timestamp: new Date().toISOString(),
+    type: gateRecord.direction === "EXIT" ? "EXIT" : "ENTRY",
+    gateId: gate,
+    status: "GRANTED",
+    employeeId: emp.id,
+    employeeName: emp.name,
+    employeeCode: emp.employeeCode,
+    department: emp.department,
+    photoSnapshot: "",
+    capturedAt: new Date(sh.firstUsableAtMs || sh.decidedAtMs).toISOString(),
+    trackId: sh.trackId,
+    confidence: pct,
+    lockAction: "Không mở cửa (chỉ ghi nhận lượt đi qua)",
+    doorName: lockStateOf(doorIdOf(gateRecord)).doorName,
+    reason: `Luồng thời gian thực nhận diện (${pct}% khớp, ${sh.framesUsed} khung hình), quét cửa không ghi lượt này. Không mở cửa, không lưu ảnh.`,
+    source: "pipeline",
+  };
+  accessLogs.unshift(log);
+  await db.saveAccessLog(log);
+  broadcastSSE("access_granted", { log, employee: emp });
+  console.log(`[Pipeline ${gateLogTag(gate)}] Ghi lượt ${log.type} cho ${emp.employeeCode || emp.id} (${log.id}), không mở cửa.`);
 }
 
 /** Watcher-runtime fields for the dashboard: stream health + decision counters. */

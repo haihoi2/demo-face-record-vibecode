@@ -6,7 +6,15 @@ import { existsSync, readFileSync } from "node:fs";
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 
-import { DEFAULT_NOTIFY_DEDUPE_SECONDS, GateNoticeDedupe, notifyDedupeSeconds, parseNotifyGates } from "../src/server/pipelineNotify";
+import {
+  DEFAULT_NOTIFY_DEDUPE_SECONDS,
+  GateNoticeDedupe,
+  notifyDedupeSeconds,
+  parseNotifyGates,
+  pipelineConfidencePct,
+  recentGrantRowId,
+} from "../src/server/pipelineNotify";
+import { storableAccessLogSource } from "../src/server/db";
 
 describe("parseNotifyGates", () => {
   it("blank or missing means no gate", () => {
@@ -81,6 +89,59 @@ describe("GateNoticeDedupe", () => {
   });
 });
 
+describe("recentGrantRowId", () => {
+  const T0 = Date.parse("2026-11-27T03:00:00.000Z");
+  const at = (s: number) => new Date(T0 + s * 1000).toISOString();
+  type L = { id: string; timestamp: string; status: string; employeeId?: string; gateId?: string; type?: string };
+  const gateOf = (l: L) => l.gateId || (l.type === "EXIT" ? "exit" : "entry");
+  // Newest first, like the server's in-memory log.
+  const logs: L[] = [
+    { id: "L5", timestamp: at(50), status: "DENIED", gateId: "exit" },
+    { id: "L4", timestamp: at(40), status: "GRANTED", employeeId: "E2", gateId: "exit" },
+    { id: "L3", timestamp: at(30), status: "GRANTED", employeeId: "E1", gateId: "entry" },
+    { id: "L2", timestamp: at(20), status: "GRANTED", employeeId: "E1", type: "EXIT" },
+    { id: "L1", timestamp: at(-100), status: "GRANTED", employeeId: "E3", gateId: "exit" },
+  ];
+
+  it("finds a grant of the same person at the same gate in the window, legacy rows included", () => {
+    assert.equal(recentGrantRowId(logs, "exit", "E1", T0, gateOf), "L2");
+    assert.equal(recentGrantRowId(logs, "entry", "E1", T0, gateOf), "L3");
+  });
+  it("ignores other people, other gates, denials and rows before the window", () => {
+    assert.equal(recentGrantRowId(logs, "exit", "E1", T0 + 25_000, gateOf), null);
+    assert.equal(recentGrantRowId(logs, "exit", "E9", T0, gateOf), null);
+    assert.equal(recentGrantRowId(logs, "exit", "E3", T0, gateOf), null, "older than the window");
+    assert.equal(recentGrantRowId(logs, "exit", "E3", T0 - 200_000, gateOf), "L1");
+  });
+  it("compares passage times: a pipeline row written after the window opened but seen before it does not count", () => {
+    // Previous passage seen at -5 s, its row written at +10 s; the new decision's window starts at 0.
+    const rows = [{ id: "P1", timestamp: at(10), capturedAt: at(-5), status: "GRANTED", employeeId: "E1", gateId: "exit" }];
+    assert.equal(recentGrantRowId(rows, "exit", "E1", T0, gateOf), null);
+    assert.equal(recentGrantRowId(rows, "exit", "E1", T0 - 10_000, gateOf), "P1");
+  });
+  it("stops after the scan limit", () => {
+    assert.equal(recentGrantRowId(logs, "exit", "E1", T0, gateOf, 3), null);
+  });
+});
+
+describe("pipelineConfidencePct", () => {
+  it("uses the door scan's scale and clamps", () => {
+    assert.equal(pipelineConfidencePct(0.35), 0);
+    assert.equal(pipelineConfidencePct(0.6), 38);
+    assert.equal(pipelineConfidencePct(1), 100);
+    assert.equal(pipelineConfidencePct(0.1), 0);
+    assert.equal(pipelineConfidencePct(2), 100);
+    for (const bad of [undefined, null, "x", NaN]) assert.equal(pipelineConfidencePct(bad), 0);
+  });
+});
+
+describe("storableAccessLogSource", () => {
+  it("stores only the one known value; anything else is a door-scan row (NULL)", () => {
+    assert.equal(storableAccessLogSource("pipeline"), "pipeline");
+    for (const v of [undefined, null, "", "Pipeline", "browser", "door-scan", 1, {}]) assert.equal(storableAccessLogSource(v), null);
+  });
+});
+
 describe("server wiring", () => {
   const src = readFileSync(new URL("../server.ts", import.meta.url), "utf8");
   const fnBody = (name: string) => {
@@ -116,6 +177,37 @@ describe("server wiring", () => {
     const grant = src.slice(src.indexOf("// 2. One GRANTED row per employee"), src.indexOf("const notice = pipelineNotifyActive(gateKey)"));
     assert.match(grant, /accessLogs\.unshift\(accessLog\);/);
     assert.match(grant, /broadcastSSE\("access_granted"/);
+  });
+
+  it("an attendance row is written only after the pipeline itself sent the message", () => {
+    assert.match(
+      fnBody("reportPipelineResult"),
+      /persistShadowResult\(gate, r\)\s*\.then\(\(legacy\) => \(notify === "sent" \? recordPipelinePassage\(gate, r, legacy\) : undefined\)\)/
+    );
+  });
+
+  it("the attendance row: employee only, skipped when a grant row exists, never an unlock or an image", () => {
+    const body = fnBody("recordPipelinePassage");
+    assert.match(body, /if \(r\.outcome\.kind !== "employee"\) return;/);
+    assert.match(body, /legacy\.status === "GRANTED" && legacy\.employeeId === employeeId/);
+    assert.match(body, /recentGrantRowId\(accessLogs, gate, employeeId, sh\.decidedAtMs - PIPELINE_NOTIFY_DEDUPE_MS, gateIdForLegacyRow\)/);
+    assert.ok(body.indexOf("if (existing)") < body.indexOf("db.saveAccessLog(log)"), "the duplicate check comes before the write");
+    assert.match(body, /source: "pipeline",/);
+    assert.match(body, /photoSnapshot: "",/);
+    assert.match(body, /status: "GRANTED",/);
+    for (const forbidden of [/unlockDoor/, /lastGrantAtByGateEmployee/, /sendEtonWebhook/, /saveStrangerFace/, /frameImage/, /annotateSnapshot/]) {
+      assert.doesNotMatch(body, forbidden);
+    }
+  });
+
+  it("the JSON response filter keeps the source and the real hasImage of a history row", () => {
+    const body = fnBody("sanitizePublicJson");
+    assert.match(body, /hasImage: typeof value\.hasImage === "boolean" \? value\.hasImage : Boolean\(value\.photoSnapshot\)/);
+    assert.match(body, /\.\.\.\(value\.source === "pipeline" \? \{ source: "pipeline" \} : \{\}\)/);
+  });
+
+  it("the shadow pairing never mistakes the pipeline's own row for a door-scan event", () => {
+    assert.match(fnBody("nearestLegacyEvent"), /if \(log\.source === "pipeline"\) continue;/);
   });
 
   // docker-compose.yml is not in the image build context (.dockerignore): checked on a host checkout only.
