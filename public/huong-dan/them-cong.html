@@ -83,7 +83,7 @@ a:focus-visible,button:focus-visible{outline:2px solid var(--accent);outline-off
   <a class="back" href="/">Về trang Gate Watch</a>
   <span class="eyebrow">SmartFace Gate Watch · Hướng dẫn cho admin</span>
   <h1>Thêm một cổng mới có camera nhận diện</h1>
-  <p class="lead">Làm theo các bước dưới đây để thêm cổng, gắn camera, vẽ vùng cổng và bật quét cửa. Mọi bước đều làm trên giao diện, không cần sửa máy chủ, trừ hai trường hợp được ghi rõ.</p>
+  <p class="lead">Làm theo các bước dưới đây để thêm cổng, gắn camera, vẽ vùng cổng và bật quét cửa. Mọi bước đều làm trên giao diện, không cần sửa máy chủ, trừ một trường hợp được ghi rõ.</p>
 </header>
 
 <section>
@@ -95,9 +95,8 @@ a:focus-visible,button:focus-visible{outline:2px solid var(--accent);outline-off
       <li><b>Cửa của cổng.</b> Nếu cổng mới mở cửa chính thì không cần làm gì thêm. Nếu cổng mở một cửa riêng, bộ điều khiển của cửa đó phải được khai báo trước, xem bước 1.</li>
     </ul>
     <div class="note warn">
-      <b>Hai trường hợp cần người phụ trách máy chủ</b>
+      <b>Một trường hợp cần người phụ trách máy chủ</b>
       <span>Camera IP không đi qua đầu ghi NVR: địa chỉ của camera phải nằm trong danh sách camera được phép của máy chủ. Nếu không, hệ thống từ chối lưu luồng. Thêm vào danh sách cần khởi động lại máy chủ.</span>
-      <span>Muốn động cơ thời gian thực gửi tin nhắn cho cổng mới: đây là cấu hình máy chủ, cần triển khai lại.</span>
     </div>
   </div>
   <div class="limits">
@@ -200,6 +199,7 @@ a:focus-visible,button:focus-visible{outline:2px solid var(--accent);outline-off
       <h3>Chạy thử động cơ thời gian thực <span class="opt">tùy chọn</span></h3>
       <p class="who">Trang <span class="page">Cấu Hình AI</span> · khung động cơ thời gian thực · chỉ admin</p>
       <p>Chọn chế độ <i>chạy thử (shadow)</i> cho cổng mới. Ở chế độ này động cơ chỉ quan sát: không mở cửa và không ghi nhật ký. Quét cửa vẫn quyết định như trước.</p>
+      <p><b>Gửi tin nhắn từ động cơ:</b> ở cùng khung, bấm <span class="ui">Đang tắt</span> cạnh dòng <i>Tin nhắn từ động cơ</i> rồi xác nhận <span class="ui">Bật tin nhắn</span>. Có hiệu lực ngay. Nhân viên được động cơ nhận ra sẽ nhận tin nhắn; mỗi lượt đi qua chỉ một tin, dù quét cửa hay động cơ thấy trước. Lượt mà quét cửa không ghi được sẽ được ghi vào nhật ký với dòng <i>Không mở cửa</i>, không có ảnh. Nút <span class="ui">Dùng mặc định máy chủ</span> bỏ lựa chọn này.</p>
       <div class="note warn">
         <b>Hỏi người phụ trách máy chủ trước</b>
         <span>Mỗi cổng chạy thử giữ thêm một luồng camera luôn mở và một worker nhận diện riêng, nên tốn thêm CPU của máy chủ dùng chung.</span>

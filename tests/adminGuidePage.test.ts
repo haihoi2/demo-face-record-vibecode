@@ -38,6 +38,12 @@ describe("admin guide page: adding a gate", () => {
     }
   });
 
+  it("tells the admin the message switch is in the app, not a redeploy (#580)", () => {
+    assert.ok(page.includes("Bật tin nhắn"));
+    assert.ok(readFileSync("src/utils/pipelineMode.ts", "utf8").includes('confirmLabel: "Bật tin nhắn"'));
+    assert.doesNotMatch(page, /triển khai lại/);
+  });
+
   it("describes the scan wait as a rest, never a period", () => {
     assert.doesNotMatch(page, /chu kỳ|tần suất|quét mỗi \d/i);
   });
