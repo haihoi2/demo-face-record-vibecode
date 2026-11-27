@@ -61,6 +61,27 @@ command: itest.sh tests/integration/*.test.ts
 result:  457 tests, 449 pass, 3 fail, 5 skipped; the 3 fails are the known baseline (2 N-gates security subtests, strangerClusterEdit needs a PG gateway), same as e1a3a20
 ```
 
+### Dev end-to-end, 27/11 10:41 to 10:47Z
+
+Setup:
+- The gateway image is `smartface-tests:notify-toggle`, from this branch.
+- Everything ran on the internal network `e2e-pn`, 192.168.250.0/24. The route to the NVR was checked before and after the run.
+- The exit camera was a looped 20 s NVR clip, with one temp employee enrolled from it.
+- The door scan was off and `PIPELINE_NOTIFY_GATES` was unset.
+
+| Phase | Pipeline employee decisions | Messages | Result |
+|---|---|---|---|
+| A, default (env, off) | 3 | 0 | ok |
+| B, switch on (`SWITCH true 200`, source config) | 4 | 1, 9 s after the switch, then deduped for 60 s; attendance row 15 s later | ok |
+| C, `docker restart` | 3 | the watcher reports `notify:true, src:config` after the restart | ok, the choice survives |
+| D, switch off | 3 | 0 | ok; the log names the actor |
+
+Afterwards the containers, the network, the clip and the face crops were removed.
+
+Two pre-existing restart edges, not caused by this change:
+- The 60 s message dedupe is in memory. One message 20 s before a restart was followed by another 20 s after it.
+- The attendance row is written 15 s after its message. A restart inside those 15 s loses that row.
+
 ## Risks, migration, rollback, compatibility
 
 - **Live on deploy:** no gate has `pipelineNotify`, so the exit gate keeps its env value. Nothing changes until an admin uses the switch.
@@ -69,5 +90,5 @@ result:  457 tests, 449 pass, 3 fail, 5 skipped; the 3 fails are the known basel
 
 ## Unresolved questions and requested integration action
 
-- **Before deploy:** a dev end-to-end run of the switch with a real pipeline. Steps: on, a message arrives; off, no message; a restart keeps the choice.
+- Dev end-to-end: done, see above.
 - Deploy only after hai.vo gives an explicit "deploy".
