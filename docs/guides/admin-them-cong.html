@@ -1,0 +1,257 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Thêm cổng Gate Watch</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Be+Vietnam+Pro:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap">
+<style>
+:root{
+  --ground:#f6f7fb; --paper:#ffffff; --ink:#1b2135; --muted:#5b6380; --line:#dfe3ee;
+  --accent:#4f46e5; --accent-soft:#eceafd; --accent-ink:#3730a3;
+  --warn:#b45309; --warn-soft:#fff6e6; --ok:#047857; --ok-soft:#e9f8f1; --bad:#be123c; --bad-soft:#fdeef2;
+  --chip:#eef0f7; --chip-ink:#2a3150;
+  --sans:"Be Vietnam Pro",system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+  --mono:"JetBrains Mono",ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+}
+@media (prefers-color-scheme: dark){
+  :root:not([data-theme="light"]){
+    --ground:#10131d; --paper:#171b28; --ink:#e6e8f2; --muted:#9aa1bd; --line:#2a3044;
+    --accent:#8b86f7; --accent-soft:#25234a; --accent-ink:#c9c6ff;
+    --warn:#f2b45a; --warn-soft:#2e2413; --ok:#5fd3a6; --ok-soft:#14291f; --bad:#f58aa5; --bad-soft:#2e1520;
+    --chip:#232838; --chip-ink:#d6d9e8;
+  }
+}
+:root[data-theme="dark"]{
+  --ground:#10131d; --paper:#171b28; --ink:#e6e8f2; --muted:#9aa1bd; --line:#2a3044;
+  --accent:#8b86f7; --accent-soft:#25234a; --accent-ink:#c9c6ff;
+  --warn:#f2b45a; --warn-soft:#2e2413; --ok:#5fd3a6; --ok-soft:#14291f; --bad:#f58aa5; --bad-soft:#2e1520;
+  --chip:#232838; --chip-ink:#d6d9e8;
+}
+*{box-sizing:border-box}
+html{-webkit-text-size-adjust:100%}
+body{margin:0;background:var(--ground);color:var(--ink);font:16px/1.65 var(--sans)}
+.wrap{max-width:760px;margin:0 auto;padding:40px 16px 72px;display:flex;flex-direction:column;gap:28px}
+header{display:flex;flex-direction:column;gap:10px}
+.eyebrow{font-size:12px;letter-spacing:.08em;text-transform:uppercase;color:var(--accent-ink);font-weight:600}
+h1{font-size:34px;line-height:1.2;margin:0;text-wrap:balance;font-weight:700}
+h2{font-size:22px;line-height:1.3;margin:0;text-wrap:balance}
+h3{font-size:17px;margin:0}
+p{margin:0;max-width:65ch}
+.lead{color:var(--muted);font-size:17px}
+section{display:flex;flex-direction:column;gap:14px}
+.card{background:var(--paper);border:1px solid var(--line);border-radius:14px;padding:20px;display:flex;flex-direction:column;gap:12px}
+ul,ol{margin:0;padding-left:22px;display:flex;flex-direction:column;gap:6px}
+li{max-width:65ch}
+.ui{display:inline-block;font-weight:600;font-size:14px;background:var(--chip);color:var(--chip-ink);border:1px solid var(--line);border-radius:6px;padding:0 7px;line-height:1.7;white-space:nowrap}
+.page{font-weight:600;color:var(--accent-ink)}
+code{font-family:var(--mono);font-size:13.5px;background:var(--chip);color:var(--chip-ink);border-radius:5px;padding:1px 5px}
+.steps{list-style:none;padding:0;gap:16px;counter-reset:s}
+.step{counter-increment:s;display:grid;grid-template-columns:40px 1fr;gap:14px;background:var(--paper);border:1px solid var(--line);border-radius:14px;padding:18px 20px}
+.step::before{content:counter(s);width:32px;height:32px;border-radius:50%;background:var(--accent);color:var(--paper);display:grid;place-items:center;font-weight:700;font-size:15px}
+.step > div{display:flex;flex-direction:column;gap:10px;min-width:0}
+.who{font-size:13px;color:var(--muted)}
+.opt{font-size:12px;font-weight:600;color:var(--muted);border:1px solid var(--line);border-radius:999px;padding:0 8px;margin-left:6px;vertical-align:2px}
+.note{border-radius:10px;padding:12px 14px;font-size:15px;display:flex;flex-direction:column;gap:6px}
+.note.warn{background:var(--warn-soft);border-left:3px solid var(--warn)}
+.note.ok{background:var(--ok-soft);border-left:3px solid var(--ok)}
+.note.bad{background:var(--bad-soft);border-left:3px solid var(--bad)}
+.note b{font-weight:600}
+.limits{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px}
+.limit{background:var(--paper);border:1px solid var(--line);border-radius:12px;padding:14px 16px;display:flex;flex-direction:column;gap:2px}
+.limit .n{font-size:26px;font-weight:700;font-variant-numeric:tabular-nums;color:var(--accent-ink)}
+.limit .l{font-size:14px;color:var(--muted)}
+.table-wrap{overflow-x:auto;border:1px solid var(--line);border-radius:12px;background:var(--paper)}
+table{border-collapse:collapse;width:100%;font-size:14.5px;min-width:560px}
+th,td{text-align:left;padding:10px 14px;border-bottom:1px solid var(--line);vertical-align:top}
+th{font-size:12px;letter-spacing:.06em;text-transform:uppercase;color:var(--muted);font-weight:600}
+tr:last-child td{border-bottom:0}
+td:first-child{font-weight:500}
+.two{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+@media (max-width:640px){.two{grid-template-columns:1fr}h1{font-size:28px}.step{grid-template-columns:1fr}.step::before{margin-bottom:-4px}}
+footer{color:var(--muted);font-size:13px;border-top:1px solid var(--line);padding-top:16px}
+a{color:var(--accent-ink)}
+a:focus-visible,button:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+</style>
+</head>
+<body>
+<main class="wrap">
+
+<header>
+  <span class="eyebrow">SmartFace Gate Watch · Hướng dẫn cho admin</span>
+  <h1>Thêm một cổng mới có camera nhận diện</h1>
+  <p class="lead">Làm theo các bước dưới đây để thêm cổng, gắn camera, vẽ vùng cổng và bật quét cửa. Mọi bước đều làm trên giao diện, không cần sửa máy chủ, trừ hai trường hợp được ghi rõ.</p>
+</header>
+
+<section>
+  <h2>Trước khi bắt đầu</h2>
+  <div class="card">
+    <ul>
+      <li><b>Tài khoản:</b> bước thêm cổng và bước chạy thử động cơ thời gian thực cần quyền <b>admin</b>. Các bước gắn camera, vẽ vùng cổng và bật quét cửa thì tài khoản vận hành cũng làm được.</li>
+      <li><b>Địa chỉ RTSP của camera.</b> Cách dễ nhất là dùng một kênh trên đầu ghi NVR mà các cổng hiện tại đang dùng.</li>
+      <li><b>Cửa của cổng.</b> Nếu cổng mới mở cửa chính thì không cần làm gì thêm. Nếu cổng mở một cửa riêng, bộ điều khiển của cửa đó phải được khai báo trước, xem bước 1.</li>
+    </ul>
+    <div class="note warn">
+      <b>Hai trường hợp cần người phụ trách máy chủ</b>
+      <span>Camera IP không đi qua đầu ghi NVR: địa chỉ của camera phải nằm trong danh sách camera được phép của máy chủ. Nếu không, hệ thống từ chối lưu luồng. Thêm vào danh sách cần khởi động lại máy chủ.</span>
+      <span>Muốn động cơ thời gian thực gửi tin nhắn cho cổng mới: đây là cấu hình máy chủ, cần triển khai lại.</span>
+    </div>
+  </div>
+  <div class="limits">
+    <div class="limit"><span class="n">16</span><span class="l">cổng tối đa, tính cả Cổng vào và Cổng ra</span></div>
+    <div class="limit"><span class="n">16</span><span class="l">luồng camera tối đa mỗi cổng</span></div>
+    <div class="limit"><span class="n">4</span><span class="l">luồng RTSP đang bật được quét cửa đọc mỗi lần quét</span></div>
+    <div class="limit"><span class="n">1</span><span class="l">luồng mỗi cổng cho động cơ thời gian thực: luồng đang bật đứng đầu danh sách</span></div>
+  </div>
+</section>
+
+<section>
+  <h2>Các bước</h2>
+  <ol class="steps">
+
+    <li class="step"><div>
+      <h3>Khai báo cửa riêng <span class="opt">chỉ khi cổng mở cửa riêng</span></h3>
+      <p class="who">Trang <span class="page">API Mở Cửa</span></p>
+      <ol>
+        <li>Bấm <span class="ui">Thêm cửa</span>. Cửa mới ở trạng thái tắt, chưa có URL và token.</li>
+        <li>Điền thông tin bộ điều khiển của cửa rồi bấm <span class="ui">Lưu Cấu Hình</span>.</li>
+      </ol>
+      <p>Token của bộ điều khiển là thông tin bí mật. Không chụp màn hình hoặc gửi token qua chat.</p>
+    </div></li>
+
+    <li class="step"><div>
+      <h3>Thêm cổng</h3>
+      <p class="who">Trang <span class="page">Luồng Camera</span> · chỉ admin</p>
+      <ol>
+        <li>Bấm <span class="ui">Thêm cổng</span> ở cạnh hàng tab các cổng.</li>
+        <li><b>Tên hiển thị:</b> tên mọi người sẽ thấy trong nhật ký và tin nhắn, ví dụ <i>Cổng phụ kho B</i>.</li>
+        <li><b>Mã cổng:</b> hệ thống tự gợi ý từ tên, ví dụ <code>cong-phu-kho-b</code>. Mã gồm 2 đến 32 ký tự: chữ thường không dấu, số, dấu gạch ngang, bắt đầu bằng chữ cái.</li>
+        <li><b>Hướng:</b> chọn <i>Vào</i> hoặc <i>Ra</i>. Hướng quyết định lượt được ghi là vào hay ra.</li>
+        <li><b>Cửa:</b> chọn cửa mà cổng này mở khi nhận ra nhân viên.</li>
+        <li>Bấm <span class="ui">Thêm cổng</span> trong hộp thoại.</li>
+      </ol>
+      <div class="note warn">
+        <b>Chọn mã cổng cẩn thận</b>
+        <span>Mã cổng không đổi được sau khi tạo. Lịch sử vào ra được lưu theo mã này, nên một mã đã xóa sẽ không bao giờ dùng lại được cho cổng khác.</span>
+      </div>
+      <p>Cổng mới được bật nhưng chưa có camera và chưa quét. Hệ thống chưa kết nối tới camera nào cho đến khi bạn làm bước 3 và bước 6.</p>
+    </div></li>
+
+    <li class="step"><div>
+      <h3>Gắn camera cho cổng</h3>
+      <p class="who">Trang <span class="page">Luồng Camera</span> · tab của cổng mới</p>
+      <ol>
+        <li>Bấm <span class="ui">Thêm luồng</span>.</li>
+        <li><b>Tên Luồng:</b> ví dụ <i>Camera chính kho B</i>. Giữ <b>Kích hoạt luồng</b> ở trạng thái bật.</li>
+        <li><b>Loại Nguồn:</b> chọn <i>Luồng URL RTSP</i>. Quét cửa tự động và động cơ thời gian thực chỉ đọc được luồng RTSP.</li>
+        <li><b>URL Luồng RTSP:</b> dán địa chỉ của kênh camera, có kèm tài khoản nếu camera yêu cầu.</li>
+        <li><b>Giao Thức Truyền Tải:</b> để <i>TCP</i>.</li>
+        <li>Bấm <span class="ui">Thêm Luồng</span>.</li>
+        <li>Bấm <span class="ui">Kiểm tra</span> để thử kết nối, rồi <span class="ui">Xem ảnh</span> để chụp một khung hình và xem camera có nhìn đúng chỗ không.</li>
+      </ol>
+      <div class="note bad">
+        <b>URL RTSP có mật khẩu camera</b>
+        <span>Không gửi URL này qua chat, email hay Taiga. Chỉ dán vào ô trên giao diện.</span>
+      </div>
+      <p><b>Nhiều camera cho một cổng:</b> thêm từng luồng như trên. Quét cửa đọc tối đa 4 luồng RTSP đang bật trong mỗi lần quét. Động cơ thời gian thực chỉ đọc luồng đang bật đứng đầu danh sách. Dùng nút mũi tên lên xuống ở mỗi luồng để đổi thứ tự. Camera phụ nhìn chỗ khác sẽ làm mỗi lần quét lâu hơn.</p>
+    </div></li>
+
+    <li class="step"><div>
+      <h3>Vẽ vùng cổng</h3>
+      <p class="who">Trang <span class="page">Luồng Camera</span> · nút <span class="ui">Vùng cổng</span> ở luồng vừa thêm</p>
+      <ol>
+        <li>Hệ thống chụp một khung hình tham chiếu. Ảnh này không được lưu lại.</li>
+        <li>Kéo chuột để vẽ khung bao chỗ người đi qua và nhìn về camera.</li>
+        <li>Bấm <span class="ui">Lưu vùng cổng</span>.</li>
+      </ol>
+      <div class="two">
+        <div class="note ok"><b>Nên</b><span>Bao trọn lối đi ở đoạn khuôn mặt to và rõ nhất. Chừa một chút khoảng trống phía trên đầu người cao.</span></div>
+        <div class="note warn"><b>Không nên</b><span>Để vùng quá thấp làm mất phần đầu, hoặc bao cả trần, tường, màn hình nơi không có ai đi qua.</span></div>
+      </div>
+      <p>Vùng cổng sai là lý do thường gặp nhất khiến một cổng nhận ra kém. Sau khi lưu, nhớ xem lại bằng <span class="ui">Xem ảnh</span>.</p>
+    </div></li>
+
+    <li class="step"><div>
+      <h3>Đăng ký khuôn mặt từ camera của cổng mới</h3>
+      <p class="who">Trang <span class="page">Đăng Ký Khuôn Mặt</span></p>
+      <p>Chọn nhân viên dùng cổng này, rồi đăng ký khuôn mặt từ camera cổng mới.</p>
+      <div class="note warn">
+        <b>Vì sao phải đăng ký lại</b>
+        <span>Ở công ty mình, khuôn mặt đăng ký ở camera này thường không khớp đủ ở camera khác, do góc đặt và ánh sáng khác nhau. Nếu bỏ bước này, cổng mới sẽ thường báo người lạ dù nhân viên đã có hồ sơ.</span>
+      </div>
+    </div></li>
+
+    <li class="step"><div>
+      <h3>Bật quét cửa</h3>
+      <p class="who">Trang <span class="page">Quét Cửa AI</span> · khung của cổng mới</p>
+      <ol>
+        <li>Bấm <span class="ui">Watcher: TẮT</span> để chuyển sang <span class="ui">Watcher: BẬT</span>.</li>
+        <li><b>Nghỉ sau mỗi lần quét:</b> số giây nghỉ từ lúc một lần quét xong đến lúc lần sau bắt đầu, từ 1 đến 300. Cổng ra hiện để 1 giây nghỉ, cổng vào để 3 giây nghỉ.</li>
+        <li><b>Số khung:</b> số khung hình chụp trên mỗi luồng trong một lần quét, từ 1 đến 5. Nhiều khung nhận ra chắc hơn nhưng mỗi lần quét lâu hơn. Nên bắt đầu với 1 hoặc 2.</li>
+        <li>Đợi một lát rồi xem trạng thái watcher: watcher phải đang chạy và số lần quét phải tăng dần.</li>
+      </ol>
+      <p>Từ lúc này, cổng mới tự quét, ghi lượt vào ra, mở cửa và gửi tin nhắn cho nhân viên như hai cổng hiện tại.</p>
+    </div></li>
+
+    <li class="step"><div>
+      <h3>Chạy thử động cơ thời gian thực <span class="opt">tùy chọn</span></h3>
+      <p class="who">Trang <span class="page">Cấu Hình AI</span> · khung động cơ thời gian thực · chỉ admin</p>
+      <p>Chọn chế độ <i>chạy thử (shadow)</i> cho cổng mới. Ở chế độ này động cơ chỉ quan sát: không mở cửa và không ghi nhật ký. Quét cửa vẫn quyết định như trước.</p>
+      <div class="note warn">
+        <b>Hỏi người phụ trách máy chủ trước</b>
+        <span>Mỗi cổng chạy thử giữ thêm một luồng camera luôn mở và một worker nhận diện riêng, nên tốn thêm CPU của máy chủ dùng chung.</span>
+      </div>
+    </div></li>
+  </ol>
+</section>
+
+<section>
+  <h2>Kiểm tra sau khi thêm</h2>
+  <div class="card">
+    <ol>
+      <li>Nhờ một nhân viên đã đăng ký ở bước 5 đi qua cổng mới.</li>
+      <li>Mở <span class="page">Nhật Ký Vào Ra</span>, lọc theo cổng mới. Phải thấy một lượt mang đúng tên cổng và đúng hướng.</li>
+      <li>Nhân viên đó nhận được tin nhắn có tên cổng.</li>
+      <li>Nếu cổng có cửa riêng, cửa phải mở.</li>
+    </ol>
+  </div>
+</section>
+
+<section>
+  <h2>Tắt hoặc xóa cổng</h2>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Việc</th><th>Kết quả</th><th>Làm lại được không</th></tr></thead>
+      <tbody>
+        <tr><td>Tắt cổng</td><td>Cổng ngừng quét. Cửa của cổng không mở bằng nhận diện, quét thủ công cũng bị từ chối. Cấu hình camera và lịch sử vẫn giữ.</td><td>Được, bật lại là chạy như cũ.</td></tr>
+        <tr><td>Xóa cổng</td><td>Cổng ngừng quét, các luồng camera bị gỡ. Lịch sử vào ra vẫn giữ và vẫn lọc được trong nhật ký.</td><td>Không. Phải tạo cổng mới với mã khác và gắn lại camera.</td></tr>
+        <tr><td>Cổng vào, cổng ra có sẵn</td><td>Là cổng cố định, chỉ tắt được.</td><td>Không xóa được.</td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<section>
+  <h2>Thông báo lỗi thường gặp</h2>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Thông báo</th><th>Cách xử lý</th></tr></thead>
+      <tbody>
+        <tr><td>Mã cổng không hợp lệ</td><td>Dùng chữ thường không dấu, số, gạch ngang; bắt đầu bằng chữ. Không dùng các từ dành riêng như <code>config</code>, <code>watch</code>, <code>snapshot</code>.</td></tr>
+        <tr><td>Cổng đã tồn tại</td><td>Đã có cổng mang mã này. Chọn mã khác.</td></tr>
+        <tr><td>Mã cổng đã dùng cho một cổng đã xóa</td><td>Mã này mang lịch sử của cổng cũ. Chọn mã khác, ví dụ thêm <code>-2</code>.</td></tr>
+        <tr><td>Tối đa 16 cổng</td><td>Xóa một cổng không còn dùng, hoặc báo người phụ trách hệ thống.</td></tr>
+        <tr><td>Cửa chưa được cấu hình</td><td>Làm bước 1 trước, rồi chọn lại cửa.</td></tr>
+        <tr><td>Luồng bị từ chối khi lưu</td><td>Địa chỉ camera không nằm trong danh sách được phép. Dùng kênh trên đầu ghi NVR, hoặc nhờ người phụ trách máy chủ thêm địa chỉ.</td></tr>
+        <tr><td>Cổng này chưa có luồng RTSP nào đang bật</td><td>Thêm luồng RTSP ở bước 3 và giữ Kích hoạt luồng ở trạng thái bật.</td></tr>
+        <tr><td>Mỗi cổng chỉ hỗ trợ tối đa 16 luồng video</td><td>Gỡ các luồng không còn dùng của cổng đó.</td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<footer>Viết theo giao diện bản đang chạy ngày 27/11/2026. Tên nút và tên trang trong hướng dẫn này lấy đúng theo giao diện.</footer>
+</main>
+</body>
+</html>
