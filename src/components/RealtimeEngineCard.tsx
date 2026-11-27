@@ -44,6 +44,9 @@ import {
   PIPELINE_MODES,
   PIPELINE_MODE_UNAVAILABLE_TITLE,
   buildPipelineModeRequest,
+  buildPipelineNotifyRequest,
+  interpretPipelineNotifyResponse,
+  pipelineNotifyConfirmText,
   gateKeysForCard,
   gateLabel,
   interpretPipelineModeResponse,
@@ -77,6 +80,7 @@ const SHADOW_SUMMARY_URL = `/api/pipeline/shadow-summary?hours=${SHADOW_SUMMARY_
 type Rows = Record<GateKey, GatePipelineRow>;
 type Notice = { tone: Tone; text: string } | null;
 type PendingSwitch = { key: GateKey; target: PipelineMode | null } | null;
+type PendingNotify = { key: GateKey; enabled: boolean | null } | null;
 
 const FOCUSABLE = 'button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])';
 
@@ -206,6 +210,7 @@ export const RealtimeEngineCard: React.FC = () => {
   const [checkedAt, setCheckedAt] = useState<string | null>(null);
   const [pendingGate, setPendingGate] = useState<GateKey | null>(null);
   const [confirm, setConfirm] = useState<PendingSwitch>(null);
+  const [notifyConfirm, setNotifyConfirm] = useState<PendingNotify>(null);
   const [notice, setNotice] = useState<Notice>(null);
   // Shadow accuracy over the last 24 h (plan Part B). `supported` false = an older
   // server without the route: the section is hidden rather than shown empty.
@@ -322,6 +327,77 @@ export const RealtimeEngineCard: React.FC = () => {
     },
     [fetchRows, gates, rows],
   );
+
+  const applyNotify = useCallback(
+    async (key: GateKey, enabled: boolean | null) => {
+      setPendingGate(key);
+      setNotice(null);
+      try {
+        const { url, init } = buildPipelineNotifyRequest(key, enabled);
+        const res = await operatorJsonFetch<unknown>(url, init);
+        if (!mounted.current) return;
+        const outcome = interpretPipelineNotifyResponse(key, res, labelOf(key));
+        if (outcome.kind === "applied") {
+          const row = readGatePipelineRow(outcome.watcher);
+          if (row) setRows((prev) => ({ ...prev, [outcome.gateId]: { ...row, key: outcome.gateId } }));
+          setNotice({ tone: "emerald", text: outcome.message });
+          void fetchRows(true);
+        } else {
+          setNotice({ tone: outcome.kind === "unreachable" ? "amber" : "rose", text: outcome.message });
+        }
+      } finally {
+        if (mounted.current) {
+          setPendingGate(null);
+          setNotifyConfirm(null);
+        }
+      }
+    },
+    [fetchRows, gates, rows],
+  );
+
+  /** Pipeline chat messages for this gate (#580): on/off, or back to the server default. */
+  const renderNotifyControls = (row: GatePipelineRow | undefined, key: GateKey) => {
+    if (!row || row.notify === null) return null; // an older server: no switch to show
+    const on = row.notify;
+    const busy = pendingGate === key;
+    const sourceText = pipelineModeSourceLabel(row.notifySource);
+    if (!isAdmin) {
+      return (
+        <p className="text-[11px] text-slate-500" data-testid={`rt-notify-${key}-state`}>
+          Tin nhắn từ động cơ: <b>{on ? "bật" : "tắt"}</b> ({sourceText}).
+        </p>
+      );
+    }
+    return (
+      <div className="flex flex-wrap items-center gap-2" data-testid={`rt-notify-${key}`}>
+        <span className="text-[11px] font-semibold text-slate-700">Tin nhắn từ động cơ</span>
+        <button
+          type="button"
+          role="switch"
+          aria-checked={on}
+          disabled={busy}
+          onClick={() => setNotifyConfirm({ key, enabled: !on })}
+          data-testid={`rt-notify-${key}-toggle`}
+          className={`px-2.5 py-1 text-[11px] font-semibold rounded-lg border transition-colors disabled:opacity-40 ${
+            on ? "bg-emerald-600 border-emerald-600 text-white" : "bg-white border-slate-200 text-slate-700 hover:bg-slate-50"
+          }`}
+        >
+          {on ? "Đang bật" : "Đang tắt"}
+        </button>
+        <span className="text-[11px] text-slate-500">({sourceText})</span>
+        <button
+          type="button"
+          disabled={busy || row.notifySource !== "config"}
+          onClick={() => setNotifyConfirm({ key, enabled: null })}
+          title={row.notifySource === "config" ? "Bỏ lựa chọn đã lưu cho cổng này" : "Cổng này đang theo mặc định máy chủ"}
+          data-testid={`rt-notify-${key}-default`}
+          className="px-2.5 py-1 text-[11px] font-semibold rounded-lg border border-slate-200 text-slate-700 hover:bg-slate-50 disabled:opacity-40 disabled:cursor-not-allowed"
+        >
+          Dùng mặc định máy chủ
+        </button>
+      </div>
+    );
+  };
 
   const renderControls = (row: GatePipelineRow | undefined, key: GateKey) => {
     if (!isAdmin) {
@@ -517,6 +593,7 @@ export const RealtimeEngineCard: React.FC = () => {
             )}
           </div>
           {renderControls(row, key)}
+          {renderNotifyControls(row, key)}
         </div>
 
         {view?.mode && <p className="text-[11px] text-slate-600">{pipelineModeHint(view.mode)}</p>}
@@ -632,6 +709,7 @@ export const RealtimeEngineCard: React.FC = () => {
   };
 
   const confirmText = confirm ? pipelineModeConfirmText(confirm.key, confirm.target, labelOf(confirm.key)) : null;
+  const notifyText = notifyConfirm ? pipelineNotifyConfirmText(notifyConfirm.key, notifyConfirm.enabled, labelOf(notifyConfirm.key)) : null;
 
   return (
     <section
@@ -717,6 +795,16 @@ export const RealtimeEngineCard: React.FC = () => {
           busy={pendingGate === confirm.key}
           onConfirm={() => void applySwitch(confirm.key, confirm.target)}
           onCancel={() => setConfirm(null)}
+        />
+      )}
+      {notifyConfirm && notifyText && (
+        <ConfirmSwitchDialog
+          title={notifyText.title}
+          body={notifyText.body}
+          confirmLabel={notifyText.confirmLabel}
+          busy={pendingGate === notifyConfirm.key}
+          onConfirm={() => void applyNotify(notifyConfirm.key, notifyConfirm.enabled)}
+          onCancel={() => setNotifyConfirm(null)}
         />
       )}
     </section>

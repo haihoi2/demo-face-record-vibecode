@@ -93,6 +93,10 @@ export interface GatePipelineRow {
    * effective mode. Null when the gate follows the server default.
    */
   configured: PipelineMode | null;
+  /** The gate's pipeline posts the employee chat message (null: an older server sent nothing). */
+  notify: boolean | null;
+  /** Where that came from: the admin's switch (config) or PIPELINE_NOTIFY_GATES (env). */
+  notifySource: PipelineModeSource | null;
 }
 
 export function readGatePipelineRow(raw: unknown): GatePipelineRow | null {
@@ -111,6 +115,8 @@ export function readGatePipelineRow(raw: unknown): GatePipelineRow | null {
     view,
     source,
     configured,
+    notify: typeof r.pipelineNotify === "boolean" ? r.pipelineNotify : null,
+    notifySource: parsePipelineModeSource(r.pipelineNotifySource),
   };
 }
 
@@ -270,4 +276,98 @@ export function interpretPipelineModeResponse(
       message = serverError || res.error || `Máy chủ từ chối yêu cầu (HTTP ${res.status}).`;
   }
   return { kind: "refused", status: res.status, code, message: `${message} Chế độ của ${gate} CHƯA đổi.` };
+}
+
+// ---------------------------------------------------------------------------
+// Pipeline chat messages per gate (admin, #580):
+// POST /api/camera-streams/:gate/pipeline-notify { enabled: true | false | null }.
+// ---------------------------------------------------------------------------
+
+/** The exact request the card sends; `enabled: null` goes back to the server default. */
+export function buildPipelineNotifyRequest(key: GateKey, enabled: boolean | null): { url: string; init: RequestInit } {
+  return {
+    url: `/api/camera-streams/${encodeURIComponent(key)}/pipeline-notify`,
+    init: {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ enabled }),
+    },
+  };
+}
+
+/** What the admin is told before the message switch goes to the server. */
+export function pipelineNotifyConfirmText(key: GateKey, enabled: boolean | null, label?: string | null): PipelineModeConfirmText {
+  const gate = gateLabel(key, label);
+  if (enabled === true) {
+    return {
+      title: `Bật tin nhắn từ động cơ thời gian thực cho ${gate}?`,
+      body:
+        "Khi động cơ của cổng này đang chạy thử, nhân viên được nó nhận ra sẽ nhận tin nhắn như khi quét cửa nhận ra. " +
+        "Mỗi người chỉ nhận một tin cho một lượt đi qua, dù quét cửa hay động cơ thấy trước. " +
+        "Lượt mà quét cửa không ghi sẽ được ghi vào nhật ký, không mở cửa, không lưu ảnh. Có hiệu lực ngay.",
+      confirmLabel: "Bật tin nhắn",
+    };
+  }
+  if (enabled === false) {
+    return {
+      title: `Tắt tin nhắn từ động cơ thời gian thực cho ${gate}?`,
+      body:
+        "Động cơ vẫn chạy thử nhưng không gửi tin nhắn và không ghi lượt nào nữa. " +
+        "Quét cửa vẫn gửi tin nhắn như trước. Có hiệu lực ngay.",
+      confirmLabel: "Tắt tin nhắn",
+    };
+  }
+  return {
+    title: `Dùng mặc định máy chủ cho tin nhắn của ${gate}?`,
+    body: "Bỏ lựa chọn đã lưu; cổng này gửi hay không gửi tin nhắn theo cấu hình máy chủ (PIPELINE_NOTIFY_GATES). Có hiệu lực ngay.",
+    confirmLabel: "Dùng mặc định máy chủ",
+  };
+}
+
+export type PipelineNotifyOutcome =
+  | { kind: "applied"; gateId: GateKey; notify: boolean | null; source: PipelineModeSource | null; watcher: unknown; message: string }
+  | { kind: "refused"; status: number; message: string }
+  | { kind: "unreachable"; message: string };
+
+/** Only a 2xx `success: true` is applied; everything else says the switch did NOT change. */
+export function interpretPipelineNotifyResponse(
+  key: GateKey,
+  res: { ok: boolean; status: number; data: unknown; error?: string },
+  label?: string | null,
+): PipelineNotifyOutcome {
+  const gate = gateLabel(key, label);
+  const data = res.data && typeof res.data === "object" ? (res.data as Record<string, unknown>) : {};
+  const serverError = typeof data.error === "string" && data.error.trim() ? data.error.trim() : null;
+  if (res.status === 0) {
+    return { kind: "unreachable", message: `Không kết nối được máy chủ. Tin nhắn của ${gate} CHƯA đổi.` };
+  }
+  if (res.ok && data.success === true) {
+    const notify = typeof data.pipelineNotify === "boolean" ? data.pipelineNotify : null;
+    const source = parsePipelineModeSource(data.pipelineNotifySource);
+    const state = notify === null ? "máy chủ chưa báo" : notify ? "bật" : "tắt";
+    const idle = notify === true && data.pipelineRunning === false ? " Động cơ của cổng này chưa chạy, nên chưa có tin nào cho tới khi chuyển sang chạy thử." : "";
+    return {
+      kind: "applied",
+      gateId: isGateId(data.gateId) ? data.gateId : key,
+      notify,
+      source,
+      watcher: data.watcher ?? null,
+      message: `${gate}: tin nhắn từ động cơ thời gian thực ${state} (${pipelineModeSourceLabel(source)}).${idle}`,
+    };
+  }
+  let message: string;
+  switch (res.status) {
+    case 403:
+      message = serverError || "Tài khoản không có quyền đổi tin nhắn của động cơ (cần Quản trị).";
+      break;
+    case 401:
+      message = "Cần đăng nhập để đổi tin nhắn.";
+      break;
+    case 404:
+      message = "Máy chủ chưa có API bật tin nhắn theo cổng (HTTP 404).";
+      break;
+    default:
+      message = serverError || res.error || `Máy chủ từ chối yêu cầu (HTTP ${res.status}).`;
+  }
+  return { kind: "refused", status: res.status, message: `${message} Tin nhắn của ${gate} CHƯA đổi.` };
 }

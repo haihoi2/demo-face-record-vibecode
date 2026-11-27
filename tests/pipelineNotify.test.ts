@@ -164,7 +164,7 @@ describe("server wiring", () => {
 
   it("only employee outcomes on a gate in PIPELINE_NOTIFY_GATES whose pipeline runs send", () => {
     assert.match(src, /const PIPELINE_NOTIFY = parseNotifyGates\(process\.env\.PIPELINE_NOTIFY_GATES\);/);
-    assert.match(fnBody("pipelineNotifyActive"), /PIPELINE_NOTIFY\.gates\.has\(gate\) && Boolean\(gatePipelines\.get\(gate\)\?\.pipeline\)/);
+    assert.match(fnBody("pipelineNotifyActive"), /pipelineNotifyFor\(gate\)\.on && Boolean\(gatePipelines\.get\(gate\)\?\.pipeline\)/);
     assert.match(fnBody("reportPipelineResult"), /r\.outcome\.kind === "employee" && pipelineNotifyActive\(gate\)\s*\?\s*notifyFromPipeline\(gate, r\.outcome\.employeeId\)/);
   });
 

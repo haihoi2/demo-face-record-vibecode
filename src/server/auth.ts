@@ -88,6 +88,8 @@ const RULES: readonly Rule[] = [
   { methods: ["POST"], pattern: new RegExp(`^/api/camera-streams/${GATE}/watch$`), role: "operator" },
   // Switching a gate's real-time pipeline mode is a rollout decision: admin only.
   { methods: ["POST"], pattern: new RegExp(`^/api/camera-streams/${GATE}/pipeline-mode$`), role: "admin" },
+  // So is letting a gate's pipeline post the employee chat message (#580).
+  { methods: ["POST"], pattern: new RegExp(`^/api/camera-streams/${GATE}/pipeline-notify$`), role: "admin" },
 
   // --- gates: adding, editing (direction, door binding) and removing a gate is
   // admin; the gate list is readable by every signed-in role.

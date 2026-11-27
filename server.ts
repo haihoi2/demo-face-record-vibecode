@@ -1820,6 +1820,8 @@ function normalizeGateConfig(gate: GateStreamConfigRecord, gateId?: string): Gat
   const pipelineMode = parsePipelineMode(gate.pipelineMode);
   if (pipelineMode) normalized.pipelineMode = pipelineMode;
   else delete normalized.pipelineMode;
+  // Pipeline chat messages set in the app: kept only as a real boolean.
+  if (typeof gate.pipelineNotify !== "boolean") delete normalized.pipelineNotify;
   return normalized;
 }
 
@@ -2007,6 +2009,7 @@ function applyGateConfigPatch(current: GateRecord, patch: any): GateRecord {
     direction: _ignoredDirection,
     doorId: _ignoredDoorId,
     pipelineMode: _ignoredPipelineMode,
+    pipelineNotify: _ignoredPipelineNotify,
     enabled: _ignoredEnabled,
     ...rest
   } = patch;
@@ -2027,6 +2030,7 @@ function applyGateConfigPatch(current: GateRecord, patch: any): GateRecord {
       gateType: base.gateType,
       doorId: base.doorId,
       pipelineMode: base.pipelineMode,
+      pipelineNotify: base.pipelineNotify,
       enabled: base.enabled,
       // A partial `watch` patch ({ enabled: true }) keeps the gate's other watch values.
       watch: "watch" in rest ? normalizeGateWatchConfig(rest.watch, base.watch) : base.watch,
@@ -6686,6 +6690,8 @@ function gateWatchRuntime(state: GateWatcherState): GateWatchRuntime & GateWatch
     pipelineMode: pipeline.mode,
     ...(pipeline.requested !== pipeline.mode ? { pipelineModeRequested: pipeline.requested } : {}),
     pipelineModeSource: pipeline.source,
+    pipelineNotify: pipelineNotifyFor(state.gateKey).on,
+    pipelineNotifySource: pipelineNotifyFor(state.gateKey).source,
     ...pipelineRuntime(state.gateKey),
     intervalSeconds: state.intervalSeconds,
     frames: state.frames,
@@ -7060,9 +7066,20 @@ if (PIPELINE_NOTIFY.gates.size || PIPELINE_NOTIFY.ignored.length) {
   );
 }
 
-/** True while `gate` is in PIPELINE_NOTIFY_GATES AND its real-time pipeline is running. */
+/**
+ * Whether `gate`'s pipeline posts messages: the admin's choice in the camera
+ * config (POST /api/camera-streams/:gate/pipeline-notify) wins over
+ * PIPELINE_NOTIFY_GATES, so a gate added in the app needs no redeploy (#580).
+ */
+function pipelineNotifyFor(gate: Gate): { on: boolean; source: "config" | "env" } {
+  const configured = cameraStreamsConfig.gates.find((g) => g.id === gate)?.pipelineNotify;
+  if (typeof configured === "boolean") return { on: configured, source: "config" };
+  return { on: PIPELINE_NOTIFY.gates.has(gate), source: "env" };
+}
+
+/** True while `gate` posts pipeline messages AND its real-time pipeline is running. */
 function pipelineNotifyActive(gate: Gate): boolean {
-  return PIPELINE_NOTIFY.gates.has(gate) && Boolean(gatePipelines.get(gate)?.pipeline);
+  return pipelineNotifyFor(gate).on && Boolean(gatePipelines.get(gate)?.pipeline);
 }
 
 /**
@@ -7582,6 +7599,44 @@ app.post(["/api/camera-streams/:gate/pipeline-mode", "/api/camera-streams/:gate/
   });
 });
 
+/**
+ * Pipeline chat messages per gate (admin, #580): `{ enabled: true | false }`
+ * stores the choice in the camera config; `null` goes back to
+ * PIPELINE_NOTIFY_GATES. Takes effect on the next decision, no restart. The
+ * message still needs the gate's pipeline running (mode shadow).
+ */
+app.post(["/api/camera-streams/:gate/pipeline-notify", "/api/camera-streams/:gate/pipeline-notify/"], (req, res) => {
+  const current = loadCameraStreamsConfig();
+  const found = gateFromConfig(current, req.params.gate);
+  if (!found) return res.status(400).json({ success: false, error: unknownGateError(req.params.gate, current) });
+  const body = req.body && typeof req.body === "object" ? req.body : {};
+  if (!("enabled" in body) || (body.enabled !== null && typeof body.enabled !== "boolean")) {
+    return res.status(400).json({ success: false, error: "enabled phải là true, false hoặc null (null = dùng mặc định máy chủ)" });
+  }
+  const gateConfig: GateRecord = { ...found };
+  if (typeof body.enabled === "boolean") gateConfig.pipelineNotify = body.enabled;
+  else delete gateConfig.pipelineNotify;
+  commitCameraConfig(withGate(current, gateConfig));
+
+  const gateKey: GateWatchKey = found.id;
+  const resolved = pipelineNotifyFor(gateKey);
+  console.log(
+    `[Pipeline ${gateLogTag(gateKey)}] ${operatorActor(req) || "unknown"} đặt gửi tin nhắn từ luồng thời gian thực: ` +
+      `${typeof body.enabled === "boolean" ? (body.enabled ? "bật" : "tắt") : "mặc định máy chủ"} -> hiệu lực ${resolved.on ? "bật" : "tắt"} (nguồn: ${resolved.source})`
+  );
+  if (!gateWatchers.has(gateKey)) gateWatchers.set(gateKey, newGateWatcherState(gateKey, found.direction));
+  const runtime = gateWatchRuntime(gateWatchers.get(gateKey)!);
+  res.json({
+    success: true,
+    gateId: gateKey,
+    gateLabel: runtime.gateLabel,
+    pipelineNotify: resolved.on,
+    pipelineNotifySource: resolved.source,
+    pipelineRunning: Boolean(gatePipelines.get(gateKey)?.pipeline),
+    watcher: runtime,
+  });
+});
+
 // ---- Gates (admin): add, edit, remove. Plan 2026-09-29 section 11. ----
 // "entry" and "exit" always exist: they can be disabled and relabelled, never
 // deleted, and their direction is fixed. Removing any other gate stops its
@@ -7600,6 +7655,7 @@ function publicGateSummary(g: GateRecord) {
     streams: (g.streams || []).length,
     watch: g.watch,
     ...(g.pipelineMode ? { pipelineMode: g.pipelineMode } : {}),
+    ...(typeof g.pipelineNotify === "boolean" ? { pipelineNotify: g.pipelineNotify } : {}),
   };
 }
 

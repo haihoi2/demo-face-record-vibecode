@@ -419,6 +419,8 @@ export interface GateStreamConfigRecord {
   watch?: GateWatchConfigRecord;
   /** Real-time pipeline mode set in the app (admin); absent = PIPELINE_MODE_<GATE> from the environment. */
   pipelineMode?: "legacy" | "shadow" | "live";
+  /** Pipeline chat messages set in the app (admin); absent = PIPELINE_NOTIFY_GATES from the environment. */
+  pipelineNotify?: boolean;
   /**
    * All video sources of the gate. Optional in persisted blobs written before
    * multi-stream support: the server derives one stream from the legacy fields

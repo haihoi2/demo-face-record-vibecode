@@ -37,6 +37,7 @@ const ADMIN_ONLY: Array<[string, string, unknown?]> = [
   ["GET", "/api/users"],
   ["GET", "/api/system/ip-info"],
   ["POST", "/api/camera-streams/entry/pipeline-mode", { mode: "off" }],
+  ["POST", "/api/camera-streams/entry/pipeline-notify", { enabled: true }],
 ];
 
 const OPERATOR_ONLY: Array<[string, string, unknown?]> = [

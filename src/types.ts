@@ -422,6 +422,10 @@ export interface GateWatchRuntime {
   pipelineModeRequested?: "legacy" | "shadow" | "live";
   /** Where the requested mode came from: the camera config (set in the app) or the environment. */
   pipelineModeSource?: "config" | "env";
+  /** The gate's pipeline posts the employee chat message (and attendance-only rows) while it runs. */
+  pipelineNotify?: boolean;
+  /** Where that choice came from: the camera config (set in the app) or PIPELINE_NOTIFY_GATES. */
+  pipelineNotifySource?: "config" | "env";
   /** Real-time pipeline stream health (shadow/live only). */
   pipelineState?: {
     status: "starting" | "streaming" | "stale" | "reconnecting" | "stopped";
@@ -495,6 +499,8 @@ export interface GateStreamConfig {
   watch?: GateWatchConfig;
   /** Real-time pipeline mode configured in the app; absent = server default. */
   pipelineMode?: "legacy" | "shadow" | "live";
+  /** Real-time pipeline chat messages set in the app (admin); absent = server default. */
+  pipelineNotify?: boolean;
   /**
    * All video sources for this gate. Optional for backward compatibility:
    * when absent or empty, the server derives a single stream from the legacy
